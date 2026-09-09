@@ -1,0 +1,5 @@
+# Agentes de proyecto descubiertos en .codex/agents/*.toml.
+# Heredar modelo, esfuerzo y permisos de la sesión.
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3

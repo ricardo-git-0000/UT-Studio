@@ -1,0 +1,42 @@
+# Compilación y herramientas .NET
+**/bin/
+**/obj/
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResults/
+artifacts/
+coverage/
+*.trx
+*.coverage
+*.coveragexml
+*.nupkg
+*.snupkg
+
+# Datos locales: nunca versionar inspecciones reales
+/data/
+/inspections/
+/captures/
+/reports/
+/sdk-local/
+/tmp/
+*.log
+*.dmp
+
+# Secretos y configuración privada
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
+appsettings.Local.json
+appsettings.*.Local.json
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+Desktop.ini
