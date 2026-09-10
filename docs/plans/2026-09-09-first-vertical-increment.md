@@ -4,6 +4,30 @@ Fecha: 2026-09-09. Estado: alcance y arquitectura aprobados; secuencia de ejecuc
 
 ## Objetivo y alcance confirmado
 
+### Scaffolding autorizado el 2026-09-10
+
+El usuario autoriza exclusivamente la solución `UTStudio.sln`, los ocho proyectos
+del ADR 0005 y su grafo de referencias. El agente principal es el único propietario
+de escritura de la solución, `Directory.Build.props`, `src/`, `tests/` y esta
+actualización documental; solution_architect y quality_reviewer revisan en lectura.
+La estructura queda creada, con nullable, implicit usings y warnings como errores.
+No se implementan funcionalidades, contratos, modelos, servicios ni ViewModels.
+
+MSTest queda confirmado para Core.Tests: la plantilla oficial del SDK 10.0.400
+genera la referencia directa `MSTest` 4.0.2. No se añaden otros paquetes directos,
+mocking ni CI. Esta autorización resuelve únicamente la elección del framework
+de Q10 y sustituye las indicaciones históricas de no crear proyectos de esta fase
+documental; las demás decisiones y pasos del incremento siguen pendientes.
+
+Validación del scaffolding: `dotnet restore UTStudio.sln` y `dotnet build UTStudio.sln`
+correctos, con cero advertencias y errores; `dotnet test UTStudio.sln` termina con
+código 0 y sin pruebas disponibles. Se elimina el test de ejemplo: este resultado
+no acredita funcionalidad. App.xaml y MainWindow.xaml conservan solo el arranque
+de una ventana vacía; no se valida aquí el ciclo de vida futuro de ADR 0006.
+Las revisiones en lectura de solution_architect (grafo) y quality_reviewer
+(targets, warnings y plantillas) concluyen sin hallazgos. El arranque visual
+no se ha verificado. No se realiza commit.
+
 Completar la sección vertical simulador -> sesión -> A-Scan neutral -> ViewModel -> ventana WPF con los siete proyectos productivos y UTStudio.Core.Tests del [ADR 0005](../adr/0005-initial-solution-structure.md). Aplicar el ciclo de vida del [ADR 0006](../adr/0006-session-window-lifecycle.md) y las políticas del [pipeline](../architecture/data-pipeline.md).
 
 No incluye SignalProcessing, Storage, GigE, PCIe, Reporting, PLC, Robot, Avalonia, 3D, otros scans ni distribución de payloads entre múltiples consumidores. Los requisitos posteriores de producto siguen vigentes.
