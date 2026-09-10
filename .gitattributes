@@ -1,0 +1,19 @@
+# Normalizar archivos de texto usando LF
+* text=auto eol=lf
+
+# Scripts tradicionales de Windows
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Archivos binarios
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.rar binary
+*.dll binary
+*.exe binary
+*.pdb binary
