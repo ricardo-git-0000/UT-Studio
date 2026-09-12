@@ -1,80 +1,126 @@
 # Plan del primer incremento — Simulador y A-Scan WPF
 
-Fecha: 2026-09-09. Estado: alcance y arquitectura aprobados; secuencia de ejecución propuesta, implementación no iniciada ni autorizada en esta tarea documental.
+Fecha inicial: 2026-09-09. Revisado: 2026-09-12.
+Estado: diseño aprobado con correcciones; scaffolding existente, implementación funcional pendiente y no autorizada por esta tarea documental.
 
-## Objetivo y alcance confirmado
+## Objetivo y fuentes vigentes
 
-### Scaffolding autorizado el 2026-09-10
+Simulador -> sesión Application -> A-Scan neutral -> ViewModel -> ventana WPF. Mantener los siete proyectos productivos y Core.Tests del [ADR 0005](../adr/0005-initial-solution-structure.md). El [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md) sustituye la política anterior de cierre; [ADR 0007](../adr/0007-frame-source-ownership.md) fija fuente/ownership y [ADR 0008](../adr/0008-latest-only-visual-delivery.md) fija entrega visual.
 
-El usuario autoriza exclusivamente la solución `UTStudio.sln`, los ocho proyectos
-del ADR 0005 y su grafo de referencias. El agente principal es el único propietario
-de escritura de la solución, `Directory.Build.props`, `src/`, `tests/` y esta
-actualización documental; solution_architect y quality_reviewer revisan en lectura.
-La estructura queda creada, con nullable, implicit usings y warnings como errores.
-No se implementan funcionalidades, contratos, modelos, servicios ni ViewModels.
+No incluye hardware GigE/PCIe, phased array, almacenamiento, DSP, informes, otros scans, distribución de payloads a varios consumidores ni infraestructura genérica de scopes por ventana. No bandeja, OnExplicitShutdown ni ejecución sin ventanas. No seleccionar biblioteca gráfica, añadir paquetes, implementar código ni hacer commit en esta tarea.
 
-MSTest queda confirmado para Core.Tests: la plantilla oficial del SDK 10.0.400
-genera la referencia directa `MSTest` 4.0.2. No se añaden otros paquetes directos,
-mocking ni CI. Esta autorización resuelve únicamente la elección del framework
-de Q10 y sustituye las indicaciones históricas de no crear proyectos de esta fase
-documental; las demás decisiones y pasos del incremento siguen pendientes.
+## Scaffolding existente: resultado histórico del 2026-09-10
 
-Validación del scaffolding: `dotnet restore UTStudio.sln` y `dotnet build UTStudio.sln`
-correctos, con cero advertencias y errores; `dotnet test UTStudio.sln` termina con
-código 0 y sin pruebas disponibles. Se elimina el test de ejemplo: este resultado
-no acredita funcionalidad. App.xaml y MainWindow.xaml conservan solo el arranque
-de una ventana vacía; no se valida aquí el ciclo de vida futuro de ADR 0006.
-Las revisiones en lectura de solution_architect (grafo) y quality_reviewer
-(targets, warnings y plantillas) concluyen sin hallazgos. El arranque visual
-no se ha verificado. No se realiza commit.
+Ya existen UTStudio.sln, siete proyectos en src y Core.Tests, con nullable, implicit usings y warnings como errores. MSTest 4.0.2 fue autorizado para Core.Tests; no se aprobaron otros paquetes directos, mocking ni CI.
 
-Completar la sección vertical simulador -> sesión -> A-Scan neutral -> ViewModel -> ventana WPF con los siete proyectos productivos y UTStudio.Core.Tests del [ADR 0005](../adr/0005-initial-solution-structure.md). Aplicar el ciclo de vida del [ADR 0006](../adr/0006-session-window-lifecycle.md) y las políticas del [pipeline](../architecture/data-pipeline.md).
+La validación histórica registró restore/build correctos sin advertencias ni errores y test con código 0 sin pruebas disponibles. No acredita funcionalidad. App/MainWindow siguen siendo scaffolding; el arranque visual y el cierre funcional no se han verificado. No recrear los proyectos en el siguiente paso. Estas comprobaciones no se han repetido en la tarea documental actual.
 
-No incluye SignalProcessing, Storage, GigE, PCIe, Reporting, PLC, Robot, Avalonia, 3D, otros scans ni distribución de payloads entre múltiples consumidores. Los requisitos posteriores de producto siguen vigentes.
+## Decisiones confirmadas el 2026-09-11
 
-## Propiedad y coordinación de esta tarea documental
-
-| Propietario | Archivos o responsabilidad |
+| Área | Decisión aceptada |
 | --- | --- |
-| Agente principal, único escritor | docs/architecture/overview.md; docs/architecture/data-pipeline.md; docs/adr/0005-initial-solution-structure.md; docs/adr/0006-session-window-lifecycle.md; este plan |
-| solution_architect, solo lectura | Redacción propuesta y revisión de estructura y contratos compartidos |
-| quality_reviewer, solo lectura | Revisión de límites, ciclo de vida, memoria y capacidad de pruebas |
+| Cierre | MainWindow solicita salir: parada ordenada, desconexión, buffers liberados, Host detenido/liberado y cierre definitivo. Secundarias futuras no detienen sesión al cerrar |
+| Frame | ConventionalUtFrame propietario, exclusivo e idempotente; `ReadOnlyMemory<short>` RF bipolar. Rectificadas reales: representación binaria abierta |
+| Fuente | Contrato neutral; Application único lector del Channel, canal nuevo por run, inicio/parada serializados y rollback de inicio |
+| Simulador | ChannelCapacity=4 y BufferCount=8 internos configurables, sujetos a benchmarks; no parte del contrato general |
+| Visualización | Mailbox latest-only, único coordinador, snapshot independiente, máximo 1.024 puntos con min/max |
+| Cadencias | Refresco visual máximo 30 Hz; métricas exactas publicadas a 5 Hz |
+| Señal | Simulador determinista: 2.048 muestras, 50 MHz, hasta 100 A-Scans/s, RF bipolar |
+| Escalas | Tiempo en microsegundos; RF fija -100 % a +100 % |
+| Timeout | Cinco segundos solo diagnóstico; mantener MainWindow y limpieza observada, sin aborto forzado |
+| Ventanas | Una vista integrada en MainWindow; sin scopes genéricos. Definir propiedad y presupuesto al añadir primera secundaria |
 
-La futura implementación tendrá una asignación explícita de propietarios antes de editar. Este plan no delega escritura de código.
+La configuración fija por ejecución contiene SourceId, RunId, canal físico, N, fs, offset y origen UTC; cada frame añade secuencia desde cero y tiempo monotónico de disparo. No confundir muestreo con frecuencia de disparo ni inferir profundidad o voltios.
 
-## Secuencia propuesta para una tarea posterior
+## Simulador y reproducibilidad
 
-1. Concretar contratos mínimos por Acquisition, Application, Presentation y Diagnostics, sin clases o servicios futuros. Precisar capacidades del simulador, metadatos/unidades, snapshots y ownership de un consumidor, incluidos consumo, sustitución, cancelación y fallo. Revisión de contratos compartidos por solution_architect.
-2. Resolver herramientas de pruebas/CI, representación/renderizado A-Scan y dependencias necesarias; justificar y obtener aprobación antes de añadir NuGet. Definir salida/reapertura tras cerrar la última ventana y política de timeout/aborto.
-3. Crear posteriormente los siete proyectos bajo src/ y tests/UTStudio.Core.Tests; validar referencias y objetivos definidos en ADR 0005. No crear proyectos aplazados.
-4. Implementar simulador determinista y sesión Application con inicio/parada/fallo, cancelación, canal acotado y propiedad explícita. El único consumidor del canal debe seguir resolviendo datos aunque no haya ventanas; ningún ViewModel compite por leerlo.
-5. Incorporar modelo y transformación A-Scan en Visualization.Core, selección latest-only, estado/ViewModel en Presentation y adaptación visual/composición en App.Wpf. Mantener trabajo por frame fuera del Dispatcher y limitar la frecuencia visual. No introducir DSP adicional.
-6. Integrar cierre de ventana con liberación de suscripciones y cierre explícito de aplicación con parada esperada. Verificar también funcionamiento sin ventanas y diagnóstico de fallo de cierre.
-7. Ejecutar build y pruebas pertinentes; revisar diff, referencias y archivos nuevos. Registrar decisiones adicionales en el documento o ADR correspondiente y mediciones reproducibles cuando existan.
+Configuración de demostración aprobada: canal 0, offset 0, semilla 1; dos ecos sinusoidales de 5 MHz en 10 y 25 microsegundos, amplitudes 60 % y 30 % FS, envolvente gaussiana con desviación típica 0,35 microsegundos y ruido opcional hasta 1 % FS. Validar portadora menor que fs/2, parámetros finitos y límites de configuración.
+
+Inyectar TimeProvider y usar reloj manual en pruebas. Definir algoritmo pseudoaleatorio explícito/versionado, redondeo y saturación. Primer disparo inmediato; tras cada entrega exitosa esperar un período antes del siguiente. Hasta 100/s es un máximo objetivo, no garantía de frecuencia exacta: generación/backpressure añaden retraso. Sin ráfagas para recuperar ticks ni huecos de secuencia por disparos no realizados.
+
+Payload reproducible por configuración/semilla/secuencia en entorno fijo; timestamps también requieren mismo reloj y calendario de consumo. Comparaciones analíticas con tolerancia justificada, sin prometer identidad de funciones trascendentes entre plataformas. No fallos avanzados todavía.
+
+## Componentes, DI y propiedad
+
+Application posee sesión, consumidor, estado y mailbox. Presentation coordina la transformación de Visualization.Core y entrega snapshots; no referencia implementaciones Application ni Simulator. Contracts no referencia Visualization.Core. Solo App.Wpf adapta UI y compone implementaciones.
+
+Singleton de aplicación: fuente, sesión, stores/mailbox encapsulados, coordinador visual, planificador UI, reloj y coordinación de salida. Transformador sin estado reutilizable. Las interfaces de sesión resuelven la misma instancia. ViewModels Main/AScan independientes, creados explícitamente para MainWindow con suscripciones de vida explícita y liberación al cerrar; no infraestructura genérica de scopes. Pool, Channel, tokens y tareas pertenecen al run, fuera de DI.
+
+Composición WPF con OnMainWindowClose: cancelar sincrónicamente el primer Closing, esperar asíncronamente limpieza y Host, autorizar/reemitir Close solo al terminar. Mantener ventana para diagnóstico. Futura secundaria: estado/suscripciones propios y cierre sin detener sesión; concretar diseño antes de incorporarla.
+
+## Inicio y parada sin interbloqueo
+
+Inicio: Host/composición -> conectar -> validar/configurar -> Start -> instalar lector Application -> publicar operativo. Si la fuente no entregó run, ella revierte productor/canal/buffers. Tras entregarlo, Application responde de consumo o rollback aunque se cancele la solicitud antes de instalar el lector. El token del solicitante no mantiene ligado un run exitoso.
+
+Salida durante inicio: cerrar admisión y cancelar la operación vigente (Connect/Configure/Start) antes de esperar la exclusión de operaciones. Sincronizar registro de inicio y marca de salida para no perder cancelación; observar finalización/rollback y continuar limpieza serializada. La cancelación privada de un run exitoso sigue siendo independiente.
+
+Parada: cerrar entrega latest y marcar Stopping; cancelar inmediatamente productor y sus esperas de reserva/reloj/WriteAsync. El único consumidor sigue drenando y liberando concurrentemente, sin cancelar su lectura. El productor libera su frame no entregado y completa writer al salir. Source.StopAsync no espera drenaje; Application observa productor y lector, vacía mailbox y espera AllFramesReleased tras sellado y cero reservas.
+
+Fallo de consumidor: su limpieza sigue siendo el único lector; cancela productor y drena. No esperar tareas bajo locks. No republicar los frames drenados durante parada. El transformador que ya tenía un frame libera en finally antes de esperar UI; no publicar resultados obsoletos. No nuevo run hasta limpiar el anterior.
+
+Salir añade desconexión, liberación visual, parada/liberación Host y cierre definitivo. Timeout diagnóstico no cancela limpieza ni destruye recursos. Detalle normativo: ADR 0006/0007.
+
+## Secuencia de implementación futura
+
+1. Autorizar implementación y resolver adaptador de dibujo WPF; justificar y aprobar paquetes adicionales necesarios para Hosting/MVVM. MSTest ya está aprobado. No crear proyectos adicionales.
+2. Incorporar modelos y contratos del ADR 0007 con validaciones, estados y errores neutrales.
+3. Implementar simulador/reloj/pool internos, sesión y rollback/parada; verificar canal lleno y ownership antes de integrar UI.
+4. Incorporar mailbox, transformación min/max, snapshot y stores según ADR 0008; probar memoria y cadencias con tiempo controlable.
+5. Componer MainViewModel/AScanViewModel y vista inicial sin referencias entre ViewModels ni scopes genéricos; adaptar hilo UI en WPF.
+6. Integrar Closing y Host según ADR 0006; comprobar timeout y errores conservando MainWindow.
+7. Ejecutar build/pruebas pertinentes, comprobación WPF separada y benchmarks reproducibles de buffers, asignaciones, GC, caudal y refresco. Registrar resultados reales, no supuestos.
+
+## Archivos previstos para implementación posterior
+
+| Proyecto | Archivos/responsabilidades orientativos |
+| --- | --- |
+| Domain | Identificadores, ConventionalAcquisitionConfiguration, ConventionalUtFrameMetadata y modo RF |
+| Contracts | IUtFrameSource, UtAcquisitionRun, ConventionalUtFrame, capacidades/estados/errores, IApplicationSession, SessionSnapshot, ILatestFrameFeed |
+| Application | ApplicationSession, LatestFrameMailbox, SessionStateStore |
+| Acquisition.Simulator | SimulatorUtFrameSource, SimulatorOptions, SyntheticRfGenerator, BoundedSampleBufferPool |
+| Visualization.Core | AScanPoint, AScanSnapshot, AScanScale, AScanProjector |
+| Presentation | MainViewModel, AScanViewModel, coordinador/store visual, UiUpdatePump, IUiDispatcher |
+| App.Wpf | Actualizar App/MainWindow; composición, vista A-Scan, adaptador Dispatcher y coordinación de salida |
+| Core.Tests | Suites neutrales por responsabilidad, reloj manual y dobles de fuente/planificador |
+
+No crear AScanWindow ni gestores/scopes genéricos todavía.
 
 ## Validación prevista del incremento
 
-UTStudio.Core.Tests agrupará suites de Domain, Contracts, Application, Acquisition.Simulator, Visualization.Core, Presentation y arquitectura. Solo referenciará los seis proyectos neutrales. No elegir ahora framework ni mocking.
+MSTest existente; sin paquetes nuevos de mocking. Core.Tests referencia solo los seis proyectos neutrales.
 
-- Grafo acíclico, referencias permitidas y ausencia de WPF/Avalonia incluso transitiva en el núcleo; ningún ViewModel referencia otro.
-- Señales sintéticas reproducibles y correspondencia de muestras, unidades y ejes del A-Scan neutral, sin hardware.
-- Inicio, parada, fallo y cancelación de sesión con tiempo controlable; evitar verificaciones dependientes solo de sleeps.
-- Sustitución latest-only con contabilidad de descartes, memoria acotada y liberación exactamente una vez, sin reutilización prematura.
-- Desuscripción de una vista sin detener fuente; ausencia de vistas sin acumulación; solicitud de salida que espera parada y liberación antes de destruir servicios.
-- Contadores de integridad exactos aunque su publicación sea muestreada.
+- Arquitectura: grafo permitido, sin WPF/Avalonia en núcleo/Presentation ni referencias entre ViewModels.
+- RF: límites, cuentas digitales, ejes, determinismo, reloj monotónico y rechazo de modos no soportados.
+- Inicio: fallo/cancelación antes y después de entregar run, sin tareas o buffers huérfanos.
+- Concurrencia: Channel lleno con productor en WriteAsync al parar; cancelación observable mientras lector drena. Fallo del consumidor; carreras Publish/Take/Close y Rent/Seal.
+- Ownership: devolución exactamente una vez, sin uso tras liberar, límite de buffers y barrera pendiente mientras transforma pero independiente de Dispatcher bloqueado.
+- Visualización: N=1/1.024/1.025/máximo, extremos min/max en orden, snapshot válido tras reutilizar muestras, latest-only y errores visuales.
+- UI: máximo 30 Hz efectivo sin recuperación de ticks, callback pendiente acotado, RunId/generación impiden actualización antigua tras reinicio; métricas a 5 Hz conservando contadores exactos.
+- Cierre principal: salida con adquisición activa o inicio pendiente, solicitudes repetidas, desconexión y Host después de limpiar; cinco segundos diagnósticos sin cierre prematuro. Fuente doble con Connect/Configure/Start bloqueados: cancelación antes de esperar exclusión, rollback observado y carrera de registro de inicio/salida.
+- Validación futura de secundarias: cerrar una no detiene sesión; no implementar su infraestructura ahora.
 
-La composición, representación A-Scan y cierre real de ventanas WPF se comprobarán por separado en Windows; Core.Tests no cubre esa integración. No se crea otro proyecto de pruebas en este incremento sin ampliar el plan. Las pruebas hardware, persistencia y rendimiento de esas futuras funciones quedan aplazadas.
+Bindings, dibujo y cierre real de WPF se comprueban por separado en Windows. Sin proyecto nuevo de pruebas en este incremento. Los benchmarks determinarán ajustes internos de capacidad/pool; los máximos del producto no son una configuración de rendimiento garantizada.
+
+## Propiedad de la tarea documental actual
+
+| Responsable | Escritura autorizada/responsabilidad |
+| --- | --- |
+| Principal, único escritor | ADR 0006/0007/0008, este plan; sincronización de índice ADR, arquitectura overview/pipeline/testing, estado de requisitos/cuestiones y referencia histórica de MSTest en ADR 0005 |
+| solution_architect, lectura | Propuesta de actualización y revisión de contratos/orden de parada; sin escritura |
+| quality_reviewer, lectura | Revisión del diff, concurrencia, memoria, consistencia y alcance; sin escritura |
+
+Sin código, paquetes ni commit. Las decisiones duraderas quedan en estos documentos; no se guarda transcripción ni resumen duplicado.
 
 ## Pendientes y riesgos
 
-- Antes de implementar el flujo: ownership de un consumidor, topología de entrega visual, representación y vida de memoria del A-Scan, semántica/hilo/versionado de snapshots, presupuestos de memoria y frecuencia visual.
-- Antes de integrar el cierre: salida/reapertura sin ventanas, timeout, aborto y diagnóstico observable.
-- Q10: framework de pruebas, mocking y CI; aprobación de paquetes necesarios. Q09: renderizado y presupuestos, sin seleccionar biblioteca todavía.
-- Antes de varios consumidores: estrategia exacta de ownership compartido; no seleccionar leases/copias ahora. Q13/Q06 conservan orden procesamiento/persistencia, datos a conservar y relación con durabilidad.
-- Para incrementos futuros: protocolos/SDK y capacidades reales (Q01–Q04), geometría (Q05), formatos (Q06–Q07), informes (Q08), Linux/despliegue (Q11) y concurrencia de inspecciones (resto de Q12).
+- Renderizador/adaptador WPF sin biblioteca elegida; aprobación de paquetes adicionales. Mocking y CI siguen abiertos.
+- Benchmarks y presupuestos medidos: buffers/envelopes/modelos visuales generan costes que no se han medido; no prometer cero asignaciones ni heap estrictamente constante.
+- Representación de rectificadas reales, hardware, PA, almacenamiento y ownership compartido se resolverán en incrementos posteriores.
+- Propiedad y presupuesto de ventanas secundarias antes de añadir la primera; no salida/reapertura sin ventanas.
+- Riesgos a verificar: reutilización prematura, parada bloqueada, publicación tardía, callback de otro run y cierre del proceso antes de terminar Host.
 
-Los riesgos principales son uso de buffers después de liberar, retención por UI lenta, detención accidental por cierre de ventana y confusión entre muestreo de métricas y pérdida de contabilidad. Los casos de validación anteriores deben demostrar su control, sin inventar SLA ni afirmar resultados antes de ejecutar pruebas.
+## Validación de esta tarea documental
 
-## Validación de esta entrega documental
+Comprobar diff y archivos nuevos, enlaces relativos y coherencia con requisitos/ADR. Compilación y pruebas funcionales no aplican: solo documentación. No presentar las pruebas o benchmarks previstos como ejecutados.
 
-Comprobar enlaces locales, consistencia entre los dos ADR y arquitectura, diff y alcance exclusivo de cinco archivos Markdown. Compilación y pruebas funcionales no aplican: no se crea solución, proyectos C#, código ni paquetes. No realizar commit.
+Revisión documental final del 2026-09-12: solution_architect confirmó coherencia arquitectónica; quality_reviewer detectó la cancelación de inicio pendiente antes de esperar exclusión, se incorporó y confirmó el hallazgo cerrado. Diff sin errores de whitespace, 11 archivos Markdown y 52 enlaces relativos comprobados sin roturas. Sin contradicciones vigentes detectadas; pendientes funcionales arriba identificados. Sin compilación, pruebas funcionales, paquetes ni commit.

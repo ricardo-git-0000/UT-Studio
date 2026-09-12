@@ -12,10 +12,12 @@ No asumir respuestas ni bloquear la fase documental por estas incógnitas. Resol
 | Q06 | Formato nativo, bloques, compresión, integridad, durabilidad y ventana recuperable; crudo/procesado a conservar | ut_storage_formats |
 | Q07 | Formatos externos prioritarios y archivos de ejemplo autorizados | ut_storage_formats |
 | Q08 | Informe: contenido, PDF/A, firmas, imágenes, plantilla corporativa y licencia | pdf_reporting |
-| Q09 | Renderizador, formato neutral de píxel, FPS y presupuestos de CPU/GPU/memoria | ut_visualization |
-| Q10 | Framework de pruebas/mocking y plataforma de CI; hardware y duración de benchmarks | quality_reviewer |
+| Q09 | Renderizador y benchmarks CPU/GPU/memoria pendientes; A-Scan de puntos, máximo 1.024/min-max y 30 Hz aceptados (ADR 0008) | ut_visualization |
+| Q10 | MSTest 4.0.2 aprobado/presente desde 2026-09-10; mocking, CI, hardware/duración de benchmarks y paquetes adicionales pendientes | quality_reviewer |
 | Q11 | Instalación, actualización y plataformas Linux realmente requeridas | solution_architect |
-| Q12 | Sesión por aplicación/ventana, inspecciones concurrentes y semántica/hilo de snapshots | wpf_mvvm_specialist |
-| Q13 | Visualización de datos recibidos o ya persistidos; bifurcación y orden exacto del pipeline | solution_architect |
+| Q12 | Sesión Application, cierre MainWindow=salida y snapshots iniciales resueltos (ADR 0006/0008); inspecciones concurrentes y propiedad/presupuesto de primera secundaria pendientes, sin scopes genéricos ahora | wpf_mvvm_specialist |
+| Q13 | Flujo inicial recibido -> Application -> latest-only resuelto (ADR 0007/0008); fan-out, ownership compartido, orden y relación con persistencia pendientes | solution_architect |
+
+La representación binaria de rectificadas reales sigue abierta; inicialmente solo RF bipolar `ReadOnlyMemory<short>`. Véanse [ADR 0007](../adr/0007-frame-source-ownership.md), [ADR 0008](../adr/0008-latest-only-visual-delivery.md) y [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 
 Q01–Q04 condicionan la adquisición real. Q06 condiciona el formato persistente. Q08 condiciona la selección PDF. No incorporar NuGet antes de justificarlo y obtener aprobación.

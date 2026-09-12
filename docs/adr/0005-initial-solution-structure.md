@@ -36,10 +36,10 @@ No crear todavía SignalProcessing, Storage, GigE, PCIe, Reporting, PLC, Robot, 
 
 ## Consecuencias y relación con decisiones previas
 
-Concreta la distribución física pendiente en ADR 0001 y en el índice histórico de ADR; mantiene las restricciones de ADR 0001–0004. Core.Tests agrupa suites por responsabilidad y no cubre integración WPF ni hardware. Framework, mocking y CI siguen pendientes de Q10; esta decisión no aprueba paquetes.
+Concreta la distribución física pendiente en ADR 0001 y en el índice histórico de ADR; mantiene las restricciones de ADR 0001–0004. Core.Tests agrupa suites por responsabilidad y no cubre integración WPF ni hardware. Actualización de estado 2026-09-11: MSTest 4.0.2 fue aprobado para scaffolding el 2026-09-10; mocking, CI y paquetes adicionales siguen pendientes. Véase el plan.
 
 El [ADR 0006](0006-session-window-lifecycle.md) fija la propiedad de sesión y el cierre. El [plan](../plans/2026-09-09-first-vertical-increment.md) organiza el trabajo posterior. En esta fase solo se actualiza documentación; no se genera solución, proyectos ni código.
 
 ## Pendientes
 
-Contratos mínimos y ownership del consumidor único; semántica de snapshots; representación y renderizado del A-Scan; presupuestos y pruebas/CI. La estrategia compartida de buffers se decidirá antes de introducir varios consumidores, conforme al [pipeline](../architecture/data-pipeline.md).
+Actualización 2026-09-11: contratos/ownership iniciales resueltos en [ADR 0007](0007-frame-source-ownership.md); snapshots y cadencias en [ADR 0008](0008-latest-only-visual-delivery.md); cierre principal en ADR 0006 revisado. Pendientes renderizado, benchmarks, mocking/CI y paquetes adicionales. La estrategia compartida de buffers se decidirá antes de introducir varios consumidores, conforme al [pipeline](../architecture/data-pipeline.md).

@@ -1,10 +1,10 @@
 # Arquitectura inicial
 
-Estado: estructura inicial y sección vertical aprobadas por el usuario el 2026-09-09; implementación pendiente. Trazabilidad: R01–R03, R08–R13; ADR 0001–0004, [ADR 0005](../adr/0005-initial-solution-structure.md) y [ADR 0006](../adr/0006-session-window-lifecycle.md).
+Estado: estructura aprobada el 2026-09-09, scaffolding existente desde 2026-09-10 y diseño corregido/aprobado el 2026-09-11; implementación funcional pendiente. Trazabilidad: R01–R03, R08–R13; ADR 0001–0004, [ADR 0005](../adr/0005-initial-solution-structure.md) y [ADR 0006](../adr/0006-session-window-lifecycle.md).
 
 ## Estructura inicial aprobada
 
-La primera sección vertical será simulador -> sesión -> A-Scan neutral -> ViewModel -> ventana WPF. Se crearán en una tarea de implementación posterior siete proyectos productivos bajo `src/` y un proyecto de pruebas bajo `tests/`. Esta aprobación no autoriza generar código o paquetes en la fase documental.
+La primera sección vertical será simulador -> sesión -> A-Scan neutral -> ViewModel -> ventana WPF. Existen siete proyectos productivos bajo `src/` y un proyecto de pruebas bajo `tests/`; no recrear el scaffolding. Esta aprobación no autoriza generar código o paquetes en la fase documental.
 
 | Proyecto UTStudio.* | Responsabilidad inicial | Referencias directas permitidas |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ La primera sección vertical será simulador -> sesión -> A-Scan neutral -> Vie
 | App.Wpf | Ejecutable, vistas, adaptación WPF y raíz de composición | Los seis proyectos neutrales |
 | Core.Tests | Pruebas neutrales agrupadas por responsabilidad y comprobaciones de arquitectura | Los seis proyectos neutrales; nunca App.Wpf |
 
-Los proyectos neutrales y Core.Tests tendrán objetivo `net10.0`; App.Wpf, `net10.0-windows`. La elección del framework de pruebas y la aprobación de paquetes siguen pendientes (Q10).
+Los proyectos neutrales y Core.Tests tendrán objetivo `net10.0`; App.Wpf, `net10.0-windows`. MSTest 4.0.2 está aprobado/presente desde 2026-09-10; mocking, CI y paquetes adicionales siguen pendientes (Q10).
 
 La flecha A -> B significa que A puede referenciar B; no representa el flujo de datos. Ninguna dependencia inversa se permite por comodidad.
 
@@ -53,15 +53,15 @@ Dependencias prohibidas: Domain hacia cualquier otro proyecto; Contracts hacia i
 
 ## Comunicación y ciclo de vida
 Los casos de uso operan mediante interfaces inyectadas. Los ViewModels no acceden al hardware ni se referencian entre sí; reciben servicios y snapshots de stores mediante IObservable<T> o equivalente. Messenger sirve solo para notificaciones ocasionales de presentación. Frames circulan por ChannelReader<T> de canales acotados.
-La sesión activa pertenece a Application y vive independientemente de las ventanas. Cerrar una ventana libera sus suscripciones y estado visual, sin detener adquisición. Cerrar la aplicación solicita y espera la parada ordenada de la sesión antes de liberar servicios. Cerrar la última ventana tampoco implica por sí mismo salir de la aplicación; el mecanismo de salida y reapertura queda pendiente. Véase [ADR 0006](../adr/0006-session-window-lifecycle.md).
+La sesión pertenece a Application. Cerrar MainWindow solicita salir: cancelar productor mientras el único lector drena, esperar buffers devueltos, desconectar y detener/liberar Host antes del cierre definitivo. MainWindow permanece abierta durante limpieza y diagnóstico tras cinco segundos. Sin bandeja, OnExplicitShutdown ni ejecución sin ventanas. Una futura secundaria podrá cerrarse sin detener sesión. Véase [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 
-Documentar orden, versión, hilo de publicación y desuscripción de snapshots antes de concretar contratos. Las operaciones largas admiten CancellationToken. No compartir un ChannelReader entre consumidores competidores: la futura distribución tendrá ramas separadas para procesamiento y almacenamiento sin pérdida silenciosa, visualización latest-only y métricas mediante muestreo. El ownership compartido se decidirá antes de introducir varios consumidores; el ownership del flujo inicial sí debe quedar definido. Véase [pipeline](data-pipeline.md).
+El [ADR 0007](../adr/0007-frame-source-ownership.md) concreta frame RF `ReadOnlyMemory<short>` y ownership exclusivo; el [ADR 0008](../adr/0008-latest-only-visual-delivery.md) concreta snapshots versionados, notificaciones fuera de locks, mailbox latest-only, máximo 1.024 puntos/30 Hz y métricas a 5 Hz. Las operaciones largas admiten CancellationToken. No compartir un ChannelReader entre consumidores competidores: la futura distribución tendrá ramas separadas para procesamiento y almacenamiento sin pérdida silenciosa, visualización latest-only y métricas mediante muestreo. El ownership compartido se decidirá antes de introducir varios consumidores; el ownership inicial queda definido en ADR 0007. Véase [pipeline](data-pipeline.md).
 
 ## Frontera WPF/Avalonia
 Presentation no importa WPF ni Avalonia. Los servicios UI abstractos se implementan inicialmente dentro de App.Wpf, separados por carpetas de composición, vistas y servicios. La extracción de Presentation.Wpf o Visualization.Wpf se aplaza hasta que una responsabilidad real la justifique. Estas abstracciones no se inyectan en hardware.
 App.Wpf configura Hosting, DI por constructor, configuración y logging, construye las ventanas y coordina arranque/cierre. No es propietario de la lógica de sesión. Los servicios de plataforma no visuales se abstraen en la frontera neutral que los necesita; no se crea un proyecto Platform genérico.
 Solo proyectos .Wpf referencian WPF. Tipos UI como Brush, Color, Point, BitmapSource, WriteableBitmap, Dispatcher y Window no aparecen en APIs públicas del núcleo. Usar unidades, coordenadas y formatos de píxel neutrales explícitos.
-Cada ventana posee su estado visual y suscripciones; la sesión compartida tiene vida independiente. El cierre libera vistas/suscripciones sin detener accidentalmente otra ventana. La frecuencia visual es limitada; nunca un control XAML por muestra.
+MainWindow compone explícitamente ViewModels independientes y suscripciones. Su cierre solicita salida; no crear scopes genéricos por ventana. La primera secundaria exigirá definir propiedad local y presupuesto; cerrarla no detendrá sesión. La frecuencia visual es limitada; nunca un control XAML por muestra.
 La futura UI Avalonia sustituirá adaptadores y composición. La portabilidad del núcleo no garantiza soporte Linux del SDK PCIe. Aislar también SDK de futuros PLC, robot y encoders.
 
 ## Proyectos aplazados y fuentes futuras
@@ -74,6 +74,6 @@ SignalProcessing, Storage y Visualization.Core mantendrán dependencias neutrale
 
 ## Decisiones abiertas y siguiente incremento
 
-Q12 queda parcialmente resuelta: propiedad de sesión y efecto del cierre están aceptados; concurrencia de inspecciones, publicación de snapshots y mecanismo de salida/reapertura siguen abiertos. Q13 queda parcialmente resuelta: políticas de ramas aceptadas; orden concreto, ownership compartido y relación entre datos visualizados y confirmados en disco pendientes. Q06 conserva las decisiones sobre datos crudos/procesados y durabilidad. Estas precisiones actualizan el estado de las cuestiones sin modificar su catálogo histórico en esta tarea.
+Q12: propiedad de sesión, cierre principal y snapshots iniciales resueltos por ADR 0006/0008; concurrencia de inspecciones y recursos de secundarias pendientes. Q13: flujo inicial y ownership exclusivo resueltos por ADR 0007/0008; fan-out, ownership compartido y relación con persistencia pendientes. Q06 conserva datos crudos/procesados y durabilidad.
 
-Siguen pendientes herramientas de pruebas/CI (Q10), renderizado y presupuestos (Q09), y requisitos de futuras integraciones. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).
+Pendientes mocking/CI y paquetes adicionales (Q10), renderizado y benchmarks (Q09), y futuras integraciones. ChannelCapacity=4 y BufferCount=8 son internos configurables del simulador sujetos a benchmarks, no del contrato general. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).

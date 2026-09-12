@@ -21,5 +21,9 @@ Fuente: [contexto inicial](../../UT-STUDIO-CONTEXT.md). Los ID siguientes permit
 
 Fuera de v1 inicial: 3D, integración PLC Panasonic/Mewtocol, robot Universal Robots y encoders/sincronización avanzada. Reservar límites de adaptación, sin implementar SDK ni protocolos ahora. Linux/Avalonia son evolución posible, no compatibilidad del hardware garantizada.
 
-## Aceptación de esta fase
+## Alcance confirmado del primer incremento (2026-09-11)
+
+Varias ventanas y rectificadas siguen siendo requisitos de producto, no capacidades de este incremento. Inicialmente RF bipolar `ReadOnlyMemory<short>`, sesión Application y A-Scan en MainWindow. Cerrar MainWindow solicita salida ordenada; secundarias futuras no detendrán sesión. Sin bandeja, OnExplicitShutdown, ejecución sin ventanas ni scopes genéricos. Diseño en [ADR 0006](../adr/0006-session-window-lifecycle.md), [ADR 0007](../adr/0007-frame-source-ownership.md) y [ADR 0008](../adr/0008-latest-only-visual-delivery.md); implementación pendiente según [plan](../plans/2026-09-09-first-vertical-increment.md).
+
+## Aceptación de la fase documental inicial (histórico)
 Configuración y once perfiles presentes; reglas de escritor único; documentación de requisitos, arquitectura y ADR enlazada; cinco áreas revisadas en paralelo por especialistas; pendientes explícitos; sin implementación, proyectos C#, paquetes ni commit.
