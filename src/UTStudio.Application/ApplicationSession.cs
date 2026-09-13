@@ -1,4 +1,5 @@
 using UTStudio.Contracts.Acquisition;
+using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 
 namespace UTStudio.Application;
@@ -15,6 +16,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
 {
     private readonly object _gate = new();
     private readonly IUtFrameSource _source;
+    private readonly IConventionalFrameSink? _visualSink;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
     private Operation? _active;
@@ -23,11 +25,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
     private Task? _disposeTask;
     private bool _disposing;
 
-    public ApplicationSession(IUtFrameSource source)
+    public ApplicationSession(IUtFrameSource source, IConventionalFrameSink? visualSink = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
         _source = source;
+        _visualSink = visualSink;
         _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0);
         _publisher = new SessionSnapshotPublisher(_snapshot);
     }
@@ -107,6 +110,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
             {
                 // Receiving a descriptor transfers its reader even if the token is already cancelled.
                 operation.Run = run;
+                if (!operation.CleanupRequested && _visualSink is not null)
+                {
+                    operation.VisualOpened = true;
+                    try { _visualSink.OpenRun(operation.RunId); }
+                    catch (Exception error) { RecordVisualError(operation, error); CloseVisual(operation); }
+                }
                 operation.Consumer = Task.Run(() => ConsumeAsync(operation, run));
                 operation.Supervisor = Task.Run(() => SuperviseProducerAsync(operation, run));
                 if (run.Metadata.SourceId != _source.SourceId || run.Metadata.RunId != operation.RunId ||
@@ -163,6 +172,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
         operation.DisconnectRequested |= disconnect;
         if (operation.CleanupRequested) { return operation.Cleanup.Task; }
         operation.CleanupRequested = true;
+        CloseVisual(operation);
         Publish(operation, SessionPhase.Stopping);
         // Marks cancellation before waiting for lifecycle exclusion; callbacks execute outside _gate.
         operation.CancellationCallbacks = operation.StartCancellation.CancelAsync();
@@ -183,7 +193,11 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
                     try
                     {
                         lock (_gate) { operation.ReceivedFrames++; }
-                        if (!drainOnly) { InspectFrame(operation, run, frame); }
+                        if (!drainOnly)
+                        {
+                            InspectFrame(operation, run, frame);
+                            DeliverVisual(operation, frame);
+                        }
                     }
                     catch (Exception error)
                     {
@@ -213,7 +227,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
         // Never await cleanup here: it waits for this sole reader.
     }
 
-    /// <summary>Internal handoff boundary for the next stage. This stage retains metadata only.</summary>
+    /// <summary>Only immutable metadata is retained; sample ownership remains with this reader.</summary>
     private void InspectFrame(Operation operation, UtAcquisitionRun run, ConventionalUtFrame frame)
     {
         var metadata = frame.Metadata;
@@ -247,6 +261,38 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
         actual.PhysicalChannelId == expected.PhysicalChannelId && actual.SignalMode == expected.SignalMode &&
         actual.SampleCount == expected.SampleCount && actual.SampleRateHz == expected.SampleRateHz &&
         actual.FirstSampleOffsetSeconds == expected.FirstSampleOffsetSeconds;
+
+    private void DeliverVisual(Operation operation, ConventionalUtFrame frame)
+    {
+        lock (_gate)
+        {
+            if (!operation.VisualOpened || operation.VisualError is not null || operation.CleanupRequested) { return; }
+        }
+
+        // Borrow only during this call. CloseRun may invalidate the projection concurrently.
+        // The frame is always released by ConsumeAsync's finally, including when Accept throws.
+        try { _visualSink!.Accept(frame.Metadata, frame.Sequence, frame.ElapsedSinceRunStart, frame.Samples.Span); }
+        catch (Exception error)
+        {
+            lock (_gate)
+            {
+                RecordVisualError(operation, error);
+                CloseVisual(operation);
+                Publish(operation, _snapshot.Phase);
+            }
+        }
+    }
+
+    private void CloseVisual(Operation operation)
+    {
+        if (!operation.VisualOpened) { return; }
+        operation.VisualOpened = false;
+        try { _visualSink!.CloseRun(operation.RunId); }
+        catch (Exception error) { RecordVisualError(operation, error); }
+    }
+
+    private static void RecordVisualError(Operation operation, Exception error) =>
+        operation.VisualError ??= Describe("session.visual", error);
 
     private async Task SuperviseProducerAsync(Operation operation, UtAcquisitionRun run)
     {
@@ -407,7 +453,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
     {
         _snapshot = new SessionSnapshot(_snapshot.Version + 1, phase, _source.SourceId, operation.RunId,
             operation.ReceivedFrames, operation.ReleasedFrames, operation.LastSequence, operation.LastMetadata,
-            operation.PrimaryError, operation.CleanupErrors, operation.AdditionalErrorCount);
+            operation.PrimaryError, operation.CleanupErrors, operation.AdditionalErrorCount, operation.VisualError);
         _publisher.Publish(_snapshot, complete);
     }
 
@@ -415,7 +461,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
     {
         _snapshot = new SessionSnapshot(_snapshot.Version + 1, phase, _source.SourceId, _snapshot.RunId,
             _snapshot.ReceivedFrames, _snapshot.ReleasedFrames, _snapshot.LastSequence, _snapshot.LastMetadata,
-            error, _snapshot.CleanupErrors, _snapshot.AdditionalErrorCount);
+            error, _snapshot.CleanupErrors, _snapshot.AdditionalErrorCount, _snapshot.VisualError);
         _publisher.Publish(_snapshot, complete);
     }
 
@@ -446,5 +492,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
         internal ulong? LastSequence;
         internal TimeSpan LastElapsed;
         internal ConventionalUtFrameMetadata? LastMetadata;
+        internal bool VisualOpened;
+        internal UtSourceError? VisualError;
     }
 }

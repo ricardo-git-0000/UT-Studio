@@ -10,7 +10,7 @@ public sealed class SessionSnapshot
     internal SessionSnapshot(ulong version, SessionPhase phase, UtSourceId sourceId,
         AcquisitionRunId? runId, long receivedFrames, long releasedFrames, ulong? lastSequence,
         ConventionalUtFrameMetadata? lastMetadata, UtSourceError? primaryError,
-        IEnumerable<UtSourceError> cleanupErrors, long additionalErrorCount)
+        IEnumerable<UtSourceError> cleanupErrors, long additionalErrorCount, UtSourceError? visualError = null)
     {
         Version = version;
         Phase = phase;
@@ -23,6 +23,7 @@ public sealed class SessionSnapshot
         PrimaryError = primaryError;
         CleanupErrors = Array.AsReadOnly(cleanupErrors.ToArray());
         AdditionalErrorCount = additionalErrorCount;
+        VisualError = visualError;
     }
 
     public ulong Version { get; }
@@ -36,4 +37,6 @@ public sealed class SessionSnapshot
     public UtSourceError? PrimaryError { get; }
     public ReadOnlyCollection<UtSourceError> CleanupErrors { get; }
     public long AdditionalErrorCount { get; }
+    /// <summary>A failure in the optional visual branch; it does not imply an acquisition failure.</summary>
+    public UtSourceError? VisualError { get; }
 }
