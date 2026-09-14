@@ -1,3 +1,4 @@
+using UTStudio.Contracts.Application;
 using UTStudio.Application;
 using UTStudio.Contracts.Presentation;
 using UTStudio.Core.Tests.Simulator;

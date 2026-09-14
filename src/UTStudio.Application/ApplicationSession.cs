@@ -1,4 +1,5 @@
 using UTStudio.Contracts.Acquisition;
+using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 
@@ -9,10 +10,9 @@ namespace UTStudio.Application;
 /// The injected source is borrowed: this session stops/disconnects it, but its external owner disposes it.
 /// It must have no active execution and must be used exclusively through this session during the loan.
 /// Stop preserves a healthy connection. Failed startup/operation and disposal disconnect after safe cleanup.
-/// Public types are local to Application for this stage; future Presentation must use a separately approved
-/// Contracts port, never a reference to this implementation.
+/// Presentation uses IApplicationSession from Contracts, never a reference to this implementation.
 /// </remarks>
-public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSnapshot>
+public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 {
     private readonly object _gate = new();
     private readonly IUtFrameSource _source;
@@ -31,7 +31,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
         _source = source;
         _visualSink = visualSink;
-        _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0);
+        _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0, canStart: true);
         _publisher = new SessionSnapshotPublisher(_snapshot);
     }
 
@@ -453,7 +453,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
     {
         _snapshot = new SessionSnapshot(_snapshot.Version + 1, phase, _source.SourceId, operation.RunId,
             operation.ReceivedFrames, operation.ReleasedFrames, operation.LastSequence, operation.LastMetadata,
-            operation.PrimaryError, operation.CleanupErrors, operation.AdditionalErrorCount, operation.VisualError);
+            operation.PrimaryError, operation.CleanupErrors, operation.AdditionalErrorCount, operation.VisualError,
+            canStart: _active is null && !_disposing, canStop: _active is { CleanupRequested: false } && !_disposing);
         _publisher.Publish(_snapshot, complete);
     }
 
@@ -461,7 +462,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IObservable<SessionSn
     {
         _snapshot = new SessionSnapshot(_snapshot.Version + 1, phase, _source.SourceId, _snapshot.RunId,
             _snapshot.ReceivedFrames, _snapshot.ReleasedFrames, _snapshot.LastSequence, _snapshot.LastMetadata,
-            error, _snapshot.CleanupErrors, _snapshot.AdditionalErrorCount, _snapshot.VisualError);
+            error, _snapshot.CleanupErrors, _snapshot.AdditionalErrorCount, _snapshot.VisualError,
+            canStart: _active is null && !_disposing, canStop: _active is { CleanupRequested: false } && !_disposing);
         _publisher.Publish(_snapshot, complete);
     }
 

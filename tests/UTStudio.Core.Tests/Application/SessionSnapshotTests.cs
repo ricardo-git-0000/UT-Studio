@@ -1,3 +1,4 @@
+using UTStudio.Contracts.Application;
 using System.Collections.Concurrent;
 using UTStudio.Application;
 using UTStudio.Domain.Acquisition;

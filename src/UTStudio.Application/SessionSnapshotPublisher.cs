@@ -1,3 +1,5 @@
+using UTStudio.Contracts.Application;
+
 namespace UTStudio.Application;
 
 /// <summary>One active callback and one replaceable pending snapshot per subscription.</summary>

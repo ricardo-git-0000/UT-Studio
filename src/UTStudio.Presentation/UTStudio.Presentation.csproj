@@ -12,4 +12,11 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Approved 2026-09-13: stable 8.4.2 provides platform-neutral ObservableObject and async-command
+         contracts compatible with net10.0. Only Presentation directly references this package.
+         Source: https://www.nuget.org/packages/CommunityToolkit.Mvvm/8.4.2 -->
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+  </ItemGroup>
+
 </Project>
