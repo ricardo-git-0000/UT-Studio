@@ -9,6 +9,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Stable .NET 10 line; supplies Generic Host, configuration, DI and logging.
+         https://www.nuget.org/packages/Microsoft.Extensions.Hosting/10.0.12 -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <InternalsVisibleTo Include="UTStudio.Tests.Wpf" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../UTStudio.Domain/UTStudio.Domain.csproj" />
     <ProjectReference Include="../UTStudio.Contracts/UTStudio.Contracts.csproj" />
     <ProjectReference Include="../UTStudio.Application/UTStudio.Application.csproj" />
@@ -17,4 +24,3 @@
     <ProjectReference Include="../UTStudio.Presentation/UTStudio.Presentation.csproj" />
   </ItemGroup>
 </Project>
-

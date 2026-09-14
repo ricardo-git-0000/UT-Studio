@@ -1,6 +1,42 @@
 <Window x:Class="UTStudio.App.Wpf.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="UT-Studio" Height="450" Width="800">
-    <Grid />
+        xmlns:controls="clr-namespace:UTStudio.App.Wpf.Controls"
+        Title="UT-Studio · A-Scan simulado" Height="680" Width="1100" MinHeight="420" MinWidth="640"
+        Background="#152235" Foreground="#E6EDF6">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <DockPanel Margin="0,0,0,16">
+            <StackPanel>
+                <TextBlock Text="UT-Studio" FontSize="26" FontWeight="SemiBold" />
+                <TextBlock Text="A-Scan convencional · RF bipolar · 2.048 muestras · 50 MHz" Foreground="#AEBFD4" Margin="0,4,0,0" />
+            </StackPanel>
+            <StackPanel x:Name="Interactions" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="Start" Command="{Binding StartCommand}" MinWidth="90" Padding="16,8" Margin="16,0,8,0" />
+                <Button Content="Stop" Command="{Binding StopCommand}" MinWidth="90" Padding="16,8" />
+            </StackPanel>
+        </DockPanel>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12">
+            <TextBlock Text="Sesión: " />
+            <TextBlock Text="{Binding Session.Phase}" FontWeight="SemiBold" />
+            <TextBlock Text="   Secuencia: " Margin="20,0,0,0" />
+            <TextBlock Text="{Binding AScan.Sequence, TargetNullValue=—}" />
+            <TextBlock Text="   Canal: " Margin="20,0,0,0" />
+            <TextBlock Text="{Binding Metadata.Configuration.PhysicalChannelId.Value, TargetNullValue=—}" />
+        </StackPanel>
+        <controls:AScanControl x:Name="Scan" Grid.Row="2" Snapshot="{Binding AScan}" />
+        <StackPanel Grid.Row="3" Margin="0,12,0,0">
+            <TextBlock x:Name="MetricsText" Text="Visual · recibidos: 0 · publicados: 0 · sustituidos: 0" />
+            <TextBlock Text="{Binding Error.Message}" Foreground="#FFB4AB" TextWrapping="Wrap" />
+            <TextBlock Text="{Binding VisualError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" />
+            <TextBlock Text="{Binding NotificationError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" />
+        </StackPanel>
+        <TextBlock x:Name="ShutdownText" Grid.Row="4" Margin="0,8,0,0" Foreground="#FFD18A" TextWrapping="Wrap" />
+    </Grid>
 </Window>

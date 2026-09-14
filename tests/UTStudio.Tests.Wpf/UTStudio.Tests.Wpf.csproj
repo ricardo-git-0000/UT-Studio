@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Reuse the existing approved test framework/version; no new test library. -->
+    <PackageReference Include="MSTest" Version="4.0.2" />
+    <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+    <ProjectReference Include="../../src/UTStudio.App.Wpf/UTStudio.App.Wpf.csproj" />
+  </ItemGroup>
+</Project>

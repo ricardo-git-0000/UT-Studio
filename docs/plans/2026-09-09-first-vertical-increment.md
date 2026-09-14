@@ -1,7 +1,7 @@
 # Plan del primer incremento — Simulador y A-Scan WPF
 
-Fecha inicial: 2026-09-09. Revisado: 2026-09-13.
-Estado: modelos/contratos, simulador, sesión y entrega visual neutral implementados; integración Presentation/WPF pendiente. Esta tarea sincroniza documentación y no autoriza cambios de código.
+Fecha inicial: 2026-09-09. Revisado: 2026-09-14.
+Estado actual: recorrido vertical integrado hasta WPF. El resultado del 2026-09-14 al final de este plan actualiza las previsiones históricas siguientes; conserva los pendientes explícitos de callbacks neutrales y benchmarks.
 
 ## Objetivo y fuentes vigentes
 
@@ -132,3 +132,45 @@ Resultado histórico de la revisión documental del 2026-09-12: solution_archite
 La tarea de implementación visual precedente registró build sin advertencias y 109 pruebas correctas. Esta revisión del 2026-09-13 contrasta código y documentación en lectura; no repite build/tests y no considera resuelta la carrera de inicio de callbacks. Validar enlaces relativos, diff y alcance de los tres documentos; no modificar código ni realizar commits.
 
 Resultado de la sincronización del 2026-09-13: solution_architect y quality_reviewer conformes en lectura; 17 enlaces relativos válidos y diff sin errores de whitespace. Únicamente se modifican los tres documentos autorizados. Compilación y pruebas funcionales no aplican; sin cambios de código ni commit. La brecha de callbacks y los benchmarks siguen pendientes.
+
+## Resultado de integración WPF — 2026-09-14
+
+La petición de implementación posterior autoriza App.Wpf, pruebas Windows separadas, proyectos/solución necesarios y este registro final. Sustituye para esta etapa las prohibiciones históricas de implementación y de proyecto adicional de pruebas que aparecen arriba. El principal es el único escritor; solution_architect, wpf_mvvm_specialist y quality_reviewer revisan en lectura. No se modifican proyectos neutrales ni se hace commit.
+
+### Composición y paquete
+
+- [DesktopRuntime](../../src/UTStudio.App.Wpf/Composition/DesktopRuntime.cs) compone Generic Host y conserva un propietario explícito desde la primera asignación, incluso durante construcción parcial. Devuelve InitializationError junto al propietario si falla la inicialización.
+- Una instancia externa de SimulatorUtFrameSource, AScanVisualDelivery, ApplicationSession y AScanViewModel. Registros DI por instancia, incluidos aliases, evitan disposición automática duplicada. MainWindow se resuelve como singleton por constructor y recibe el ViewModel como DataContext. No hay scopes por ventana ni referencias entre ViewModels.
+- El puerto IApplicationSession y SessionSnapshot/SessionPhase ya pertenecen a Contracts/Application; Presentation no referencia Application. WpfUiDispatcher adapta el puerto neutral sin cambiarlo.
+- Único paquete productivo directo añadido: [Microsoft.Extensions.Hosting 10.0.12](https://www.nuget.org/packages/Microsoft.Extensions.Hosting/10.0.12), estable de la línea .NET 10. Aporta las dependencias oficiales de DI, configuración y logging; no se añaden referencias directas redundantes ni biblioteca gráfica. CommunityToolkit.Mvvm 8.4.2 sigue exclusivamente en Presentation.
+- Configuración inicial: canal 0, 2.048 muestras, 50 MHz, semilla 1, 50 A-Scans/s como máximo configurado. Simulator:Seed y Simulator:AScansPerSecond admiten configuración estándar del Host; el simulador valida el límite de 100/s. BufferCount=8 y ChannelCapacity=4 conservan sus valores internos. Sin adquisición automática al abrir.
+
+### Ventana y dibujo
+
+App retira StartupUri, inicia Host y resuelve/muestra MainWindow con OnMainWindowClose. Start/Stop enlazan los comandos del ViewModel. Se muestran fase, canal, secuencia, errores y contadores visuales. El hilo UI no realiza adquisición ni reducción.
+
+[AScanControl](../../src/UTStudio.App.Wpf/Controls/AScanControl.cs) consume snapshots independientes y dibuja mediante DrawingContext/StreamGeometry, sin elemento visual por punto. Escala horizontal al tamaño disponible, etiquetas en microsegundos, escala vertical RF fija ±100 %, línea de cero, clipping y recursos congelados. AScanCoordinates mantiene separada la matemática comprobable sin ventana.
+
+La adopción de **nuevos datos de señal en OnRender** queda separada por al menos 333.334 ticks, medidos con reloj monotónico en el momento de dibujar. Un tick retrasado no recupera actualizaciones. Los repintados por redimensionamiento pueden reutilizar los mismos datos; borrar una ejecución invalidada es inmediato. Se conserva una referencia pendiente y una mostrada. La consulta visible de métricas usa intervalos mínimos de 200 ms, sin confundir Published con callbacks o frames persistidos. La cadencia no es una garantía de rendimiento sostenido.
+
+### Cierre y fallos
+
+Primer Closing cancela sincrónicamente, desactiva interacciones y observa una sola tarea. Se solicita primero DisposeAsync del ViewModel, que invalida callbacks; inmediatamente después, sin esperar callbacks de cancelación que puedan depender de Stop, se solicita DisposeAsync de sesión. Se observan ambas tareas antes de disponer dependencias. La sesión mantiene su lector único, cancelación del productor, drenaje, ProducerCompletion, AllFramesReleased y desconexión existentes.
+
+Después: disponer fuente, disponer entrega visual, detener Host, disponer Host y autorizar/reemitir Close. Dispatcher y ventana siguen vivos hasta completar la barrera UI. No hay recursión ni disposición repetida. HostOptions.ShutdownTimeout es infinito; los cinco segundos del coordinador son exclusivamente diagnósticos, sin token de aborto ni devolución forzada.
+
+Un error histórico de adquisición no impide el cierre si sesión acredita Disposed y la fuente queda Disconnected después de su disposición. Un fallo sin confirmación detiene las fases dependientes y mantiene la ventana diagnóstica; no se repite automáticamente toda la secuencia. El diagnóstico de cierre no depende del ViewModel ya liberado ni del logger del Host ya dispuesto.
+
+Si falla la construcción o el arranque, StartupFailureWindow permanece visible mientras se limpia el propietario parcial. Solo permite cerrar tras confirmación; no se usa un diálogo efímero que deje un proceso sin ventanas. La excepción inicial y el diagnóstico de limpieza permanecen accesibles.
+
+### Validación y límites
+
+- Nuevo proyecto [UTStudio.Tests.Wpf](../../tests/UTStudio.Tests.Wpf/UTStudio.Tests.Wpf.csproj), separado de Core.Tests y registrado en la solución. Reutiliza MSTest 4.0.2 existente; sin framework ni mocking nuevos. Solo App.Wpf y Tests.Wpf usan WPF.
+- Pruebas de composición/aliases/DataContext, Dispatcher STA bombeado, cancelación/excepciones, coordenadas/resize/señal constante/dimensiones cero, admisión 30 Hz y métricas 5 Hz con reloj manual, orden/repetición/fallo de cierre, diagnóstico a cinco segundos, construcción parcial, fallo histórico del productor y ventana de diagnóstico.
+- Prueba de integración del simulador hasta bitmap WPF: snapshot independiente de 2.048 muestras reducido a un máximo de 1.024 puntos, curva detectada y cero hijos visuales por punto. Captura PNG temporal inspeccionada; no se guarda fixture ni captura en Git. Pruebas reales de Closing con adquisición activa.
+- Arranque externo comprobado desde el directorio del ejecutable: MainWindow visible y proceso terminado mediante CloseMainWindow, sin finalizarlo a la fuerza. Esto es una comprobación automatizada de arranque/cierre, no una sesión de aceptación manual prolongada.
+- Los tres revisores confirman corregidos los hallazgos de construcción parcial, ventana diagnóstica, error histórico de fuente y admisión en el dibujo efectivo. Formato limitado, restore/build/tests, diff y referencias se validan al finalizar; el resultado numérico se registra debajo.
+
+Pendientes conservados: brecha estricta de admisión/inicio de callbacks de AScanVisualDelivery en ADR 0008 (fuera del alcance WPF), benchmarks de proyección/asignaciones/GC y capacidad, sincronización histórica de otros ADR, aceptación visual prolongada/DPI y futuras ventanas secundarias. El ViewModel invalida callbacks tardíos para que no alteren bindings tras el cierre, sin afirmar que corrige el servicio neutral. No se implementan hardware, almacenamiento, DSP, PA ni composición de secundarias.
+
+Resultado final de validación: formato limitado y restore correctos; build con 0 advertencias y 0 errores; 149 pruebas correctas (128 neutrales y 21 WPF), ninguna omitida. Diff sin errores de whitespace, incluidos archivos nuevos; referencias WPF limitadas a App.Wpf y Tests.Wpf, y enlaces relativos del plan comprobados. Sin commit.
