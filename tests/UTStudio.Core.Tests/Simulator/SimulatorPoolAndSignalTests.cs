@@ -1,5 +1,6 @@
 using UTStudio.Acquisition.Simulator;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Core.Tests.TestDoubles;
 
 namespace UTStudio.Core.Tests.Simulator;
 
@@ -32,11 +33,11 @@ public sealed class SimulatorPoolAndSignalTests
     {
         var pool = new BoundedSampleBufferPool(1, 2);
         Assert.IsFalse(pool.AllFramesReleased.IsCompleted);
-        var first = await pool.RentAsync(default);
+        using var first = await DiagnosticWait.For(pool.RentAsync(default).AsTask());
         var memory = first.Memory;
         first.Dispose();
         Assert.IsFalse(pool.AllFramesReleased.IsCompleted);
-        var second = await pool.RentAsync(default);
+        using var second = await DiagnosticWait.For(pool.RentAsync(default).AsTask());
         Assert.IsTrue(memory.Equals(second.Memory));
         first.Dispose();
         Assert.AreEqual(1, pool.Outstanding);
@@ -45,28 +46,28 @@ public sealed class SimulatorPoolAndSignalTests
         Assert.IsFalse(pool.AllFramesReleased.IsCompleted);
         second.Dispose();
         second.Dispose();
-        await pool.AllFramesReleased;
+        await DiagnosticWait.For(pool.AllFramesReleased);
         Assert.AreEqual(0, pool.Outstanding);
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => pool.RentAsync(default).AsTask());
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => DiagnosticWait.For(pool.RentAsync(default).AsTask()));
     }
 
     [TestMethod]
     public async Task PoolWaitObservesCancellationAndSeal()
     {
         var pool = new BoundedSampleBufferPool(1, 2);
-        using var owner = await pool.RentAsync(default);
+        using var owner = await DiagnosticWait.For(pool.RentAsync(default).AsTask());
         using var cancellation = new CancellationTokenSource();
         var pending = pool.RentAsync(cancellation.Token).AsTask();
         Assert.IsFalse(pending.IsCompleted);
         cancellation.Cancel();
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pending);
+        await Assert.ThrowsAsync<OperationCanceledException>(() => DiagnosticWait.For(pending, "pool wait observes caller cancellation"));
         var sealedWait = pool.RentAsync(default).AsTask();
         Assert.IsFalse(sealedWait.IsCompleted);
         pool.Seal();
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => sealedWait);
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => DiagnosticWait.For(sealedWait, "pool wait observes sealing"));
         Assert.IsFalse(pool.AllFramesReleased.IsCompleted);
         owner.Dispose();
-        await pool.AllFramesReleased;
+        await DiagnosticWait.For(pool.AllFramesReleased);
     }
 
     [TestMethod]
@@ -78,21 +79,30 @@ public sealed class SimulatorPoolAndSignalTests
             var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var rent = Task.Run(async () =>
             {
-                await start.Task;
+                await DiagnosticWait.For(start.Task, "rent/seal race start signal");
                 try { return await pool.RentAsync(default); }
                 catch (InvalidOperationException) { return null; }
             });
-            var seal = Task.Run(async () => { await start.Task; pool.Seal(); });
+            var seal = Task.Run(async () => { await DiagnosticWait.For(start.Task, "seal start signal"); pool.Seal(); });
             start.SetResult();
-            await seal;
-            var owner = await rent;
-            if (owner is not null)
+            try
             {
-                Assert.IsFalse(pool.AllFramesReleased.IsCompleted);
-                owner.Dispose();
+                await DiagnosticWait.For(seal);
+                using var owner = await DiagnosticWait.For(rent);
+                if (owner is not null) { Assert.IsFalse(pool.AllFramesReleased.IsCompleted); }
             }
-
-            await pool.AllFramesReleased;
+            finally
+            {
+                pool.Seal();
+                // Even if the diagnostic wait failed, a later successful rent still returns its owner.
+                _ = rent.ContinueWith(completed =>
+                {
+                    if (completed.IsCompletedSuccessfully) { completed.Result?.Dispose(); }
+                    else { _ = completed.Exception; }
+                },
+                    CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+            await DiagnosticWait.For(pool.AllFramesReleased, "sealed racing pool has no outstanding loans");
             Assert.AreEqual(0, pool.Outstanding);
         }
     }

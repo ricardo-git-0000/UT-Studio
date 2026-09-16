@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
@@ -43,12 +44,13 @@ internal sealed class ManualUiDispatcher : IUiDispatcher
         await completion;
     }
 
-    internal async Task DriveUntilAsync(Func<bool> condition)
+    internal async Task DriveUntilAsync(Func<bool> condition,
+        [CallerArgumentExpression(nameof(condition))] string description = "UI condition")
     {
         using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         while (!condition())
         {
-            watchdog.Token.ThrowIfCancellationRequested();
+            if (watchdog.IsCancellationRequested) { throw new TimeoutException($"Not reached within 10 seconds while driving UI: {description}"); }
             if (!RunNext()) { await Task.Yield(); }
         }
     }

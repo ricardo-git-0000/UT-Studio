@@ -21,14 +21,15 @@ public sealed class RenderTests
         var clock = new ManualClock();
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher), clock: clock);
         var window = runtime.Host.Services.GetRequiredService<MainWindow>();
+        string capturePath = Path.Combine(Path.GetTempPath(), $"UTStudio-Wpf-{Guid.NewGuid():N}.png");
         try
         {
-            await runtime.Host.StartAsync();
+            await DiagnosticWait.For(runtime.Host.StartAsync());
             var vm = (AScanViewModel)window.DataContext;
             var received = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             vm.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(vm.AScan) && vm.AScan is not null) { received.TrySetResult(); } };
-            await vm.StartCommand.ExecuteAsync(null);
-            await received.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await DiagnosticWait.For(vm.StartCommand.ExecuteAsync(null));
+            await DiagnosticWait.For(received.Task, "first A-Scan in ViewModel");
             Assert.IsNotNull(vm.AScan);
             Assert.AreEqual(2048, vm.AScan.OriginalSampleCount);
             Assert.IsLessThanOrEqualTo(1024, vm.Points.Count);
@@ -66,14 +67,28 @@ public sealed class RenderTests
             { if (pixels[i + 1] > 170 && pixels[i + 2] < 100 && pixels[i] > 120) { curvePixels++; } }
             var encoder = new PngBitmapEncoder();
             encoder.Frames.Add(BitmapFrame.Create(bitmap));
-            using var file = File.Create(Path.Combine(Path.GetTempPath(), "UTStudio-Wpf-smoke.png"));
-            encoder.Save(file);
+            using (var file = File.Create(capturePath)) { encoder.Save(file); }
             Assert.IsGreaterThan(100, curvePixels);
             control.Measure(new Size(640, 300));
             control.Arrange(new Rect(0, 0, 640, 300));
             var resized = new RenderTargetBitmap(640, 300, 96, 96, PixelFormats.Pbgra32);
             resized.Render(control);
         }
-        finally { await runtime.Shutdown.ShutdownAsync(); window.Close(); }
+        finally
+        {
+            try
+            {
+                if (window.IsVisible)
+                {
+                    var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    window.Closed += (_, _) => closed.TrySetResult();
+                    window.Close();
+                    await DiagnosticWait.For(closed.Task, "render test window closed through its lifecycle");
+                }
+                await DiagnosticWait.For(runtime.Shutdown.ShutdownAsync());
+            }
+            finally { File.Delete(capturePath); }
+        }
+        Assert.IsFalse(File.Exists(capturePath));
     });
 }

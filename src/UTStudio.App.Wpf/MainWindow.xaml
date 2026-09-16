@@ -34,7 +34,7 @@
         <StackPanel Grid.Row="3" Margin="0,12,0,0">
             <TextBlock x:Name="MetricsText" Text="Visual · recibidos: 0 · publicados: 0 · sustituidos: 0" />
             <TextBlock Text="{Binding Error.Message}" Foreground="#FFB4AB" TextWrapping="Wrap" />
-            <TextBlock Text="{Binding VisualError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" />
+            <TextBlock x:Name="VisualErrorText" Text="{Binding VisualError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" />
             <TextBlock Text="{Binding NotificationError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" />
         </StackPanel>
         <TextBlock x:Name="ShutdownText" Grid.Row="4" Margin="0,8,0,0" Foreground="#FFD18A" TextWrapping="Wrap" />

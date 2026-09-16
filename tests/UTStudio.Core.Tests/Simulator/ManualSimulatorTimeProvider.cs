@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using UTStudio.Core.Tests.TestDoubles;
 
 namespace UTStudio.Core.Tests.Simulator;
 
@@ -35,7 +36,7 @@ internal sealed class ManualSimulatorTimeProvider : TimeProvider
     }
 
     internal async Task<ManualTimer> NextTimerAsync() =>
-        await _registrations.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await DiagnosticWait.For(_registrations.Reader.ReadAsync().AsTask(), "manual simulator timer registered");
 
     internal sealed class ManualTimer(ManualSimulatorTimeProvider clock, TimerCallback callback, object? state, long due) : ITimer
     {

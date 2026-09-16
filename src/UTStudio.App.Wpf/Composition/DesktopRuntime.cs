@@ -79,7 +79,7 @@ public sealed class DesktopRuntime
             checkpoint?.Invoke("visual");
             var session = runtime._session = new ApplicationSession(source, visual);
             var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, SimulatorUtFrameSource.DefaultConfiguration,
-                readVisualStatistics: () => visual.Statistics);
+                readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges);
             // Instance registrations, including aliases, are borrowed and never disposed by DI.
             builder.Services.AddSingleton(source);
             builder.Services.AddSingleton<IUtFrameSource>(source);

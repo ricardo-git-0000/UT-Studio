@@ -1,7 +1,7 @@
 # ADR 0008 — Entrega A-Scan latest-only y publicación visual acotada
 
-Fecha original: 2026-09-11. Revisado: 2026-09-13.
-Estado: decisión actualizada según la implementación y la petición del usuario; entrega neutral implementada, requisito estricto de inicio de callbacks pendiente.
+Fecha original: 2026-09-11. Revisado: 2026-09-16.
+Estado: entrega neutral implementada; cancelación estricta por suscriptor y diagnóstico terminal independiente corregidos según la petición del usuario del 2026-09-15.
 Trazabilidad: R01, R02, R06–R08 y R13; complementa [ADR 0005](0005-initial-solution-structure.md), [ADR 0006](0006-session-window-lifecycle.md) y [ADR 0007](0007-frame-source-ownership.md).
 
 ## Contexto y sustitución
@@ -20,7 +20,7 @@ Esta revisión prevalece para la rama visual sobre las referencias anteriores a 
 - ApplicationSession conserva el frame y lo libera en finally, también si falla la transformación o entrega. Ninguna espera de observadores conserva muestras UT.
 - [AScanVisualDelivery](../../src/UTStudio.Visualization.Core/AScanVisualDelivery.cs) implementa el puerto y proyecta fuera del bloqueo del mailbox. Confirma el resultado solo si la ejecución y generación siguen vigentes. Sin suscriptores evita proyección y acumulación.
 - El mailbox retiene solamente un snapshot independiente pendiente. Una entrada sustituye al pendiente anterior; descartarlo elimina una referencia visual, no devuelve un owner UT.
-- Fuente y sink son prestados a la sesión. Esta abre/cierra la ejecución visual; sus propietarios externos disponen los servicios después. Composición DI, Presentation, ViewModels y WPF siguen pendientes.
+- Fuente y sink son prestados a la sesión. Esta abre/cierra la ejecución visual; sus propietarios externos disponen los servicios después. La integración Presentation/WPF existente se registra en el plan del incremento.
 
 CloseRun invalida generación, pendiente y snapshot actual. Una proyección síncrona ya iniciada puede terminar, pero su resultado invalidado no entra al mailbox. La sesión mantiene drenaje y liberación, observa productor y consumidor y espera AllFramesReleased. La barrera no depende de callbacks visuales.
 
@@ -60,15 +60,21 @@ HasPending y LastError completan el diagnóstico. Los contadores de sesión y vi
 
 ## Suscripciones y requisito de cierre
 
-Observadores fuera de bloqueos y adquisición. Cada suscripción conserva como máximo un callback admitido y un snapshot pendiente reemplazable. Un observador lento no bloquea Accept; uno que lanza se desuscribe y registra diagnóstico sin detener adquisición. Cancelación y limpieza de temporizadores se observan fuera de los bloqueos. La disposición es idempotente y no espera código arbitrario de un observador ya admitido.
+Cada suscripción conserva como máximo un callback en ejecución y un snapshot pendiente reemplazable. Un observador lento no bloquea Accept, CloseRun ni el despacho de sus pares; uno que lanza se desuscribe y registra diagnóstico sin detener adquisición. Ningún código externo se ejecuta bajo el bloqueo global del publicador.
 
-**Requisito confirmado:** un callback que ya comenzó puede finalizar después del cierre, pero no deben comenzar callbacks nuevos después de cancelar la suscripción o completar la entrega.
+**Contrato corregido:** cuando Dispose de una suscripción retorna, no puede comenzar otra invocación de OnNext en ella. Seleccionar o extraer un snapshot no significa que el callback haya comenzado. Su comienzo es la llamada síncrona a OnNext, tras la comprobación final de vigencia y bajo una puerta reentrante exclusiva de ese suscriptor. La puerta se conserva durante la llamada externa.
 
-**Brecha pendiente:** Subscription.Pump comprueba vigencia y admite el callback bajo bloqueo; después lo libera y llama a OnNext. Una cancelación entre admisión e invocación puede permitir que ese callback comience después del cierre. El código impide nuevas admisiones, pero no garantiza aún el requisito estricto sobre el inicio efectivo. No equiparar «admitido» con «ya comenzó». La misma separación impide afirmar 30 Hz para los comienzos efectivos de OnNext. Corregir y probar determinísticamente esa carrera exige una tarea de código separada; esta sincronización documental no la resuelve.
+Dispose marca la suscripción cancelada y elimina su pendiente bajo el bloqueo global; después lo libera y cruza la puerta del suscriptor. Si la cancelación gana antes de la comprobación final, se descarta el snapshot extraído. Si la invocación gana, Dispose externo espera a que termine antes de retornar. La autocancelación desde OnNext es reentrante: retorna y permite terminar esa misma invocación, pero ninguna posterior. Todas las cancelaciones concurrentes cruzan la barrera, también las repetidas.
+
+Esto sustituye expresamente la cláusula anterior de disposición sin espera de código externo: esa cláusula no garantizaba el comienzo físico estricto solicitado. La disposición de una suscripción lenta puede tardar; no debe ejecutarse bloqueando el hilo UI. AScanViewModel ya libera suscripciones en un worker y mantiene su barrera UI. DisposeAsync del servicio cancela y espera fuera del bloqueo global las puertas de las suscripciones activas. Los cinco segundos del cierre de aplicación siguen siendo solo diagnósticos, sin aborto forzado. No esperar sincronizadamente desde un callback una tarea de cierre que necesite que ese callback termine.
+
+CloseRun invalida generación y pendientes sin esperar observadores; no equivale a cancelar la suscripción, que puede recibir ejecuciones posteriores. No establece una barrera de comienzos efectivos al retornar: esa garantía corresponde a Dispose de suscripción y a la finalización de DisposeAsync del servicio. La comprobación previa a OnNext descarta selecciones cuya generación ya se invalidó. La prueba de regresión suspende después de extraer, completa Dispose y luego permite intentar la invocación: el observador no es llamado.
 
 ## Fallos y memoria
 
 ApplicationSession registra fallos de apertura, entrega o cierre del sink en SessionSnapshot.VisualError y deshabilita la rama afectada. VisualError no convierte automáticamente un fallo visual en fallo de adquisición. La liberación del frame continúa en finally; los errores propios de adquisición/liberación conservan tratamiento independiente. El servicio visual registra sus fallos de proyección/publicación/observadores.
+
+Un fallo terminal de PublishLoopAsync publica además AScanDeliveryStatus mediante StatusChanges, un observable independiente de los A-Scans con reproducción del estado vigente al suscribirse. Contiene versión y TerminalError; no retiene muestras ni crea un lector adicional. AScanViewModel recibe opcionalmente este observable por constructor, valida versiones, actualiza VisualStatus/VisualError mediante su despachador y retira la curva obsoleta. WPF utiliza el binding existente, sin sondeo de errores desde code-behind. La nueva suscripción se libera junto a las de sesión y A-Scan. No es necesario recibir otro frame ni convertir la sesión en Faulted para mostrar el error.
 
 Snapshots con almacenamiento propio sin pooling visual: un pendiente, un actual y referencias acotadas por suscripción, además de proyección en curso. El presupuesto total depende de las suscripciones y de la retención externa. La cifra anterior de cuatro snapshots o 30 asignaciones/s no es una garantía actual. Referencias acotadas no equivalen a límite de heap antes del GC.
 
@@ -78,4 +84,6 @@ Queda pendiente medir CPU, asignaciones, GC y backpressure al proyectar cada fra
 
 Pruebas existentes: reducción y último intervalo, independencia tras devolver memoria, sustitución, reloj manual, observadores lentos/fallidos, cierre durante proyección y fallos de limpieza de temporizadores. La tarea de implementación precedente registró 109 pruebas correctas y build sin advertencias. No se repiten aquí ni acreditan la carrera pendiente de inicio de callbacks.
 
-Pendientes: requisito estricto de callbacks; benchmarks y posible optimización previa al mailbox; sincronización de documentos fuera de alcance; telemetría a 5 Hz; composición DI, Presentation, ViewModels, refresco UI, WPF y presupuesto de futuras secundarias.
+La corrección del 2026-09-15 añade pruebas deterministas de extracción/cancelación/intento, autocancelación, observador lento con pares independientes, cancelaciones concurrentes y diagnóstico terminal tras una primera curva sin snapshots posteriores, tanto en ViewModel como en WPF. El plan recoge resultados de build y ejecuciones repetidas.
+
+Pendientes: benchmarks y posible optimización previa al mailbox; sincronización de documentos históricos fuera de alcance; presupuesto de futuras secundarias. La integración WPF, sus métricas a 5 Hz y su admisión de nuevos datos de dibujo a 30 Hz ya constan en el plan. El límite de admisión del observable no se presenta como medida del instante de dibujo.

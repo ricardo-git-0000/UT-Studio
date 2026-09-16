@@ -7,6 +7,7 @@ internal sealed class ManualClock : TimeProvider
     private readonly List<ManualTimer> _timers = [];
     internal bool FailNextTimer { get; set; }
     internal TaskCompletionSource TimerFailed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    internal int RegisteredTimers { get { lock (_gate) { return _timers.Count; } } }
     public override long TimestampFrequency => TimeSpan.TicksPerSecond;
     public override long GetTimestamp() => Interlocked.Read(ref _ticks);
     public override DateTimeOffset GetUtcNow() => DateTimeOffset.UnixEpoch + TimeSpan.FromTicks(GetTimestamp());

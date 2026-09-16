@@ -8,8 +8,9 @@ namespace UTStudio.Visualization.Core;
 /// Explicit adaptation of ADR 0008 for the borrowed-span port: projection happens synchronously per
 /// interested input, not at 30 Hz. Only independent data crosses the async boundary. This adds O(N)
 /// work/allocation per input. It does not implement Presentation coordination or the future UI refresh limit.
-/// Subscribers have one admitted callback and one latest pending snapshot; slow/failing user code cannot
-/// block Accept, CloseRun or disposal. An already admitted callback may finish after invalidation.
+/// Subscribers have one executing callback and one latest pending snapshot. Slow user code cannot
+/// block Accept, CloseRun or peers. External subscription disposal waits for its current callback;
+/// self-cancellation is reentrant. No new callback can begin after subscription disposal returns.
 /// </remarks>
 public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AScanSnapshot>, IAsyncDisposable
 {
@@ -20,6 +21,11 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     private readonly SemaphoreSlim _wake = new(0, 1);
     private readonly CancellationTokenSource _shutdown = new();
     private readonly List<Subscription> _subscriptions = [];
+    private readonly DeliveryStatusStore _status = new();
+    // Deterministic race seam: selection is not callback entry. Never runs under a lock.
+    internal Action? BeforeCallbackAttempt { get; set; }
+    internal Action? AfterCallbackAttempt { get; set; }
+    internal Action? BeforeSubscriptionWait { get; set; }
     private readonly Task _worker;
     private Task? _disposal;
     private bool _disposed;
@@ -43,6 +49,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     }
 
     public AScanSnapshot? Current { get { lock (_gate) { return _current; } } }
+    public IObservable<AScanDeliveryStatus> StatusChanges => _status;
     public AScanDeliveryStatistics Statistics
     {
         get
@@ -157,23 +164,30 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                 _disposed = true;
                 Invalidate();
                 _runId = null;
-                var cancellations = _subscriptions.Select(subscription => subscription.Detach()).ToArray();
+                var subscriptions = _subscriptions.ToArray();
+                var cancellations = subscriptions.Select(subscription => subscription.Detach()).ToArray();
                 _subscriptions.Clear();
                 var cancellation = _shutdown.CancelAsync();
-                _disposal = DisposeCoreAsync(Task.WhenAll(cancellations.Append(cancellation)));
+                _disposal = Task.Run(() => DisposeCoreAsync(Task.WhenAll(cancellations.Append(cancellation)), subscriptions));
             }
             return new ValueTask(_disposal);
         }
     }
 
-    private async Task DisposeCoreAsync(Task cancellation)
+    private async Task DisposeCoreAsync(Task cancellation, Subscription[] subscriptions)
     {
         try { await Task.WhenAll(cancellation, _worker).ConfigureAwait(false); }
         catch (Exception error)
         {
             lock (_gate) { _lastError = Describe("visual.cleanup", error); }
         }
-        finally { _shutdown.Dispose(); _wake.Dispose(); }
+        finally
+        {
+            foreach (var subscription in subscriptions) { subscription.WaitForCallback(); }
+            _status.Dispose();
+            _shutdown.Dispose();
+            _wake.Dispose();
+        }
     }
 
     private async Task PublishLoopAsync()
@@ -213,6 +227,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
             lock (_gate)
             {
                 _lastError = Describe("visual.publication", error);
+                _status.Publish(new AScanDeliveryStatus(1, _lastError));
                 _failed = true;
                 Invalidate();
                 _runId = null;
@@ -246,6 +261,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     // All subscription admission/state uses the publisher lock. User code never holds that lock.
     private sealed class Subscription(AScanVisualDelivery owner, IObserver<AScanSnapshot> observer) : IDisposable
     {
+        private readonly object _callbackGate = new();
         private AScanSnapshot? _pending;
         private long _generation;
         private long? _lastAdmission;
@@ -298,6 +314,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                 while (true)
                 {
                     AScanSnapshot? next = null;
+                    long selectedGeneration;
                     TimeSpan remaining;
                     lock (owner._gate)
                     {
@@ -310,6 +327,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                         remaining = _lastAdmission is { } previous
                             ? MinimumPublicationInterval - owner._timeProvider.GetElapsedTime(previous, owner._timeProvider.GetTimestamp())
                             : TimeSpan.Zero;
+                        selectedGeneration = _generation;
                         if (remaining <= TimeSpan.Zero)
                         {
                             next = _pending;
@@ -322,7 +340,21 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                         await owner.DelayAsync(remaining, token).ConfigureAwait(false);
                         continue;
                     }
-                    observer.OnNext(next);
+                    owner.BeforeCallbackAttempt?.Invoke();
+                    try
+                    {
+                        lock (_callbackGate)
+                        {
+                            lock (owner._gate)
+                            {
+                                if (_detached || owner._disposed || selectedGeneration != owner._generation) { continue; }
+                            }
+                            // Callback entry is this synchronous call while holding the per-subscriber gate.
+                            // Dispose cannot return between the final check and entry (or during this call).
+                            observer.OnNext(next);
+                        }
+                    }
+                    finally { owner.AfterCallbackAttempt?.Invoke(); }
                 }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
@@ -354,6 +386,10 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                 owner._subscriptions.Remove(this);
                 if (owner._subscriptions.Count == 0) { owner.Invalidate(); }
             }
+            owner.BeforeSubscriptionWait?.Invoke();
+            WaitForCallback();
         }
+
+        internal void WaitForCallback() { lock (_callbackGate) { } }
     }
 }

@@ -1,5 +1,6 @@
 using UTStudio.Acquisition.Simulator;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Core.Tests.TestDoubles;
 
 namespace UTStudio.Core.Tests.Simulator;
 
@@ -61,8 +62,8 @@ public sealed class SimulatorSourceTests
         await SimulatorHarness.UntilAsync(() => simulation.Source.WaitReason == SimulatorWaitReason.Channel);
         Assert.AreEqual(4, simulation.Run.Frames.Count);
         Assert.AreEqual(5, simulation.Source.OutstandingBuffers);
-        await simulation.Source.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
-        await simulation.Run.ProducerCompletion;
+        await DiagnosticWait.For(simulation.Source.StopAsync());
+        await DiagnosticWait.For(simulation.Run.ProducerCompletion);
         Assert.AreEqual(4, simulation.Source.OutstandingBuffers);
         Assert.IsFalse(simulation.Run.AllFramesReleased.IsCompleted);
         Assert.AreEqual(UtAcquisitionState.Stopping, simulation.Source.State.Acquisition);
@@ -73,8 +74,8 @@ public sealed class SimulatorSourceTests
             frame.Dispose();
         }
 
-        await simulation.Run.AllFramesReleased.WaitAsync(TimeSpan.FromSeconds(10));
-        await simulation.Run.Frames.Completion;
+        await DiagnosticWait.For(simulation.Run.AllFramesReleased);
+        await DiagnosticWait.For(simulation.Run.Frames.Completion);
         Assert.IsFalse(simulation.Run.Frames.TryRead(out _));
         Assert.AreEqual(UtAcquisitionState.Idle, simulation.Source.State.Acquisition);
     }
@@ -92,7 +93,7 @@ public sealed class SimulatorSourceTests
 
         await SimulatorHarness.UntilAsync(() => simulation.Source.WaitReason == SimulatorWaitReason.Buffer);
         Assert.AreEqual(8, simulation.Source.OutstandingBuffers);
-        await simulation.Source.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await DiagnosticWait.For(simulation.Source.StopAsync());
         Assert.IsFalse(simulation.Run.AllFramesReleased.IsCompleted);
         Assert.IsTrue(simulation.Run.ProducerCompletion.IsCompletedSuccessfully);
     }
@@ -107,18 +108,18 @@ public sealed class SimulatorSourceTests
         var firstDispose = simulation.Source.DisposeAsync().AsTask();
         var secondDispose = simulation.Source.DisposeAsync().AsTask();
         Assert.AreSame(firstDispose, secondDispose);
-        await simulation.Run.ProducerCompletion.WaitAsync(TimeSpan.FromSeconds(10));
+        await DiagnosticWait.For(simulation.Run.ProducerCompletion);
         Assert.IsTrue(timer.IsDisposed);
         Assert.IsFalse(firstDispose.IsCompleted);
         Assert.IsFalse(simulation.Run.AllFramesReleased.IsCompleted);
         Assert.AreEqual(2048, frame.Samples.Length);
         frame.Dispose();
         frame.Dispose();
-        await firstDispose.WaitAsync(TimeSpan.FromSeconds(10));
-        await secondDispose;
+        await DiagnosticWait.For(firstDispose);
+        await DiagnosticWait.For(secondDispose);
         Assert.IsTrue(simulation.Run.AllFramesReleased.IsCompletedSuccessfully);
         Assert.AreEqual(UtConnectionState.Disconnected, simulation.Source.State.Connection);
-        await simulation.Source.DisposeAsync();
+        await DiagnosticWait.For(simulation.Source.DisposeAsync().AsTask());
         Assert.ThrowsExactly<ObjectDisposedException>(() => simulation.Source.ConnectAsync());
     }
 
@@ -144,10 +145,10 @@ public sealed class SimulatorSourceTests
         await simulation.StartAsync();
         _ = await simulation.ReadAsync();
         _ = await simulation.Clock.NextTimerAsync();
-        try { await simulation.Source.StopAsync(new CancellationToken(true)); }
+        try { await DiagnosticWait.For(simulation.Source.StopAsync(new CancellationToken(true))); }
         catch (OperationCanceledException) { }
-        await simulation.Run.ProducerCompletion.WaitAsync(TimeSpan.FromSeconds(10));
-        await simulation.Source.StopAsync();
+        await DiagnosticWait.For(simulation.Run.ProducerCompletion);
+        await DiagnosticWait.For(simulation.Source.StopAsync());
         Assert.IsFalse(simulation.Run.AllFramesReleased.IsCompleted);
     }
 
@@ -155,7 +156,7 @@ public sealed class SimulatorSourceTests
     public async Task CancelledStartRollsBackAllocatedPoolAndCanRetry()
     {
         await using var simulation = new SimulatorHarness();
-        await simulation.Source.ConnectAsync();
+        await DiagnosticWait.For(simulation.Source.ConnectAsync());
         using var request = new CancellationTokenSource();
         simulation.Clock.BeforeUtcRead = request.Cancel; // Invoked after pool allocation during preparation.
         Assert.ThrowsExactly<OperationCanceledException>(() =>
@@ -173,7 +174,7 @@ public sealed class SimulatorSourceTests
     public async Task FailedStartRollsBackAndRequiresRecovery(string message)
     {
         await using var simulation = new SimulatorHarness();
-        await simulation.Source.ConnectAsync();
+        await DiagnosticWait.For(simulation.Source.ConnectAsync());
         var expected = new InvalidOperationException(message);
         simulation.Clock.BeforeUtcRead = () => throw expected;
         var observed = Assert.ThrowsExactly<InvalidOperationException>(() =>
@@ -183,7 +184,7 @@ public sealed class SimulatorSourceTests
         Assert.AreEqual("simulator.start", simulation.Source.State.PrimaryError!.Code);
         Assert.AreEqual(0, simulation.Source.OutstandingBuffers);
         Assert.ThrowsExactly<InvalidOperationException>(() => simulation.Source.StartAsync(new AcquisitionRunId(Guid.NewGuid())));
-        await simulation.Source.DisconnectAsync();
+        await DiagnosticWait.For(simulation.Source.DisconnectAsync());
         simulation.Clock.BeforeUtcRead = null;
         await simulation.StartAsync();
         Assert.AreEqual(0UL, (await simulation.ReadAsync()).Sequence);
@@ -201,14 +202,14 @@ public sealed class SimulatorSourceTests
         simulation.Clock.TimerFailure = expected;
         await simulation.StartAsync();
         var observed = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
-            simulation.Run.ProducerCompletion.WaitAsync(TimeSpan.FromSeconds(10)));
+            DiagnosticWait.For(simulation.Run.ProducerCompletion));
         Assert.AreSame(expected, observed);
         Assert.AreEqual(UtAcquisitionState.Faulted, simulation.Source.State.Acquisition);
         Assert.AreEqual("simulator.producer", simulation.Source.State.PrimaryError!.Code);
         Assert.IsFalse(simulation.Run.AllFramesReleased.IsCompleted);
         (await simulation.ReadAsync()).Dispose();
-        await simulation.Run.AllFramesReleased;
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => simulation.Run.Frames.Completion);
+        await DiagnosticWait.For(simulation.Run.AllFramesReleased);
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => DiagnosticWait.For(simulation.Run.Frames.Completion));
         Assert.IsFalse(simulation.Run.Frames.TryRead(out _));
     }
 
@@ -235,15 +236,15 @@ public sealed class SimulatorSourceTests
         var frame = await simulation.ReadAsync();
         _ = await simulation.Clock.NextTimerAsync();
         var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var stop = Task.Run(async () => { await start.Task; await simulation.Source.StopAsync(); });
-        var dispose = Task.Run(async () => { await start.Task; await simulation.Source.DisposeAsync(); });
+        var stop = Task.Run(async () => { await DiagnosticWait.For(start.Task); await DiagnosticWait.For(simulation.Source.StopAsync()); });
+        var dispose = Task.Run(async () => { await DiagnosticWait.For(start.Task); await DiagnosticWait.For(simulation.Source.DisposeAsync().AsTask()); });
         start.SetResult();
-        await stop.WaitAsync(TimeSpan.FromSeconds(10));
+        await DiagnosticWait.For(stop);
         Assert.IsFalse(dispose.IsCompleted);
         frame.Dispose();
-        await dispose.WaitAsync(TimeSpan.FromSeconds(10));
-        await simulation.Source.StopAsync();
-        await simulation.Source.DisposeAsync();
+        await DiagnosticWait.For(dispose);
+        await DiagnosticWait.For(simulation.Source.StopAsync());
+        await DiagnosticWait.For(simulation.Source.DisposeAsync().AsTask());
         Assert.IsTrue(simulation.Run.AllFramesReleased.IsCompletedSuccessfully);
     }
 
@@ -257,20 +258,20 @@ public sealed class SimulatorSourceTests
         bool readState = false;
         simulation.Clock.OnTimerDispose = () =>
         {
-            _ = Task.Run(() => simulation.Source.State).WaitAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult();
+            _ = DiagnosticWait.For(Task.Run(() => simulation.Source.State)).GetAwaiter().GetResult();
             readState = true;
             throw new InvalidOperationException("Synthetic timer disposal failure.");
         };
         await Assert.ThrowsExactlyAsync<AggregateException>(() =>
-            simulation.Source.StopAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+            DiagnosticWait.For(simulation.Source.StopAsync()));
         Assert.IsTrue(readState);
         Assert.IsTrue(simulation.Run.ProducerCompletion.IsCompletedSuccessfully);
         Assert.AreEqual(UtAcquisitionState.Faulted, simulation.Source.State.Acquisition);
         Assert.AreEqual("simulator.cancellation", simulation.Source.State.PrimaryError!.Code);
         frame.Dispose();
-        await simulation.Run.AllFramesReleased;
+        await DiagnosticWait.For(simulation.Run.AllFramesReleased);
         await Assert.ThrowsExactlyAsync<AggregateException>(() =>
-            simulation.Source.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10)));
+            DiagnosticWait.For(simulation.Source.DisposeAsync().AsTask()));
         Assert.AreEqual(UtConnectionState.Disconnected, simulation.Source.State.Connection);
     }
 
@@ -281,14 +282,14 @@ public sealed class SimulatorSourceTests
         await simulation.StartAsync();
         var frame = await simulation.ReadAsync();
         _ = await simulation.Clock.NextTimerAsync();
-        await simulation.Source.StopAsync();
+        await DiagnosticWait.For(simulation.Source.StopAsync());
         Assert.ThrowsExactly<InvalidOperationException>(() => simulation.Source.ConfigureAsync(SimulatorUtFrameSource.DefaultConfiguration));
         Assert.ThrowsExactly<InvalidOperationException>(() => simulation.Source.StartAsync(new AcquisitionRunId(Guid.NewGuid())));
         Assert.ThrowsExactly<InvalidOperationException>(() => simulation.Source.DisconnectAsync());
         var previous = simulation.Run;
         var samples = frame.Samples.ToArray();
         frame.Dispose();
-        await previous.AllFramesReleased;
+        await DiagnosticWait.For(previous.AllFramesReleased);
         await simulation.StartAsync();
         Assert.AreNotSame(previous.Frames, simulation.Run.Frames);
         Assert.AreNotEqual(previous.Metadata.RunId, simulation.Run.Metadata.RunId);
@@ -301,9 +302,9 @@ public sealed class SimulatorSourceTests
     public async Task ConfigurationIsValidatedJointlyAndRejectionPreservesPreviousSettings()
     {
         await using var simulation = new SimulatorHarness();
-        await simulation.Source.ConnectAsync();
+        await DiagnosticWait.For(simulation.Source.ConnectAsync());
         var valid = new ConventionalAcquisitionConfiguration(default, 1, 100_000_000, -1e-6);
-        await simulation.Source.ConfigureAsync(valid);
+        await DiagnosticWait.For(simulation.Source.ConfigureAsync(valid));
         foreach (var invalid in new[]
         {
             new ConventionalAcquisitionConfiguration(new PhysicalChannelId(1), 2048, 50_000_000),
@@ -326,7 +327,7 @@ public sealed class SimulatorSourceTests
     {
         await using var simulation = new SimulatorHarness();
         Assert.ThrowsExactly<InvalidOperationException>(() => simulation.Source.StartAsync(new AcquisitionRunId(Guid.NewGuid())));
-        await simulation.Source.ConnectAsync();
+        await DiagnosticWait.For(simulation.Source.ConnectAsync());
         Assert.ThrowsExactly<ArgumentException>(() => simulation.Source.StartAsync(default));
         Assert.ThrowsExactly<OperationCanceledException>(() =>
             simulation.Source.StartAsync(new AcquisitionRunId(Guid.NewGuid()), new CancellationToken(true)));

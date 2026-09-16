@@ -1,7 +1,7 @@
 # Plan del primer incremento — Simulador y A-Scan WPF
 
-Fecha inicial: 2026-09-09. Revisado: 2026-09-14.
-Estado actual: recorrido vertical integrado hasta WPF. El resultado del 2026-09-14 al final de este plan actualiza las previsiones históricas siguientes; conserva los pendientes explícitos de callbacks neutrales y benchmarks.
+Fecha inicial: 2026-09-09. Revisado: 2026-09-16.
+Estado actual: recorrido vertical integrado hasta WPF; correcciones de la revisión final registradas al final. Los resultados fechados actualizan las previsiones históricas siguientes; los benchmarks siguen pendientes.
 
 ## Objetivo y fuentes vigentes
 
@@ -174,3 +174,18 @@ Si falla la construcción o el arranque, StartupFailureWindow permanece visible 
 Pendientes conservados: brecha estricta de admisión/inicio de callbacks de AScanVisualDelivery en ADR 0008 (fuera del alcance WPF), benchmarks de proyección/asignaciones/GC y capacidad, sincronización histórica de otros ADR, aceptación visual prolongada/DPI y futuras ventanas secundarias. El ViewModel invalida callbacks tardíos para que no alteren bindings tras el cierre, sin afirmar que corrige el servicio neutral. No se implementan hardware, almacenamiento, DSP, PA ni composición de secundarias.
 
 Resultado final de validación: formato limitado y restore correctos; build con 0 advertencias y 0 errores; 149 pruebas correctas (128 neutrales y 21 WPF), ninguna omitida. Diff sin errores de whitespace, incluidos archivos nuevos; referencias WPF limitadas a App.Wpf y Tests.Wpf, y enlaces relativos del plan comprobados. Sin commit.
+
+## Correcciones de la revisión final — 2026-09-15
+
+Alcance: Visualization.Core, Presentation para diagnóstico, WPF para enlazarlo, pruebas afectadas y ADR 0008/este plan. El principal es único escritor; ut_visualization, wpf_mvvm_specialist y quality_reviewer revisan en lectura. Sin paquetes, commits ni funcionalidades adicionales.
+
+1. Cancelación estricta: una puerta reentrante por suscriptor protege la comprobación final y la llamada OnNext. Dispose marca cancelación sin esperar bajo el bloqueo global y después cruza esa puerta; al retornar no puede comenzar otro callback. Una cancelación externa puede esperar al callback activo; la autocancelación es reentrante. Accept, CloseRun y los pares siguen independientes. Esta semántica sustituye la cláusula histórica de cancelación sin espera de código externo: véase ADR 0008 corregido. La aplicación sigue disponiendo fuera del hilo UI, con timeout exclusivamente diagnóstico.
+2. Diagnóstico terminal: AScanDeliveryStatus/StatusChanges entrega y reproduce el fallo del publicador independientemente de nuevas curvas. AScanViewModel integra el estado por dispatcher, muestra VisualError y descarta la curva obsoleta; WPF usa binding. La sesión continúa en Running si no hay fallo de adquisición.
+3. Esperas de pruebas: watchdogs diagnósticos de diez segundos identifican la condición no alcanzada. Continúan usándose señales y TimeProvider manual, sin retardos para ocultar carreras. Los préstamos se liberan mediante using/finally, incluso si falla una aserción o termina tarde una reserva; el harness devuelve sus frames aunque falle Stop.
+4. Captura WPF: nombre temporal con GUID por ejecución, stream cerrado antes de eliminar y eliminación en finally aun si falla renderizado o limpieza. Las ventanas de prueba se cierran mediante su evento y se espera Closed antes de terminar su Dispatcher; las capturas no comparten rutas entre procesos.
+
+Pruebas nuevas: intercalación extracción -> Dispose terminado -> intento de callback; autocancelación; dos cancelaciones que alcanzan su barrera mientras el observador está retenido; continuidad de un observador sano; error del publicador después de una primera curva, sin otro snapshot, con actualización de ViewModel/binding WPF y adquisición intacta; reproducción del error para suscriptores tardíos; liberación de la suscripción de estado y descarte de estados tardíos/antiguos. No se da por corregida una carrera únicamente porque tareas aún no planificadas aparezcan pendientes.
+
+El cambio no realiza benchmarks ni modifica protocolos, ownership UT, sesión, hardware, procesamiento o composición ajena al diagnóstico. No cambia el criterio de cinco segundos ni autoriza detener código externo a la fuerza.
+
+Validación final del 2026-09-16: formato limitado correcto; build completo con cero errores y advertencias. Tres ejecuciones completas consecutivas correctas, con 156 casos por ejecución (134 neutrales y 22 WPF), sin omisiones. Dos ejecuciones WPF adicionales simultáneas: 22/22 correctas cada una, sin colisiones ni capturas temporales GUID restantes. Diff y archivos nuevos sin errores de whitespace. Alcance limitado a los componentes y pruebas citados; sin cambios de paquetes, proyectos, contratos UT ni commits. Revisores en lectura: ut_visualization y wpf_mvvm_specialist conformes; quality_reviewer confirmó barreras y watchdogs y pidió precisar que CloseRun no es la barrera de cancelación, distinción incorporada en ADR 0008.

@@ -17,12 +17,14 @@ public sealed class ShutdownTests
             Step("source", calls), Step("visual", calls), Step("host.stop", calls), Step("host.dispose", calls)
         ], NullLogger.Instance, new ManualClock());
         Task first = coordinator.ShutdownAsync();
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.AreSame(first, coordinator.ShutdownAsync());
-        Assert.HasCount(1, calls);
-        Assert.IsFalse(coordinator.Status.Completed);
-        held.SetResult();
-        await first;
+        try
+        {
+            await DiagnosticWait.For(entered.Task, "first cleanup phase entered");
+            Assert.AreSame(first, coordinator.ShutdownAsync());
+            Assert.HasCount(1, calls);
+            Assert.IsFalse(coordinator.Status.Completed);
+        }
+        finally { held.TrySetResult(); await DiagnosticWait.For(first, "cleanup after releasing held phase"); }
         CollectionAssert.AreEqual(new[] { "VM/session", "source", "visual", "host.stop", "host.dispose" }, calls);
         Assert.IsTrue(coordinator.Status.Completed);
         Assert.AreSame(first, coordinator.ShutdownAsync());
@@ -39,13 +41,15 @@ public sealed class ShutdownTests
             new("drain", async () => { entered.SetResult(); await held.Task; }), Step("host", calls)
         ], NullLogger.Instance, clock);
         Task shutdown = coordinator.ShutdownAsync();
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        clock.Advance(TimeSpan.FromSeconds(5));
-        while (!coordinator.Status.DiagnosticTimeout) { await Task.Yield(); }
-        Assert.IsFalse(shutdown.IsCompleted);
-        Assert.IsEmpty(calls);
-        held.SetResult();
-        await shutdown;
+        try
+        {
+            await DiagnosticWait.For(entered.Task, "drain phase entered");
+            clock.Advance(TimeSpan.FromSeconds(5));
+            await DiagnosticWait.Until(() => coordinator.Status.DiagnosticTimeout, "five-second shutdown diagnostic");
+            Assert.IsFalse(shutdown.IsCompleted);
+            Assert.IsEmpty(calls);
+        }
+        finally { held.TrySetResult(); await DiagnosticWait.For(shutdown, "cleanup after drain released"); }
         Assert.IsTrue(coordinator.Status.Completed);
     }
 
@@ -60,7 +64,7 @@ public sealed class ShutdownTests
             Step("must not dispose", calls)
         ], NullLogger.Instance, new ManualClock());
         Task first = coordinator.ShutdownAsync();
-        await Assert.ThrowsAsync<InvalidOperationException>(() => first);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => DiagnosticWait.For(first));
         Assert.IsFalse(coordinator.Status.Completed);
         Assert.AreEqual("failed", coordinator.Status.Error);
         Assert.AreSame(first, coordinator.ShutdownAsync());
@@ -75,7 +79,7 @@ public sealed class ShutdownTests
             new("session", () => Task.FromException(new InvalidOperationException("primary")), () => true),
             Step("host", calls)
         ], NullLogger.Instance, new ManualClock());
-        await coordinator.ShutdownAsync();
+        await DiagnosticWait.For(coordinator.ShutdownAsync());
         Assert.IsTrue(coordinator.Status.Completed);
         Assert.AreEqual("primary", coordinator.Status.Error);
         Assert.HasCount(1, calls);

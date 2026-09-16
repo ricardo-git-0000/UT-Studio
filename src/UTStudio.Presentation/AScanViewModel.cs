@@ -14,7 +14,7 @@ namespace UTStudio.Presentation;
 /// Statistics are sampled on visual feed updates, not periodically at 5 Hz. Effective UI throttling is
 /// a future scheduling concern; this ViewModel does not claim that upstream 30 Hz limits UI execution.
 /// DisposeAsync completes after a serial UI barrier. Already executing updates finish before that barrier;
-/// late/queued callbacks become no-ops. This does not fix the upstream callback-admission race.
+/// late/queued callbacks become no-ops. Terminal visual status does not depend on frame arrival.
 /// </remarks>
 public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 {
@@ -25,10 +25,11 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
     private readonly UiAsyncCommand _start, _stop;
-    private IDisposable? _sessionSubscription, _visualSubscription;
+    private IDisposable? _sessionSubscription, _visualSubscription, _statusSubscription;
     private SessionSnapshot _latestSession;
     private AScanSnapshot? _latestVisual;
     private AScanDeliveryStatistics? _latestStatistics;
+    private AScanDeliveryStatus? _latestStatus;
     private UtSourceError? _feedError;
     private AScanViewState _state;
     private UtSourceError? _notificationError;
@@ -37,7 +38,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     public AScanViewModel(IApplicationSession session, IObservable<AScanSnapshot> visualFeed,
         IUiDispatcher dispatcher, ConventionalAcquisitionConfiguration configuration,
-        Func<AcquisitionRunId>? newRun = null, Func<AScanDeliveryStatistics>? readVisualStatistics = null)
+        Func<AcquisitionRunId>? newRun = null, Func<AScanDeliveryStatistics>? readVisualStatistics = null,
+        IObservable<AScanDeliveryStatus>? visualStatus = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(visualFeed);
@@ -60,6 +62,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         catch (Exception error) { ReceiveError(error); }
         try { _visualSubscription = visualFeed.Subscribe(new Observer<AScanSnapshot>(ReceiveVisual, ReceiveError)); }
         catch (Exception error) { ReceiveError(error); }
+        try { _statusSubscription = visualStatus?.Subscribe(new Observer<AScanDeliveryStatus>(ReceiveStatus, ReceiveError)); }
+        catch (Exception error) { ReceiveError(error); }
     }
 
     public AScanViewState State => _state;
@@ -71,7 +75,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public long ReceivedFrames => _state.Session.ReceivedFrames;
     public long ReleasedFrames => _state.Session.ReleasedFrames;
     public UtSourceError? Error => _state.CommandError ?? _state.FeedError ?? _state.Session.PrimaryError;
-    public UtSourceError? VisualError => _state.Session.VisualError ?? _state.VisualStatistics?.LastError;
+    public AScanDeliveryStatus? VisualStatus => _state.VisualStatus;
+    public UtSourceError? VisualError => _state.VisualStatus?.TerminalError ?? _state.Session.VisualError ?? _state.VisualStatistics?.LastError;
     public UtSourceError? NotificationError => _notificationError;
     public IAsyncRelayCommand StartCommand => _start;
     public IAsyncRelayCommand StopCommand => _stop;
@@ -130,6 +135,16 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    private void ReceiveStatus(AScanDeliveryStatus status)
+    {
+        lock (_gate)
+        {
+            if (_lifetime.IsClosed || (_latestStatus is { } previous && status.Version <= previous.Version)) { return; }
+            _latestStatus = status;
+            Schedule();
+        }
+    }
+
     // Must hold _gate. No callback captures a historical snapshot; the UI action reads latest.
     private void Schedule()
     {
@@ -165,6 +180,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         AScanSnapshot? visual;
         AScanDeliveryStatistics? statistics;
         UtSourceError? error;
+        AScanDeliveryStatus? status;
         lock (_gate)
         {
             _dirty = false;
@@ -172,12 +188,14 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             visual = _latestVisual;
             statistics = _latestStatistics;
             error = _feedError;
+            status = _latestStatus;
         }
         AScanSnapshot? current = _state.AScan;
         if (session.Phase != SessionPhase.Running || current?.Metadata.RunId != session.RunId) { current = null; }
         if (session.Phase == SessionPhase.Running && visual is not null && visual.Metadata.RunId == session.RunId &&
             visual.Metadata.SourceId == session.SourceId) { current = visual; }
-        ReplaceState(new(session, current, statistics, _state.CommandError, error));
+        if (status?.TerminalError is not null) { current = null; }
+        ReplaceState(new(session, current, statistics, _state.CommandError, error, status));
         RefreshCommands();
     }
 
@@ -186,7 +204,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         if (_lifetime.IsClosed || state == _state) { return; }
         _state = state;
         foreach (string name in new[] { nameof(State), nameof(Session), nameof(AScan), nameof(Points), nameof(Metadata),
-            nameof(VisualStatistics), nameof(ReceivedFrames), nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
+            nameof(VisualStatistics), nameof(VisualStatus), nameof(ReceivedFrames), nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
         {
             OnPropertyChanged(name);
         }
@@ -234,7 +252,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private async Task CloseAsync()
     {
         List<Exception> errors = [];
-        foreach (var subscription in new[] { _sessionSubscription, _visualSubscription })
+        foreach (var subscription in new[] { _sessionSubscription, _visualSubscription, _statusSubscription })
         {
             try { subscription?.Dispose(); }
             catch (Exception error) { errors.Add(error); }

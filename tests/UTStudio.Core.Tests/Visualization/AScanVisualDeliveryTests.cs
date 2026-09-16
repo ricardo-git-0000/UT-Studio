@@ -50,7 +50,7 @@ public sealed class AScanVisualDeliveryTests
     }
 
     [TestMethod]
-    public async Task SlowObserverDoesNotBlockInputAndDisposalDoesNotWaitForUserCode()
+    public async Task SlowObserverDoesNotBlockInputAndDisposalWaitsOutsideGlobalLock()
     {
         var clock = new ManualSimulatorTimeProvider();
         await using var delivery = new AScanVisualDelivery(timeProvider: clock);
@@ -67,6 +67,7 @@ public sealed class AScanVisualDeliveryTests
         using var subscription = delivery.Subscribe(observer);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
+        Task? disposal = null;
         try
         {
             delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
@@ -79,13 +80,13 @@ public sealed class AScanVisualDeliveryTests
             await UntilAsync(() => delivery.Statistics.Published == 2);
             Assert.AreEqual(21L, delivery.Statistics.Received);
             Assert.AreEqual(19L, delivery.Statistics.Replaced);
-            var disposal = delivery.DisposeAsync().AsTask();
+            disposal = delivery.DisposeAsync().AsTask();
             Assert.AreSame(disposal, delivery.DisposeAsync().AsTask());
-            await Watch(disposal);
+            Assert.IsFalse(disposal.IsCompleted);
             Assert.IsNull(delivery.Current);
             Assert.IsFalse(delivery.Statistics.HasPending);
         }
-        finally { unblock.TrySetResult(); }
+        finally { unblock.TrySetResult(); if (disposal is not null) { await Watch(disposal); } }
     }
 
     [TestMethod]
