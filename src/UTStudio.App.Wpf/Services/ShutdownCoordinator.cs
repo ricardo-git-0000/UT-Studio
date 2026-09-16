@@ -49,8 +49,11 @@ public sealed class ShutdownCoordinator
         }
         finally
         {
-            await diagnosticCancellation.CancelAsync().ConfigureAwait(false);
-            await diagnostic.ConfigureAwait(false);
+            // Diagnostic teardown must never replace the resource-cleanup result.
+            try { await diagnosticCancellation.CancelAsync().ConfigureAwait(false); }
+            catch (Exception error) { _logger.LogWarning(error, "Shutdown diagnostic timer cancellation failed"); }
+            try { await diagnostic.ConfigureAwait(false); }
+            catch (Exception error) { _logger.LogWarning(error, "Shutdown diagnostic observation failed"); }
         }
     }
 

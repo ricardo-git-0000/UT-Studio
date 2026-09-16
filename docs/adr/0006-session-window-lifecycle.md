@@ -12,7 +12,7 @@ La revisión del usuario del 2026-09-11 sustituye expresamente la decisión ante
 
 - Cerrar MainWindow solicita parada ordenada, desconexión, liberación de recursos, parada y liberación del Host y cierre de la aplicación, también con adquisición activa.
 - No implementar bandeja, `OnExplicitShutdown` ni ejecución sin ventanas.
-- La composición usa `OnMainWindowClose`. En el primer evento Closing cancela el cierre sincrónicamente y observa una única tarea de salida asíncrona. MainWindow permanece abierta durante la limpieza; solicitudes repetidas se unen a esa tarea. Solo tras completarla se autoriza y reemite Close; el segundo Closing permite terminar WPF. No bloquear el Dispatcher con esperas síncronas.
+- La composición usa `OnMainWindowClose`. En el primer evento Closing cancela el cierre sincrónicamente y observa una única tarea de salida asíncrona. MainWindow permanece abierta durante la limpieza; solicitudes repetidas se unen a esa tarea. Solo tras completarla se programa una única finalización mediante Dispatcher: dentro de esa operación se autoriza y reemite Close; el segundo Closing permite terminar WPF. Incluso si la tarea ya estaba completada, Close nunca se reemite dentro de la primera pila de Closing. No bloquear el Dispatcher con esperas síncronas.
 - Una futura ventana secundaria liberará sus suscripciones y estado al cerrarse sin detener la sesión. Cerrar MainWindow seguirá significando salir aunque haya secundarias abiertas.
 - No crear infraestructura genérica de scopes por ventana. La primera secundaria exigirá concretar propiedad, suscripciones y presupuesto antes de implementarse.
 
@@ -36,6 +36,8 @@ Parar desde UI limpia la ejecución y deja la aplicación abierta; desconexión 
 ## Timeout, errores y cancelación
 
 Cinco segundos es un umbral exclusivamente diagnóstico. Si se supera, MainWindow sigue abierta e informa la fase pendiente; la limpieza continúa observada. No matar el proceso, devolver buffers aún en uso, destruir el Host prematuramente ni declarar completada la salida. Una solicitud repetida no duplica limpieza. Si una fase falla y no se acredita su resolución, se mantiene cierre pendiente y diagnóstico.
+
+Los fallos al cancelar o disponer el temporizador diagnóstico se registran separadamente y no alteran el resultado principal del cierre: no convierten una limpieza correcta en fallo ni sustituyen una excepción real de limpieza. Las tareas diagnósticas se observan también cuando la limpieza falla. Estas garantías y la finalización diferida están cubiertas por pruebas WPF deterministas de robustez del cierre.
 
 Cancelar la espera del solicitante no interrumpe la limpieza interna. El token de Start no gobierna el run tras el éxito. Conservar error primario y errores de limpieza por separado; observar todas las tareas. No hay aborto forzado automático.
 

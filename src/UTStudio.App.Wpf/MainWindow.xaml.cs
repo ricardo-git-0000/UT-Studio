@@ -63,8 +63,13 @@ public partial class MainWindow : Window
         try
         {
             await _shutdown.ShutdownAsync();
-            _allowClose = true;
-            Close();
+            // Always unwind Closing first, even when shutdown was already completed.
+            // _closing admits only this one final-close operation.
+            await Dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(() =>
+            {
+                _allowClose = true;
+                Close();
+            })).Task;
         }
         catch (Exception error)
         {
