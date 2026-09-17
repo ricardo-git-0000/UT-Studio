@@ -1,6 +1,6 @@
 # Plan de línea base de rendimiento y estabilidad A-Scan
 
-Fecha: 2026-09-16. Estado: infraestructura inicial aprobada e implementada; campañas, baseline medido y presupuestos pendientes de aprobación. No contiene resultados experimentales aprobados.
+Fecha: 2026-09-16. Estado: primera baseline A-Scan cerrada el 2026-09-17 como referencia de regresión de una VM concreta; no certifica capacidad de producto ni sustituye las campañas pendientes en hardware físico.
 
 ## Objetivo, fuentes y alcance
 
@@ -267,3 +267,47 @@ Requisito confirmado por el usuario, implementado exclusivamente en LoadTests y 
 - Cabecera explícita: `telemetry=Minimal detailedPerFrameInstrumentation=disabled` o `telemetry=Full detailedPerFrameInstrumentation=enabled`. JSON schemaVersion=2 usa null para métricas no recopiladas; consola usa unavailable. También son null/unavailable los histogramas Full sin observaciones. La lista de campos y semántica de extremos se documentan en el [README de LoadTests](../../tools/UTStudio.LoadTests/README.md).
 
 Validación realizada: formato aplicado y verificado sin cambios pendientes; build Release con cero advertencias/errores; 188 pruebas Core y 28 WPF correctas; dos cargas smoke diagnósticas de dos segundos (Minimal/Full, fuente experimental, 2.048 muestras, objetivo 1.000/s, progress quiet), ambas código 0, balances completos y cero buffers pendientes. JSON revisado: null en sondas deshabilitadas de Minimal, valores e histogramas poblados en Full, snapshots de memoria de extremos disponibles en ambos. Artefactos sintéticos temporales fuera del checkout. Revisión independiente en lectura sin bloqueantes. Ambas cargas informaron TARGET_NOT_REACHED; no se interpreta como pérdida UT ni como medición de capacidad. Pruebas de sondas sin registros/anillo en Minimal, registros en Full, demanda, recorrido visual determinista, balances, serialización y las cuatro combinaciones telemetry/progress. Estas cargas verifican comportamiento, no cuantifican overhead ni constituyen baseline. El piloto comparativo sigue pendiente.
+
+## Cierre de la primera baseline — 2026-09-17
+
+### Entorno y protocolo confirmado
+
+La referencia se obtuvo en `VM-R7700X-4vCPU-8GiB-W11-26200-dotnet10.0.11`, con plan de energía **Equilibrado**, compilación Release y ejecución sin depurador. Cada caso consolidado tuvo tres procesos independientes, un minuto de calentamiento y cinco minutos de ventana activa, con telemetría `Full` y progreso `Quiet`. Se conservaron canal 4, pool 8, observador visual rápido y la instrumentación descrita en este plan. Los resultados JSON son artefactos locales ignorados y no se versionan.
+
+La campaña confirmó propiedad y barreras: en todas las repeticiones hubo cero errores, `P=C=L`, `rent=return`, cero buffers pendientes al cierre y `FramesReleasedBarrier=true`. En los casos experimentales consolidados la demanda omitida y pendiente fue cero. El caso objetivo 1.000/s usó pacing `catch-up-bounded`, con ráfaga máxima configurada en 32; `max` permaneció sin pacing.
+
+### Resultados consolidados
+
+Los intervalos siguientes son mínimo–máximo de tres procesos. Son una baseline de regresión de esta VM y configuración, no garantías ni requisitos del producto.
+
+| Caso | Tasa consumida | CPU activa | Máx. working set | Proyección p95 | Entrega visual p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2.048 muestras, experimental, objetivo 1.000/s, `catch-up-bounded` | 999,999–1.000,002/s | 25,68–30,31 % | 54,55–54,91 MiB | 13,4–13,7 µs | 1.079,5–1.086,3 µs |
+| 65.535 muestras, experimental, `max` sin pacing | 15.522,75–16.273,49/s | 55,78–57,06 % | 55,83–56,02 MiB | 69,5–71,5 µs | 169,1–184,7 µs |
+
+La primera repetición de `max` produjo **15.677,95/s**. Esa cifra no es capacidad certificada del producto: `max` usa fuente, generador LCG y pool experimentales, incluye sus costes y no representa SyntheticRfGenerator, GigE, PCIe ni una tasa sostenible garantizada en despliegue.
+
+Las referencias productivas anteriores, de una sola ejecución por caso y por tanto no consolidadas estadísticamente, quedaron en 31,169–31,175/s para objetivos de 50/s y 60,992–61,084/s para objetivos de 100/s, con 2.048 y 65.535 muestras. Registraron cero errores, cero buffers pendientes y barrera confirmada, pero demanda omitida (6.782–6.789 y 14.028–14.093 slots, respectivamente). La limitación corresponde al pacing productivo basado en temporizadores bajo VMware; no demuestra pérdida de frames UT ni limita por sí sola la capacidad del pipeline.
+
+### Umbrales provisionales de aviso
+
+Para comparar futuras ejecuciones únicamente en la misma VM, configuración y protocolo, se proponen estos avisos conservadores:
+
+- objetivo experimental 1.000/s: avisar si la tasa consumida sale de 999,9–1.000,1/s, CPU activa supera 35 %, working set máximo supera 60 MiB, proyección p95 supera 16 µs o entrega visual p95 supera 1.250 µs;
+- `max` experimental de 65.535 muestras: avisar si la tasa consumida baja de 15.000/s, CPU activa supera 65 %, working set máximo supera 62 MiB, proyección p95 supera 85 µs o entrega visual p95 supera 225 µs;
+- todos los casos: avisar ante errores, balances finales inválidos, buffers pendientes, barrera no confirmada o demanda omitida/pendiente en los casos experimentales con `catch-up-bounded`.
+
+Estos presupuestos son umbrales provisionales de aviso para provocar investigación y repetición. No son requisitos absolutos, criterios de aceptación del producto ni fallos de CI. La VM solo sirve para regresiones con la misma configuración; cambios de host, hipervisor, runtime, energía, instrumentación o parámetros invalidan la comparación directa.
+
+### Pendientes fuera de esta baseline
+
+- baseline en hardware físico;
+- transporte GigE real;
+- transporte PCIe real;
+- phased array con leyes focales;
+- almacenamiento sin pérdida;
+- runner WPF/DPI;
+- soak prolongado;
+- presupuestos específicos por transporte y configuración.
+
+El resumen de cierre y su clasificación de hechos, límites y pendientes está en [progreso del 2026-09-17](../progress/2026-09-17-ascan-performance-baseline.md).
