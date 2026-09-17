@@ -1,12 +1,19 @@
 namespace UTStudio.LoadTests;
 
 internal enum LoadProfile { Smoke, Baseline, Soak }
+internal enum LoadSourceMode { Auto, Production, Experimental }
+internal enum TelemetryMode { Minimal, Full }
+internal enum ProgressMode { Normal, Quiet }
 
 internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double? Rate, TimeSpan Duration)
 {
     internal TimeSpan Warmup { get; init; } = TimeSpan.Zero;
     internal TimeSpan ProgressTimeout { get; init; } = TimeSpan.FromSeconds(10);
     internal TimeSpan CleanupTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    internal LoadSourceMode Source { get; init; } = LoadSourceMode.Auto;
+    internal TelemetryMode Telemetry { get; init; } = TelemetryMode.Full;
+    internal ProgressMode Progress { get; init; } = ProgressMode.Normal;
+    internal string? OutputPath { get; init; }
     internal static readonly TimeSpan SmokeDuration = TimeSpan.FromSeconds(30);
     internal static readonly TimeSpan BaselineDuration = TimeSpan.FromMinutes(5);
     internal static readonly TimeSpan SoakDuration = TimeSpan.FromMinutes(30);
@@ -23,6 +30,10 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
         TimeSpan? duration = null;
         TimeSpan warmup = TimeSpan.Zero;
         TimeSpan progressTimeout = TimeSpan.FromSeconds(10), cleanupTimeout = TimeSpan.FromSeconds(10);
+        LoadSourceMode source = LoadSourceMode.Auto;
+        TelemetryMode telemetry = TelemetryMode.Full;
+        ProgressMode progress = ProgressMode.Normal;
+        string? outputPath = null;
         for (int i = 0; i < args.Length; i++)
         {
             string value;
@@ -55,6 +66,26 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
                     { error = "--warmup expects 0s or a positive duration."; return false; }
                     if (value == "0s") { warmup = TimeSpan.Zero; }
                     break;
+                case "--source":
+                    if (!Take(args, ref i, out value) || !TryEnum(value, out source))
+                    { error = "--source expects auto, production or experimental."; return false; }
+                    break;
+                case "--telemetry":
+                    if (!Take(args, ref i, out value) || !TryEnum(value, out telemetry))
+                    { error = "--telemetry expects minimal or full."; return false; }
+                    break;
+                case "--progress":
+                    if (!Take(args, ref i, out value) || !TryEnum(value, out progress))
+                    { error = "--progress expects normal or quiet."; return false; }
+                    break;
+                case "--output":
+                    if (!Take(args, ref i, out value) || string.IsNullOrWhiteSpace(value) ||
+                        !Path.GetExtension(value).Equals(".json", StringComparison.OrdinalIgnoreCase))
+                    { error = "--output expects a .json path."; return false; }
+                    try { outputPath = Path.GetFullPath(value); }
+                    catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+                    { error = "--output expects a valid .json path."; return false; }
+                    break;
                 case "--progress-timeout":
                     if (!Take(args, ref i, out value) || !TryDuration(value, out progressTimeout))
                     { error = "--progress-timeout expects a positive duration."; return false; }
@@ -74,6 +105,8 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
         if (rate is { } finite && (!double.IsFinite(finite) || finite <= 0 || finite > 1_000_000))
         { error = "--rate must be finite, positive and no greater than 1000000, or max."; return false; }
         if (rate is null && samples != 65535) { error = "--rate max is defined only for 65535 samples."; return false; }
+        if (source == LoadSourceMode.Production && (rate is null or > 100))
+        { error = "--source production supports a numeric --rate no greater than 100/s."; return false; }
         if (rate is { } target && progressTimeout.TotalSeconds <= 1 / target)
         { error = "--progress-timeout must exceed the target frame period."; return false; }
         TimeSpan selected = duration ?? profile switch
@@ -83,7 +116,15 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
             _ => SoakDuration
         };
         options = new(profile, samples, rate, selected)
-        { Warmup = warmup, ProgressTimeout = progressTimeout, CleanupTimeout = cleanupTimeout };
+        {
+            Warmup = warmup,
+            ProgressTimeout = progressTimeout,
+            CleanupTimeout = cleanupTimeout,
+            Source = source,
+            Telemetry = telemetry,
+            Progress = progress,
+            OutputPath = outputPath
+        };
         return true;
     }
 
@@ -92,6 +133,9 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
         if (++index >= args.Length) { value = string.Empty; return false; }
         value = args[index]; return true;
     }
+
+    private static bool TryEnum<T>(string value, out T parsed) where T : struct, Enum =>
+        Enum.TryParse(value, true, out parsed) && Enum.IsDefined(parsed) && !int.TryParse(value, out _);
 
     private static bool TryDuration(string text, out TimeSpan duration)
     {

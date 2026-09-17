@@ -15,7 +15,12 @@ internal sealed class LoadRunner
         Func<LoadTelemetry, IUtFrameSource>? sourceFactory = null, Action<ResourceSample>? sampleObserved = null)
     {
         var telemetry = new LoadTelemetry(options.Rate);
-        bool experimental = options.Rate is null or > 100;
+        bool experimental = options.Source switch
+        {
+            LoadSourceMode.Experimental => true,
+            LoadSourceMode.Production => false,
+            _ => options.Rate is null or > 100
+        };
         IUtFrameSource source = sourceFactory?.Invoke(telemetry) ?? (experimental
             ? new ExperimentalFrameSource(options, telemetry)
             : new SimulatorUtFrameSource(new UtSourceId("load-test-simulator"),
@@ -79,15 +84,16 @@ internal sealed class LoadRunner
                 if (current.Timestamp >= deadline) { break; }
                 if (Stopwatch.GetElapsedTime(lastSampleAt, current.Timestamp) >= interval)
                 {
-                    Sample(current);
+                    Sample(current, options.Telemetry == TelemetryMode.Full);
                     var rates = new RateWindow(previous, current);
-                    Console.WriteLine($"progress offered={current.Offered} generated={current.Generated} accepted={current.Accepted} consumed={current.Consumed} released={current.Released} inTransit={current.InTransit} offered.rate={rates.OfferedPerSecond:F2}/s accepted.rate={rates.AcceptedPerSecond:F2}/s consumed.rate={rates.ConsumedPerSecond:F2}/s");
+                    if (options.Progress == ProgressMode.Normal)
+                    { Console.WriteLine($"progress offered={current.Offered} generated={current.Generated} accepted={current.Accepted} consumed={current.Consumed} released={current.Released} inTransit={current.InTransit} offered.rate={rates.OfferedPerSecond:F2}/s accepted.rate={rates.AcceptedPerSecond:F2}/s consumed.rate={rates.ConsumedPerSecond:F2}/s"); }
                     previous = current;
                 }
                 TimeSpan remaining = Stopwatch.GetElapsedTime(current.Timestamp, deadline);
                 await Task.Delay(remaining < poll ? remaining : poll, cancellationToken).ConfigureAwait(false);
             }
-            void Sample(CounterSnapshot current)
+            void Sample(CounterSnapshot current, bool retain)
             {
                 process.Refresh();
                 TimeSpan cpu = process.TotalProcessorTime;
@@ -96,7 +102,8 @@ internal sealed class LoadRunner
                 double percent = CpuMeasurement.Percent(cpu - lastCpu, wall, Environment.ProcessorCount);
                 var sample = new ResourceSample(Stopwatch.GetElapsedTime(start.Timestamp, current.Timestamp).TotalSeconds,
                     wall.TotalSeconds, percent, GC.GetTotalMemory(false), process.WorkingSet64, current.Accepted, current.Consumed);
-                series.Add(sample); sampleObserved?.Invoke(sample);
+                if (retain) { series.Add(sample); }
+                sampleObserved?.Invoke(sample);
                 maximumCpu = Math.Max(maximumCpu, percent);
                 maximumWorkingSet = Math.Max(maximumWorkingSet, sample.WorkingSetBytes);
                 lastSampleAt = cpuAt; lastCpu = cpu;
@@ -122,7 +129,7 @@ internal sealed class LoadRunner
                 double percent = CpuMeasurement.Percent(cpuActiveEnd - lastCpu, residual, Environment.ProcessorCount);
                 var sample = new ResourceSample(Stopwatch.GetElapsedTime(start.Timestamp, end.Timestamp).TotalSeconds,
                     residual.TotalSeconds, percent, GC.GetTotalMemory(false), process.WorkingSet64, end.Accepted, end.Consumed);
-                series.Add(sample);
+                if (options.Telemetry == TelemetryMode.Full) { series.Add(sample); }
                 maximumCpu = Math.Max(maximumCpu, percent);
                 maximumWorkingSet = Math.Max(maximumWorkingSet, sample.WorkingSetBytes);
             }

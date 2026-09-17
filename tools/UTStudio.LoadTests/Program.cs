@@ -5,7 +5,7 @@ using UTStudio.LoadTests;
 
 if (!LoadOptions.TryParse(args, out LoadOptions? options, out string? error))
 {
-    Console.WriteLine(error ?? "Usage: --profile smoke|baseline|soak --samples 2048|65535 --rate <number|max> [--duration 10s|5m|30m]");
+    Console.WriteLine(error ?? "Usage: --profile smoke|baseline|soak --samples 2048|65535 --rate <number|max> [--source auto|production|experimental] [--duration 10s|5m|30m] [--warmup 0s|60s] [--telemetry minimal|full] [--progress normal|quiet] [--output <path.json>]");
     return error is null ? 0 : 64;
 }
 
@@ -16,17 +16,20 @@ try
 {
     PrintEnvironment(options!);
     LoadResult result = await new LoadRunner().RunAsync(options!, shutdown.Token);
-    PrintResult(result);
+    PrintResult(options!, result);
     IReadOnlyList<string> failures = FunctionalCriteria.Evaluate(result);
     foreach (string failure in failures) { Console.Error.WriteLine($"FAIL: {failure}"); }
-    return FunctionalCriteria.ExitCode(result);
+    int exitCode = FunctionalCriteria.ExitCode(result);
+    if (options!.OutputPath is not null)
+    { await ResultWriter.WriteAsync(options.OutputPath, options, result, failures, exitCode); }
+    return exitCode;
 }
 finally { Console.CancelKeyPress -= handler; }
 
 static void PrintEnvironment(LoadOptions options)
 {
-    Console.WriteLine($"profile={options.Profile} samples={options.SampleCount} rate={options.RateLabel}/s duration={options.Duration}");
-    Console.WriteLine($"warmup.excluded={options.Warmup} instrumentation=enabled progressTimeout={options.ProgressTimeout} cleanupTimeout={options.CleanupTimeout}");
+    Console.WriteLine($"profile={options.Profile} samples={options.SampleCount} rate={options.RateLabel}/s duration={options.Duration} source.requested={options.Source}");
+    Console.WriteLine($"warmup.excluded={options.Warmup} instrumentation=enabled telemetry={options.Telemetry} progress={options.Progress} progressTimeout={options.ProgressTimeout} cleanupTimeout={options.CleanupTimeout}");
     Console.WriteLine($"os={RuntimeInformation.OSDescription} arch={RuntimeInformation.ProcessArchitecture} runtime={RuntimeInformation.FrameworkDescription}");
     Console.WriteLine($"machine={Environment.MachineName} cpu.logical={Environment.ProcessorCount} commit={TryGitCommit() ?? "unavailable"}");
     Console.WriteLine($"assembly={Assembly.GetExecutingAssembly().GetName().Version} pid={Environment.ProcessId}");
@@ -44,7 +47,7 @@ static string? TryGitCommit()
     catch { return null; }
 }
 
-static void PrintResult(LoadResult result)
+static void PrintResult(LoadOptions options, LoadResult result)
 {
     static string Percentiles(PercentileSnapshot value) =>
         $"n={value.Population} window={value.WindowPopulation} mean={value.Mean:F3}us p50={value.P50:F3}us p95={value.P95:F3}us p99={value.P99:F3}us";
@@ -63,7 +66,10 @@ static void PrintResult(LoadResult result)
     Console.WriteLine($"memory.postCleanup.managedEstimate={result.ManagedBytes} workingSet.postCleanup={result.WorkingSetBytes} workingSet.active.sampledMax={result.MaximumWorkingSetBytes} gc.active={result.Gen0}/{result.Gen1}/{result.Gen2}");
     Console.WriteLine($"cpu.active.average={result.CpuPercent:F2}% cpu.active.sampledMax={result.MaximumCpuPercent:F2}% cpu.startup.seconds={result.StartupCpuSeconds:F6} cpu.cleanup.seconds={result.CleanupCpuSeconds:F6} neutral.cleanup={result.StopDuration.TotalMilliseconds:F3}ms barrier={result.FramesReleasedBarrier} errors={result.Errors.Count} cancelled={result.Cancelled}");
     Console.WriteLine($"correlation.misses={result.CorrelationMisses} correlation.slotOverwrites={result.CorrelationOverwrites} histogram=last-8192-active-observations resourceSeries.retained={result.ResourceSamples.Length} resourceSeries.total={result.TotalResourceSamples}");
-    foreach (var sample in result.ResourceSamples)
-    { Console.WriteLine($"resource elapsed={sample.ElapsedSeconds:F6}s interval={sample.IntervalSeconds:F6}s cpu={sample.CpuPercent:F3}% managedEstimate={sample.ManagedEstimateBytes} workingSet={sample.WorkingSetBytes} accepted={sample.Accepted} consumed={sample.Consumed}"); }
+    if (options.Telemetry == TelemetryMode.Full)
+    {
+        foreach (var sample in result.ResourceSamples)
+        { Console.WriteLine($"resource elapsed={sample.ElapsedSeconds:F6}s interval={sample.IntervalSeconds:F6}s cpu={sample.CpuPercent:F3}% managedEstimate={sample.ManagedEstimateBytes} workingSet={sample.WorkingSetBytes} accepted={sample.Accepted} consumed={sample.Consumed}"); }
+    }
     foreach (var error in result.Errors) { Console.Error.WriteLine($"error {error}"); }
 }
