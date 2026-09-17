@@ -7,12 +7,14 @@ internal sealed class LoadTelemetry
     internal CorrelationRing? Correlation { get; }
     internal bool DetailedPerFrameInstrumentation { get; }
     private long _activeStart = long.MaxValue, _activeEnd = long.MaxValue;
-    internal LoadTelemetry(double? rate = null, TelemetryMode mode = TelemetryMode.Full)
+    internal LoadTelemetry(double? rate = null, TelemetryMode mode = TelemetryMode.Full,
+        PacingMode pacing = PacingMode.SkipMissed, int maxCatchUp = 32, IPacingClock? clock = null)
     {
         DetailedPerFrameInstrumentation = mode == TelemetryMode.Full;
         Correlation = DetailedPerFrameInstrumentation ? new(65536) : null;
-        Demand = new(rate, detailed: DetailedPerFrameInstrumentation);
-        Counters = new() { Offering = Demand.Offer };
+        Demand = new(rate, frequency: clock?.Frequency ?? 0, detailed: DetailedPerFrameInstrumentation, mode: pacing, capacity: maxCatchUp,
+            timestamp: () => (clock ?? StopwatchPacingClock.Instance).Timestamp);
+        Counters = new() { Offering = _ => Demand.Offer() };
     }
     internal AcquisitionMetrics Counters { get; }
     internal DemandSchedule Demand { get; }

@@ -5,7 +5,7 @@ using UTStudio.LoadTests;
 
 if (!LoadOptions.TryParse(args, out LoadOptions? options, out string? error))
 {
-    Console.WriteLine(error ?? "Usage: --profile smoke|baseline|soak --samples 2048|65535 --rate <number|max> [--source auto|production|experimental] [--duration 10s|5m|30m] [--warmup 0s|60s] [--telemetry minimal|full] [--progress normal|quiet] [--output <path.json>]");
+    Console.WriteLine(error ?? "Usage: --profile smoke|baseline|soak --samples 2048|65535 --rate <number|max> [--source auto|production|experimental] [--pacing skip-missed|catch-up-bounded] [--max-catch-up <1..32>] [--duration 10s|5m|30m] [--warmup 0s|60s] [--telemetry minimal|full] [--progress normal|quiet] [--output <path.json>]");
     return error is null ? 0 : 64;
 }
 
@@ -28,7 +28,7 @@ finally { Console.CancelKeyPress -= handler; }
 
 static void PrintEnvironment(LoadOptions options)
 {
-    Console.WriteLine($"profile={options.Profile} samples={options.SampleCount} rate={options.RateLabel}/s duration={options.Duration} source.requested={options.Source}");
+    Console.WriteLine($"profile={options.Profile} samples={options.SampleCount} rate={options.RateLabel}/s duration={options.Duration} source.requested={options.Source} pacing={options.Pacing} max.catch.up={options.MaxCatchUp}");
     Console.WriteLine($"warmup.excluded={options.Warmup} telemetry={options.Telemetry} detailedPerFrameInstrumentation={(options.Telemetry == TelemetryMode.Full ? "enabled" : "disabled")} progress={options.Progress} progressTimeout={options.ProgressTimeout} cleanupTimeout={options.CleanupTimeout}");
     Console.WriteLine($"os={RuntimeInformation.OSDescription} arch={RuntimeInformation.ProcessArchitecture} runtime={RuntimeInformation.FrameworkDescription}");
     Console.WriteLine($"machine={Environment.MachineName} cpu.logical={Environment.ProcessorCount} commit={TryGitCommit() ?? "unavailable"}");
@@ -58,7 +58,7 @@ static void PrintResult(LoadOptions options, LoadResult result)
     var counters = result.Counters;
     Console.WriteLine($"consumed.afterActive.beforeStop={result.ConsumedAfterActiveBeforeStop} (-1 means stop cut unavailable)");
     Console.WriteLine($"lifetime offered={counters.Offered} generated={counters.Generated} accepted={counters.Accepted} consumed={counters.Consumed} released={counters.Released} untransferred={counters.Untransferred} attempts.beforeFrame={counters.Offered - counters.Generated} rents={counters.Rented} returns={counters.Returned} inTransit={counters.InTransit}");
-    Console.WriteLine($"demand.untilActiveEnd scheduled={result.Demand.Scheduled} fulfilled.attempts={result.Demand.Offered - result.Demand.EarlyOrDuplicate} omitted={result.Demand.Missed} earlyOrDuplicate={result.Demand.EarlyOrDuplicate} pacing.delay.mean={Metric(result.Demand.MeanDelayMicroseconds, "F3", "us")} pacing.delay.max={Metric(result.Demand.MaximumDelayMicroseconds, "F3", "us")}");
+    Console.WriteLine($"demand.untilActiveEnd scheduled={result.Demand.Scheduled} offered={result.Demand.Offered} recovered={result.Demand.Recovered} omitted={result.Demand.Missed} pending={result.Demand.Pending} bursts={result.Demand.Bursts} burst.mean={result.Demand.MeanBurstSize:F2} burst.max={result.Demand.MaximumBurstSize} pacing.delay.mean={Metric(result.Demand.MeanDelayMicroseconds, "F3", "us")} pacing.delay.max={Metric(result.Demand.MaximumDelayMicroseconds, "F3", "us")}");
     if (result.TargetRate is { } target && (result.ActiveWindow.OfferedPerSecond < target || result.ActiveWindow.ConsumedPerSecond < target))
     { Console.WriteLine("TARGET_NOT_REACHED: requested rate was not fully offered and/or consumed; this is not a capacity baseline."); }
     Console.WriteLine($"visual received={result.VisualReceived} published={result.VisualPublished} replaced={result.VisualReplaced} dropped={result.VisualDropped} observerErrors={result.VisualObserverErrors}");

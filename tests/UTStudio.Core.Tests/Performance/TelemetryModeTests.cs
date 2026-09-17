@@ -159,7 +159,9 @@ public sealed class TelemetryModeTests
         {
             await ResultWriter.WriteAsync(path, options, result, [], 0);
             using var json = JsonDocument.Parse(await File.ReadAllTextAsync(path));
-            Assert.AreEqual(2, json.RootElement.GetProperty("schemaVersion").GetInt32());
+            Assert.AreEqual(3, json.RootElement.GetProperty("schemaVersion").GetInt32());
+            Assert.IsTrue(json.RootElement.GetProperty("options").TryGetProperty("pacing", out _));
+            Assert.IsTrue(json.RootElement.GetProperty("result").TryGetProperty("rates", out _));
             Assert.AreEqual(full ? "enabled" : "disabled", json.RootElement.GetProperty("options").GetProperty("detailedPerFrameInstrumentation").GetString());
             var values = json.RootElement.GetProperty("result");
             foreach (string field in new[] { "VisualDeliveryLatencyMicroseconds", "ProjectionMicroseconds", "CorrelationMisses", "CorrelationOverwrites", "MaximumWorkingSetBytes", "MaximumCpuPercent", "resourceSamples", "TotalResourceSamples" })

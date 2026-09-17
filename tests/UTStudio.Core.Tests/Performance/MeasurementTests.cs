@@ -19,8 +19,73 @@ public sealed class MeasurementTests
         Assert.AreEqual(9, snapshot.Scheduled);
         Assert.AreEqual(2, snapshot.Offered);
         Assert.AreEqual(7, snapshot.Missed);
+        Assert.AreEqual(0, snapshot.Pending);
         Assert.AreEqual(4700d, snapshot.MaximumDelayMicroseconds);
         Assert.AreEqual(TimeSpan.FromMicroseconds(300), demand.UntilNext(5700));
+    }
+
+    [TestMethod]
+    public void CatchUpCadenceAndLateWakeAreDeterministic()
+    {
+        var demand = new DemandSchedule(1000, 1_000_000, mode: PacingMode.CatchUpBounded, capacity: 32);
+        demand.Start(0);
+        Assert.AreEqual(1, demand.Claim(0));
+        demand.Offer(0, 0);
+        Assert.AreEqual(1, demand.Claim(1000));
+        demand.Offer(1000, 0);
+        Assert.AreEqual(4, demand.Claim(5000));
+        for (int i = 0; i < 4; i++) { demand.Offer(5000, i); }
+        var snapshot = demand.Snapshot(5000);
+        Assert.AreEqual(6, snapshot.Scheduled);
+        Assert.AreEqual(6, snapshot.Offered);
+        Assert.AreEqual(3, snapshot.Recovered);
+        Assert.AreEqual(0, snapshot.Missed);
+        Assert.AreEqual(0, snapshot.Pending);
+        Assert.AreEqual(1, snapshot.Bursts);
+        Assert.AreEqual(4d, snapshot.MeanBurstSize);
+        Assert.AreEqual(4, snapshot.MaximumBurstSize);
+    }
+
+    [TestMethod]
+    public void CatchUpBoundsBurstAndExplicitlyOmitsExcessDebt()
+    {
+        var demand = new DemandSchedule(1000, 1_000_000, mode: PacingMode.CatchUpBounded, capacity: 32);
+        demand.Start(0);
+        Assert.AreEqual(32, demand.Claim(99_000));
+        for (int i = 0; i < 32; i++) { demand.Offer(99_000, i); }
+        var snapshot = demand.Snapshot(99_000);
+        Assert.AreEqual(100, snapshot.Scheduled);
+        Assert.AreEqual(32, snapshot.Offered);
+        Assert.AreEqual(31, snapshot.Recovered);
+        Assert.AreEqual(68, snapshot.Missed);
+        Assert.AreEqual(0, snapshot.Pending);
+        Assert.AreEqual(32, snapshot.MaximumBurstSize);
+    }
+
+    [TestMethod]
+    public void PartialBurstKeepsPendingDebtAndActualBurstSize()
+    {
+        var demand = new DemandSchedule(1000, 1_000_000, mode: PacingMode.CatchUpBounded, capacity: 32);
+        demand.Start(0);
+        Assert.AreEqual(10, demand.Claim(9000));
+        demand.Offer(9000, 0);
+        demand.Offer(9000, 1);
+        var snapshot = demand.Snapshot(9000);
+        Assert.AreEqual(snapshot.Scheduled, snapshot.Offered + snapshot.Missed + snapshot.Pending);
+        Assert.AreEqual(8, snapshot.Pending);
+        Assert.AreEqual(2, snapshot.MaximumBurstSize);
+    }
+
+    [TestMethod]
+    public void TemporalCalculationsSaturateAtTimestampLimits()
+    {
+        var demand = new DemandSchedule(1, 1, mode: PacingMode.CatchUpBounded, capacity: 32);
+        demand.Start(long.MinValue);
+        Assert.AreEqual(32, demand.Claim(long.MaxValue));
+        Assert.AreEqual(TimeSpan.Zero, demand.UntilNext(long.MaxValue));
+        var snapshot = demand.Snapshot(long.MaxValue);
+        Assert.IsGreaterThanOrEqualTo(0, snapshot.Scheduled);
+        Assert.IsGreaterThanOrEqualTo(0, snapshot.Missed);
     }
     [TestMethod]
     public void ConcurrentRingOverwriteCannotMixTimestampAndSequence()

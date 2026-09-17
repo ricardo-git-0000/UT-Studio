@@ -14,12 +14,16 @@ internal sealed class LoadRunner
         TimeSpan? telemetryInterval = null, Action? runStarted = null,
         Func<LoadTelemetry, IUtFrameSource>? sourceFactory = null, Action<ResourceSample>? sampleObserved = null)
     {
-        var telemetry = new LoadTelemetry(options.Rate, options.Telemetry);
+        if (options.Rate is null && options.Pacing != PacingMode.SkipMissed)
+        { throw new ArgumentException("Unpaced max mode is incompatible with catch-up pacing.", nameof(options)); }
+        if (options.Source == LoadSourceMode.Production && options.Pacing == PacingMode.CatchUpBounded)
+        { throw new ArgumentException("The production source does not support catch-up pacing.", nameof(options)); }
+        var telemetry = new LoadTelemetry(options.Rate, options.Telemetry, options.Pacing, options.MaxCatchUp);
         bool experimental = options.Source switch
         {
             LoadSourceMode.Experimental => true,
             LoadSourceMode.Production => false,
-            _ => options.Rate is null or > 100
+            _ => options.Pacing == PacingMode.CatchUpBounded || options.Rate is null or > 100
         };
         IUtFrameSource source = sourceFactory?.Invoke(telemetry) ?? (experimental
             ? new ExperimentalFrameSource(options, telemetry)
@@ -202,7 +206,7 @@ internal sealed class LoadRunner
             TargetRate = options.Rate,
             GridRate = telemetry.Demand.GridRate,
             SourceDescription = sourceFactory is not null ? "injected-test-source" : experimental
-                ? "experimental; generator=LCG; pool=experimental.SamplePool; pacing=max means unpaced" : "productive; generator=SyntheticRfGenerator; pool=BoundedSampleBufferPool",
+                ? $"experimental; generator=LCG; pool=experimental.SamplePool; pacing={options.Pacing}" : "productive; generator=SyntheticRfGenerator; pool=BoundedSampleBufferPool",
             CorrelationMisses = telemetry.CorrelationMisses,
             CorrelationOverwrites = telemetry.CorrelationOverwrites,
             ManagedBytesAtActiveStart = managedStart,

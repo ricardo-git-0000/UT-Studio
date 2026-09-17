@@ -56,6 +56,12 @@ Coordenadas viven en App.Wpf: no referenciarlo desde ejecutables neutrales. Dife
 
 ## Nivel 2: carga del pipeline
 
+### Pacing experimental con recuperación acotada
+
+La fuente experimental ofrece `skip-missed` (predeterminado) y `catch-up-bounded`, con capacidad configurable de 1 a 32 y valor inicial 32. `skip-missed` conserva la conducta anterior y permite observar la limitación del planificador. `catch-up-bounded` usa una rejilla monotónica, acumula demanda vencida y puede ofrecerla secuencialmente en una ráfaga acotada; la deuda que excede el límite se registra como omitida. Canal, pool, generación y escritura no se amplían ni se ejecutan en paralelo: cualquier backpressure durante la ráfaga continúa visible. No se usa espera activa permanente ni se altera la resolución global de temporizadores.
+
+Las ráfagas no simulan llegadas perfectamente uniformes; validan capacidad media solicitada e incluyen el coste del generador experimental. Registrar demanda programada, ofrecida, recuperada, omitida y pendiente; número, media y máximo de ráfagas; retraso de pacing; y tasas objetivo, ofrecida, aceptada y consumida. `max` permanece sin pacing y mide carga sin pacing, no capacidad sostenible. Cinco segundos son diagnósticos y nunca baseline.
+
 Ejecutable propio, proceso separado y tiempo real monotónico para rendimiento. Las pruebas de corrección usan reloj manual y señales. Nunca interpretar una ejecución de reloj manual como medición de CPU/latencia del sistema real.
 
 1. Simulador -> ApplicationSession -> AScanVisualDelivery, primero sin interés y después con observador rápido. Mismas configuraciones y ventanas de medida; confirmar proyecciones cero sin interés y distinguir Drop visual de pérdida UT.

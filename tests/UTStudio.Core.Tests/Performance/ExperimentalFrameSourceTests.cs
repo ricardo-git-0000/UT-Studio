@@ -90,6 +90,53 @@ public sealed class ExperimentalFrameSourceTests
         }
         finally { await Cleanup(source, null); }
     }
+
+    [TestMethod]
+    public async Task CatchUpBurstExposesChannelBackpressureAndBalancesOwnership()
+    {
+        var clock = new ManualPacingClock(1_000_000);
+        var options = new LoadOptions(LoadProfile.Smoke, 2048, 1000, TimeSpan.FromSeconds(1))
+        { Source = LoadSourceMode.Experimental, Pacing = PacingMode.CatchUpBounded, MaxCatchUp = 32 };
+        var telemetry = new LoadTelemetry(options.Rate, pacing: options.Pacing, maxCatchUp: options.MaxCatchUp, clock: clock);
+        var source = new ExperimentalFrameSource(options, telemetry, clock);
+        UtAcquisitionRun? run = null;
+        try
+        {
+            run = await Start(source).WaitAsync(Limit);
+            await WaitForReason(source, ExperimentalWaitReason.Pacing).WaitAsync(Limit);
+            clock.AdvanceTo(10_000);
+            await WaitForReason(source, ExperimentalWaitReason.Channel).WaitAsync(Limit);
+            var cut = telemetry.Counters.Snapshot();
+            Assert.IsGreaterThan(cut.Accepted, cut.Offered);
+            Assert.IsGreaterThan(0, telemetry.Demand.Snapshot(clock.Timestamp).Recovered);
+            Assert.IsLessThanOrEqualTo(32L, telemetry.Demand.Snapshot(clock.Timestamp).MaximumBurstSize);
+        }
+        finally { await Cleanup(source, run); }
+        var counts = telemetry.Counters.Snapshot();
+        Assert.AreEqual(counts.Generated, counts.Accepted + counts.Untransferred);
+        Assert.AreEqual(counts.Accepted, counts.Consumed);
+        Assert.AreEqual(counts.Consumed, counts.Released);
+        Assert.AreEqual(counts.Rented, counts.Returned);
+        Assert.AreEqual(0, source.OutstandingBuffers);
+    }
+
+    [TestMethod]
+    public async Task CancellationInterruptsManualPacingWait()
+    {
+        var clock = new ManualPacingClock(1_000_000);
+        var options = new LoadOptions(LoadProfile.Smoke, 2048, 1000, TimeSpan.FromSeconds(1));
+        var telemetry = new LoadTelemetry(options.Rate, clock: clock);
+        var source = new ExperimentalFrameSource(options, telemetry, clock);
+        UtAcquisitionRun? run = null;
+        try
+        {
+            run = await Start(source).WaitAsync(Limit);
+            await WaitForReason(source, ExperimentalWaitReason.Pacing).WaitAsync(Limit);
+            await source.StopAsync().WaitAsync(Limit);
+            Assert.IsTrue(run.ProducerCompletion.IsCompletedSuccessfully);
+        }
+        finally { await Cleanup(source, run); }
+    }
     private static ExperimentalFrameSource Create(LoadTelemetry telemetry) =>
         new(new(LoadProfile.Smoke, 2048, null, TimeSpan.FromSeconds(1)), telemetry);
     private static async Task<UtAcquisitionRun> Start(ExperimentalFrameSource source)
@@ -103,6 +150,10 @@ public sealed class ExperimentalFrameSourceTests
         using var deadline = new CancellationTokenSource(Limit);
         while (source.WaitReason != ExperimentalWaitReason.Channel)
         { deadline.Token.ThrowIfCancellationRequested(); await Task.Yield(); }
+    }
+    private static async Task WaitForReason(ExperimentalFrameSource source, ExperimentalWaitReason reason)
+    {
+        while (source.WaitReason != reason) { await Task.Yield(); }
     }
     private static async Task Cleanup(ExperimentalFrameSource source, UtAcquisitionRun? run, Task? reader = null)
     {
@@ -131,4 +182,33 @@ public sealed class ExperimentalFrameSourceTests
     }
     private static async Task Drain(UtAcquisitionRun run)
     { await foreach (var frame in run.Frames.ReadAllAsync()) { frame.Dispose(); } }
+
+    private sealed class ManualPacingClock(long frequency) : IPacingClock
+    {
+        private readonly object _gate = new();
+        private long _timestamp;
+        private TaskCompletionSource? _delay;
+        private bool _permit;
+        public long Frequency { get; } = frequency;
+        public long Timestamp { get { lock (_gate) { return _timestamp; } } }
+        public ValueTask DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
+        {
+            lock (_gate)
+            {
+                if (_permit) { _permit = false; return ValueTask.CompletedTask; }
+                _delay = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                return new(_delay.Task.WaitAsync(cancellationToken));
+            }
+        }
+        internal void AdvanceTo(long timestamp)
+        {
+            TaskCompletionSource? delay;
+            lock (_gate)
+            {
+                _timestamp = timestamp; delay = _delay; _delay = null;
+                if (delay is null) { _permit = true; }
+            }
+            delay?.TrySetResult();
+        }
+    }
 }

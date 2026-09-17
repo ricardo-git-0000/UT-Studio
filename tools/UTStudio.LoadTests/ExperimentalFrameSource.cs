@@ -15,16 +15,18 @@ internal sealed class ExperimentalFrameSource : IUtFrameSource
     private readonly object _gate = new();
     private readonly LoadOptions _options;
     private readonly LoadTelemetry _telemetry;
+    private readonly IPacingClock _clock;
     private ConventionalAcquisitionConfiguration? _configuration;
     private RunContext? _run;
     private UtSourceState _state = new(0, UtConnectionState.Disconnected, UtAcquisitionState.Idle);
     private Task? _dispose;
     private AcquisitionRunId _lastRunId;
 
-    internal ExperimentalFrameSource(LoadOptions options, LoadTelemetry telemetry)
+    internal ExperimentalFrameSource(LoadOptions options, LoadTelemetry telemetry, IPacingClock? clock = null)
     {
         _options = options;
         _telemetry = telemetry;
+        _clock = clock ?? StopwatchPacingClock.Instance;
         SourceId = new UtSourceId("load-test-experimental");
         Capabilities = new UtSourceCapabilities([new PhysicalChannelId(0)],
             ConventionalAcquisitionConfiguration.MaximumSampleCount,
@@ -155,7 +157,7 @@ internal sealed class ExperimentalFrameSource : IUtFrameSource
         ConventionalUtFrame? frame = null;
         AcquisitionMetrics.TrackedOwner? tracked = null;
         ulong sequence = 0;
-        long origin = Stopwatch.GetTimestamp();
+        long origin = _clock.Timestamp;
 
         var token = context.Cancellation.Token;
         try
@@ -163,31 +165,36 @@ internal sealed class ExperimentalFrameSource : IUtFrameSource
             while (true)
             {
                 TimeSpan delay;
-                while ((delay = _telemetry.Demand.UntilNext(Stopwatch.GetTimestamp())) > TimeSpan.Zero)
+                while ((delay = _telemetry.Demand.UntilNext(_clock.Timestamp)) > TimeSpan.Zero)
                 {
                     context.WaitReason = ExperimentalWaitReason.Pacing;
-                    await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(delay.TotalMilliseconds))), token).ConfigureAwait(false);
+                    await _clock.DelayAsync(delay, token).ConfigureAwait(false);
                 }
                 token.ThrowIfCancellationRequested();
-                _telemetry.Counters.Offer();
-                var rent = context.Pool.RentAsync(token);
-                context.WaitReason = rent.IsCompleted ? ExperimentalWaitReason.None : ExperimentalWaitReason.Buffer;
-                owner = await rent.ConfigureAwait(false);
-                owner = tracked = _telemetry.Counters.Track(owner);
-                context.WaitReason = ExperimentalWaitReason.None;
-                Fill(owner.Memory.Span, sequence, token);
-                frame = new ConventionalUtFrame(context.Metadata, sequence,
-                    Stopwatch.GetElapsedTime(origin), owner);
-                tracked.Generated();
-                owner = null;
-                var write = _telemetry.Counters.WriteAsync(context.Channel.Writer, frame, token);
-                context.WaitReason = write.IsCompleted ? ExperimentalWaitReason.None : ExperimentalWaitReason.Channel;
-                await write.ConfigureAwait(false);
-                frame = null;
-                tracked = null;
-                context.WaitReason = ExperimentalWaitReason.None;
-
-                sequence = checked(sequence + 1);
+                int batch = _telemetry.Demand.Claim(_clock.Timestamp);
+                for (int index = 0; index < batch; index++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    _telemetry.Demand.PrepareOffer(index);
+                    _telemetry.Counters.Offer();
+                    var rent = context.Pool.RentAsync(token);
+                    context.WaitReason = rent.IsCompleted ? ExperimentalWaitReason.None : ExperimentalWaitReason.Buffer;
+                    owner = await rent.ConfigureAwait(false);
+                    owner = tracked = _telemetry.Counters.Track(owner);
+                    context.WaitReason = ExperimentalWaitReason.None;
+                    Fill(owner.Memory.Span, sequence, token);
+                    frame = new ConventionalUtFrame(context.Metadata, sequence,
+                        Stopwatch.GetElapsedTime(origin), owner);
+                    tracked.Generated();
+                    owner = null;
+                    var write = _telemetry.Counters.WriteAsync(context.Channel.Writer, frame, token);
+                    context.WaitReason = write.IsCompleted ? ExperimentalWaitReason.None : ExperimentalWaitReason.Channel;
+                    await write.ConfigureAwait(false);
+                    frame = null;
+                    tracked = null;
+                    context.WaitReason = ExperimentalWaitReason.None;
+                    sequence = checked(sequence + 1);
+                }
 
             }
         }

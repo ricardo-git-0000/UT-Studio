@@ -17,7 +17,29 @@ public sealed class LoadOptionsTests
         Assert.AreEqual(LoadSourceMode.Auto, options.Source);
         Assert.AreEqual(TelemetryMode.Full, options.Telemetry);
         Assert.AreEqual(ProgressMode.Normal, options.Progress);
+        Assert.AreEqual(PacingMode.SkipMissed, options.Pacing);
+        Assert.AreEqual(32, options.MaxCatchUp);
         Assert.IsNull(options.OutputPath);
+    }
+
+    [TestMethod]
+    public void ParsesCatchUpAndResolvesAutoToExperimental()
+    {
+        Assert.IsTrue(LoadOptions.TryParse(["--rate", "1000", "--pacing", "catch-up-bounded", "--max-catch-up", "16"], out var options, out _));
+        Assert.AreEqual(PacingMode.CatchUpBounded, options!.Pacing);
+        Assert.AreEqual(16, options.MaxCatchUp);
+        Assert.AreEqual(LoadSourceMode.Experimental, options.Source);
+    }
+
+    [TestMethod]
+    public void RejectsIncompatiblePacingArguments()
+    {
+        Assert.IsFalse(LoadOptions.TryParse(["--samples", "65535", "--rate", "max", "--pacing", "skip-missed"], out _, out _));
+        Assert.IsFalse(LoadOptions.TryParse(["--samples", "65535", "--rate", "max", "--pacing", "catch-up-bounded"], out _, out _));
+        Assert.IsFalse(LoadOptions.TryParse(["--source", "production", "--pacing", "catch-up-bounded"], out _, out _));
+        Assert.IsFalse(LoadOptions.TryParse(["--max-catch-up", "0", "--pacing", "catch-up-bounded"], out _, out _));
+        Assert.IsFalse(LoadOptions.TryParse(["--max-catch-up", "33", "--pacing", "catch-up-bounded"], out _, out _));
+        Assert.IsFalse(LoadOptions.TryParse(["--max-catch-up", "4"], out _, out _));
     }
 
     [TestMethod]

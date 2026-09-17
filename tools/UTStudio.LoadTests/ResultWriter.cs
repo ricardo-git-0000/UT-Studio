@@ -13,7 +13,7 @@ internal static class ResultWriter
         if (!string.IsNullOrEmpty(directory)) { Directory.CreateDirectory(directory); }
         var report = new
         {
-            schemaVersion = 2,
+            schemaVersion = 3,
             referenceMachine = "VM-R7700X-4vCPU-8GiB-W11-26200-dotnet10.0.11",
             interpretation = "same-VM regression reference; not an absolute product-capacity measurement",
             options = new
@@ -24,6 +24,8 @@ internal static class ResultWriter
                 duration = options.Duration,
                 warmup = options.Warmup,
                 source = options.Source.ToString(),
+                pacing = options.Pacing.ToString(),
+                maxCatchUp = options.MaxCatchUp,
                 telemetry = options.Telemetry.ToString(),
                 detailedPerFrameInstrumentation = options.Telemetry == TelemetryMode.Full ? "enabled" : "disabled",
                 progress = options.Progress.ToString()
@@ -41,6 +43,13 @@ internal static class ResultWriter
                 result.MaximumOutstandingBuffers,
                 result.Counters,
                 result.ActiveWindow,
+                rates = new
+                {
+                    target = result.TargetRate,
+                    offered = result.ActiveWindow.OfferedPerSecond,
+                    accepted = result.ActiveWindow.AcceptedPerSecond,
+                    consumed = result.ActiveWindow.ConsumedPerSecond
+                },
                 result.DrainedDuringStop,
                 result.ConsumedAfterActiveBeforeStop,
                 result.Demand,
