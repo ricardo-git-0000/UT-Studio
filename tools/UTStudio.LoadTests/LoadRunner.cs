@@ -14,17 +14,22 @@ internal sealed class LoadRunner
         TimeSpan? telemetryInterval = null, Action? runStarted = null,
         Func<LoadTelemetry, IUtFrameSource>? sourceFactory = null, Action<ResourceSample>? sampleObserved = null)
     {
-        if (options.Rate is null && options.Pacing != PacingMode.SkipMissed)
-        { throw new ArgumentException("Unpaced max mode is incompatible with catch-up pacing.", nameof(options)); }
-        if (options.Source == LoadSourceMode.Production && options.Pacing == PacingMode.CatchUpBounded)
-        { throw new ArgumentException("The production source does not support catch-up pacing.", nameof(options)); }
-        var telemetry = new LoadTelemetry(options.Rate, options.Telemetry, options.Pacing, options.MaxCatchUp);
+        if (options.Rate is null && options.PacingSpecified)
+        { throw new ArgumentException("Unpaced max mode is incompatible with an explicit pacing selection.", nameof(options)); }
+        if (options.Source == LoadSourceMode.Production && options.PacingSpecified)
+        { throw new ArgumentException("Pacing selection is available only for the experimental source.", nameof(options)); }
         bool experimental = options.Source switch
         {
             LoadSourceMode.Experimental => true,
             LoadSourceMode.Production => false,
-            _ => options.Pacing == PacingMode.CatchUpBounded || options.Rate is null or > 100
+            _ => options.PacingSpecified || options.Rate is null or > 100
         };
+        EffectivePacing effectivePacing = options.Rate is null ? EffectivePacing.Unpaced : experimental
+            ? options.Pacing == PacingMode.CatchUpBounded ? EffectivePacing.CatchUpBounded : EffectivePacing.SkipMissed
+            : EffectivePacing.ProductionFixedDelay;
+        // The productive source owns a fixed-delay cadence, not a slot grid. Its target remains diagnostic only.
+        double? scheduledRate = effectivePacing == EffectivePacing.ProductionFixedDelay ? null : options.Rate;
+        var telemetry = new LoadTelemetry(scheduledRate, options.Telemetry, options.Pacing, options.MaxCatchUp);
         IUtFrameSource source = sourceFactory?.Invoke(telemetry) ?? (experimental
             ? new ExperimentalFrameSource(options, telemetry)
             : new SimulatorUtFrameSource(new UtSourceId("load-test-simulator"),
@@ -205,8 +210,12 @@ internal sealed class LoadRunner
             Demand = demand,
             TargetRate = options.Rate,
             GridRate = telemetry.Demand.GridRate,
+            EffectivePacing = effectivePacing,
+            DiagnosticTargetDeficitFrames = effectivePacing == EffectivePacing.ProductionFixedDelay && options.Rate is { } diagnosticTarget
+                ? Math.Max(0, diagnosticTarget * window.Seconds - (end.Offered - start.Offered)) : null,
             SourceDescription = sourceFactory is not null ? "injected-test-source" : experimental
-                ? $"experimental; generator=LCG; pool=experimental.SamplePool; pacing={options.Pacing}" : "productive; generator=SyntheticRfGenerator; pool=BoundedSampleBufferPool",
+                ? $"experimental; generator=LCG; pool=experimental.SamplePool; pacing={effectivePacing.Label()}"
+                : "production; generator=SyntheticRfGenerator; pool=BoundedSampleBufferPool; pacing=production-fixed-delay",
             CorrelationMisses = telemetry.CorrelationMisses,
             CorrelationOverwrites = telemetry.CorrelationOverwrites,
             ManagedBytesAtActiveStart = managedStart,

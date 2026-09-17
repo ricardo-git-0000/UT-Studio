@@ -19,7 +19,7 @@ Resultados consolidados (mínimo–máximo de tres repeticiones):
 
 En todas las repeticiones hubo cero errores, balances completos, cero buffers pendientes y barrera de liberación confirmada. Los casos experimentales consolidados terminaron además con demanda omitida y pendiente igual a cero. Quedaron confirmadas la propiedad de buffers y las barreras de cierre bajo este protocolo.
 
-Las referencias productivas anteriores, con una sola ejecución por caso, abarcaron 31,169–31,175/s para objetivos de 50/s y 60,992–61,084/s para objetivos de 100/s. Aunque mantuvieron integridad y limpieza, acumularon demanda omitida. Es una limitación del pacing productivo basado en temporizadores dentro de VMware, no evidencia de pérdida UT.
+Las referencias productivas anteriores, con una sola ejecución por caso, abarcaron 31,169–31,175/s para objetivos de 50/s y 60,992–61,084/s para objetivos de 100/s. Mantuvieron integridad y limpieza. Su cadencia efectiva era y sigue siendo `production-fixed-delay`: generación y backpressure se suman al periodo. Los slots que los JSON históricos llamaron omitidos procedían de una rejilla diagnóstica externa; no fueron demanda gestionada u omitida por el productor. Se conservan como cadencia observada y déficit diagnóstico bajo VMware, no como validación de `skip-missed` ni evidencia de pérdida UT.
 
 La observación de **15.677,95/s** en la primera ejecución `max` no es capacidad certificada del producto. `max` usa una fuente, un generador LCG y un pool experimentales, y mide carga sin pacing; no representa hardware ni transporte reales y no autoriza extrapolación.
 
@@ -27,6 +27,7 @@ La observación de **15.677,95/s** en la primera ejecución `max` no es capacida
 
 - Esta VM se usa únicamente para detectar regresiones al repetir exactamente la misma configuración y protocolo.
 - El pacing de la campaña a 1.000/s es `catch-up-bounded`; `max` permanece sin pacing.
+- La calibración Minimal/Full quedó completada antes del cierre; su overhead fue inferior a la variabilidad observada entre repeticiones de la VM.
 - Los JSON de resultados continúan como artefactos locales ignorados y no forman parte de la documentación versionada.
 - Los presupuestos añadidos al [plan](../plans/2026-09-16-ascan-performance-baseline.md) son umbrales provisionales de aviso. No son requisitos absolutos, garantías de producto, criterios de aceptación ni fallos de CI.
 
@@ -35,11 +36,11 @@ La observación de **15.677,95/s** en la primera ejecución `max` no es capacida
 - `docs/plans/2026-09-16-ascan-performance-baseline.md`: estado, protocolo, resultados consolidados, rangos anteriores, límites, avisos provisionales y pendientes.
 - `docs/progress/2026-09-17-ascan-performance-baseline.md`: este resumen de cierre.
 
-No se modificaron código, proyectos, paquetes ni resultados JSON.
+El cierre original no modificó código, proyectos, paquetes ni resultados JSON. La corrección posterior de semántica de pacing modificó únicamente LoadTests, pruebas Performance y esta documentación; no cambió la fuente productiva ni añadió paquetes.
 
 ## Pruebas y validaciones
 
-Tarea exclusivamente documental: compilación y pruebas funcionales no aplican. Se revisaron los resultados locales para consolidar rangos, sin añadirlos al control de versiones. Se validaron los enlaces relativos de los documentos modificados y `git diff --check`.
+Para el cierre original se revisaron los resultados locales sin añadirlos al control de versiones. La corrección posterior se valida mediante formato limitado, build Release, suite completa, smokes diagnósticos mínimos de las cuatro etiquetas efectivas, JSON schema 4, enlaces y `git diff --check`; los resultados concretos se registran en la entrega de la tarea y no se versionan.
 
 ## Riesgos y límites
 

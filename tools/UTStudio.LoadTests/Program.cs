@@ -28,7 +28,7 @@ finally { Console.CancelKeyPress -= handler; }
 
 static void PrintEnvironment(LoadOptions options)
 {
-    Console.WriteLine($"profile={options.Profile} samples={options.SampleCount} rate={options.RateLabel}/s duration={options.Duration} source.requested={options.Source} pacing={options.Pacing} max.catch.up={options.MaxCatchUp}");
+    Console.WriteLine($"profile={options.Profile} samples={options.SampleCount} rate={options.RateLabel}/s duration={options.Duration} source.requested={options.Source} pacing.requested={(options.PacingSpecified ? options.Pacing.Label() : "unspecified")} max.catch.up={options.MaxCatchUp}");
     Console.WriteLine($"warmup.excluded={options.Warmup} telemetry={options.Telemetry} detailedPerFrameInstrumentation={(options.Telemetry == TelemetryMode.Full ? "enabled" : "disabled")} progress={options.Progress} progressTimeout={options.ProgressTimeout} cleanupTimeout={options.CleanupTimeout}");
     Console.WriteLine($"os={RuntimeInformation.OSDescription} arch={RuntimeInformation.ProcessArchitecture} runtime={RuntimeInformation.FrameworkDescription}");
     Console.WriteLine($"machine={Environment.MachineName} cpu.logical={Environment.ProcessorCount} commit={TryGitCommit() ?? "unavailable"}");
@@ -53,14 +53,19 @@ static void PrintResult(LoadOptions options, LoadResult result)
     static string Percentiles(PercentileSnapshot? snapshot) => snapshot is not { } value ? "unavailable" :
         $"n={value.Population} window={value.WindowPopulation} mean={value.Mean:F3}us p50={value.P50:F3}us p95={value.P95:F3}us p99={value.P99:F3}us";
     Console.WriteLine($"result produced={result.Produced} consumed={result.Consumed} released={result.Released} outstanding={result.OutstandingBuffers} outstanding.max={result.MaximumOutstandingBuffers}");
-    Console.WriteLine($"campaign={result.Outcome} campaign.primary={result.PrimaryOutcome} cleanup.succeeded={result.CleanupSucceeded} source={result.SourceDescription}");
+    Console.WriteLine($"campaign={result.Outcome} campaign.primary={result.PrimaryOutcome} cleanup.succeeded={result.CleanupSucceeded} pacing.effective={result.EffectivePacing.Label()} source={result.SourceDescription}");
     Console.WriteLine($"active.seconds={result.ActiveWindow.Seconds:F6} target.rate={result.TargetRate?.ToString("F2") ?? "unpaced"}/s grid.rate={result.GridRate?.ToString("F2") ?? "none"}/s offered.rate={result.ActiveWindow.OfferedPerSecond:F2}/s accepted.rate={result.ActiveWindow.AcceptedPerSecond:F2}/s consumed.rate={result.ActiveWindow.ConsumedPerSecond:F2}/s drained.duringStop={result.DrainedDuringStop}");
     var counters = result.Counters;
     Console.WriteLine($"consumed.afterActive.beforeStop={result.ConsumedAfterActiveBeforeStop} (-1 means stop cut unavailable)");
     Console.WriteLine($"lifetime offered={counters.Offered} generated={counters.Generated} accepted={counters.Accepted} consumed={counters.Consumed} released={counters.Released} untransferred={counters.Untransferred} attempts.beforeFrame={counters.Offered - counters.Generated} rents={counters.Rented} returns={counters.Returned} inTransit={counters.InTransit}");
-    Console.WriteLine($"demand.untilActiveEnd scheduled={result.Demand.Scheduled} offered={result.Demand.Offered} recovered={result.Demand.Recovered} omitted={result.Demand.Missed} pending={result.Demand.Pending} bursts={result.Demand.Bursts} burst.mean={result.Demand.MeanBurstSize:F2} burst.max={result.Demand.MaximumBurstSize} pacing.delay.mean={Metric(result.Demand.MeanDelayMicroseconds, "F3", "us")} pacing.delay.max={Metric(result.Demand.MaximumDelayMicroseconds, "F3", "us")}");
+    if (result.EffectivePacing is EffectivePacing.ProductionFixedDelay or EffectivePacing.Unpaced)
+    { Console.WriteLine($"demand.untilActiveEnd slots=not-applicable offered={result.Demand.Offered} omitted=not-applicable pending=not-applicable"); }
+    else
+    { Console.WriteLine($"demand.untilActiveEnd scheduled={result.Demand.Scheduled} offered={result.Demand.Offered} recovered={result.Demand.Recovered} omitted={result.Demand.Missed} pending={result.Demand.Pending} bursts={result.Demand.Bursts} burst.mean={result.Demand.MeanBurstSize:F2} burst.max={result.Demand.MaximumBurstSize} pacing.delay.mean={Metric(result.Demand.MeanDelayMicroseconds, "F3", "us")} pacing.delay.max={Metric(result.Demand.MaximumDelayMicroseconds, "F3", "us")}"); }
+    if (result.DiagnosticTargetDeficitFrames is { } deficit)
+    { Console.WriteLine($"diagnostic.targetDeficit.frames={deficit:F3} note=fixed-delay comparison; not producer-omitted demand"); }
     if (result.TargetRate is { } target && (result.ActiveWindow.OfferedPerSecond < target || result.ActiveWindow.ConsumedPerSecond < target))
-    { Console.WriteLine("TARGET_NOT_REACHED: requested rate was not fully offered and/or consumed; this is not a capacity baseline."); }
+    { Console.WriteLine("DIAGNOSTIC_TARGET_DEFICIT: target rate was not fully offered and/or consumed; this comparison is separate from Demand.Missed and is not a capacity certification."); }
     Console.WriteLine($"visual received={result.VisualReceived} published={result.VisualPublished} replaced={result.VisualReplaced} dropped={result.VisualDropped} observerErrors={result.VisualObserverErrors}");
     Console.WriteLine($"throughput.active={result.ThroughputFramesPerSecond:F2} frames/s visual.accept-to-callback {Percentiles(result.VisualDeliveryLatencyMicroseconds)}");
     Console.WriteLine($"projection {Percentiles(result.ProjectionMicroseconds)}");

@@ -9,6 +9,34 @@ namespace UTStudio.Core.Tests.Performance;
 public sealed class LoadRunnerTests
 {
     [TestMethod]
+    [DataRow(1, "50", false, 0, 0)]
+    [DataRow(2, "1000", false, 0, 1)]
+    [DataRow(2, "1000", true, 1, 2)]
+    [DataRow(2, "max", false, 0, 3)]
+    public async Task ReportsEffectivePacing(int sourceValue, string rateText, bool specified,
+        int requestedValue, int expectedValue)
+    {
+        var source = (LoadSourceMode)sourceValue;
+        double? rate = rateText == "max" ? null : double.Parse(rateText, System.Globalization.CultureInfo.InvariantCulture);
+        var requested = (PacingMode)requestedValue;
+        var expected = (EffectivePacing)expectedValue;
+        int samples = rate is null ? 65535 : 2048;
+        var options = new LoadOptions(LoadProfile.Smoke, samples, rate, TimeSpan.FromMilliseconds(100))
+        { Source = source, Pacing = requested, PacingSpecified = specified, Progress = ProgressMode.Quiet };
+        var result = await new LoadRunner().RunAsync(options, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.AreEqual(expected, result.EffectivePacing);
+        Assert.AreEqual(0, FunctionalCriteria.ExitCode(result));
+        if (expected == EffectivePacing.ProductionFixedDelay)
+        {
+            Assert.AreEqual(0, result.Demand.Missed);
+            Assert.AreEqual(0, result.Demand.Pending);
+            Assert.AreEqual(result.Demand.Offered, result.Demand.Scheduled);
+            Assert.IsNull(result.GridRate);
+            Assert.IsNotNull(result.DiagnosticTargetDeficitFrames);
+        }
+    }
+
+    [TestMethod]
     public async Task CancellationStopsAndBalancesRun()
     {
         using var cancellation = new CancellationTokenSource();

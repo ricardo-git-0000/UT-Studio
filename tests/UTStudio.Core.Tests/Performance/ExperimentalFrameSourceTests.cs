@@ -103,9 +103,9 @@ public sealed class ExperimentalFrameSourceTests
         try
         {
             run = await Start(source).WaitAsync(Limit);
-            await WaitForReason(source, ExperimentalWaitReason.Pacing).WaitAsync(Limit);
+            await WaitForReason(source, ExperimentalWaitReason.Pacing);
             clock.AdvanceTo(10_000);
-            await WaitForReason(source, ExperimentalWaitReason.Channel).WaitAsync(Limit);
+            await WaitForReason(source, ExperimentalWaitReason.Channel);
             var cut = telemetry.Counters.Snapshot();
             Assert.IsGreaterThan(cut.Accepted, cut.Offered);
             Assert.IsGreaterThan(0, telemetry.Demand.Snapshot(clock.Timestamp).Recovered);
@@ -131,7 +131,7 @@ public sealed class ExperimentalFrameSourceTests
         try
         {
             run = await Start(source).WaitAsync(Limit);
-            await WaitForReason(source, ExperimentalWaitReason.Pacing).WaitAsync(Limit);
+            await WaitForReason(source, ExperimentalWaitReason.Pacing);
             await source.StopAsync().WaitAsync(Limit);
             Assert.IsTrue(run.ProducerCompletion.IsCompletedSuccessfully);
         }
@@ -151,9 +151,60 @@ public sealed class ExperimentalFrameSourceTests
         while (source.WaitReason != ExperimentalWaitReason.Channel)
         { deadline.Token.ThrowIfCancellationRequested(); await Task.Yield(); }
     }
+    [TestMethod]
+    public async Task OuterTimeoutDoesNotLeaveReasonWaitRunning()
+    {
+        var source = Create(new());
+        using var cancellation = new CancellationTokenSource();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int active = 0;
+        Task wait = WaitForReasonCore(source, (ExperimentalWaitReason)int.MaxValue, cancellation.Token,
+            () => { Interlocked.Exchange(ref active, 1); entered.TrySetResult(); },
+            () => Interlocked.Exchange(ref active, 0));
+        await entered.Task.WaitAsync(Limit);
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(() => wait.WaitAsync(TimeSpan.FromMilliseconds(10)));
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try { await wait; }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+            await Cleanup(source, null);
+        }
+        Assert.IsTrue(wait.IsCompleted);
+        Assert.AreEqual(0, Volatile.Read(ref active));
+    }
+
     private static async Task WaitForReason(ExperimentalFrameSource source, ExperimentalWaitReason reason)
     {
-        while (source.WaitReason != reason) { await Task.Yield(); }
+        using var deadline = new CancellationTokenSource(Limit);
+        Task wait = WaitForReasonCore(source, reason, deadline.Token);
+        try { await wait; }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        { throw new TimeoutException($"Timed out waiting for experimental source state {reason}."); }
+        finally
+        {
+            deadline.Cancel();
+            if (!wait.IsCompleted)
+            {
+                try { await wait; }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested) { }
+            }
+        }
+    }
+
+    private static async Task WaitForReasonCore(ExperimentalFrameSource source, ExperimentalWaitReason reason,
+        CancellationToken cancellationToken, Action? entered = null, Action? exited = null)
+    {
+        entered?.Invoke();
+        try
+        {
+            while (source.WaitReason != reason)
+            { cancellationToken.ThrowIfCancellationRequested(); await Task.Yield(); }
+        }
+        finally { exited?.Invoke(); }
     }
     private static async Task Cleanup(ExperimentalFrameSource source, UtAcquisitionRun? run, Task? reader = null)
     {

@@ -5,6 +5,26 @@ internal enum LoadSourceMode { Auto, Production, Experimental }
 internal enum TelemetryMode { Minimal, Full }
 internal enum ProgressMode { Normal, Quiet }
 internal enum PacingMode { SkipMissed, CatchUpBounded }
+internal enum EffectivePacing { ProductionFixedDelay, SkipMissed, CatchUpBounded, Unpaced }
+
+internal static class PacingLabels
+{
+    internal static string Label(this PacingMode value) => value switch
+    {
+        PacingMode.SkipMissed => "skip-missed",
+        PacingMode.CatchUpBounded => "catch-up-bounded",
+        _ => throw new ArgumentOutOfRangeException(nameof(value))
+    };
+
+    internal static string Label(this EffectivePacing value) => value switch
+    {
+        EffectivePacing.ProductionFixedDelay => "production-fixed-delay",
+        EffectivePacing.SkipMissed => "skip-missed",
+        EffectivePacing.CatchUpBounded => "catch-up-bounded",
+        EffectivePacing.Unpaced => "unpaced",
+        _ => throw new ArgumentOutOfRangeException(nameof(value))
+    };
+}
 
 internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double? Rate, TimeSpan Duration)
 {
@@ -16,6 +36,7 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
     internal ProgressMode Progress { get; init; } = ProgressMode.Normal;
     internal string? OutputPath { get; init; }
     internal PacingMode Pacing { get; init; } = PacingMode.SkipMissed;
+    internal bool PacingSpecified { get; init; }
     internal int MaxCatchUp { get; init; } = 32;
     internal static readonly TimeSpan SmokeDuration = TimeSpan.FromSeconds(30);
     internal static readonly TimeSpan BaselineDuration = TimeSpan.FromMinutes(5);
@@ -125,9 +146,9 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
         { error = "--rate max is unpaced and incompatible with --pacing."; return false; }
         if (maxCatchUpSpecified && pacing != PacingMode.CatchUpBounded)
         { error = "--max-catch-up requires --pacing catch-up-bounded."; return false; }
-        if (source == LoadSourceMode.Production && pacing == PacingMode.CatchUpBounded)
-        { error = "--source production is incompatible with --pacing catch-up-bounded."; return false; }
-        if (pacing == PacingMode.CatchUpBounded && source == LoadSourceMode.Auto)
+        if (source == LoadSourceMode.Production && pacingSpecified)
+        { error = "--pacing selects an experimental algorithm and is incompatible with --source production."; return false; }
+        if (pacingSpecified && source == LoadSourceMode.Auto)
         { source = LoadSourceMode.Experimental; }
         if (source == LoadSourceMode.Production && (rate is null or > 100))
         { error = "--source production supports a numeric --rate no greater than 100/s."; return false; }
@@ -149,6 +170,7 @@ internal sealed record LoadOptions(LoadProfile Profile, int SampleCount, double?
             Progress = progress,
             OutputPath = outputPath,
             Pacing = pacing,
+            PacingSpecified = pacingSpecified,
             MaxCatchUp = maxCatchUp
         };
         return true;

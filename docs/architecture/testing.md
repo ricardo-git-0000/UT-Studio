@@ -1,6 +1,6 @@
 # Estrategia de pruebas
 
-Trazabilidad: R01–R14. Estrategia de producto; alcance inicial en [plan](../plans/2026-09-09-first-vertical-increment.md). MSTest 4.0.2 aprobado/presente desde 2026-09-10; mocking y CI abiertos (Q10). No instalar paquetes ni crear proyectos en esta actualización.
+Trazabilidad: R01–R14. Estrategia de producto; alcance inicial en [plan](../plans/2026-09-09-first-vertical-increment.md). MSTest 4.0.2 está aprobado y presente desde 2026-09-10; mocking y CI siguen abiertos (Q10). BenchmarkDotNet 0.15.8 está autorizado exclusivamente en `UTStudio.Benchmarks`.
 
 | Nivel | Casos y evidencia esperada |
 | --- | --- |
@@ -19,5 +19,6 @@ El simulador inicial tiene semilla y reloj controlable. Para incrementos posteri
 Generar inspecciones sintéticas grandes fuera de Git durante las pruebas; fixtures versionados pequeños con procedencia, semilla, tamaño y propósito documentados. Umbral de fixture pendiente de acordar; revisar manualmente tamaño y contenido.
 Medir presupuestos de memoria, CPU, FPS, duración de soak y margen de caudal antes de fijar criterios de rendimiento: no inventar SLA. Contabilizar frames recibidos, persistidos y discontinuidades.
 
-El [plan de rendimiento y estabilidad A-Scan](../plans/2026-09-16-ascan-performance-baseline.md) propone microbenchmarks, carga del pipeline y pruebas prolongadas por separado. Distingue el techo actual de 100 A-Scans/s del simulador del escenario experimental de 1.000/s; no autoriza paquetes ni implementación. Benchmarks y soak serán ejecutables explícitos fuera de `dotnet test`, con resultados no versionados y comparación en la misma máquina; los presupuestos se aprobarán tras establecer la línea base.
-Cuando exista código, ejecutar build y pruebas pertinentes después de cambios. En esta actualización solo se comprueban documentación, enlaces, consistencia y ausencia de cambios de código. Las pruebas del plan sobre canal lleno, ownership, cierre MainWindow, 30 Hz y métricas a 5 Hz no se consideran ejecutadas.
+El [plan de rendimiento y estabilidad A-Scan](../plans/2026-09-16-ascan-performance-baseline.md) separa microbenchmarks, carga del pipeline y pruebas prolongadas. `UTStudio.Benchmarks` contiene los microbenchmarks; `UTStudio.LoadTests` es un ejecutable neutral separado de MSTest. Las campañas se lanzan deliberadamente y nunca mediante `dotnet test`; la suite solo ejecuta pruebas deterministas de sus componentes y contratos.
+
+Las señales y fixtures son sintéticos. Los fixtures grandes, JSON de resultados, capturas, trazas y artefactos permanecen fuera de Git; cualquier fixture pequeño versionado requiere procedencia, semilla, tamaño y revisión. La baseline disponible pertenece únicamente a `VM-R7700X-4vCPU-8GiB-W11-26200-dotnet10.0.11` y sirve para regresiones con la misma configuración. Sus presupuestos son umbrales provisionales de aviso, no requisitos absolutos ni fallos de CI. Siguen pendientes baseline en hardware físico, transporte GigE real, transporte PCIe real y soak prolongado.

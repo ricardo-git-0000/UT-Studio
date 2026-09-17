@@ -18,6 +18,7 @@ public sealed class LoadOptionsTests
         Assert.AreEqual(TelemetryMode.Full, options.Telemetry);
         Assert.AreEqual(ProgressMode.Normal, options.Progress);
         Assert.AreEqual(PacingMode.SkipMissed, options.Pacing);
+        Assert.IsFalse(options.PacingSpecified);
         Assert.AreEqual(32, options.MaxCatchUp);
         Assert.IsNull(options.OutputPath);
     }
@@ -27,6 +28,7 @@ public sealed class LoadOptionsTests
     {
         Assert.IsTrue(LoadOptions.TryParse(["--rate", "1000", "--pacing", "catch-up-bounded", "--max-catch-up", "16"], out var options, out _));
         Assert.AreEqual(PacingMode.CatchUpBounded, options!.Pacing);
+        Assert.IsTrue(options.PacingSpecified);
         Assert.AreEqual(16, options.MaxCatchUp);
         Assert.AreEqual(LoadSourceMode.Experimental, options.Source);
     }
@@ -37,6 +39,7 @@ public sealed class LoadOptionsTests
         Assert.IsFalse(LoadOptions.TryParse(["--samples", "65535", "--rate", "max", "--pacing", "skip-missed"], out _, out _));
         Assert.IsFalse(LoadOptions.TryParse(["--samples", "65535", "--rate", "max", "--pacing", "catch-up-bounded"], out _, out _));
         Assert.IsFalse(LoadOptions.TryParse(["--source", "production", "--pacing", "catch-up-bounded"], out _, out _));
+        Assert.IsFalse(LoadOptions.TryParse(["--source", "production", "--pacing", "skip-missed"], out _, out _));
         Assert.IsFalse(LoadOptions.TryParse(["--max-catch-up", "0", "--pacing", "catch-up-bounded"], out _, out _));
         Assert.IsFalse(LoadOptions.TryParse(["--max-catch-up", "33", "--pacing", "catch-up-bounded"], out _, out _));
         Assert.IsFalse(LoadOptions.TryParse(["--max-catch-up", "4"], out _, out _));
@@ -76,6 +79,14 @@ public sealed class LoadOptionsTests
         Assert.IsFalse(LoadOptions.TryParse(["--source", "production", "--samples", "65535", "--rate", "max"], out _, out _));
         Assert.IsTrue(LoadOptions.TryParse(["--source", "production", "--rate", "100"], out var options, out _));
         Assert.AreEqual(LoadSourceMode.Production, options!.Source);
+    }
+
+    [TestMethod]
+    public void ExplicitExperimentalPacingResolvesAutoToExperimental()
+    {
+        Assert.IsTrue(LoadOptions.TryParse(["--rate", "50", "--pacing", "skip-missed"], out var options, out _));
+        Assert.AreEqual(LoadSourceMode.Experimental, options!.Source);
+        Assert.IsTrue(options.PacingSpecified);
     }
 
     [TestMethod]

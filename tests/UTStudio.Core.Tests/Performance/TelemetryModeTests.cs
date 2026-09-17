@@ -159,8 +159,10 @@ public sealed class TelemetryModeTests
         {
             await ResultWriter.WriteAsync(path, options, result, [], 0);
             using var json = JsonDocument.Parse(await File.ReadAllTextAsync(path));
-            Assert.AreEqual(3, json.RootElement.GetProperty("schemaVersion").GetInt32());
-            Assert.IsTrue(json.RootElement.GetProperty("options").TryGetProperty("pacing", out _));
+            Assert.AreEqual(4, json.RootElement.GetProperty("schemaVersion").GetInt32());
+            Assert.AreEqual(JsonValueKind.Null, json.RootElement.GetProperty("options").GetProperty("requestedPacing").ValueKind);
+            Assert.AreEqual("skip-missed", json.RootElement.GetProperty("result").GetProperty("effectivePacing").GetString());
+            Assert.IsFalse(json.RootElement.GetProperty("options").TryGetProperty("pacing", out _));
             Assert.IsTrue(json.RootElement.GetProperty("result").TryGetProperty("rates", out _));
             Assert.AreEqual(full ? "enabled" : "disabled", json.RootElement.GetProperty("options").GetProperty("detailedPerFrameInstrumentation").GetString());
             var values = json.RootElement.GetProperty("result");
@@ -173,6 +175,50 @@ public sealed class TelemetryModeTests
                 Assert.IsGreaterThan(0L, values.GetProperty("VisualDeliveryLatencyMicroseconds").GetProperty("Population").GetInt64());
                 Assert.IsGreaterThan(0, values.GetProperty("resourceSamples").GetArrayLength());
             }
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public async Task JsonDistinguishesRequestedAndEffectivePacingAndProductionDemand()
+    {
+        var options = new LoadOptions(LoadProfile.Smoke, 2048, 50, TimeSpan.FromMilliseconds(100))
+        { Source = LoadSourceMode.Production, Progress = ProgressMode.Quiet };
+        var result = await new LoadRunner().RunAsync(options, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
+        string path = Path.Combine(Path.GetTempPath(), $"ut-pacing-{Guid.NewGuid():N}.json");
+        try
+        {
+            await ResultWriter.WriteAsync(path, options, result, [], 0);
+            using var json = JsonDocument.Parse(await File.ReadAllTextAsync(path));
+            Assert.AreEqual(4, json.RootElement.GetProperty("schemaVersion").GetInt32());
+            Assert.AreEqual(JsonValueKind.Null, json.RootElement.GetProperty("options").GetProperty("requestedPacing").ValueKind);
+            var values = json.RootElement.GetProperty("result");
+            Assert.AreEqual("production-fixed-delay", values.GetProperty("effectivePacing").GetString());
+            Assert.AreEqual(0L, values.GetProperty("Demand").GetProperty("Missed").GetInt64());
+            Assert.AreEqual(0L, values.GetProperty("Demand").GetProperty("Pending").GetInt64());
+            Assert.AreEqual(JsonValueKind.Number, values.GetProperty("DiagnosticTargetDeficitFrames").ValueKind);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public async Task JsonPreservesExplicitExperimentalPacingRequest()
+    {
+        var options = new LoadOptions(LoadProfile.Smoke, 2048, 1000, TimeSpan.FromMilliseconds(100))
+        {
+            Source = LoadSourceMode.Experimental,
+            Pacing = PacingMode.CatchUpBounded,
+            PacingSpecified = true,
+            Progress = ProgressMode.Quiet
+        };
+        var result = await new LoadRunner().RunAsync(options, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
+        string path = Path.Combine(Path.GetTempPath(), $"ut-requested-pacing-{Guid.NewGuid():N}.json");
+        try
+        {
+            await ResultWriter.WriteAsync(path, options, result, [], 0);
+            using var json = JsonDocument.Parse(await File.ReadAllTextAsync(path));
+            Assert.AreEqual("catch-up-bounded", json.RootElement.GetProperty("options").GetProperty("requestedPacing").GetString());
+            Assert.AreEqual("catch-up-bounded", json.RootElement.GetProperty("result").GetProperty("effectivePacing").GetString());
         }
         finally { File.Delete(path); }
     }

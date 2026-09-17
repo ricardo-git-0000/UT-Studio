@@ -46,6 +46,8 @@ internal sealed record LoadResult(
     internal double? TargetRate { get; init; }
     internal double? GridRate { get; init; }
     internal string SourceDescription { get; init; } = "unspecified";
+    internal EffectivePacing EffectivePacing { get; init; }
+    internal double? DiagnosticTargetDeficitFrames { get; init; }
     internal long? CorrelationMisses { get; init; }
     internal long? CorrelationOverwrites { get; init; }
     internal ResourceSample[]? ResourceSamples { get; init; }
