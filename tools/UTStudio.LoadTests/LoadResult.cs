@@ -15,21 +15,25 @@ internal sealed record LoadResult(
     long VisualDropped,
     long VisualObserverErrors,
     double ThroughputFramesPerSecond,
-    PercentileSnapshot VisualDeliveryLatencyMicroseconds,
-    PercentileSnapshot ProjectionMicroseconds,
+    PercentileSnapshot? VisualDeliveryLatencyMicroseconds,
+    PercentileSnapshot? ProjectionMicroseconds,
     long ManagedBytes,
     long WorkingSetBytes,
-    long MaximumWorkingSetBytes,
+    long? MaximumWorkingSetBytes,
     int Gen0,
     int Gen1,
     int Gen2,
     double CpuPercent,
-    double MaximumCpuPercent,
+    double? MaximumCpuPercent,
     bool FramesReleasedBarrier,
     TimeSpan StopDuration,
     IReadOnlyList<UtSourceError> Errors,
     bool Cancelled)
 {
+    internal long? ManagedBytesAtActiveStart { get; init; }
+    internal long? ManagedBytesAtActiveEnd { get; init; }
+    internal long? WorkingSetBytesAtActiveStart { get; init; }
+    internal long? WorkingSetBytesAtActiveEnd { get; init; }
     internal CampaignOutcome Outcome { get; init; } = CampaignOutcome.Completed;
     internal CampaignOutcome PrimaryOutcome { get; init; } = CampaignOutcome.Completed;
     internal Task<CleanupReport>? PendingCleanup { get; init; }
@@ -42,10 +46,10 @@ internal sealed record LoadResult(
     internal double? TargetRate { get; init; }
     internal double? GridRate { get; init; }
     internal string SourceDescription { get; init; } = "unspecified";
-    internal long CorrelationMisses { get; init; }
-    internal long CorrelationOverwrites { get; init; }
-    internal ResourceSample[] ResourceSamples { get; init; } = [];
-    internal long TotalResourceSamples { get; init; }
+    internal long? CorrelationMisses { get; init; }
+    internal long? CorrelationOverwrites { get; init; }
+    internal ResourceSample[]? ResourceSamples { get; init; }
+    internal long? TotalResourceSamples { get; init; }
     internal double StartupCpuSeconds { get; init; }
     internal double CleanupCpuSeconds { get; init; }
 }

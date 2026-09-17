@@ -4,11 +4,14 @@ namespace UTStudio.LoadTests;
 
 internal sealed class LoadTelemetry
 {
-    private readonly CorrelationRing _correlation = new(65536);
+    internal CorrelationRing? Correlation { get; }
+    internal bool DetailedPerFrameInstrumentation { get; }
     private long _activeStart = long.MaxValue, _activeEnd = long.MaxValue;
-    internal LoadTelemetry(double? rate = null)
+    internal LoadTelemetry(double? rate = null, TelemetryMode mode = TelemetryMode.Full)
     {
-        Demand = new(rate);
+        DetailedPerFrameInstrumentation = mode == TelemetryMode.Full;
+        Correlation = DetailedPerFrameInstrumentation ? new(65536) : null;
+        Demand = new(rate, detailed: DetailedPerFrameInstrumentation);
         Counters = new() { Offering = Demand.Offer };
     }
     internal AcquisitionMetrics Counters { get; }
@@ -16,8 +19,8 @@ internal sealed class LoadTelemetry
     internal BoundedHistogram AcceptToCallbackMicroseconds { get; } = new();
     internal BoundedHistogram ProjectionMicroseconds { get; } = new();
     internal long Produced => Counters.Snapshot().Accepted;
-    internal long CorrelationMisses => _correlation.Misses;
-    internal long CorrelationOverwrites => _correlation.Overwrites;
+    internal long? CorrelationMisses => Correlation?.Misses;
+    internal long? CorrelationOverwrites => Correlation?.Overwrites;
     internal CounterSnapshot BeginWindow()
     {
         lock (Counters.SyncRoot)
@@ -38,11 +41,15 @@ internal sealed class LoadTelemetry
         }
     }
     internal bool InWindow(long timestamp) => timestamp >= Volatile.Read(ref _activeStart) && timestamp < Volatile.Read(ref _activeEnd);
-    internal void PrepareFrame(ulong sequence) => _correlation.Write(sequence, Stopwatch.GetTimestamp());
+    internal void PrepareFrame(ulong sequence)
+    {
+        if (DetailedPerFrameInstrumentation) { Correlation!.Write(sequence, Stopwatch.GetTimestamp()); }
+    }
     internal void ObserveVisual(ulong sequence)
     {
+        if (!DetailedPerFrameInstrumentation) { return; }
         long end = Stopwatch.GetTimestamp();
-        if (_correlation.TryRead(sequence, out long start))
+        if (Correlation!.TryRead(sequence, out long start))
         {
             lock (Counters.SyncRoot)
             {
@@ -53,6 +60,7 @@ internal sealed class LoadTelemetry
     }
     internal void Projection(long start, long end)
     {
+        if (!DetailedPerFrameInstrumentation) { return; }
         lock (Counters.SyncRoot)
         {
             if (InWindow(start) && InWindow(end))

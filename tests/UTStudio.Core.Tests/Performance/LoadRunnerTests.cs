@@ -57,6 +57,7 @@ public sealed class LoadRunnerTests
             telemetryInterval: TimeSpan.FromMilliseconds(1),
             sampleObserved: sample => { if (sample.Consumed > 0) { cancellation.Cancel(); } })
             .WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsNotNull(result.ResourceSamples);
         Assert.IsTrue(result.ResourceSamples.Any(sample => sample.Consumed > 0));
         Assert.IsGreaterThan(0d, result.ActiveWindow.ConsumedPerSecond);
         Assert.IsGreaterThan(0d, result.ActiveWindow.AcceptedPerSecond);

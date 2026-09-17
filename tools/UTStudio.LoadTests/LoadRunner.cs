@@ -14,7 +14,7 @@ internal sealed class LoadRunner
         TimeSpan? telemetryInterval = null, Action? runStarted = null,
         Func<LoadTelemetry, IUtFrameSource>? sourceFactory = null, Action<ResourceSample>? sampleObserved = null)
     {
-        var telemetry = new LoadTelemetry(options.Rate);
+        var telemetry = new LoadTelemetry(options.Rate, options.Telemetry);
         bool experimental = options.Source switch
         {
             LoadSourceMode.Experimental => true,
@@ -42,6 +42,7 @@ internal sealed class LoadRunner
         Task<CleanupReport>? pendingCleanup = null;
         List<UtSourceError> errors = [];
         var series = new ResourceSeries();
+        long? managedStart = null, managedEnd = null, workingStart = null, workingEnd = null;
         long maximumWorkingSet = 0;
         double maximumCpu = 0;
         bool active = false, cleanupSucceeded = false, barrier = false;
@@ -61,6 +62,7 @@ internal sealed class LoadRunner
             if (options.Warmup > TimeSpan.Zero) { await Task.Delay(options.Warmup, cancellationToken).ConfigureAwait(false); }
             cancellationToken.ThrowIfCancellationRequested();
             process.Refresh();
+            managedStart = GC.GetTotalMemory(false); workingStart = process.WorkingSet64;
             cpuActiveStart = process.TotalProcessorTime;
             cpuActiveStartAt = Stopwatch.GetTimestamp();
             gen0 = GC.CollectionCount(0); gen1 = GC.CollectionCount(1); gen2 = GC.CollectionCount(2);
@@ -76,15 +78,17 @@ internal sealed class LoadRunner
             lastSampleAt = cpuActiveStartAt;
             lastCpu = cpuActiveStart;
             CounterSnapshot previous = start;
+            long lastProgressAt = start.Timestamp;
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var current = telemetry.Counters.Snapshot();
                 if (watchdog.Expired(current.Timestamp, current.Consumed)) { outcome = CampaignOutcome.NoProgress; break; }
                 if (current.Timestamp >= deadline) { break; }
-                if (Stopwatch.GetElapsedTime(lastSampleAt, current.Timestamp) >= interval)
+                if (Stopwatch.GetElapsedTime(lastProgressAt, current.Timestamp) >= interval)
                 {
-                    Sample(current, options.Telemetry == TelemetryMode.Full);
+                    if (options.Telemetry == TelemetryMode.Full) { Sample(current); }
+                    lastProgressAt = current.Timestamp;
                     var rates = new RateWindow(previous, current);
                     if (options.Progress == ProgressMode.Normal)
                     { Console.WriteLine($"progress offered={current.Offered} generated={current.Generated} accepted={current.Accepted} consumed={current.Consumed} released={current.Released} inTransit={current.InTransit} offered.rate={rates.OfferedPerSecond:F2}/s accepted.rate={rates.AcceptedPerSecond:F2}/s consumed.rate={rates.ConsumedPerSecond:F2}/s"); }
@@ -93,7 +97,7 @@ internal sealed class LoadRunner
                 TimeSpan remaining = Stopwatch.GetElapsedTime(current.Timestamp, deadline);
                 await Task.Delay(remaining < poll ? remaining : poll, cancellationToken).ConfigureAwait(false);
             }
-            void Sample(CounterSnapshot current, bool retain)
+            void Sample(CounterSnapshot current)
             {
                 process.Refresh();
                 TimeSpan cpu = process.TotalProcessorTime;
@@ -102,7 +106,7 @@ internal sealed class LoadRunner
                 double percent = CpuMeasurement.Percent(cpu - lastCpu, wall, Environment.ProcessorCount);
                 var sample = new ResourceSample(Stopwatch.GetElapsedTime(start.Timestamp, current.Timestamp).TotalSeconds,
                     wall.TotalSeconds, percent, GC.GetTotalMemory(false), process.WorkingSet64, current.Accepted, current.Consumed);
-                if (retain) { series.Add(sample); }
+                series.Add(sample);
                 sampleObserved?.Invoke(sample);
                 maximumCpu = Math.Max(maximumCpu, percent);
                 maximumWorkingSet = Math.Max(maximumWorkingSet, sample.WorkingSetBytes);
@@ -125,6 +129,10 @@ internal sealed class LoadRunner
             if (active)
             {
                 activeGen0 = GC.CollectionCount(0) - gen0; activeGen1 = GC.CollectionCount(1) - gen1; activeGen2 = GC.CollectionCount(2) - gen2;
+                managedEnd = GC.GetTotalMemory(false); workingEnd = process.WorkingSet64;
+            }
+            if (active && options.Telemetry == TelemetryMode.Full)
+            {
                 TimeSpan residual = Stopwatch.GetElapsedTime(lastSampleAt, cpuActiveEndAt);
                 double percent = CpuMeasurement.Percent(cpuActiveEnd - lastCpu, residual, Environment.ProcessorCount);
                 var sample = new ResourceSample(Stopwatch.GetElapsedTime(start.Timestamp, end.Timestamp).TotalSeconds,
@@ -175,10 +183,12 @@ internal sealed class LoadRunner
         long managed = GC.GetTotalMemory(false), workingSet = process.WorkingSet64;
         return new(counters.Accepted, counters.Consumed, counters.Released, outstanding, maximumOutstanding,
             statistics.Received, statistics.Published, statistics.Replaced, statistics.Dropped, statistics.ObserverErrors,
-            window.ConsumedPerSecond, telemetry.AcceptToCallbackMicroseconds.Snapshot(), telemetry.ProjectionMicroseconds.Snapshot(),
-            managed, workingSet, maximumWorkingSet, activeGen0, activeGen1, activeGen2,
+            window.ConsumedPerSecond,
+            telemetry.DetailedPerFrameInstrumentation && telemetry.AcceptToCallbackMicroseconds.Count > 0 ? telemetry.AcceptToCallbackMicroseconds.Snapshot() : null,
+            telemetry.DetailedPerFrameInstrumentation && telemetry.ProjectionMicroseconds.Count > 0 ? telemetry.ProjectionMicroseconds.Snapshot() : null,
+            managed, workingSet, options.Telemetry == TelemetryMode.Full && active ? maximumWorkingSet : null, activeGen0, activeGen1, activeGen2,
             active ? CpuMeasurement.Percent(cpuActiveEnd - cpuActiveStart, Stopwatch.GetElapsedTime(cpuActiveStartAt, cpuActiveEndAt), Environment.ProcessorCount) : 0,
-            maximumCpu, barrier, stopDuration, errors, outcome == CampaignOutcome.Cancelled)
+            options.Telemetry == TelemetryMode.Full && active ? maximumCpu : null, barrier, stopDuration, errors, outcome == CampaignOutcome.Cancelled)
         {
             Outcome = outcome,
             PrimaryOutcome = primaryOutcome,
@@ -195,8 +205,12 @@ internal sealed class LoadRunner
                 ? "experimental; generator=LCG; pool=experimental.SamplePool; pacing=max means unpaced" : "productive; generator=SyntheticRfGenerator; pool=BoundedSampleBufferPool",
             CorrelationMisses = telemetry.CorrelationMisses,
             CorrelationOverwrites = telemetry.CorrelationOverwrites,
-            ResourceSamples = series.Snapshot(),
-            TotalResourceSamples = series.TotalSamples,
+            ManagedBytesAtActiveStart = managedStart,
+            ManagedBytesAtActiveEnd = managedEnd,
+            WorkingSetBytesAtActiveStart = workingStart,
+            WorkingSetBytesAtActiveEnd = workingEnd,
+            ResourceSamples = options.Telemetry == TelemetryMode.Full ? series.Snapshot() : null,
+            TotalResourceSamples = options.Telemetry == TelemetryMode.Full ? series.TotalSamples : null,
             StartupCpuSeconds = (cpuActiveStart - cpuOrigin).TotalSeconds,
             CleanupCpuSeconds = (process.TotalProcessorTime - cpuActiveEnd).TotalSeconds
         };

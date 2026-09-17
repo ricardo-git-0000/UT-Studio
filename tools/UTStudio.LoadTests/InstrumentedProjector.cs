@@ -9,6 +9,8 @@ internal sealed class InstrumentedProjector(IAScanProjector inner, LoadTelemetry
     public AScanSnapshot Project(ConventionalUtFrameMetadata metadata, ulong sequence,
         TimeSpan elapsedSinceRunStart, ReadOnlySpan<short> samples, ulong version)
     {
+        if (!telemetry.DetailedPerFrameInstrumentation)
+        { return inner.Project(metadata, sequence, elapsedSinceRunStart, samples, version); }
         long started = Stopwatch.GetTimestamp();
         try { return inner.Project(metadata, sequence, elapsedSinceRunStart, samples, version); }
         finally { telemetry.Projection(started, Stopwatch.GetTimestamp()); }
