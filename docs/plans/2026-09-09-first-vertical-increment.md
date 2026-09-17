@@ -149,7 +149,7 @@ La petición de implementación posterior autoriza App.Wpf, pruebas Windows sepa
 
 App retira StartupUri, inicia Host y resuelve/muestra MainWindow con OnMainWindowClose. Start/Stop enlazan los comandos del ViewModel. Se muestran fase, canal, secuencia, errores y contadores visuales. El hilo UI no realiza adquisición ni reducción.
 
-[AScanControl](../../src/UTStudio.App.Wpf/Controls/AScanControl.cs) consume snapshots independientes y dibuja mediante DrawingContext/StreamGeometry, sin elemento visual por punto. Escala horizontal al tamaño disponible, etiquetas en microsegundos, escala vertical RF fija ±100 %, línea de cero, clipping y recursos congelados. AScanCoordinates mantiene separada la matemática comprobable sin ventana.
+[AScanControl](../../src/UTStudio.Visualization.Wpf/Controls/AScanControl.cs) consume snapshots independientes y dibuja mediante DrawingContext/StreamGeometry, sin elemento visual por punto. Desde la extracción aceptada en [ADR 0009](../adr/0009-reusable-scan-visualization-controls.md), el control y AScanCoordinates viven en `UTStudio.Visualization.Wpf`; App.Wpf solo los aloja desde XAML. Escala horizontal al tamaño disponible, etiquetas en microsegundos, escala vertical RF fija ±100 %, línea de cero, clipping y recursos congelados.
 
 La adopción de **nuevos datos de señal en OnRender** queda separada por al menos 333.334 ticks, medidos con reloj monotónico en el momento de dibujar. Un tick retrasado no recupera actualizaciones. Los repintados por redimensionamiento pueden reutilizar los mismos datos; borrar una ejecución invalidada es inmediato. Se conserva una referencia pendiente y una mostrada. La consulta visible de métricas usa intervalos mínimos de 200 ms, sin confundir Published con callbacks o frames persistidos. La cadencia no es una garantía de rendimiento sostenido.
 
@@ -165,7 +165,7 @@ Si falla la construcción o el arranque, StartupFailureWindow permanece visible 
 
 ### Validación y límites
 
-- Nuevo proyecto [UTStudio.Tests.Wpf](../../tests/UTStudio.Tests.Wpf/UTStudio.Tests.Wpf.csproj), separado de Core.Tests y registrado en la solución. Reutiliza MSTest 4.0.2 existente; sin framework ni mocking nuevos. Solo App.Wpf y Tests.Wpf usan WPF.
+- Resultado histórico previo a la extracción: el nuevo proyecto [UTStudio.Tests.Wpf](../../tests/UTStudio.Tests.Wpf/UTStudio.Tests.Wpf.csproj) quedó separado de Core.Tests y reutilizó MSTest 4.0.2 sin framework ni mocking nuevos. Desde ADR 0009, App.Wpf, Visualization.Wpf y Tests.Wpf son los únicos proyectos que usan WPF.
 - Pruebas de composición/aliases/DataContext, Dispatcher STA bombeado, cancelación/excepciones, coordenadas/resize/señal constante/dimensiones cero, admisión 30 Hz y métricas 5 Hz con reloj manual, orden/repetición/fallo de cierre, diagnóstico a cinco segundos, construcción parcial, fallo histórico del productor y ventana de diagnóstico.
 - Prueba de integración del simulador hasta bitmap WPF: snapshot independiente de 2.048 muestras reducido a un máximo de 1.024 puntos, curva detectada y cero hijos visuales por punto. Captura PNG temporal inspeccionada; no se guarda fixture ni captura en Git. Pruebas reales de Closing con adquisición activa.
 - Arranque externo comprobado desde el directorio del ejecutable: MainWindow visible y proceso terminado mediante CloseMainWindow, sin finalizarlo a la fuerza. Esto es una comprobación automatizada de arranque/cierre, no una sesión de aceptación manual prolongada.
@@ -173,7 +173,7 @@ Si falla la construcción o el arranque, StartupFailureWindow permanece visible 
 
 Pendientes conservados: brecha estricta de admisión/inicio de callbacks de AScanVisualDelivery en ADR 0008 (fuera del alcance WPF), benchmarks de proyección/asignaciones/GC y capacidad, sincronización histórica de otros ADR, aceptación visual prolongada/DPI y futuras ventanas secundarias. El ViewModel invalida callbacks tardíos para que no alteren bindings tras el cierre, sin afirmar que corrige el servicio neutral. No se implementan hardware, almacenamiento, DSP, PA ni composición de secundarias.
 
-Resultado final de validación: formato limitado y restore correctos; build con 0 advertencias y 0 errores; 149 pruebas correctas (128 neutrales y 21 WPF), ninguna omitida. Diff sin errores de whitespace, incluidos archivos nuevos; referencias WPF limitadas a App.Wpf y Tests.Wpf, y enlaces relativos del plan comprobados. Sin commit.
+Resultado histórico de validación previo al ADR 0009: formato limitado y restore correctos; build con 0 advertencias y 0 errores; 149 pruebas correctas (128 neutrales y 21 WPF), ninguna omitida. Diff sin errores de whitespace, incluidos archivos nuevos; en ese momento las referencias WPF estaban limitadas a App.Wpf y Tests.Wpf, y se comprobaron los enlaces relativos del plan. Desde la extracción, Visualization.Wpf es también un proyecto WPF. Sin commit.
 
 ## Correcciones de la revisión final — 2026-09-15
 

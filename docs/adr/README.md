@@ -11,5 +11,6 @@ Aceptado identifica decisiones aprobadas, sin autorizar paquetes ni implementaci
 - [0006-session-window-lifecycle](0006-session-window-lifecycle.md): MainWindow solicita salida ordenada; secundarias futuras no detienen sesión.
 - [0007-frame-source-ownership](0007-frame-source-ownership.md): Contrato RF y ownership exclusivo de muestras short.
 - [0008-latest-only-visual-delivery](0008-latest-only-visual-delivery.md): Mailbox latest-only, snapshot independiente y cadencias.
+- [0009-reusable-scan-visualization-controls](0009-reusable-scan-visualization-controls.md): Renderizadores de scan específicos y reutilizables por plataforma.
 
-Renderizador, paquetes adicionales y benchmarks pendientes; véanse [plan](../plans/2026-09-09-first-vertical-increment.md) y [cuestiones](../requirements/open-questions.md).
+Renderizadores de otros scans, paquetes adicionales y benchmarks pendientes; véanse [plan](../plans/2026-09-09-first-vertical-increment.md) y [cuestiones](../requirements/open-questions.md).
