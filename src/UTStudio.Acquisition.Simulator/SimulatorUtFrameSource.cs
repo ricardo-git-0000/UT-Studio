@@ -21,6 +21,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
     private AcquisitionRunId _lastRunId;
     private UtSourceState _state = new(0, UtConnectionState.Disconnected, UtAcquisitionState.Idle);
     private Task? _disposeTask;
+    private long _producedFrames;
 
     public SimulatorUtFrameSource(UtSourceId sourceId, SimulatorOptions? options = null, TimeProvider? timeProvider = null)
     {
@@ -38,6 +39,9 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
     public UtSourceCapabilities Capabilities { get; }
     internal SimulatorWaitReason WaitReason { get { lock (_gate) { return _run?.WaitReason ?? SimulatorWaitReason.None; } } }
     internal int OutstandingBuffers { get { lock (_gate) { return _run?.Pool.Outstanding ?? 0; } } }
+    internal int MaximumOutstandingBuffers { get { lock (_gate) { return _run?.Pool.MaximumOutstanding ?? 0; } } }
+    internal AcquisitionMetrics? Metrics { get; init; }
+    internal long ProducedFrames => Interlocked.Read(ref _producedFrames);
     public UtSourceState State
     {
         get { lock (_gate) { Refresh(); return _state; } }
@@ -88,11 +92,12 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
             {
                 pool = new BoundedSampleBufferPool(_options.BufferCount, configuration.SampleCount);
                 var metadata = new ConventionalUtFrameMetadata(SourceId, runId, configuration, _time.GetUtcNow());
-                context = new RunContext(metadata, pool, _options.ChannelCapacity, _time.GetTimestamp());
-                var result = new UtAcquisitionRun(metadata, context.Channel.Reader, context.Producer.Task, pool.AllFramesReleased);
+                context = new RunContext(metadata, pool, _options.ChannelCapacity, _time.GetTimestamp(), Metrics);
+                var result = new UtAcquisitionRun(metadata, context.Metrics?.Reader(context.Channel.Reader) ?? context.Channel.Reader, context.Producer.Task, pool.AllFramesReleased);
                 cancellationToken.ThrowIfCancellationRequested();
                 // Commit: all fallible preparation precedes enabling the producer. No request token is linked.
                 _run = context;
+                Interlocked.Exchange(ref _producedFrames, 0);
                 _lastRunId = runId;
                 SetState(UtConnectionState.Connected, UtAcquisitionState.Running);
                 _ = Task.Run(() => ProduceAsync(context));
@@ -195,25 +200,31 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
         Exception? failure = null;
         IMemoryOwner<short>? owner = null;
         ConventionalUtFrame? frame = null;
+        AcquisitionMetrics.TrackedOwner? tracked = null;
         var token = context.Cancellation.Token;
         try
         {
             ulong sequence = 0;
             while (true)
             {
+                context.Metrics?.Offer();
                 var reservation = context.Pool.RentAsync(token);
                 context.WaitReason = reservation.IsCompleted ? SimulatorWaitReason.None : SimulatorWaitReason.Buffer;
                 owner = await reservation.ConfigureAwait(false);
+                if (context.Metrics is { } metrics) { owner = tracked = metrics.Track(owner); }
                 context.WaitReason = SimulatorWaitReason.None;
                 token.ThrowIfCancellationRequested();
                 var elapsed = _time.GetElapsedTime(context.OriginTimestamp);
                 SyntheticRfGenerator.Fill(owner.Memory.Span, context.Metadata.Configuration, _options, sequence, token);
                 frame = new ConventionalUtFrame(context.Metadata, sequence, elapsed, owner);
+                tracked?.Generated();
                 owner = null;
-                var write = context.Channel.Writer.WriteAsync(frame, token);
+                var write = context.Metrics is { } instrumentation ? instrumentation.WriteAsync(context.Channel.Writer, frame, token) : context.Channel.Writer.WriteAsync(frame, token);
                 context.WaitReason = write.IsCompleted ? SimulatorWaitReason.None : SimulatorWaitReason.Channel;
                 await write.ConfigureAwait(false);
+                tracked = null;
                 frame = null; // Successful write, even if cancellation raced: reader now owns it.
+                Interlocked.Increment(ref _producedFrames);
                 context.WaitReason = SimulatorWaitReason.None;
                 sequence = checked(sequence + 1);
                 long deliveredAt = _time.GetTimestamp();
@@ -242,6 +253,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
                 }
             }
 
+            tracked?.NotTransferred();
             Cleanup(() => frame?.Dispose());
             Cleanup(() => owner?.Dispose());
             Cleanup(context.Pool.Seal);
@@ -347,11 +359,12 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
 
     private sealed class RunContext
     {
-        internal RunContext(ConventionalUtFrameMetadata metadata, BoundedSampleBufferPool pool, int capacity, long originTimestamp)
+        internal RunContext(ConventionalUtFrameMetadata metadata, BoundedSampleBufferPool pool, int capacity, long originTimestamp, AcquisitionMetrics? metrics)
         {
             Metadata = metadata;
             Pool = pool;
             OriginTimestamp = originTimestamp;
+            Metrics = metrics;
             Channel = System.Threading.Channels.Channel.CreateBounded<ConventionalUtFrame>(new BoundedChannelOptions(capacity)
             {
                 SingleReader = true,
@@ -364,6 +377,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
         internal ConventionalUtFrameMetadata Metadata { get; }
         internal BoundedSampleBufferPool Pool { get; }
         internal long OriginTimestamp { get; }
+        internal AcquisitionMetrics? Metrics { get; }
         internal Channel<ConventionalUtFrame> Channel { get; }
         internal CancellationTokenSource Cancellation { get; } = new();
         internal TaskCompletionSource Producer { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

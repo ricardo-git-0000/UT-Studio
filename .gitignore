@@ -25,6 +25,15 @@ coverage/
 /tmp/
 *.log
 *.dmp
+*.etl
+*.nettrace
+*.gcdump
+*.speedscope.json
+/BenchmarkDotNet.Artifacts/
+/benchmarks/**/BenchmarkDotNet.Artifacts/
+/tools/UTStudio.LoadTests/results/
+/performance-results/
+/performance-captures/
 
 # Secretos y configuración privada
 .env

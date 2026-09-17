@@ -10,6 +10,7 @@ internal sealed class BoundedSampleBufferPool
     private readonly Channel<short[]> _free;
     private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _outstanding;
+    private int _maximumOutstanding;
     private bool _sealed;
 
     internal BoundedSampleBufferPool(int bufferCount, int sampleCount)
@@ -30,6 +31,7 @@ internal sealed class BoundedSampleBufferPool
 
     internal Task AllFramesReleased => _released.Task;
     internal int Outstanding { get { lock (_gate) { return _outstanding; } } }
+    internal int MaximumOutstanding { get { lock (_gate) { return _maximumOutstanding; } } }
 
     internal async ValueTask<IMemoryOwner<short>> RentAsync(CancellationToken cancellationToken)
     {
@@ -47,6 +49,7 @@ internal sealed class BoundedSampleBufferPool
                 {
                     var owner = new SampleOwner(this, samples);
                     _outstanding++;
+                    _maximumOutstanding = Math.Max(_maximumOutstanding, _outstanding);
                     return owner;
                 }
             }

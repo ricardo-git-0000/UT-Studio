@@ -1,12 +1,12 @@
 # Plan de línea base de rendimiento y estabilidad A-Scan
 
-Fecha: 2026-09-16. Estado: propuesta documental pendiente de aprobación para implementación y ejecución. No contiene resultados experimentales ni presupuestos de rendimiento aprobados.
+Fecha: 2026-09-16. Estado: infraestructura inicial aprobada e implementada; campañas, baseline medido y presupuestos pendientes de aprobación. No contiene resultados experimentales aprobados.
 
 ## Objetivo, fuentes y alcance
 
 Establecer una línea base reproducible del pipeline convencional RF, localizar costes y verificar integridad bajo carga antes de optimizar. Requisitos aplicables: R01–R08, R13 y R14 de la [línea base](../requirements/baseline.md). Restricciones aceptadas en [ADR 0002](../adr/0002-bounded-pipeline.md), [ADR 0007](../adr/0007-frame-source-ownership.md), [ADR 0008](../adr/0008-latest-only-visual-delivery.md) y [ADR 0006](../adr/0006-session-window-lifecycle.md). Contexto: [arquitectura](../architecture/overview.md), [pipeline](../architecture/data-pipeline.md), [pruebas](../architecture/testing.md) y [primer incremento](2026-09-09-first-vertical-increment.md).
 
-Esta tarea solo crea el plan y su enlace. El principal es único escritor; revisores en lectura: solution_architect, ut_acquisition, ut_visualization y quality_reviewer, en tandas de hasta tres. No autoriza código, proyectos, paquetes, instrumentación ni cambios de contratos. No incluye hardware, PA, DSP, persistencia, secundarias ni benchmark de transporte real. Los textos históricos de arquitectura/pipeline sobre integración pendiente y mailbox de owners no describen el código vigente; para esta medición prevalecen ADR 0008 revisado y las secciones finales del plan del incremento. Su sincronización general queda fuera de alcance.
+El plan nació como propuesta documental y su infraestructura inicial ya está implementada en los proyectos descritos al final. No incluye hardware, PA, DSP, persistencia, ventanas secundarias ni benchmark de transporte real. Los textos históricos de arquitectura/pipeline sobre integración pendiente y mailbox de owners no describen el código vigente; para esta medición prevalecen ADR 0008 revisado y las secciones finales del plan del incremento. Su sincronización general queda fuera de alcance.
 
 ## Límites del producto y configuración vigente
 
@@ -108,43 +108,43 @@ Contadores de integridad exactos por evento; publicación de métricas muestread
 
 | Origen | Adecuado para | No demuestra |
 | --- | --- | --- |
-| BenchmarkDotNet propuesto | Distribución de tiempo por operación, repetición/warmup, bytes/op y GC mediante MemoryDiagnoser | Latencia individual extremo a extremo, LOH retenido, working set sostenido, FPS o ausencia de fugas |
+| BenchmarkDotNet | Distribución de tiempo por operación, repetición/warmup, bytes/op y GC mediante MemoryDiagnoser | Latencia individual extremo a extremo, LOH retenido, working set sostenido, FPS o ausencia de fugas |
 | Contadores/sondas del pipeline | Balances, secuencias, esperas, high-water, throughput, histogramas por frame/hito, shutdown | Uso global de CPU/GPU sin medición externa |
 | Runtime/proceso/SO | Asignación total multihilo, GC/pausas/LOH, CPU, working set; dotnet-counters/dotnet-trace/PerfView/WPR si están disponibles y autorizados | Integridad UT solo por observar memoria plana |
 | MSTest determinista | Propiedad exacta, cancelación, min/max, admisión visual, barreras y errores | Presupuesto de rendimiento de una máquina |
 | Soak y sesión WPF manual | Tendencias, cierre real, Dispatcher/dibujo, variaciones térmicas/DPI | Prueba universal de estabilidad o transporte real |
 
-BenchmarkDotNet está justificado para comparaciones aisladas repetibles, no para encapsular el soak. Proponer referencia exclusivamente en `benchmarks/UTStudio.Benchmarks` (y solo si se aprueba, su runner .Wpf); nunca en src, Contracts o tests normales. Versión estable compatible con .NET 10 por verificar y aprobar al implementar; ningún paquete añadido ahora. Los [diagnosers oficiales](https://benchmarkdotnet.org/articles/configs/diagnosers.html) incluyen memoria/GC; sus cifras no sustituyen telemetría multihilo del pipeline. Para medición usar Release sin debugger y controlar entorno, conforme a las [buenas prácticas oficiales](https://benchmarkdotnet.org/articles/guides/good-practices.html).
+BenchmarkDotNet está justificado para comparaciones aisladas repetibles, no para encapsular el soak. La referencia 0.15.8 está fijada exclusivamente en `benchmarks/UTStudio.Benchmarks`; nunca en src, Contracts o tests normales. Los [diagnosers oficiales](https://benchmarkdotnet.org/articles/configs/diagnosers.html) incluyen memoria/GC; sus cifras no sustituyen telemetría multihilo del pipeline. Para medición usar Release sin debugger y controlar entorno, conforme a las [buenas prácticas oficiales](https://benchmarkdotnet.org/articles/guides/good-practices.html).
 
 Alternativa sin paquete: ejecutable con Stopwatch.GetTimestamp, calentamiento, lotes, checksum, repeticiones en procesos separados, GC.CollectionCount y mediciones de asignación del runtime. Hay que mantener manualmente metodología, exportación y análisis; no atribuir bytes de otros hilos a GetAllocatedBytesForCurrentThread ni tratar promedio de lote como percentil por frame. Esta alternativa permite empezar, con menor automatización y más riesgo metodológico.
 
-## Organización y comandos propuestos
+## Organización y comandos
 
-Nada de lo siguiente existe por autorización de este documento. Propuesta de archivos futuros:
+La infraestructura inicial contiene:
 
 - `benchmarks/UTStudio.Benchmarks/`: csproj ejecutable net10.0, Program, Generation/Pool/Frame/Projection/Delivery benchmarks, SyntheticFixtures y configuración de jobs. Referencias solo a Domain, Contracts, Simulator y Visualization.Core que cada caso necesite.
 - `tools/UTStudio.LoadTests/`: csproj ejecutable net10.0, Program, ScenarioConfiguration, PipelineRunner, LoadFrameSource experimental, MetricsCollector, ResultWriter y fixtures; referencias neutrales incluyendo Application. No referencias WPF, ViewModels ni Host productivo. No dependencias inversas desde src.
 - Runner matemático/UI .Wpf opcional separado y pendiente, sin importar WPF transitivamente en herramientas neutrales. No crear una abstracción general de benchmarking en producción.
 
-No usar Microsoft.NET.Test.Sdk ni atributos de test en estos ejecutables; no llamarlos desde targets de build/test ni desde MSTest. Preferir dejarlos fuera de UTStudio.sln inicialmente y ejecutarlos por ruta. Soak exige selección explícita de perfil/duración, nunca valor predeterminado al ejecutar `dotnet test`. CI compartida solo pruebas de corrección y smoke explícito corto; rendimiento y soak en jobs opt-in dedicados.
+No usar Microsoft.NET.Test.Sdk ni atributos de test en estos ejecutables; no llamarlos desde targets de test ni desde MSTest. Ambos están en UTStudio.sln para build y se ejecutan explícitamente por ruta. Soak exige selección explícita de perfil/duración, nunca se ejecuta mediante `dotnet test`. CI compartida solo pruebas de corrección y smoke explícito corto; rendimiento y soak en jobs opt-in dedicados.
 
-Sintaxis futura ilustrativa; no ejecutar estos comandos ahora. Los flags propios se implementarán y validarán antes de documentarlos como operativos:
+Sintaxis operativa:
 
 ```powershell
 # Debug: corrección y smoke, nunca resultados comparables de rendimiento
 dotnet build UTStudio.sln -c Debug
 dotnet test UTStudio.sln -c Debug
-dotnet run -c Debug --project tools/UTStudio.LoadTests -- --profile smoke --scenario S1 --duration 10s --output <directorio-externo-unico>
+dotnet run -c Debug --project tools/UTStudio.LoadTests -- --profile smoke --samples 2048 --rate 50 --duration 10s
 
 # Release: primero build; luego medir sin debugger en proceso dedicado
 dotnet build benchmarks/UTStudio.Benchmarks/UTStudio.Benchmarks.csproj -c Release
-dotnet run -c Release --no-build --project benchmarks/UTStudio.Benchmarks -- --filter '*Projection*' --artifacts <directorio-externo-unico>
+dotnet run -c Release --no-build --project benchmarks/UTStudio.Benchmarks -- --filter '*Projection*'
 dotnet build tools/UTStudio.LoadTests/UTStudio.LoadTests.csproj -c Release
-dotnet run -c Release --no-build --project tools/UTStudio.LoadTests -- --profile baseline --scenario S2 --warmup 60s --duration 5m --output <directorio-externo-unico>
-dotnet run -c Release --no-build --project tools/UTStudio.LoadTests -- --profile soak --scenario S4 --warmup 60s --duration 8h --output <directorio-externo-unico>
+dotnet run -c Release --no-build --project tools/UTStudio.LoadTests -- --profile baseline --samples 2048 --rate 100
+dotnet run -c Release --no-build --project tools/UTStudio.LoadTests -- --profile soak --samples 65535 --rate max
 ```
 
-S3/S6 solo seleccionables al existir la fuente experimental aprobada; rechazar perfiles incompatibles con mensaje explícito. Excluir resultados Debug de comparaciones. Las pruebas largas son automatizables técnicamente, pero su lanzamiento/interpretación serán deliberados, no parte implícita de CI.
+S3/S6 usan la fuente experimental local aprobada para LoadTests. Excluir resultados Debug de comparaciones. Las pruebas largas son automatizables técnicamente, pero su lanzamiento/interpretación serán deliberados, no parte implícita de CI.
 
 ## Salidas y comparación con baseline
 
@@ -168,11 +168,81 @@ La corrección funcional bloquea aceptación aunque los números sean rápidos. 
 
 ## Secuencia y decisiones pendientes
 
-1. Aprobar estructura de herramientas y BenchmarkDotNet o alternativa sin paquete; después concretar versión y acceso interno/sondas, con revisión de contratos si resultara imprescindible.
-2. Implementar smoke e integridad determinista antes de medir; sin fuente de carga superior, ejecutar solo escenarios admitidos y declarar S3/S6 pendientes.
-3. Piloto Release, medir overhead de instrumentación, guardar línea base de la máquina y ajustar duración/resolución; después carga y soak dedicados.
-4. Revisar resultados y aprobar presupuestos/reglas de comparación. Solo entonces proponer optimizaciones previas al mailbox o cambios de capacidad/pool. Ninguna optimización queda seleccionada por este plan.
+1. Infraestructura, BenchmarkDotNet 0.15.8, smoke e integridad determinista: implementados.
+2. Piloto Release: medir overhead de instrumentación, guardar línea base de la máquina y ajustar duración/resolución; después ejecutar carga y soak dedicados.
+3. Revisar resultados y aprobar presupuestos/reglas de comparación. Solo entonces proponer optimizaciones previas al mailbox o cambios de capacidad/pool. Ninguna optimización queda seleccionada por este plan.
 
-Requieren aprobación: paquete/versión, proyectos y accesos internos futuros; fuente de carga experimental y sus modos; runner .Wpf opcional; máquina de referencia, duración/coste de campañas y retención de artefactos. Los umbrales de CPU/memoria/latencia y tolerancias de tasa se decidirán tras la primera medición. No se requiere cambiar ahora ADR de ownership ni los límites productivos.
+Requieren aprobación posterior: runner .Wpf opcional; máquina de referencia, duración/coste de campañas y retención de artefactos. Los umbrales de CPU/memoria/latencia y tolerancias de tasa se decidirán tras la primera medición. No se requiere cambiar ahora ADR de ownership ni los límites productivos.
 
-Validación de esta tarea: documental únicamente (enlaces, consistencia, alcance y whitespace). No se ejecutan build, tests funcionales, microbenchmarks ni carga; no hay cifras medidas en este documento.
+La infraestructura se valida mediante restore, build, MSTest, un benchmark Dry filtrado y una carga diagnóstica corta. Sus cifras no se registran aquí ni forman una baseline aprobada.
+
+## Infraestructura inicial implementada — 2026-09-16
+
+La implementación aprobada crea `benchmarks/UTStudio.Benchmarks` y `tools/UTStudio.LoadTests`, ambos ejecutables net10.0 separados de MSTest y añadidos a la solución. BenchmarkDotNet 0.15.8 queda fijado exclusivamente en el proyecto de benchmarks: es la versión estable compatible con .NET 10 seleccionada para jobs aislados, parámetros y MemoryDiagnoser. LoadTests no añade paquetes ni referencias WPF.
+
+Los microbenchmarks cubren generación productiva y pool mediante amistad de ensamblado restringida, frame propietario, proyección N=2.048/65.535 con presupuestos 4/256/1.024, y entrega visual compuesta con/sin interés. Esta última no se presenta como coste puro del mailbox. Los fixtures se preparan fuera del tramo medido y los resultados no son pruebas ni presupuestos.
+
+LoadTests implementa perfiles smoke/baseline/soak de 30 s/5 min/30 min, override explícito, escenarios por muestras/cadencia y `max`. Hasta 100/s usa el simulador productivo; tasas superiores y máximo sostenible usan una fuente experimental local con pool/canal 8/4, ownership, cancelación, backpressure y barreras compatibles. La herramienta registra balances, high-water de préstamos, visual, throughput activo, ventana acotada de latencia visual, proyección, memoria/working set, GC, CPU y Stop; Ctrl+C solicita cierre ordenado. No fija umbrales temporales.
+
+Comandos operativos:
+
+```powershell
+dotnet run -c Release --project benchmarks/UTStudio.Benchmarks
+dotnet run -c Release --project tools/UTStudio.LoadTests -- --profile smoke --samples 2048 --rate 100
+```
+
+Los artefactos de BenchmarkDotNet, resultados de carga, trazas, dumps y capturas de rendimiento quedan ignorados. Core.Tests cubre parser/validación, percentiles de ventana acotada, criterios/códigos, balances, cancelación y backpressure; `dotnet test` no ejecuta campañas. Las cifras de las ejecuciones diagnósticas pertenecen al resultado de la tarea y no constituyen baseline aprobada.
+
+## Corrección metodológica de la infraestructura — 2026-09-16
+
+Alcance autorizado: correcciones de medición y pruebas diagnósticas; no ejecutar ni aceptar todavía una baseline. El principal es propietario de los archivos editados; ut_acquisition, solution_architect y quality_reviewer revisan en lectura. No se añaden paquetes ni contratos públicos.
+
+### Contabilidad y ventanas
+
+La instrumentación interna opcional `AcquisitionMetrics` conserva un solo lector Application. Decora el reader, las escrituras y los owners sin copiar muestras ni crear otra cola. Un gate ordena TryWrite/aceptado, TryRead/consumido y cortes monotónicos de contadores; los awaits se hacen fuera. Hay un wrapper adicional por préstamo y locks adicionales: los resultados de LoadTests son del pipeline instrumentado, no una estimación descontada del coste productivo. La propiedad se fija al crear cada run; el simulador normal no habilita estos wrappers.
+
+- Ofrecido: intento de adquisición antes de reservar; puede cancelarse antes de construir un frame.
+- Generado: constructor de frame completado; aceptado: escritura en Channel exitosa.
+- Consumido: extracción por el único lector, incluido drenaje. Liberado: Dispose interior exitoso del owner de un frame transferido.
+- No transferido: frame construido cuya escritura no se aceptó, liberado por productor. Préstamos cancelados antes de construir cuentan en rent/return, no como frames.
+- En tránsito = aceptados - liberados; en cola = aceptados - consumidos. Solo tras barreras se exige G=P+U, P=C=L y rent=return.
+
+No se usa SessionSnapshot para throughput periódico. Los cortes del contador incluyen timestamp bajo su gate. La ventana activa comienza después de `--warmup` (0s por defecto, explícito en salida) y termina antes de solicitar Stop. Las tasas son deltas ofrecidos/aceptados/consumidos sobre esa misma ventana. El drenaje posterior se informa por separado. No se publica tasa de ejecución completa.
+
+### Demanda y fuente
+
+`--rate N` es una tasa objetivo, no una garantía. La rejilla monotónica se origina al solicitar el inicio y redondea el periodo hacia arriba a ticks de Stopwatch; se publican objetivo y tasa de rejilla. Un deadline cumplido significa que se inició un intento para ese slot, no entrega puntual ni escritura aceptada. Slots vencidos sin intento son omitidos; intentos tempranos/repetidos se separan. Los contadores de demanda y el retraso medio/máximo abarcan desde solicitud de inicio hasta fin activo (incluyen warmup), identificados como `demand.untilActiveEnd`.
+
+La fuente experimental espera al próximo deadline con Task.Delay, redondeando la espera a milisegundos hacia arriba, sin busy-spin. Si llega tarde, emite un intento del último slot vencido y contabiliza los anteriores omitidos: no recupera una ráfaga ilimitada. El retraso informado se mide desde el próximo deadline pendiente antes de saltar slots, para no esconder pausas largas. Task.Delay y el scheduler de Windows no garantizan 1 ms; el déficit puede proceder también de generación/backpressure. Comparar siempre tasas objetivo/ofrecida/aceptada/consumida; TARGET_NOT_REACHED identifica seguimiento incompleto sin convertirlo automáticamente en corrupción funcional.
+
+Hasta 100/s se conserva la fuente y pacing productivos. Su rejilla es una referencia diagnóstica externa: demanda omitida no significa pérdida de frames UT. Por encima de 100/s se usa fuente experimental, generador LCG y SamplePool propio, identificados en salida. No equivalen a coste de SyntheticRfGenerator ni al modo fixture/copia, que permanece pendiente.
+
+`--rate max` significa exclusivamente carga experimental sin pacing. No implementa aún S6 ni demuestra capacidad máxima sostenible. Calentamiento, duración, repeticiones y estabilidad de una campaña sostenible siguen pendientes.
+
+### Latencias, recursos y resultados
+
+`visual.accept-to-callback` comienza en el decorador de Accept y acaba al medir dentro del callback. Excluye reserva/generación/cola UT y solo incluye seleccionados visuales. La correlación usa versión por slot, sin asignación por frame ni lock global; un par sobrescrito/incoherente cuenta como miss. Se publican también reutilizaciones de slots (no equivalen a pérdidas UT).
+
+Latencia y proyección registran observaciones con ambos extremos activos. Media/p50/p95/p99 son nearest-rank de las últimas 8.192 observaciones válidas de cada métrica, no de toda la campaña; población acumulada y retenida se distinguen. Pocas observaciones no acreditan colas de distribución.
+
+CPU activa se normaliza por procesadores lógicos. CPU de inicio (incluido warmup) y cierre se informa separadamente en segundos de proceso. Máximos CPU/working set son máximos muestreados, nunca absolutos. Se conserva una serie circular de hasta 4.096 muestras activas, con duración real de cada intervalo (incluido residual), tiempo transcurrido, estimación administrada, working set y progreso. Se exporta por consola después de cerrar; se informa población total/retención. Retención a 1 s cubre aproximadamente los últimos 68 minutos; no acredita estabilidad anterior. GC.GetTotalMemory(false) estima bytes administrados actuales, no heap reservado ni retención comprobada. La muestra resumen de memoria es posterior al cierre.
+
+La consola de progreso es periódica, no por frame; no calcula/copía histogramas en cada sondeo. La instrumentación conserva costes de timestamps, atomics, wrappers y locks. Su comparación A/B con instrumentación mínima sigue siendo prerrequisito de una futura baseline, no se realiza ahora.
+
+Resultado de campaña y limpieza son independientes: Completed, Cancelled, NoProgress, FunctionalFailure y CleanupTimeout. Códigos: 0 completada y balances válidos; 2 fallo funcional; 3 cancelación voluntaria; 4 sin progreso/cero frames; 5 cierre pendiente tras límite diagnóstico; 64 argumentos inválidos. Completed solo indica ejecución funcional durante la duración configurada: no aprobación estadística de baseline/soak. Watchdog activo configurable `--progress-timeout`; cierre neutral diagnosticado mediante `--cleanup-timeout`. El timeout no reclama buffers ni simula barrera; la tarea de limpieza sigue observada y la ejecución queda fallida/inconclusa. El umbral de progreso debe superar el periodo esperado para tasas muy bajas. No hay garantía de cierre si código externo bloquea indefinidamente.
+
+Las pruebas Performance cubren pacing aritmético, anillo concurrente, series acotadas, ventanas, contadores vivos, cancelación, falta de progreso y timeout de barrera. Toda espera nueva tiene límite diagnóstico; ningún timeout autoriza liberación forzada. Las cargas cortas y BDN Dry son exclusivamente smoke, no resultados de baseline.
+
+### Estado de cierre de la corrección
+
+Resuelto el 2026-09-17: aislamiento determinista del setup visual. `Statistics` tiene benchmark separado y no contamina `Accept`; hay casos independientes sin interés, proyección hacia mailbox vacío y sustitución latest-only con pendiente sembrado. La API interna `WaitForDiagnosticStateAsync` captura la generación vigente y, con `Accept` serializado por el arnés, completa únicamente cuando no quedan proyecciones admitidas en curso, los pumps/callbacks preparatorios han terminado, el mailbox tiene el estado esperado y el worker conserva una tarea incompleta de espera de señal o timer. `WaitingForTimer` describe una espera física que puede pertenecer a una generación invalidada; no se denomina idle y el pending esperado prueba que ningún snapshot anterior seguirá publicable.
+
+La barrera admite múltiples esperadores; cancelación y timeout retiran solo al solicitante. Dispose invalida los esperadores. `DisposeForDiagnosticsAsync` conserva la semántica pública de Dispose y añade, solo para pruebas/benchmarks, observación de pumps y proyecciones concurrentes. Sin esperadores no se crean TCS, registros ni listas por frame: el coste productivo añadido es un contador de proyecciones incrementado/decrementado dentro de locks existentes, una rama nullable al terminar y transiciones diagnósticas del worker. No se ejecuta código externo bajo el lock global ni cambian mailbox latest-only o 30 Hz.
+
+Los benchmarks preparan el timer congelado después de publicar y terminar el callback inicial. Para proyección sin reemplazo, Close/Open invalida y vacía el pending antiguo mientras conserva la espera física del timer; una segunda barrera confirma generación nueva, mailbox vacío y pumps finalizados. Para latest-only se conserva el pending y todas las operaciones medidas son sustituciones. `IterationSetup` fuerza una sola invocación por iteración. El cleanup diagnóstico observa worker, suscripción, pump, callback y proyecciones antes de retornar. Las pruebas cubren ausencia de interés, callback/proyección bloqueados, fallo invalidado, cancelación, timeout, varios esperadores, Dispose y conservación latest-only. Dry continúa siendo solo smoke.
+
+El corte de inicio/fin de contadores, demanda e inserción de histogramas comparte la exclusión de instrumentación. La correlación del anillo sigue sin lock global propio. Los contadores posteriores al fin activo y anteriores a solicitar realmente Stop se presentan separados del drenaje desde Stop; ninguno entra en las tasas activas. Las diferencias de flujo dentro de una ventana pueden incluir trabajo en tránsito desde la ventana anterior (aceptada puede superar ligeramente a ofrecida).
+
+CPU usa timestamps adyacentes a sus lecturas de proceso, separados de los cortes de contadores para evitar dividir una lectura posterior por una duración anterior; no son capturas atómicas del SO. El resultado primario de campaña se conserva aun cuando el cierre expire. El cierre devuelve un informe inmutable; después de timeout, buffers pendientes se etiquetan desconocidos (-1), barrera no confirmada y tarea pendiente observable. La barrera real se inspecciona mediante el descriptor existente del run, sin leer su canal desde otro consumidor.
+
+Validación de la corrección (smoke, no baseline): restore correcto; formato limitado a archivos autorizados; solución Release sin warnings/errores; 172 pruebas Core y 28 WPF correctas (incluidas las pruebas deterministas de la barrera visual); ocho casos visuales Dry ejecutados; cargas explícitas de dos segundos a objetivo 100/s, objetivo 1.000/s y sin pacing completadas con P=C=L y cero buffers pendientes. No se afirma seguimiento de objetivo: las salidas finitas registran TARGET_NOT_REACHED cuando corresponde. Revisión en lectura de ut_acquisition, ut_visualization, solution_architect y quality_reviewer: sin bloqueantes tras cerrar atómicamente la admisión durante el cleanup diagnóstico y rearmar la observación cuando cambia el pump. El punto 4, aislamiento determinista del benchmark visual, queda cerrado. Sin commit ni campaña baseline.

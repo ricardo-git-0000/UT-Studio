@@ -22,6 +22,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     private readonly CancellationTokenSource _shutdown = new();
     private readonly List<Subscription> _subscriptions = [];
     private readonly DeliveryStatusStore _status = new();
+    private List<DiagnosticWaiter>? _diagnosticWaiters;
     // Deterministic race seam: selection is not callback entry. Never runs under a lock.
     internal Action? BeforeCallbackAttempt { get; set; }
     internal Action? AfterCallbackAttempt { get; set; }
@@ -40,6 +41,11 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     private AScanSnapshot? _current;
     private long _received, _published, _replaced, _dropped, _observerCoalesced, _observerErrors;
     private UtSourceError? _lastError;
+    private VisualDiagnosticWorkerState _diagnosticWorkerState = VisualDiagnosticWorkerState.Starting;
+    private Task? _diagnosticWorkerWait;
+    private int _projectionsInFlight;
+    private bool _diagnosticFullCleanupRequested;
+    private TaskCompletionSource? _diagnosticProjectionDrain;
 
     public AScanVisualDelivery(IAScanProjector? projector = null, TimeProvider? timeProvider = null)
     {
@@ -60,6 +66,57 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                     _observerErrors, _pending is not null, _lastError);
             }
         }
+    }
+
+    /// <summary>
+    /// Diagnostic-only barrier for tests and benchmarks. It completes after the publisher has registered the
+    /// requested asynchronous wait, the expected mailbox state is visible, and every subscriber pump/callback
+    /// admitted before that observation has finished. The caller must serialize this diagnostic operation with
+    /// Accept; a returned Accept has already completed its synchronous projection. Cancellation abandons only this waiter.
+    /// </summary>
+    internal async Task WaitForDiagnosticStateAsync(VisualDiagnosticExpectation expectation, TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero);
+        using var timeoutSource = new CancellationTokenSource(timeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+        try { await WaitForDiagnosticStateCoreAsync(expectation, linked.Token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        { throw new TimeoutException($"Visual diagnostic state {expectation} was not reached within {timeout}."); }
+    }
+
+    /// <summary>Diagnostic cleanup that additionally observes detached subscriber pump tasks.</summary>
+    internal async Task DisposeForDiagnosticsAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero);
+        Task projectionDrain;
+        Task disposal;
+        lock (_gate)
+        {
+            _diagnosticFullCleanupRequested = true;
+            disposal = DisposeAsync().AsTask();
+            projectionDrain = _projectionsInFlight == 0
+                ? Task.CompletedTask
+                : (_diagnosticProjectionDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
+        await Task.WhenAll(disposal, projectionDrain)
+            .WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task WaitForDiagnosticStateCoreAsync(VisualDiagnosticExpectation expectation, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        DiagnosticWaiter waiter;
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            waiter = new(expectation, _generation);
+            (_diagnosticWaiters ??= []).Add(waiter);
+            foreach (var subscription in _subscriptions) { subscription.ArmDiagnosticCompletion(); }
+            TryCompleteDiagnosticWaitersUnderLock();
+        }
+        waiter.RegisterCancellation(this, token);
+        return waiter.Completion.Task;
     }
 
     public void OpenRun(AcquisitionRunId runId)
@@ -101,6 +158,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
             _lastElapsed = elapsedSinceRunStart;
             generation = _generation;
             version = ++_version;
+            _projectionsInFlight++;
         }
 
         AScanSnapshot snapshot;
@@ -109,23 +167,30 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         {
             lock (_gate)
             {
+                _projectionsInFlight--;
+                if (_projectionsInFlight == 0) { _diagnosticProjectionDrain?.TrySetResult(); }
                 _dropped++;
                 _lastError = Describe("visual.projection", error);
                 if (_generation == generation) { Invalidate(); _runId = null; }
+                if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
             }
             throw;
         }
 
         lock (_gate)
         {
+            _projectionsInFlight--;
+            if (_projectionsInFlight == 0) { _diagnosticProjectionDrain?.TrySetResult(); }
             if (_disposed || _generation != generation || _subscriptions.Count == 0)
             {
                 _dropped++;
+                if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
                 return;
             }
             if (_pending is not null) { _replaced++; }
             _pending = snapshot;
             if (_wake.CurrentCount == 0) { _wake.Release(); }
+            if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
         }
     }
 
@@ -162,6 +227,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
             if (_disposal is null)
             {
                 _disposed = true;
+                FailDiagnosticWaitersUnderLock(new ObjectDisposedException(nameof(AScanVisualDelivery)));
                 Invalidate();
                 _runId = null;
                 var subscriptions = _subscriptions.ToArray();
@@ -184,6 +250,8 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         finally
         {
             foreach (var subscription in subscriptions) { subscription.WaitForCallback(); }
+            if (_diagnosticFullCleanupRequested)
+            { await Task.WhenAll(subscriptions.Select(subscription => subscription.DiagnosticCleanup)).ConfigureAwait(false); }
             _status.Dispose();
             _shutdown.Dispose();
             _wake.Dispose();
@@ -196,7 +264,21 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         {
             while (true)
             {
-                await _wake.WaitAsync(_shutdown.Token).ConfigureAwait(false);
+                Task wake = _wake.WaitAsync(_shutdown.Token);
+                lock (_gate)
+                {
+                    _diagnosticWorkerWait = wake;
+                    _diagnosticWorkerState = wake.IsCompleted
+                        ? VisualDiagnosticWorkerState.Processing
+                        : VisualDiagnosticWorkerState.WaitingForSignal;
+                    if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
+                }
+                await wake.ConfigureAwait(false);
+                lock (_gate)
+                {
+                    _diagnosticWorkerWait = null;
+                    _diagnosticWorkerState = VisualDiagnosticWorkerState.Processing;
+                }
                 while (true)
                 {
                     TimeSpan remaining;
@@ -217,7 +299,21 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                         }
                     }
                     // Recheck the monotonic time after every wake, including early timer callbacks.
-                    await DelayAsync(remaining).ConfigureAwait(false);
+                    Task delay = DelayAsync(remaining);
+                    lock (_gate)
+                    {
+                        _diagnosticWorkerWait = delay;
+                        _diagnosticWorkerState = delay.IsCompleted
+                            ? VisualDiagnosticWorkerState.Processing
+                            : VisualDiagnosticWorkerState.WaitingForTimer;
+                        if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
+                    }
+                    await delay.ConfigureAwait(false);
+                    lock (_gate)
+                    {
+                        _diagnosticWorkerWait = null;
+                        _diagnosticWorkerState = VisualDiagnosticWorkerState.Processing;
+                    }
                 }
             }
         }
@@ -226,17 +322,71 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         {
             lock (_gate)
             {
+                _diagnosticWorkerWait = null;
                 _lastError = Describe("visual.publication", error);
                 _status.Publish(new AScanDeliveryStatus(1, _lastError));
                 _failed = true;
                 Invalidate();
                 _runId = null;
+                FailDiagnosticWaitersUnderLock(error);
+            }
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _diagnosticWorkerState = VisualDiagnosticWorkerState.Stopped;
+                if (_diagnosticWaiters is not null && !_disposed)
+                { FailDiagnosticWaitersUnderLock(new InvalidOperationException("Visual publisher stopped.")); }
             }
         }
     }
 
+    private void TryCompleteDiagnosticWaitersUnderLock()
+    {
+        if (_diagnosticWaiters is null) { return; }
+        bool subscriptionsQuiescent = _subscriptions.All(subscription => subscription.IsQuiescent);
+        for (int index = _diagnosticWaiters.Count - 1; index >= 0; index--)
+        {
+            var waiter = _diagnosticWaiters[index];
+            if (_diagnosticWorkerState == waiter.Expectation.WorkerState &&
+                _diagnosticWorkerWait is { IsCompleted: false } && _generation == waiter.Generation &&
+                _projectionsInFlight == 0 &&
+                (_pending is not null) == waiter.Expectation.HasPendingSnapshot && subscriptionsQuiescent)
+            {
+                _diagnosticWaiters.RemoveAt(index);
+                waiter.Completion.TrySetResult();
+            }
+        }
+        if (_diagnosticWaiters.Count == 0) { _diagnosticWaiters = null; }
+    }
+
+    private void CancelDiagnosticWaiter(DiagnosticWaiter waiter, CancellationToken token)
+    {
+        lock (_gate)
+        {
+            if (_diagnosticWaiters?.Remove(waiter) == true)
+            {
+                if (_diagnosticWaiters.Count == 0) { _diagnosticWaiters = null; }
+                waiter.Completion.TrySetCanceled(token);
+            }
+        }
+    }
+
+    private void FailDiagnosticWaitersUnderLock(Exception error)
+    {
+        if (_diagnosticWaiters is null) { return; }
+        foreach (var waiter in _diagnosticWaiters)
+        {
+            waiter.Completion.TrySetException(error);
+        }
+        _diagnosticWaiters = null;
+    }
+
     private void Invalidate()
     {
+        if (_diagnosticWaiters is not null)
+        { FailDiagnosticWaitersUnderLock(new InvalidOperationException("Visual diagnostic generation was invalidated.")); }
         _generation++;
         if (_pending is not null) { _dropped++; }
         _pending = null;
@@ -269,6 +419,27 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         private readonly CancellationTokenSource _cancellation = new();
         private Task _pump = Task.CompletedTask;
         private Task? _cancellationCompletion;
+        private Task? _detachCompletion;
+        private bool _diagnosticCompletionArmed;
+        internal bool IsQuiescent => !_scheduled && _pending is null && _pump.IsCompleted;
+        internal void ArmDiagnosticCompletion()
+        {
+            if (_pump.IsCompleted || _diagnosticCompletionArmed) { return; }
+            _diagnosticCompletionArmed = true;
+            var armedPump = _pump;
+            _ = armedPump.ContinueWith(_ =>
+            {
+                lock (owner._gate)
+                {
+                    _diagnosticCompletionArmed = false;
+                    if (owner._diagnosticWaiters is not null)
+                    {
+                        if (!ReferenceEquals(_pump, armedPump)) { ArmDiagnosticCompletion(); }
+                        owner.TryCompleteDiagnosticWaitersUnderLock();
+                    }
+                }
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
 
         internal void Offer(AScanSnapshot snapshot, long generation)
         {
@@ -289,7 +460,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
             _pending = null;
             _cancellationCompletion = _cancellation.CancelAsync();
             var pump = _pump;
-            _ = Task.Run(async () =>
+            _detachCompletion = Task.Run(async () =>
             {
                 try { await Task.WhenAll(_cancellationCompletion, pump).ConfigureAwait(false); }
                 catch (Exception error)
@@ -322,6 +493,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
                         {
                             _pending = null;
                             _scheduled = false;
+                            if (owner._diagnosticWaiters is not null) { ArmDiagnosticCompletion(); }
                             return;
                         }
                         remaining = _lastAdmission is { } previous
@@ -391,5 +563,23 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         }
 
         internal void WaitForCallback() { lock (_callbackGate) { } }
+        internal Task DiagnosticCleanup => _detachCompletion ?? Task.CompletedTask;
+    }
+
+    private sealed class DiagnosticWaiter(VisualDiagnosticExpectation expectation, long generation)
+    {
+        internal VisualDiagnosticExpectation Expectation { get; } = expectation;
+        internal long Generation { get; } = generation;
+        internal TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal void RegisterCancellation(AScanVisualDelivery owner, CancellationToken token)
+        {
+            if (!token.CanBeCanceled) { return; }
+            token.Register(() => owner.CancelDiagnosticWaiter(this, token));
+        }
     }
 }
+
+internal enum VisualDiagnosticWorkerState { Starting, Processing, WaitingForSignal, WaitingForTimer, Stopped }
+
+internal readonly record struct VisualDiagnosticExpectation(
+    VisualDiagnosticWorkerState WorkerState, bool HasPendingSnapshot);
