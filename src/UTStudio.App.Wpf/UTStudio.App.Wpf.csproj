@@ -21,6 +21,7 @@
     <ProjectReference Include="../UTStudio.Application/UTStudio.Application.csproj" />
     <ProjectReference Include="../UTStudio.Acquisition.Simulator/UTStudio.Acquisition.Simulator.csproj" />
     <ProjectReference Include="../UTStudio.Visualization.Core/UTStudio.Visualization.Core.csproj" />
+    <ProjectReference Include="../UTStudio.Visualization.Wpf/UTStudio.Visualization.Wpf.csproj" />
     <ProjectReference Include="../UTStudio.Presentation/UTStudio.Presentation.csproj" />
   </ItemGroup>
 </Project>

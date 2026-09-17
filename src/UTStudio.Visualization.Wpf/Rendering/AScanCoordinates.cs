@@ -1,6 +1,6 @@
 using UTStudio.Visualization.Core;
 
-namespace UTStudio.App.Wpf.Controls;
+namespace UTStudio.Visualization.Wpf.Rendering;
 
 internal readonly record struct PlotCoordinate(double X, double Y);
 

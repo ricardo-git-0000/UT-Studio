@@ -2,18 +2,19 @@ using System.Globalization;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
-using UTStudio.App.Wpf.Services;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Wpf.Rendering;
 
-namespace UTStudio.App.Wpf.Controls;
+namespace UTStudio.Visualization.Wpf.Controls;
 
-/// <summary>One drawing surface for an immutable reduced A-Scan; never a visual per sample.</summary>
+/// <summary>WPF drawing surface for an immutable, already projected A-Scan snapshot.</summary>
 public sealed class AScanControl : FrameworkElement
 {
     public static readonly DependencyProperty SnapshotProperty = DependencyProperty.Register(nameof(Snapshot),
         typeof(AScanSnapshot), typeof(AScanControl), new PropertyMetadata(null, SnapshotChanged));
     private readonly DispatcherTimer _timer;
-    private readonly RefreshGate _refresh;
+    private readonly TimeProvider _clock;
+    private long? _lastRefresh;
     private AScanSnapshot? _displayed;
     private bool _dirty;
     private static readonly Brush BackgroundBrush = FrozenBrush(0x0B, 0x12, 0x20);
@@ -27,7 +28,7 @@ public sealed class AScanControl : FrameworkElement
 
     internal AScanControl(TimeProvider clock)
     {
-        _refresh = new RefreshGate(clock, AScanVisualDelivery.MinimumPublicationInterval);
+        _clock = clock;
         ClipToBounds = true;
         _timer = new DispatcherTimer(DispatcherPriority.Render, Dispatcher) { Interval = TimeSpan.FromMilliseconds(16) };
         _timer.Tick += Refresh;
@@ -35,7 +36,14 @@ public sealed class AScanControl : FrameworkElement
         Unloaded += OnUnloaded;
     }
 
-    public AScanSnapshot? Snapshot { get => (AScanSnapshot?)GetValue(SnapshotProperty); set => SetValue(SnapshotProperty, value); }
+    public AScanSnapshot? Snapshot
+    {
+        get => (AScanSnapshot?)GetValue(SnapshotProperty);
+        set => SetValue(SnapshotProperty, value);
+    }
+
+    internal bool IsRefreshTimerEnabled => _timer.IsEnabled;
+    internal bool HasDisplayedSnapshot => _displayed is not null;
 
     private static void SnapshotChanged(DependencyObject sender, DependencyPropertyChangedEventArgs args)
     {
@@ -46,10 +54,7 @@ public sealed class AScanControl : FrameworkElement
 
     private void OnLoaded(object sender, RoutedEventArgs args) { _dirty = true; _timer.Start(); }
     private void OnUnloaded(object sender, RoutedEventArgs args) { _timer.Stop(); _displayed = null; }
-    private void Refresh(object? sender, EventArgs args)
-    {
-        RefreshSnapshot();
-    }
+    private void Refresh(object? sender, EventArgs args) => RefreshSnapshot();
 
     internal void RefreshSnapshot()
     {
@@ -66,7 +71,7 @@ public sealed class AScanControl : FrameworkElement
     {
         base.OnRender(drawing);
         // Measure from actual drawing, not timer admission: delayed WPF work cannot bunch new data.
-        if (_dirty && _refresh.TryEnter()) { _dirty = false; _displayed = Snapshot; }
+        if (_dirty && TryAdmitSnapshot()) { _dirty = false; _displayed = Snapshot; }
         drawing.DrawRectangle(BackgroundBrush, null, new Rect(RenderSize));
         double width = ActualWidth - 84, height = ActualHeight - 54;
         if (width <= 0 || height <= 0) { return; }
@@ -82,7 +87,11 @@ public sealed class AScanControl : FrameworkElement
         double maximum = _displayed?.MaximumTimeSeconds ?? 2047d / 50_000_000;
         Label(drawing, $"{minimum * 1e6:0.##} µs", new Point(plot.Left, plot.Bottom + 10));
         Label(drawing, $"{maximum * 1e6:0.##} µs", new Point(Math.Max(plot.Left, plot.Right - 64), plot.Bottom + 10));
-        if (_displayed is null) { Label(drawing, "Pulse Start para adquirir RF simulada", new Point(plot.Left + 16, plot.Top + 16)); return; }
+        if (_displayed is null)
+        {
+            Label(drawing, "Pulse Start para adquirir RF simulada", new Point(plot.Left + 16, plot.Top + 16));
+            return;
+        }
         var points = AScanCoordinates.Map(_displayed.Points, minimum, maximum, width, height);
         if (points.Length == 0) { return; }
         drawing.PushClip(new RectangleGeometry(plot));
@@ -103,6 +112,16 @@ public sealed class AScanControl : FrameworkElement
             drawing.DrawGeometry(null, CurvePen, geometry);
         }
         drawing.Pop();
+    }
+
+    private bool TryAdmitSnapshot()
+    {
+        long now = _clock.GetTimestamp();
+        if (_lastRefresh is { } last &&
+            _clock.GetElapsedTime(last, now) < AScanVisualDelivery.MinimumPublicationInterval)
+        { return false; }
+        _lastRefresh = now;
+        return true;
     }
 
     private void Label(DrawingContext drawing, string text, Point origin) => drawing.DrawText(

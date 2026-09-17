@@ -6,9 +6,9 @@ using System.Windows.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using UTStudio.App.Wpf;
 using UTStudio.App.Wpf.Composition;
-using UTStudio.App.Wpf.Controls;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Presentation;
+using UTStudio.Visualization.Wpf.Controls;
 
 namespace UTStudio.Tests.Wpf;
 

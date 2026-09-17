@@ -1,6 +1,6 @@
-using UTStudio.App.Wpf.Controls;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Wpf.Rendering;
 
 namespace UTStudio.Tests.Wpf;
 

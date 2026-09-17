@@ -1,7 +1,7 @@
 <Window x:Class="UTStudio.App.Wpf.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:controls="clr-namespace:UTStudio.App.Wpf.Controls"
+        xmlns:controls="clr-namespace:UTStudio.Visualization.Wpf.Controls;assembly=UTStudio.Visualization.Wpf"
         Title="UT-Studio · A-Scan simulado" Height="680" Width="1100" MinHeight="420" MinWidth="640"
         Background="#152235" Foreground="#E6EDF6">
     <Grid Margin="24">

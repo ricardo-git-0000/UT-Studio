@@ -9,5 +9,6 @@
     <PackageReference Include="MSTest" Version="4.0.2" />
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
     <ProjectReference Include="../../src/UTStudio.App.Wpf/UTStudio.App.Wpf.csproj" />
+    <ProjectReference Include="../../src/UTStudio.Visualization.Wpf/UTStudio.Visualization.Wpf.csproj" />
   </ItemGroup>
 </Project>
