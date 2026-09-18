@@ -2,6 +2,7 @@ using System.IO;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Input;
 using System.Windows.Threading;
 using System.Xml.Linq;
 using UTStudio.App.Wpf;
@@ -91,13 +92,131 @@ public sealed class VisualizationComponentTests
         }
     }
 
-    private static AScanSnapshot Snapshot()
+    [TestMethod]
+    public Task CursorHitTestingResizeDpiVisibilityAndDragAreDeterministic() => StaTest.Run(() =>
+    {
+        var snapshot = Snapshot();
+        var cursors = AScanCursorMeasurements.Create(snapshot);
+        var control = new AScanControl { Snapshot = snapshot, CursorState = cursors };
+        var host = new Window { Content = control, Width = 640, Height = 300, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
+        try
+        {
+            VisualTreeHelper.SetRootDpi(control, new DpiScale(1.5, 1.5));
+            host.Show();
+            host.UpdateLayout();
+            new RenderTargetBitmap((int)control.ActualWidth, (int)control.ActualHeight, 144, 144, PixelFormats.Pbgra32).Render(control);
+            double x = 64 + (control.ActualWidth - 84) * .25;
+            Assert.AreEqual(AScanCursorId.A, control.HitTestCursor(new Point(x + 7, 120)));
+            Assert.IsNull(control.HitTestCursor(new Point(x + 9, 120)));
+
+            AScanCursorMoveRequestedEventArgs? requested = null;
+            control.CursorMoveRequested += (_, args) => requested = args;
+            Assert.IsTrue(control.BeginCursorDrag(new Point(x, 120)));
+            Assert.IsTrue(control.IsMouseCaptured);
+            Assert.AreEqual(AScanCursorId.A, control.DraggingCursor);
+            control.ContinueCursorDrag(new Point(10_000, 120));
+            Assert.AreEqual(snapshot.MaximumTimeSeconds, requested!.TimeSeconds);
+            control.EndCursorDrag();
+            Assert.IsFalse(control.IsMouseCaptured);
+            Assert.IsNull(control.DraggingCursor);
+
+            control.CursorState = cursors with { IsVisible = false };
+            Assert.IsNull(control.HitTestCursor(new Point(x, 120)));
+            control.CursorState = null;
+            Assert.IsNull(control.DisplayedCursorSnapshotVersion);
+            control.CursorState = cursors;
+            host.Width = 840;
+            host.Height = 400;
+            host.UpdateLayout();
+            new RenderTargetBitmap((int)control.ActualWidth, (int)control.ActualHeight, 144, 144, PixelFormats.Pbgra32).Render(control);
+            double resizedX = 64 + (control.ActualWidth - 84) * .25;
+            Assert.AreEqual(AScanCursorId.A, control.HitTestCursor(new Point(resizedX, 120)));
+        }
+        finally { host.Close(); }
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task LostMouseCaptureCancelsDragWithoutFurtherUpdates() => StaTest.Run(() =>
+    {
+        var snapshot = Snapshot();
+        var control = new AScanControl { Snapshot = snapshot, CursorState = AScanCursorMeasurements.Create(snapshot) };
+        var host = new Window { Content = control, Width = 640, Height = 300, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
+        try
+        {
+            host.Show();
+            host.UpdateLayout();
+            int requests = 0;
+            control.CursorMoveRequested += (_, _) => requests++;
+            double x = 64 + (control.ActualWidth - 84) * .25;
+            Assert.IsTrue(control.BeginCursorDrag(new Point(x, 120)));
+            Assert.IsTrue(control.IsMouseCaptured);
+            Mouse.Capture(null);
+            Assert.IsNull(control.DraggingCursor);
+            Assert.IsFalse(control.IsMouseCaptured);
+            int before = requests;
+            control.ContinueCursorDrag(new Point(200, 120));
+            Assert.AreEqual(before, requests);
+        }
+        finally { host.Close(); }
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task NarrowResizeAndUnloadDuringDragRemainSafe() => StaTest.Run(async () =>
+    {
+        var snapshot = Snapshot();
+        var control = new AScanControl { Snapshot = snapshot, CursorState = AScanCursorMeasurements.Create(snapshot) };
+        var host = new Window { Content = control, Width = 120, Height = 180, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
+        try
+        {
+            host.Show();
+            host.UpdateLayout();
+            var narrow = new RenderTargetBitmap((int)control.ActualWidth, (int)control.ActualHeight, 96, 96, PixelFormats.Pbgra32);
+            narrow.Render(control);
+            double x = 64 + (control.ActualWidth - 84) * .25;
+            Assert.IsTrue(control.BeginCursorDrag(new Point(x, 80)));
+            Assert.IsTrue(control.IsMouseCaptured);
+            host.Content = null;
+            host.UpdateLayout();
+            await Dispatcher.Yield(DispatcherPriority.Loaded);
+            Assert.IsNull(control.DraggingCursor);
+            Assert.IsFalse(control.IsMouseCaptured);
+        }
+        finally { host.Close(); }
+    });
+
+    [TestMethod]
+    public Task CursorMeasurementsArePairedWithDisplayedSnapshotVersion() => StaTest.Run(async () =>
+    {
+        var clock = new ManualClock();
+        var first = Snapshot(version: 1);
+        var control = new AScanControl(clock) { Snapshot = first, CursorState = AScanCursorMeasurements.Create(first) };
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+        control.Measure(new Size(640, 300));
+        control.Arrange(new Rect(0, 0, 640, 300));
+        new RenderTargetBitmap(640, 300, 96, 96, PixelFormats.Pbgra32).Render(control);
+        Assert.AreEqual(1UL, control.DisplayedCursorSnapshotVersion);
+
+        var second = Snapshot(version: 2);
+        control.CursorState = AScanCursorMeasurements.Create(second);
+        Assert.AreEqual(1UL, control.DisplayedCursorSnapshotVersion);
+        control.Snapshot = second;
+        clock.Advance(AScanVisualDelivery.MinimumPublicationInterval);
+        control.RefreshSnapshot();
+        await Dispatcher.Yield(DispatcherPriority.Render);
+        new RenderTargetBitmap(640, 300, 96, 96, PixelFormats.Pbgra32).Render(control);
+        Assert.AreEqual(2UL, control.DisplayedCursorSnapshotVersion);
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent));
+    });
+
+    private static AScanSnapshot Snapshot(ulong version = 0)
     {
         var configuration = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), 4, 50_000_000);
         var metadata = new ConventionalUtFrameMetadata(new UtSourceId("standalone"),
             new AcquisitionRunId(Guid.NewGuid()), configuration, DateTimeOffset.UnixEpoch);
         short[] samples = [short.MinValue, 0, short.MaxValue, 0];
-        return new AScanProjector(4).Project(metadata, 1, TimeSpan.Zero, samples);
+        return new AScanProjector(4).Project(metadata, 1, TimeSpan.Zero, samples, version);
     }
 
     private static string[] ProjectReferences(string path) => XDocument.Load(path)

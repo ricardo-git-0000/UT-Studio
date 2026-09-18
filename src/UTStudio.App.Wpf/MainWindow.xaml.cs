@@ -4,6 +4,7 @@ using System.Windows.Threading;
 using Microsoft.Extensions.Logging;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Presentation;
+using UTStudio.Visualization.Wpf.Controls;
 
 namespace UTStudio.App.Wpf;
 
@@ -49,6 +50,16 @@ public partial class MainWindow : Window
             }
         }
         catch (Exception error) { _logger.LogError(error, "Status update failed"); ShutdownText.Text = error.Message; }
+    }
+
+    private void OnCursorActivated(object sender, AScanCursorActivatedEventArgs args)
+    {
+        if (DataContext is AScanViewModel viewModel) { viewModel.ActivateCursor(args.Cursor); }
+    }
+
+    private void OnCursorMoveRequested(object sender, AScanCursorMoveRequestedEventArgs args)
+    {
+        if (DataContext is AScanViewModel viewModel) { viewModel.MoveCursor(args.Cursor, args.TimeSeconds); }
     }
 
     // WPF requires a void Closing event. Every asynchronous failure is caught and logged.

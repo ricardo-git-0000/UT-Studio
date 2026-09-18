@@ -25,6 +25,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
     private readonly UiAsyncCommand _start, _stop;
+    private readonly RelayCommand _toggleCursors, _resetCursors;
     private IDisposable? _sessionSubscription, _visualSubscription, _statusSubscription;
     private SessionSnapshot _latestSession;
     private AScanSnapshot? _latestVisual;
@@ -56,6 +57,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             ReportCommandError, RefreshCommands);
         _stop = new(_lifetime, StopAsync, () => (_state.Session.CanStop || _start.IsRunning) && !_stop!.IsRunning,
             ReportCommandError, RefreshCommands);
+        _toggleCursors = new(ToggleCursors, () => _state.Cursors is not null);
+        _resetCursors = new(ResetCursors, () => _state.AScan is not null && _state.Cursors is not null);
         _start.Initialize();
         _stop.Initialize();
         try { _sessionSubscription = session.Subscribe(new Observer<SessionSnapshot>(ReceiveSession, ReceiveError)); }
@@ -76,10 +79,37 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public long ReleasedFrames => _state.Session.ReleasedFrames;
     public UtSourceError? Error => _state.CommandError ?? _state.FeedError ?? _state.Session.PrimaryError;
     public AScanDeliveryStatus? VisualStatus => _state.VisualStatus;
+    public AScanCursorState? Cursors => _state.Cursors;
     public UtSourceError? VisualError => _state.VisualStatus?.TerminalError ?? _state.Session.VisualError ?? _state.VisualStatistics?.LastError;
     public UtSourceError? NotificationError => _notificationError;
     public IAsyncRelayCommand StartCommand => _start;
     public IAsyncRelayCommand StopCommand => _stop;
+    public IRelayCommand ToggleCursorsCommand => _toggleCursors;
+    public IRelayCommand ResetCursorsCommand => _resetCursors;
+
+    public void ActivateCursor(AScanCursorId cursor)
+    {
+        if (_lifetime.IsClosed || _state.Cursors is not { } cursors) { return; }
+        ReplaceState(_state with { Cursors = cursors with { ActiveCursor = cursor } });
+    }
+
+    public void MoveCursor(AScanCursorId cursor, double timeSeconds)
+    {
+        if (_lifetime.IsClosed || _state is not { AScan: { } snapshot, Cursors: { } cursors }) { return; }
+        ReplaceState(_state with { Cursors = AScanCursorMeasurements.Move(cursors, snapshot, cursor, timeSeconds) });
+    }
+
+    private void ToggleCursors()
+    {
+        if (_lifetime.IsClosed || _state.Cursors is not { } cursors) { return; }
+        ReplaceState(_state with { Cursors = cursors with { IsVisible = !cursors.IsVisible } });
+    }
+
+    private void ResetCursors()
+    {
+        if (_lifetime.IsClosed || _state is not { AScan: { } snapshot, Cursors: { } cursors }) { return; }
+        ReplaceState(_state with { Cursors = AScanCursorMeasurements.Reset(cursors, snapshot) });
+    }
 
     private async Task StartAsync(CancellationToken token)
     {
@@ -195,7 +225,10 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         if (session.Phase == SessionPhase.Running && visual is not null && visual.Metadata.RunId == session.RunId &&
             visual.Metadata.SourceId == session.SourceId) { current = visual; }
         if (status?.TerminalError is not null) { current = null; }
-        ReplaceState(new(session, current, statistics, _state.CommandError, error, status));
+        AScanCursorState? cursors = current is null ? null : _state.Cursors is null || _state.AScan?.Metadata.RunId != current.Metadata.RunId
+            ? AScanCursorMeasurements.Create(current)
+            : AScanCursorMeasurements.Reconcile(_state.Cursors, current);
+        ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors));
         RefreshCommands();
     }
 
@@ -204,7 +237,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         if (_lifetime.IsClosed || state == _state) { return; }
         _state = state;
         foreach (string name in new[] { nameof(State), nameof(Session), nameof(AScan), nameof(Points), nameof(Metadata),
-            nameof(VisualStatistics), nameof(VisualStatus), nameof(ReceivedFrames), nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
+            nameof(VisualStatistics), nameof(VisualStatus), nameof(Cursors), nameof(ReceivedFrames), nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
         {
             OnPropertyChanged(name);
         }
@@ -215,6 +248,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         if (_lifetime.IsClosed) { return; }
         _start.Refresh();
         _stop.Refresh();
+        _toggleCursors.NotifyCanExecuteChanged();
+        _resetCursors.NotifyCanExecuteChanged();
     }
 
     private void ReportCommandError(Exception error)

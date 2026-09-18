@@ -40,6 +40,14 @@ public sealed class RenderTests
             window.Measure(new Size(1100, 680));
             window.Arrange(new Rect(0, 0, 1100, 680));
             window.UpdateLayout();
+            Assert.IsNotNull(vm.Cursors);
+            double cursorAX = 64 + Math.Max(0, control.ActualWidth - 84) *
+                (vm.Cursors.A.TimeSeconds - vm.AScan.MinimumTimeSeconds) /
+                (vm.AScan.MaximumTimeSeconds - vm.AScan.MinimumTimeSeconds);
+            Assert.IsTrue(control.BeginCursorDrag(new Point(cursorAX, 120)));
+            control.ContinueCursorDrag(new Point(control.ActualWidth + 100, 120));
+            control.EndCursorDrag();
+            Assert.AreEqual(vm.AScan.MaximumTimeSeconds, vm.Cursors.A.TimeSeconds);
             clock.Advance(TimeSpan.FromMilliseconds(200));
             window.UpdateStatus(null, EventArgs.Empty);
             window.UpdateLayout();

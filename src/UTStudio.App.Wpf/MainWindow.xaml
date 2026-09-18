@@ -18,7 +18,9 @@
                 <TextBlock Text="A-Scan convencional · RF bipolar · 2.048 muestras · 50 MHz" Foreground="#AEBFD4" Margin="0,4,0,0" />
             </StackPanel>
             <StackPanel x:Name="Interactions" Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Content="Start" Command="{Binding StartCommand}" MinWidth="90" Padding="16,8" Margin="16,0,8,0" />
+                <Button Content="Cursores" Command="{Binding ToggleCursorsCommand}" MinWidth="90" Padding="16,8" Margin="16,0,8,0" />
+                <Button Content="Restablecer" Command="{Binding ResetCursorsCommand}" MinWidth="100" Padding="16,8" Margin="0,0,8,0" />
+                <Button Content="Start" Command="{Binding StartCommand}" MinWidth="90" Padding="16,8" Margin="0,0,8,0" />
                 <Button Content="Stop" Command="{Binding StopCommand}" MinWidth="90" Padding="16,8" />
             </StackPanel>
         </DockPanel>
@@ -30,8 +32,24 @@
             <TextBlock Text="   Canal: " Margin="20,0,0,0" />
             <TextBlock Text="{Binding Metadata.Configuration.PhysicalChannelId.Value, TargetNullValue=—}" />
         </StackPanel>
-        <controls:AScanControl x:Name="Scan" Grid.Row="2" Snapshot="{Binding AScan}" />
+        <controls:AScanControl x:Name="Scan" Grid.Row="2" Snapshot="{Binding AScan}" CursorState="{Binding Cursors}"
+                               CursorActivated="OnCursorActivated" CursorMoveRequested="OnCursorMoveRequested" />
         <StackPanel Grid.Row="3" Margin="0,12,0,0">
+            <TextBlock Text="Medida manual aproximada sobre los puntos visuales reducidos; no representa precisión de muestra original." Foreground="#AEBFD4" />
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="A: " FontWeight="SemiBold" />
+                <TextBlock Text="{Binding Cursors.A.TimeMicroseconds, StringFormat={}{0:0.###} µs, TargetNullValue=—}" />
+                <TextBlock Text=" / " />
+                <TextBlock Text="{Binding Cursors.A.AmplitudePercent, StringFormat={}{0:+0.##;-0.##;0} %, TargetNullValue=—}" />
+                <TextBlock Text="   B: " FontWeight="SemiBold" Margin="20,0,0,0" />
+                <TextBlock Text="{Binding Cursors.B.TimeMicroseconds, StringFormat={}{0:0.###} µs, TargetNullValue=—}" />
+                <TextBlock Text=" / " />
+                <TextBlock Text="{Binding Cursors.B.AmplitudePercent, StringFormat={}{0:+0.##;-0.##;0} %, TargetNullValue=—}" />
+                <TextBlock Text="   Δt: " FontWeight="SemiBold" Margin="20,0,0,0" />
+                <TextBlock Text="{Binding Cursors.DeltaTimeMicroseconds, StringFormat={}{0:+0.###;-0.###;0} µs, TargetNullValue=—}" />
+                <TextBlock Text="   ΔRF: " FontWeight="SemiBold" Margin="20,0,0,0" />
+                <TextBlock Text="{Binding Cursors.DeltaAmplitudePercent, StringFormat={}{0:+0.##;-0.##;0} %, TargetNullValue=—}" />
+            </StackPanel>
             <TextBlock x:Name="MetricsText" Text="Visual · recibidos: 0 · publicados: 0 · sustituidos: 0" />
             <TextBlock Text="{Binding Error.Message}" Foreground="#FFB4AB" TextWrapping="Wrap" />
             <TextBlock x:Name="VisualErrorText" Text="{Binding VisualError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" />

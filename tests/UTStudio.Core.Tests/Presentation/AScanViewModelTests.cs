@@ -392,6 +392,43 @@ public sealed class AScanViewModelTests
         finally { ui.FailDispatch = false; await ui.DriveAsync(vm.DisposeAsync().AsTask()); }
     }
 
+    [TestMethod]
+    public async Task PresentationOwnsCursorStateReconcilesSnapshotsAndStopsAfterDispose()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var vm = new AScanViewModel(session, feed, ui, Configuration);
+        var run = NewRun();
+        session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+        feed.Emit(Visual(run, 1));
+        await ui.DriveUntilAsync(() => vm.Cursors is not null);
+        vm.MoveCursor(AScanCursorId.A, vm.AScan!.MinimumTimeSeconds);
+        vm.ActivateCursor(AScanCursorId.B);
+        double movedTime = vm.Cursors!.A.TimeSeconds;
+        Assert.AreEqual(AScanCursorId.B, vm.Cursors.ActiveCursor);
+        Assert.IsTrue(vm.ToggleCursorsCommand.CanExecute(null));
+        vm.ToggleCursorsCommand.Execute(null);
+        Assert.IsFalse(vm.Cursors.IsVisible);
+        vm.ResetCursorsCommand.Execute(null);
+        Assert.IsFalse(vm.Cursors.IsVisible);
+        Assert.AreNotEqual(movedTime, vm.Cursors.A.TimeSeconds);
+        double resetTime = vm.Cursors.A.TimeSeconds;
+
+        feed.Emit(Visual(run, 2, sequence: 2));
+        await ui.DriveUntilAsync(() => vm.AScan?.Version == 2);
+        Assert.AreEqual(resetTime, vm.Cursors!.A.TimeSeconds);
+        double stable = vm.Cursors.A.TimeSeconds;
+        await ui.DriveAsync(vm.DisposeAsync().AsTask());
+        var disposedState = vm.State;
+        vm.MoveCursor(AScanCursorId.A, vm.AScan!.MaximumTimeSeconds);
+        vm.ActivateCursor(AScanCursorId.A);
+        vm.ToggleCursorsCommand.Execute(null);
+        vm.ResetCursorsCommand.Execute(null);
+        Assert.AreSame(disposedState, vm.State);
+        Assert.AreEqual(stable, vm.Cursors!.A.TimeSeconds);
+    }
+
     private static ConcurrentQueue<bool> Trace(AScanViewModel vm, ManualUiDispatcher ui)
     {
         var access = new ConcurrentQueue<bool>();
