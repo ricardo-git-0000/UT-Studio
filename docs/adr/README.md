@@ -12,5 +12,6 @@ Aceptado identifica decisiones aprobadas, sin autorizar paquetes ni implementaci
 - [0007-frame-source-ownership](0007-frame-source-ownership.md): Contrato RF y ownership exclusivo de muestras short.
 - [0008-latest-only-visual-delivery](0008-latest-only-visual-delivery.md): Mailbox latest-only, snapshot independiente y cadencias.
 - [0009-reusable-scan-visualization-controls](0009-reusable-scan-visualization-controls.md): Renderizadores de scan específicos y reutilizables por plataforma.
+- [0010-ascan-manual-cursor-measurements](0010-ascan-manual-cursor-measurements.md): Ejes físicos y cursores manuales aproximados sobre puntos visuales A-Scan.
 
 Renderizadores de otros scans, paquetes adicionales y benchmarks pendientes; véanse [plan](../plans/2026-09-09-first-vertical-increment.md) y [cuestiones](../requirements/open-questions.md).
