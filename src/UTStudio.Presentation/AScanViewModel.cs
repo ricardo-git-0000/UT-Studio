@@ -116,7 +116,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         await _lifetime.InvokeAsync(() => ReplaceState(_state with { CommandError = null })).ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
         try { await _session.StartAsync(_configuration, _newRun(), token).ConfigureAwait(false); }
-        finally { ReceiveSession(_session.Snapshot); }
+        finally { await SynchronizeSessionAsync().ConfigureAwait(false); }
     }
 
     private async Task StopAsync(CancellationToken token)
@@ -126,9 +126,17 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         try { await _session.StopAsync(token).ConfigureAwait(false); }
         finally
         {
-            ReceiveSession(_session.Snapshot);
             await startCancellation.ConfigureAwait(false);
+            await SynchronizeSessionAsync().ConfigureAwait(false);
         }
+    }
+
+    // Command completion is a presentation barrier: the authoritative session snapshot must be applied
+    // on UI before UiAsyncCommand clears IsRunning and refreshes CanExecute.
+    private async Task SynchronizeSessionAsync()
+    {
+        ReceiveSession(_session.Snapshot);
+        await _lifetime.InvokeAsync(ApplyLatest).ConfigureAwait(false);
     }
 
     private void ReceiveSession(SessionSnapshot snapshot)
@@ -228,19 +236,20 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         AScanCursorState? cursors = current is null ? null : _state.Cursors is null || _state.AScan?.Metadata.RunId != current.Metadata.RunId
             ? AScanCursorMeasurements.Create(current)
             : AScanCursorMeasurements.Reconcile(_state.Cursors, current);
-        ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors));
-        RefreshCommands();
+        if (ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors)))
+        { RefreshCommands(); }
     }
 
-    private void ReplaceState(AScanViewState state)
+    private bool ReplaceState(AScanViewState state)
     {
-        if (_lifetime.IsClosed || state == _state) { return; }
+        if (_lifetime.IsClosed || state == _state) { return false; }
         _state = state;
         foreach (string name in new[] { nameof(State), nameof(Session), nameof(AScan), nameof(Points), nameof(Metadata),
             nameof(VisualStatistics), nameof(VisualStatus), nameof(Cursors), nameof(ReceivedFrames), nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
         {
             OnPropertyChanged(name);
         }
+        return true;
     }
 
     private void RefreshCommands()

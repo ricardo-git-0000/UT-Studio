@@ -11,7 +11,7 @@ internal sealed class ManualUiDispatcher : IUiDispatcher
     [ThreadStatic] private static ManualUiDispatcher? _executing;
     private readonly ConcurrentQueue<(Action Action, CancellationToken Token, TaskCompletionSource Done)> _queue = new();
     private readonly object _executionGate = new();
-    internal int Pending => _queue.Count;
+    internal int Pending { get { lock (_executionGate) { return _queue.Count; } } }
     internal bool FailDispatch { get; set; }
     public bool CheckAccess() => ReferenceEquals(_executing, this);
     public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
@@ -19,7 +19,7 @@ internal sealed class ManualUiDispatcher : IUiDispatcher
         if (FailDispatch) { return Task.FromException(new InvalidOperationException("UI unavailable")); }
         if (CheckAccess()) { cancellationToken.ThrowIfCancellationRequested(); action(); return Task.CompletedTask; }
         var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        _queue.Enqueue((action, cancellationToken, done));
+        lock (_executionGate) { _queue.Enqueue((action, cancellationToken, done)); }
         return done.Task;
     }
 
@@ -28,14 +28,32 @@ internal sealed class ManualUiDispatcher : IUiDispatcher
         lock (_executionGate)
         {
             if (!_queue.TryDequeue(out var item)) { return false; }
-            var previous = _executing;
-            _executing = this;
-            try { item.Token.ThrowIfCancellationRequested(); item.Action(); item.Done.TrySetResult(); }
-            catch (OperationCanceledException) { item.Done.TrySetCanceled(); }
-            catch (Exception error) { item.Done.TrySetException(error); }
-            finally { _executing = previous; }
+            Execute(item);
             return true;
         }
+    }
+
+    internal bool RunLast()
+    {
+        lock (_executionGate)
+        {
+            var pending = new List<(Action Action, CancellationToken Token, TaskCompletionSource Done)>();
+            while (_queue.TryDequeue(out var item)) { pending.Add(item); }
+            if (pending.Count == 0) { return false; }
+            for (int index = 0; index < pending.Count - 1; index++) { _queue.Enqueue(pending[index]); }
+            Execute(pending[^1]);
+            return true;
+        }
+    }
+
+    private void Execute((Action Action, CancellationToken Token, TaskCompletionSource Done) item)
+    {
+        var previous = _executing;
+        _executing = this;
+        try { item.Token.ThrowIfCancellationRequested(); item.Action(); item.Done.TrySetResult(); }
+        catch (OperationCanceledException) { item.Done.TrySetCanceled(); }
+        catch (Exception error) { item.Done.TrySetException(error); }
+        finally { _executing = previous; }
     }
 
     internal async Task DriveAsync(Task completion)

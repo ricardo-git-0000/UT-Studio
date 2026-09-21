@@ -163,6 +163,96 @@ public sealed class AScanViewModelTests
     }
 
     [TestMethod]
+    public async Task StopCompletionWaitsForPendingSessionSnapshotBeforeRefreshingStart()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var run = NewRun();
+        var idlePublished = Signal();
+        var releaseStop = Signal();
+        var vm = new AScanViewModel(session, new ManualObservable<AScanSnapshot>(), ui, Configuration);
+        try
+        {
+            await ui.DriveUntilAsync(() => ui.Pending == 0);
+            session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+            await ui.DriveUntilAsync(() => vm.Session.Phase == SessionPhase.Running);
+            session.StopAction = async _ =>
+            {
+                session.Set(ManualApplicationSession.Create(2, SessionPhase.Idle, run, canStart: true));
+                idlePublished.TrySetResult();
+                await releaseStop.Task;
+            };
+
+            Task stop = vm.StopCommand.ExecuteAsync(null);
+            int commandEvents = 0;
+            vm.StartCommand.CanExecuteChanged += (_, _) => commandEvents++;
+            vm.StopCommand.CanExecuteChanged += (_, _) => commandEvents++;
+            await ui.DriveAsync(idlePublished.Task);
+            Assert.AreEqual(SessionPhase.Running, vm.Session.Phase);
+            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 1);
+            releaseStop.TrySetResult();
+            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 2);
+
+            // Execute the newest UI item before the older coalesced pump. The command-level barrier
+            // must apply Idle here; without it this item is command finalization over stale Running.
+            Assert.IsTrue(ui.RunLast());
+            Assert.AreEqual(SessionPhase.Idle, vm.Session.Phase);
+            Assert.IsFalse(stop.IsCompleted);
+            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 2);
+            Assert.IsTrue(ui.RunLast());
+            await stop;
+            Assert.IsTrue(vm.StartCommand.CanExecute(null));
+            Assert.IsFalse(vm.StopCommand.CanExecute(null));
+            int afterCompletion = commandEvents;
+            Assert.IsTrue(ui.RunNext()); // Previously scheduled coalesced pump.
+            Assert.AreEqual(afterCompletion, commandEvents);
+        }
+        finally
+        {
+            releaseStop.TrySetResult();
+            await ui.DriveAsync(vm.DisposeAsync().AsTask());
+        }
+    }
+
+    [TestMethod]
+    public async Task StartCompletionWaitsForPendingSessionSnapshotBeforeRefreshingStop()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var run = NewRun();
+        var runningPublished = Signal();
+        var releaseStart = Signal();
+        session.StartAction = async _ =>
+        {
+            session.Set(ManualApplicationSession.Create(2, SessionPhase.Running, run, canStop: true));
+            runningPublished.TrySetResult();
+            await releaseStart.Task;
+        };
+        var vm = new AScanViewModel(session, new ManualObservable<AScanSnapshot>(), ui, Configuration, () => run);
+        try
+        {
+            Task start = vm.StartCommand.ExecuteAsync(null);
+            await ui.DriveAsync(runningPublished.Task);
+            Assert.AreEqual(SessionPhase.Idle, vm.Session.Phase);
+            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 1);
+            releaseStart.TrySetResult();
+            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 2);
+
+            Assert.IsTrue(ui.RunLast());
+            Assert.AreEqual(SessionPhase.Running, vm.Session.Phase);
+            Assert.IsFalse(start.IsCompleted);
+            await ui.DriveAsync(start);
+            Assert.IsFalse(vm.StartCommand.CanExecute(null));
+            Assert.IsTrue(vm.StopCommand.CanExecute(null));
+        }
+        finally
+        {
+            releaseStart.TrySetResult();
+            await ui.DriveAsync(vm.DisposeAsync().AsTask());
+        }
+    }
+
+    [TestMethod]
     public async Task StopCanCancelPendingStartWithoutWaitingForItsCompletionFirst()
     {
         var ui = new ManualUiDispatcher();
