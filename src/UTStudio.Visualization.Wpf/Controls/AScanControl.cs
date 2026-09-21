@@ -16,6 +16,9 @@ public sealed class AScanControl : FrameworkElement
     public static readonly DependencyProperty CursorStateProperty = DependencyProperty.Register(nameof(CursorState),
         typeof(AScanCursorState), typeof(AScanControl),
         new FrameworkPropertyMetadata(null, CursorStateChanged));
+    public static readonly DependencyProperty TimeViewportProperty = DependencyProperty.Register(nameof(TimeViewport),
+        typeof(ScanTimeViewport), typeof(AScanControl),
+        new FrameworkPropertyMetadata(null, TimeViewportChanged));
     private readonly DispatcherTimer _timer;
     private readonly TimeProvider _clock;
     private long? _lastRefresh;
@@ -23,6 +26,8 @@ public sealed class AScanControl : FrameworkElement
     private AScanCursorState? _displayedCursors;
     private bool _dirty;
     private AScanCursorId? _draggingCursor;
+    private bool _panning;
+    private double _lastPanX;
     private static readonly Brush BackgroundBrush = FrozenBrush(0x0B, 0x12, 0x20);
     private static readonly Brush CurveBrush = FrozenBrush(0x41, 0xDD, 0xBA);
     private static readonly Brush LabelBrush = FrozenBrush(0xB8, 0xC7, 0xDA);
@@ -44,8 +49,11 @@ public sealed class AScanControl : FrameworkElement
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
         MouseLeftButtonDown += OnMouseLeftButtonDown;
+        MouseDown += OnMouseDown;
         MouseMove += OnMouseMove;
         MouseLeftButtonUp += OnMouseLeftButtonUp;
+        MouseUp += OnMouseUp;
+        MouseWheel += OnMouseWheel;
         LostMouseCapture += OnLostMouseCapture;
     }
 
@@ -61,8 +69,16 @@ public sealed class AScanControl : FrameworkElement
         set => SetValue(CursorStateProperty, value);
     }
 
+    public ScanTimeViewport? TimeViewport
+    {
+        get => (ScanTimeViewport?)GetValue(TimeViewportProperty);
+        set => SetValue(TimeViewportProperty, value);
+    }
+
     public event EventHandler<AScanCursorMoveRequestedEventArgs>? CursorMoveRequested;
     public event EventHandler<AScanCursorActivatedEventArgs>? CursorActivated;
+    public event EventHandler<ScanTimeZoomRequestedEventArgs>? TimeZoomRequested;
+    public event EventHandler<ScanTimePanRequestedEventArgs>? TimePanRequested;
 
     internal bool IsRefreshTimerEnabled => _timer.IsEnabled;
     internal bool HasDisplayedSnapshot => _displayed is not null;
@@ -86,9 +102,12 @@ public sealed class AScanControl : FrameworkElement
         { control._displayedCursors = state; control.InvalidateVisual(); }
     }
 
+    private static void TimeViewportChanged(DependencyObject sender, DependencyPropertyChangedEventArgs args) =>
+        ((AScanControl)sender).InvalidateVisual();
+
     private void OnLoaded(object sender, RoutedEventArgs args) { _dirty = true; _timer.Start(); }
     private void OnUnloaded(object sender, RoutedEventArgs args)
-    { EndCursorDrag(); _timer.Stop(); _displayed = null; _displayedCursors = null; }
+    { EndInteraction(); _timer.Stop(); _displayed = null; _displayedCursors = null; }
     private void Refresh(object? sender, EventArgs args) => RefreshSnapshot();
 
     internal void RefreshSnapshot()
@@ -123,8 +142,7 @@ public sealed class AScanControl : FrameworkElement
             Label(drawing, $"{100 - 50 * i:+0;-0;0} %", new Point(5, y - 8));
         }
         drawing.DrawRectangle(null, AxisPen, plot);
-        double minimum = _displayed?.MinimumTimeSeconds ?? 0;
-        double maximum = _displayed?.MaximumTimeSeconds ?? 2047d / 50_000_000;
+        (double minimum, double maximum) = VisibleRange();
         for (int i = 0; i <= 4; i++)
         {
             double x = plot.Left + width * i / 4;
@@ -171,6 +189,7 @@ public sealed class AScanControl : FrameworkElement
 
         void DrawCursor(AScanCursorId id, AScanCursorMeasurement measurement, Pen pen)
         {
+            if (measurement.TimeSeconds < minimum || measurement.TimeSeconds > maximum) { return; }
             double x = plot.Left + (measurement.TimeSeconds - minimum) / (maximum - minimum) * plot.Width;
             drawing.DrawLine(pen, new Point(x, plot.Top), new Point(x, plot.Bottom));
             string active = cursors.ActiveCursor == id ? "*" : string.Empty;
@@ -182,13 +201,43 @@ public sealed class AScanControl : FrameworkElement
 
     private void OnMouseLeftButtonDown(object sender, MouseButtonEventArgs args)
     {
+        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
+        { if (BeginPan(args.GetPosition(this))) { args.Handled = true; } return; }
         if (BeginCursorDrag(args.GetPosition(this))) { args.Handled = true; }
+    }
+
+    private void OnMouseDown(object sender, MouseButtonEventArgs args)
+    {
+        if (args.ChangedButton == MouseButton.Middle && BeginPan(args.GetPosition(this))) { args.Handled = true; }
     }
 
     private void OnMouseMove(object sender, MouseEventArgs args)
     {
+        if (_panning)
+        { ContinuePan(args.GetPosition(this)); args.Handled = true; return; }
         if (_draggingCursor is not null && args.LeftButton == MouseButtonState.Pressed)
         { ContinueCursorDrag(args.GetPosition(this)); args.Handled = true; }
+    }
+
+    private void OnMouseUp(object sender, MouseButtonEventArgs args)
+    {
+        if (_panning && (args.ChangedButton == MouseButton.Middle || args.ChangedButton == MouseButton.Left))
+        { ContinuePan(args.GetPosition(this)); EndInteraction(); args.Handled = true; }
+    }
+
+    private void OnMouseWheel(object sender, MouseWheelEventArgs args)
+    {
+        if (RequestTimeZoom(args.GetPosition(this), args.Delta)) { args.Handled = true; }
+    }
+
+    internal bool RequestTimeZoom(Point position, int wheelDelta)
+    {
+        Rect plot = PlotBounds();
+        if (!plot.Contains(position) || plot.Width <= 0 || wheelDelta == 0) { return false; }
+        (double minimum, double maximum) = VisibleRange();
+        double anchor = minimum + Math.Clamp((position.X - plot.Left) / plot.Width, 0, 1) * (maximum - minimum);
+        TimeZoomRequested?.Invoke(this, new(anchor, Math.Pow(1.2, wheelDelta / 120d)));
+        return true;
     }
 
     private void OnMouseLeftButtonUp(object sender, MouseButtonEventArgs args)
@@ -196,7 +245,8 @@ public sealed class AScanControl : FrameworkElement
         if (_draggingCursor is not null) { ContinueCursorDrag(args.GetPosition(this)); EndCursorDrag(); args.Handled = true; }
     }
 
-    private void OnLostMouseCapture(object sender, MouseEventArgs args) => _draggingCursor = null;
+    private void OnLostMouseCapture(object sender, MouseEventArgs args)
+    { _draggingCursor = null; _panning = false; }
 
     internal bool BeginCursorDrag(Point position)
     {
@@ -215,13 +265,39 @@ public sealed class AScanControl : FrameworkElement
         Rect plot = PlotBounds();
         if (plot.Width <= 0) { return; }
         double ratio = Math.Clamp((position.X - plot.Left) / plot.Width, 0, 1);
-        double time = _displayed.MinimumTimeSeconds + ratio * (_displayed.MaximumTimeSeconds - _displayed.MinimumTimeSeconds);
+        (double minimum, double maximum) = VisibleRange();
+        double time = minimum + ratio * (maximum - minimum);
         CursorMoveRequested?.Invoke(this, new(cursor, time));
     }
 
     internal void EndCursorDrag()
     {
         _draggingCursor = null;
+        if (IsMouseCaptured) { ReleaseMouseCapture(); }
+    }
+
+    internal bool BeginPan(Point position)
+    {
+        if (!PlotBounds().Contains(position) || TimeViewport is null || !CaptureMouse()) { return false; }
+        _panning = true;
+        _lastPanX = position.X;
+        return true;
+    }
+
+    internal void ContinuePan(Point position)
+    {
+        if (!_panning || TimeViewport is not { } viewport) { return; }
+        Rect plot = PlotBounds();
+        if (plot.Width <= 0) { return; }
+        double delta = -((position.X - _lastPanX) / plot.Width) * viewport.VisibleSpanSeconds;
+        _lastPanX = position.X;
+        TimePanRequested?.Invoke(this, new(delta));
+    }
+
+    internal void EndInteraction()
+    {
+        _draggingCursor = null;
+        _panning = false;
         if (IsMouseCaptured) { ReleaseMouseCapture(); }
     }
 
@@ -233,17 +309,24 @@ public sealed class AScanControl : FrameworkElement
         if (_displayed is null || _displayedCursors is not { IsVisible: true } cursors) { return null; }
         Rect plot = PlotBounds();
         if (!plot.Contains(position) || plot.Width <= 0) { return null; }
-        double range = _displayed.MaximumTimeSeconds - _displayed.MinimumTimeSeconds;
+        (double minimum, double maximum) = VisibleRange();
+        double range = maximum - minimum;
         if (range <= 0) { return null; }
-        double ax = plot.Left + (cursors.A.TimeSeconds - _displayed.MinimumTimeSeconds) / range * plot.Width;
-        double bx = plot.Left + (cursors.B.TimeSeconds - _displayed.MinimumTimeSeconds) / range * plot.Width;
-        double ad = Math.Abs(position.X - ax), bd = Math.Abs(position.X - bx);
+        double ad = Distance(cursors.A.TimeSeconds), bd = Distance(cursors.B.TimeSeconds);
         if (ad > CursorHitToleranceDip && bd > CursorHitToleranceDip) { return null; }
         if (ad == bd) { return cursors.ActiveCursor; }
         return ad < bd ? AScanCursorId.A : AScanCursorId.B;
+
+        double Distance(double time) => time < minimum || time > maximum
+            ? double.PositiveInfinity
+            : Math.Abs(position.X - (plot.Left + (time - minimum) / range * plot.Width));
     }
 
     private Rect PlotBounds() => new(64, 16, Math.Max(0, ActualWidth - 84), Math.Max(0, ActualHeight - 54));
+    private (double Minimum, double Maximum) VisibleRange() => TimeViewport is { } viewport && _displayed is not null
+        ? (Math.Max(_displayed.MinimumTimeSeconds, viewport.VisibleMinimumSeconds),
+            Math.Min(_displayed.MaximumTimeSeconds, viewport.VisibleMaximumSeconds))
+        : (_displayed?.MinimumTimeSeconds ?? 0, _displayed?.MaximumTimeSeconds ?? 2047d / 50_000_000);
     private static double LabelOriginX(Rect plot, double desired, double labelWidth) =>
         plot.Width <= labelWidth ? plot.Left : Math.Clamp(desired, plot.Left, plot.Right - labelWidth);
     private static bool Matches(AScanCursorState? state, AScanSnapshot snapshot) =>
@@ -277,4 +360,15 @@ public sealed class AScanCursorMoveRequestedEventArgs(AScanCursorId cursor, doub
 public sealed class AScanCursorActivatedEventArgs(AScanCursorId cursor) : EventArgs
 {
     public AScanCursorId Cursor { get; } = cursor;
+}
+
+public sealed class ScanTimeZoomRequestedEventArgs(double anchorSeconds, double factor) : EventArgs
+{
+    public double AnchorSeconds { get; } = anchorSeconds;
+    public double Factor { get; } = factor;
+}
+
+public sealed class ScanTimePanRequestedEventArgs(double deltaSeconds) : EventArgs
+{
+    public double DeltaSeconds { get; } = deltaSeconds;
 }

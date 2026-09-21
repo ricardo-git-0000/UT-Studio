@@ -62,6 +62,21 @@ public partial class MainWindow : Window
         if (DataContext is AScanViewModel viewModel) { viewModel.MoveCursor(args.Cursor, args.TimeSeconds); }
     }
 
+    private void OnTimeZoomRequested(object sender, ScanTimeZoomRequestedEventArgs args)
+    {
+        if (DataContext is AScanViewModel viewModel) { viewModel.ZoomTime(args.AnchorSeconds, args.Factor); }
+    }
+
+    private void OnTimePanRequested(object sender, ScanTimePanRequestedEventArgs args)
+    {
+        if (DataContext is AScanViewModel viewModel) { viewModel.PanTime(args.DeltaSeconds); }
+    }
+
+    private void OnResetZoom(object sender, RoutedEventArgs args)
+    {
+        if (DataContext is AScanViewModel viewModel) { viewModel.ResetTimeZoom(); }
+    }
+
     // WPF requires a void Closing event. Every asynchronous failure is caught and logged.
     private async void OnClosing(object? sender, CancelEventArgs args)
     {

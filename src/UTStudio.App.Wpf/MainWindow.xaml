@@ -20,6 +20,7 @@
             <StackPanel x:Name="Interactions" Orientation="Horizontal" HorizontalAlignment="Right">
                 <Button Content="Cursores" Command="{Binding ToggleCursorsCommand}" MinWidth="90" Padding="16,8" Margin="16,0,8,0" />
                 <Button Content="Restablecer" Command="{Binding ResetCursorsCommand}" MinWidth="100" Padding="16,8" Margin="0,0,8,0" />
+                <Button Content="Restablecer zoom" Click="OnResetZoom" MinWidth="125" Padding="16,8" Margin="0,0,8,0" />
                 <Button Content="Start" Command="{Binding StartCommand}" MinWidth="90" Padding="16,8" Margin="0,0,8,0" />
                 <Button Content="Stop" Command="{Binding StopCommand}" MinWidth="90" Padding="16,8" />
             </StackPanel>
@@ -33,8 +34,11 @@
             <TextBlock Text="{Binding Metadata.Configuration.PhysicalChannelId.Value, TargetNullValue=—}" />
         </StackPanel>
         <controls:AScanControl x:Name="Scan" Grid.Row="2" Snapshot="{Binding AScan}" CursorState="{Binding Cursors}"
-                               CursorActivated="OnCursorActivated" CursorMoveRequested="OnCursorMoveRequested" />
+                               TimeViewport="{Binding TimeViewport}" CursorActivated="OnCursorActivated"
+                               CursorMoveRequested="OnCursorMoveRequested" TimeZoomRequested="OnTimeZoomRequested"
+                               TimePanRequested="OnTimePanRequested" />
         <StackPanel Grid.Row="3" Margin="0,12,0,0">
+            <TextBlock Text="Zoom temporal: rueda sobre el gráfico · desplazar: botón central o Mayús + arrastre izquierdo." Foreground="#AEBFD4" />
             <TextBlock Text="Medida manual aproximada sobre los puntos visuales reducidos; no representa precisión de muestra original." Foreground="#AEBFD4" />
             <StackPanel Orientation="Horizontal">
                 <TextBlock Text="A: " FontWeight="SemiBold" />

@@ -78,8 +78,9 @@ public sealed class DesktopRuntime
             var visual = runtime._visual = new AScanVisualDelivery(timeProvider: clock);
             checkpoint?.Invoke("visual");
             var session = runtime._session = new ApplicationSession(source, visual);
+            var timeViewport = new SharedScanTimeViewport(dispatcher);
             var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, SimulatorUtFrameSource.DefaultConfiguration,
-                readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges);
+                readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges, timeViewport: timeViewport);
             // Instance registrations, including aliases, are borrowed and never disposed by DI.
             builder.Services.AddSingleton(source);
             builder.Services.AddSingleton<IUtFrameSource>(source);
@@ -89,6 +90,7 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton(session);
             builder.Services.AddSingleton<IApplicationSession>(session);
             builder.Services.AddSingleton(viewModel);
+            builder.Services.AddSingleton(timeViewport);
             builder.Services.AddSingleton(dispatcher);
             builder.Services.AddSingleton(clock);
             builder.Services.AddSingleton(runtime.Shutdown);

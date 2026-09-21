@@ -24,6 +24,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private readonly ConventionalAcquisitionConfiguration _configuration;
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
+    private readonly SharedScanTimeViewport _timeViewport;
     private readonly UiAsyncCommand _start, _stop;
     private readonly RelayCommand _toggleCursors, _resetCursors;
     private IDisposable? _sessionSubscription, _visualSubscription, _statusSubscription;
@@ -40,7 +41,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public AScanViewModel(IApplicationSession session, IObservable<AScanSnapshot> visualFeed,
         IUiDispatcher dispatcher, ConventionalAcquisitionConfiguration configuration,
         Func<AcquisitionRunId>? newRun = null, Func<AScanDeliveryStatistics>? readVisualStatistics = null,
-        IObservable<AScanDeliveryStatus>? visualStatus = null)
+        IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(visualFeed);
@@ -51,6 +52,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _newRun = newRun ?? (() => new AcquisitionRunId(Guid.NewGuid()));
         _readStatistics = readVisualStatistics;
         _lifetime = new UiLifetime(dispatcher);
+        _timeViewport = timeViewport ?? new SharedScanTimeViewport(dispatcher);
+        _timeViewport.PropertyChanged += OnTimeViewportChanged;
         _latestSession = session.Snapshot;
         _state = new(_latestSession, null, null, null, null);
         _start = new(_lifetime, StartAsync, () => _state.Session.CanStart && !_start!.IsRunning && !_stop!.IsRunning,
@@ -80,12 +83,17 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public UtSourceError? Error => _state.CommandError ?? _state.FeedError ?? _state.Session.PrimaryError;
     public AScanDeliveryStatus? VisualStatus => _state.VisualStatus;
     public AScanCursorState? Cursors => _state.Cursors;
+    public ScanTimeViewport? TimeViewport => _timeViewport.Viewport;
     public UtSourceError? VisualError => _state.VisualStatus?.TerminalError ?? _state.Session.VisualError ?? _state.VisualStatistics?.LastError;
     public UtSourceError? NotificationError => _notificationError;
     public IAsyncRelayCommand StartCommand => _start;
     public IAsyncRelayCommand StopCommand => _stop;
     public IRelayCommand ToggleCursorsCommand => _toggleCursors;
     public IRelayCommand ResetCursorsCommand => _resetCursors;
+
+    public void ZoomTime(double anchorSeconds, double factor) => _timeViewport.Zoom(anchorSeconds, factor);
+    public void PanTime(double deltaSeconds) => _timeViewport.Pan(deltaSeconds);
+    public void ResetTimeZoom() => _timeViewport.Reset();
 
     public void ActivateCursor(AScanCursorId cursor) => _lifetime.Post(() =>
     {
@@ -236,6 +244,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         AScanCursorState? cursors = current is null ? null : _state.Cursors is null || _state.AScan?.Metadata.RunId != current.Metadata.RunId
             ? AScanCursorMeasurements.Create(current)
             : AScanCursorMeasurements.Reconcile(_state.Cursors, current);
+        if (current is not null) { _timeViewport.ReconcileDomain(current.MinimumTimeSeconds, current.MaximumTimeSeconds); }
         if (ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors)))
         { RefreshCommands(); }
     }
@@ -279,6 +288,11 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    private void OnTimeViewportChanged(object? sender, PropertyChangedEventArgs args)
+    {
+        if (args.PropertyName == nameof(SharedScanTimeViewport.Viewport)) { OnPropertyChanged(nameof(TimeViewport)); }
+    }
+
     public ValueTask DisposeAsync()
     {
         lock (_gate)
@@ -296,6 +310,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private async Task CloseAsync()
     {
         List<Exception> errors = [];
+        _timeViewport.PropertyChanged -= OnTimeViewportChanged;
         foreach (var subscription in new[] { _sessionSubscription, _visualSubscription, _statusSubscription })
         {
             try { subscription?.Dispose(); }

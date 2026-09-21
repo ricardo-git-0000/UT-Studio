@@ -19,6 +19,28 @@ public sealed class AScanViewModelTests
         new short[Configuration.SampleCount], version);
 
     [TestMethod]
+    public void SharedTimeViewportAppliesOrderedIntentionsOnlyOnUi()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var notifications = new ConcurrentQueue<bool>();
+        shared.PropertyChanged += (_, _) => notifications.Enqueue(ui.CheckAccess());
+
+        shared.ReconcileDomain(0, 100e-6);
+        Assert.IsNull(shared.Viewport);
+        Assert.IsTrue(ui.RunNext());
+        Assert.IsNotNull(shared.Viewport);
+        shared.Zoom(25e-6, 2);
+        shared.Pan(1);
+        Assert.AreEqual(2, ui.Pending);
+        Assert.IsTrue(ui.RunLast());
+        Assert.AreEqual(50e-6, shared.Viewport.VisibleSpanSeconds, 1e-15);
+        Assert.IsTrue(ui.RunLast());
+        Assert.AreEqual(100e-6, shared.Viewport.VisibleMaximumSeconds, 1e-15);
+        Assert.IsTrue(notifications.All(access => access));
+    }
+
+    [TestMethod]
     public async Task InitialStateAndBorrowedSubscriptions()
     {
         var ui = new ManualUiDispatcher();

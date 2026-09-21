@@ -13,5 +13,6 @@ Aceptado identifica decisiones aprobadas, sin autorizar paquetes ni implementaci
 - [0008-latest-only-visual-delivery](0008-latest-only-visual-delivery.md): Mailbox latest-only, snapshot independiente y cadencias.
 - [0009-reusable-scan-visualization-controls](0009-reusable-scan-visualization-controls.md): Renderizadores de scan específicos y reutilizables por plataforma.
 - [0010-ascan-manual-cursor-measurements](0010-ascan-manual-cursor-measurements.md): Ejes físicos y cursores manuales aproximados sobre puntos visuales A-Scan.
+- [0011-shared-physical-time-viewport](0011-shared-physical-time-viewport.md): Zoom temporal neutral compartible entre A-Scan y futuros B-Scan.
 
 Renderizadores de otros scans, paquetes adicionales y benchmarks pendientes; véanse [plan](../plans/2026-09-09-first-vertical-increment.md) y [cuestiones](../requirements/open-questions.md).

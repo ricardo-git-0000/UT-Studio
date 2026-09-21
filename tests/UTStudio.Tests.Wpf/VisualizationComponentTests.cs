@@ -271,6 +271,40 @@ public sealed class VisualizationComponentTests
         return Task.CompletedTask;
     });
 
+    [TestMethod]
+    public Task TimeZoomAndPanPublishPhysicalIntentionsWithSafeCapture() => StaTest.Run(() =>
+    {
+        var snapshot = Snapshot();
+        var viewport = ScanTimeViewportOperations.Create(snapshot.MinimumTimeSeconds, snapshot.MaximumTimeSeconds);
+        var control = new AScanControl { Snapshot = snapshot, TimeViewport = viewport };
+        var host = new Window { Content = control, Width = 640, Height = 300, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
+        try
+        {
+            host.Show();
+            host.UpdateLayout();
+            ScanTimeZoomRequestedEventArgs? zoom = null;
+            ScanTimePanRequestedEventArgs? pan = null;
+            control.TimeZoomRequested += (_, args) => zoom = args;
+            control.TimePanRequested += (_, args) => pan = args;
+            var center = new Point(64 + (control.ActualWidth - 84) / 2, 120);
+            Assert.IsTrue(control.RequestTimeZoom(center, 120));
+            Assert.AreEqual((snapshot.MinimumTimeSeconds + snapshot.MaximumTimeSeconds) / 2,
+                zoom!.AnchorSeconds, 1e-15);
+            Assert.IsGreaterThan(1, zoom.Factor);
+
+            Assert.IsTrue(control.BeginPan(center));
+            Assert.IsTrue(control.IsMouseCaptured);
+            control.ContinuePan(new Point(center.X + 100, center.Y));
+            Assert.IsNotNull(pan);
+            Assert.IsLessThan(0, pan.DeltaSeconds);
+            control.EndInteraction();
+            Assert.IsFalse(control.IsMouseCaptured);
+            Assert.IsFalse(control.RequestTimeZoom(new Point(0, 0), 120));
+        }
+        finally { host.Close(); }
+        return Task.CompletedTask;
+    });
+
     private static AScanSnapshot Snapshot(ulong version = 0, AcquisitionRunId? runId = null, short[]? samples = null)
     {
         var configuration = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), 4, 50_000_000);
