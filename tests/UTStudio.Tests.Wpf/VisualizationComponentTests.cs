@@ -210,13 +210,74 @@ public sealed class VisualizationComponentTests
         control.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent));
     });
 
-    private static AScanSnapshot Snapshot(ulong version = 0)
+    [TestMethod]
+    public Task SameRunWithDifferentVersionDoesNotReplaceDisplayedCursorMeasurements() => StaTest.Run(() =>
+    {
+        var run = new AcquisitionRunId(Guid.Parse("11111111-1111-1111-1111-111111111111"));
+        var visible = Snapshot(version: 7, runId: run, samples: [short.MinValue, 0, short.MaxValue, 0]);
+        var control = new AScanControl { Snapshot = visible, CursorState = AScanCursorMeasurements.Create(visible) };
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+        control.Measure(new Size(640, 300));
+        control.Arrange(new Rect(0, 0, 640, 300));
+        new RenderTargetBitmap(640, 300, 96, 96, PixelFormats.Pbgra32).Render(control);
+        double originalAX = 64 + (640 - 84) * .25;
+
+        var next = Snapshot(version: 8, runId: run, samples: [short.MaxValue, 0, short.MinValue, 0]);
+        double requestedTime = visible.Points[2].TimeSeconds;
+        var moved = AScanCursorMeasurements.Move(control.CursorState!, visible, AScanCursorId.A, requestedTime);
+        var reconciled = AScanCursorMeasurements.Reconcile(moved, next);
+        Assert.AreEqual(run, reconciled.RunId);
+        Assert.AreEqual(8UL, reconciled.SnapshotVersion);
+        Assert.AreEqual(requestedTime, reconciled.A.TimeSeconds);
+        Assert.AreEqual(next.Points[2].AmplitudePercent, reconciled.A.AmplitudePercent);
+
+        control.CursorState = reconciled;
+        Assert.AreEqual(7UL, control.DisplayedCursorSnapshotVersion);
+        Assert.AreEqual(AScanCursorId.A, control.HitTestCursor(new Point(originalAX, 120)));
+        Assert.IsNull(control.HitTestCursor(new Point(64 + (640 - 84) * 2d / 3, 120)));
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent));
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task DifferentRunWithSameVersionDoesNotReplaceDisplayedCursorMeasurements() => StaTest.Run(() =>
+    {
+        var visibleRun = new AcquisitionRunId(Guid.Parse("22222222-2222-2222-2222-222222222222"));
+        var otherRun = new AcquisitionRunId(Guid.Parse("33333333-3333-3333-3333-333333333333"));
+        const ulong version = 9;
+        var visible = Snapshot(version, visibleRun, [short.MinValue, 0, short.MaxValue, 0]);
+        var control = new AScanControl { Snapshot = visible, CursorState = AScanCursorMeasurements.Create(visible) };
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+        control.Measure(new Size(640, 300));
+        control.Arrange(new Rect(0, 0, 640, 300));
+        new RenderTargetBitmap(640, 300, 96, 96, PixelFormats.Pbgra32).Render(control);
+        double originalAX = 64 + (640 - 84) * .25;
+
+        var other = Snapshot(version, otherRun, [short.MaxValue, 0, short.MinValue, 0]);
+        double requestedTime = visible.Points[2].TimeSeconds;
+        var moved = AScanCursorMeasurements.Move(control.CursorState!, visible, AScanCursorId.A, requestedTime);
+        var reconciled = AScanCursorMeasurements.Reconcile(moved, other);
+        Assert.AreEqual(otherRun, reconciled.RunId);
+        Assert.AreEqual(version, reconciled.SnapshotVersion);
+        Assert.AreEqual(requestedTime, reconciled.A.TimeSeconds);
+        Assert.AreEqual(other.Points[2].AmplitudePercent, reconciled.A.AmplitudePercent);
+
+        control.CursorState = reconciled;
+        Assert.AreEqual(version, control.DisplayedCursorSnapshotVersion);
+        Assert.AreEqual(AScanCursorId.A, control.HitTestCursor(new Point(originalAX, 120)));
+        double foreignAX = 64 + (640 - 84) * 2d / 3;
+        Assert.IsNull(control.HitTestCursor(new Point(foreignAX, 120)));
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent));
+        return Task.CompletedTask;
+    });
+
+    private static AScanSnapshot Snapshot(ulong version = 0, AcquisitionRunId? runId = null, short[]? samples = null)
     {
         var configuration = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), 4, 50_000_000);
         var metadata = new ConventionalUtFrameMetadata(new UtSourceId("standalone"),
-            new AcquisitionRunId(Guid.NewGuid()), configuration, DateTimeOffset.UnixEpoch);
-        short[] samples = [short.MinValue, 0, short.MaxValue, 0];
-        return new AScanProjector(4).Project(metadata, 1, TimeSpan.Zero, samples, version);
+            runId ?? new AcquisitionRunId(Guid.NewGuid()), configuration, DateTimeOffset.UnixEpoch);
+        return new AScanProjector(4).Project(metadata, 1, TimeSpan.Zero,
+            samples ?? [short.MinValue, 0, short.MaxValue, 0], version);
     }
 
     private static string[] ProjectReferences(string path) => XDocument.Load(path)
