@@ -87,29 +87,29 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public IRelayCommand ToggleCursorsCommand => _toggleCursors;
     public IRelayCommand ResetCursorsCommand => _resetCursors;
 
-    public void ActivateCursor(AScanCursorId cursor)
+    public void ActivateCursor(AScanCursorId cursor) => _lifetime.Post(() =>
     {
-        if (_lifetime.IsClosed || _state.Cursors is not { } cursors) { return; }
+        if (_state.Cursors is not { } cursors) { return; }
         ReplaceState(_state with { Cursors = cursors with { ActiveCursor = cursor } });
-    }
+    });
 
-    public void MoveCursor(AScanCursorId cursor, double timeSeconds)
+    public void MoveCursor(AScanCursorId cursor, double timeSeconds) => _lifetime.Post(() =>
     {
-        if (_lifetime.IsClosed || _state is not { AScan: { } snapshot, Cursors: { } cursors }) { return; }
+        if (_state is not { AScan: { } snapshot, Cursors: { } cursors }) { return; }
         ReplaceState(_state with { Cursors = AScanCursorMeasurements.Move(cursors, snapshot, cursor, timeSeconds) });
-    }
+    });
 
-    private void ToggleCursors()
+    private void ToggleCursors() => _lifetime.Post(() =>
     {
-        if (_lifetime.IsClosed || _state.Cursors is not { } cursors) { return; }
+        if (_state.Cursors is not { } cursors) { return; }
         ReplaceState(_state with { Cursors = cursors with { IsVisible = !cursors.IsVisible } });
-    }
+    });
 
-    private void ResetCursors()
+    private void ResetCursors() => _lifetime.Post(() =>
     {
-        if (_lifetime.IsClosed || _state is not { AScan: { } snapshot, Cursors: { } cursors }) { return; }
+        if (_state is not { AScan: { } snapshot, Cursors: { } cursors }) { return; }
         ReplaceState(_state with { Cursors = AScanCursorMeasurements.Reset(cursors, snapshot) });
-    }
+    });
 
     private async Task StartAsync(CancellationToken token)
     {

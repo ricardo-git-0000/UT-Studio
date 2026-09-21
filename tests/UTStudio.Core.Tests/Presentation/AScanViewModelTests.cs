@@ -494,13 +494,17 @@ public sealed class AScanViewModelTests
         feed.Emit(Visual(run, 1));
         await ui.DriveUntilAsync(() => vm.Cursors is not null);
         vm.MoveCursor(AScanCursorId.A, vm.AScan!.MinimumTimeSeconds);
+        Assert.IsTrue(ui.RunNext());
         vm.ActivateCursor(AScanCursorId.B);
+        Assert.IsTrue(ui.RunNext());
         double movedTime = vm.Cursors!.A.TimeSeconds;
         Assert.AreEqual(AScanCursorId.B, vm.Cursors.ActiveCursor);
         Assert.IsTrue(vm.ToggleCursorsCommand.CanExecute(null));
         vm.ToggleCursorsCommand.Execute(null);
+        Assert.IsTrue(ui.RunNext());
         Assert.IsFalse(vm.Cursors.IsVisible);
         vm.ResetCursorsCommand.Execute(null);
+        Assert.IsTrue(ui.RunNext());
         Assert.IsFalse(vm.Cursors.IsVisible);
         Assert.AreNotEqual(movedTime, vm.Cursors.A.TimeSeconds);
         double resetTime = vm.Cursors.A.TimeSeconds;
@@ -517,6 +521,102 @@ public sealed class AScanViewModelTests
         vm.ResetCursorsCommand.Execute(null);
         Assert.AreSame(disposedState, vm.State);
         Assert.AreEqual(stable, vm.Cursors!.A.TimeSeconds);
+    }
+
+    [TestMethod]
+    public async Task CursorIntentionsDispatchOnceInOrderAndOnlyNotifyOnUi()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var vm = new AScanViewModel(session, feed, ui, Configuration);
+        try
+        {
+            var run = NewRun();
+            session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+            feed.Emit(Visual(run, 1));
+            await ui.DriveUntilAsync(() => vm.Cursors is not null);
+            var notifications = Trace(vm, ui);
+
+            var beforeMove = vm.State;
+            vm.MoveCursor(AScanCursorId.A, vm.AScan!.MaximumTimeSeconds);
+            Assert.AreSame(beforeMove, vm.State);
+            Assert.AreEqual(1, ui.Pending);
+            Assert.IsTrue(ui.RunNext());
+            Assert.AreEqual(vm.AScan.MaximumTimeSeconds, vm.Cursors!.A.TimeSeconds);
+
+            var beforeActivate = vm.State;
+            vm.ActivateCursor(AScanCursorId.B);
+            Assert.AreSame(beforeActivate, vm.State);
+            Assert.AreEqual(1, ui.Pending);
+            Assert.IsTrue(ui.RunNext());
+            Assert.AreEqual(AScanCursorId.B, vm.Cursors.ActiveCursor);
+
+            var beforeToggle = vm.State;
+            vm.ToggleCursorsCommand.Execute(null);
+            Assert.AreSame(beforeToggle, vm.State);
+            Assert.AreEqual(1, ui.Pending);
+            Assert.IsTrue(ui.RunNext());
+            Assert.IsFalse(vm.Cursors.IsVisible);
+
+            var beforeReset = vm.State;
+            vm.ResetCursorsCommand.Execute(null);
+            Assert.AreSame(beforeReset, vm.State);
+            Assert.AreEqual(1, ui.Pending);
+            Assert.IsTrue(ui.RunNext());
+            Assert.AreNotEqual(vm.AScan.MaximumTimeSeconds, vm.Cursors.A.TimeSeconds);
+            Assert.IsTrue(notifications.Count > 0 && notifications.All(access => access));
+
+            vm.MoveCursor(AScanCursorId.A, vm.AScan.MaximumTimeSeconds);
+            vm.ResetCursorsCommand.Execute(null);
+            vm.MoveCursor(AScanCursorId.A, vm.AScan.MinimumTimeSeconds);
+            Assert.AreEqual(3, ui.Pending);
+            Assert.IsTrue(ui.RunLast());
+            Assert.AreEqual(vm.AScan.MaximumTimeSeconds, vm.Cursors.A.TimeSeconds);
+            Assert.IsTrue(ui.RunLast());
+            Assert.AreNotEqual(vm.AScan.MaximumTimeSeconds, vm.Cursors.A.TimeSeconds);
+            Assert.AreNotEqual(vm.AScan.MinimumTimeSeconds, vm.Cursors.A.TimeSeconds);
+            Assert.IsTrue(ui.RunLast());
+            Assert.AreEqual(vm.AScan.MinimumTimeSeconds, vm.Cursors.A.TimeSeconds);
+        }
+        finally { await ui.DriveAsync(vm.DisposeAsync().AsTask()); }
+    }
+
+    [TestMethod]
+    public async Task CursorIntentionsExecuteInlineOnUiAndPendingOnesAreInvalidatedByClose()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var vm = new AScanViewModel(session, feed, ui, Configuration);
+        var run = NewRun();
+        session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+        feed.Emit(Visual(run, 1));
+        await ui.DriveUntilAsync(() => vm.Cursors is not null);
+
+        vm.MoveCursor(AScanCursorId.A, vm.AScan!.MaximumTimeSeconds);
+        var inline = ui.InvokeAsync(() =>
+        {
+            vm.MoveCursor(AScanCursorId.A, vm.AScan!.MinimumTimeSeconds);
+            vm.ActivateCursor(AScanCursorId.B);
+            Assert.AreEqual(vm.AScan.MinimumTimeSeconds, vm.Cursors!.A.TimeSeconds);
+            Assert.AreEqual(AScanCursorId.B, vm.Cursors!.ActiveCursor);
+        });
+        Assert.AreEqual(2, ui.Pending);
+        Assert.IsTrue(ui.RunLast());
+        await inline;
+        Assert.AreEqual(vm.AScan.MinimumTimeSeconds, vm.Cursors!.A.TimeSeconds);
+        Assert.IsTrue(ui.RunNext()); // Callback already consumed inline; it must be inert.
+        Assert.AreEqual(vm.AScan.MinimumTimeSeconds, vm.Cursors.A.TimeSeconds);
+        Assert.AreEqual(AScanCursorId.B, vm.Cursors.ActiveCursor);
+
+        var stable = vm.State;
+        vm.MoveCursor(AScanCursorId.A, vm.AScan!.MaximumTimeSeconds);
+        Assert.AreEqual(1, ui.Pending);
+        var close = vm.DisposeAsync().AsTask();
+        Assert.AreSame(stable, vm.State);
+        await ui.DriveAsync(close);
+        Assert.AreSame(stable, vm.State);
     }
 
     private static ConcurrentQueue<bool> Trace(AScanViewModel vm, ManualUiDispatcher ui)
