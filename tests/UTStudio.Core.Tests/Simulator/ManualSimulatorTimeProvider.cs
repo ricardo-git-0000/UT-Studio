@@ -14,6 +14,7 @@ internal sealed class ManualSimulatorTimeProvider : TimeProvider
     internal bool FailTimerCreation { get; set; }
     internal Exception TimerFailure { get; set; } = new InvalidOperationException("Synthetic timer failure.");
     internal Action? OnTimerDispose { get; set; }
+    internal Action? OnTimerCreate { get; set; }
     public override long TimestampFrequency => TimeSpan.TicksPerSecond;
 
     public override long GetTimestamp() { lock (_gate) { return _ticks; } }
@@ -27,6 +28,7 @@ internal sealed class ManualSimulatorTimeProvider : TimeProvider
 
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
+        OnTimerCreate?.Invoke();
         if (FailTimerCreation) { throw TimerFailure; }
         if (period != Timeout.InfiniteTimeSpan) { throw new NotSupportedException("Tests expect one-shot delays."); }
         ManualTimer timer;

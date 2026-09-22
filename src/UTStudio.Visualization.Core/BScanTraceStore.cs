@@ -46,6 +46,9 @@ internal sealed class BScanTraceStore
     private bool _returned;
     private int _nextSlot;
     private ulong _revision;
+    private ulong _wrapGeneration;
+    private ulong _visualRevision;
+    private ulong _visualWrapGeneration;
     private int _activeLeases;
     private int _activeWriters;
     private int _maximumLeases;
@@ -64,11 +67,13 @@ internal sealed class BScanTraceStore
         int columns = 0;
         try
         {
+            const int indexedBucketBytes = sizeof(short) * 4;
             long fixedVisualBytes = checked(
-                checked((long)_bucketCount * sizeof(short) * 2) +
-                checked((long)sampleCount * sizeof(short) * 2));
+                checked((long)_bucketCount * indexedBucketBytes) +
+                checked((long)sampleCount * sizeof(short) * 2) +
+                checked(2L * 1024 * 1024));
             long availableVisualBytes = options.VisualMemoryBudgetBytes - fixedVisualBytes;
-            long visualBytesPerColumn = checked(128L + checked((long)_bucketCount * sizeof(short) * 2));
+            long visualBytesPerColumn = checked(128L + checked((long)_bucketCount * indexedBucketBytes));
             int visualCapacity = (int)Math.Min(options.MaximumColumns,
                 Math.Max(0, availableVisualBytes) / visualBytesPerColumn);
             if (visualCapacity < options.MinimumColumns)
@@ -181,9 +186,11 @@ internal sealed class BScanTraceStore
                 slot.Generation = generation;
                 _revision = checked(_revision + 1);
                 slot.Descriptor = uncommitted with { StoreRevision = _revision, Generation = generation };
+                slot.AcceptedWrapGeneration = _wrapGeneration;
                 slot.Committed = true;
                 slot.IndexedGeneration = 0;
                 _nextSlot = (_nextSlot + 1) % _slots.Length;
+                if (_nextSlot == 0) { _wrapGeneration = checked(_wrapGeneration + 1); }
                 _accepted++;
                 return new(StoreWriteKind.Accepted, slot.Descriptor);
             }
@@ -225,7 +232,7 @@ internal sealed class BScanTraceStore
                 _activeLeases++;
                 _maximumLeases = Math.Max(_maximumLeases, _activeLeases);
                 return new(this, index, slot.Generation, slot.Descriptor,
-                    _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount));
+                    _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount), slot.Index);
             }
             return null;
         }
@@ -258,7 +265,7 @@ internal sealed class BScanTraceStore
         }
     }
 
-    internal bool CommitIndex(BScanTraceIdentity identity, ulong generation, ReadOnlySpan<BScanMinMax> buckets)
+    internal bool CommitIndex(BScanTraceIdentity identity, ulong generation, ReadOnlySpan<BScanIndexedMinMax> buckets)
     {
         lock (_gate)
         {
@@ -276,6 +283,8 @@ internal sealed class BScanTraceStore
             if (buckets.Length != slot.Index.Length) { throw new ArgumentException("Invalid index length.", nameof(buckets)); }
             buckets.CopyTo(slot.Index);
             slot.IndexedGeneration = generation;
+            slot.VisualRevision = checked(++_visualRevision);
+            _visualWrapGeneration = Math.Max(_visualWrapGeneration, slot.AcceptedWrapGeneration);
             return true;
         }
     }
@@ -289,13 +298,60 @@ internal sealed class BScanTraceStore
             {
                 if (candidate.Committed && candidate.Descriptor!.Identity == identity) { slot = candidate; break; }
             }
-            return slot is not null && slot.IndexedGeneration == slot.Generation ? [.. slot.Index] : null;
+            if (slot is null || slot.IndexedGeneration != slot.Generation) { return null; }
+            var result = new BScanMinMax[slot.Index.Length];
+            for (int index = 0; index < result.Length; index++)
+            {
+                result[index] = new(slot.Index[index].Minimum, slot.Index[index].Maximum);
+            }
+            return result;
         }
     }
 
     internal void RecordSuperseded()
     {
         lock (_gate) { _superseded++; }
+    }
+
+    internal int CaptureVisualLeases(Span<BScanTraceLease?> destination, out BScanStoreVisualState state)
+    {
+        lock (_gate)
+        {
+            if (destination.Length < _slots.Length)
+            {
+                throw new ArgumentException("Visual capture requires storage for the complete ring.", nameof(destination));
+            }
+            if (!_leasesAllowed)
+            {
+                state = default;
+                return 0;
+            }
+            int count = 0;
+            ulong minimum = ulong.MaxValue, maximum = 0;
+            for (int slotIndex = 0; slotIndex < _slots.Length; slotIndex++)
+            {
+                Slot slot = _slots[slotIndex];
+                if (!slot.Committed || slot.Writing || slot.IndexedGeneration != slot.Generation) { continue; }
+                if (count == destination.Length) { break; }
+                slot.Leases++;
+                _activeLeases++;
+                _maximumLeases = Math.Max(_maximumLeases, _activeLeases);
+                BScanTraceDescriptor descriptor = slot.Descriptor!;
+                destination[count++] = new(this, slotIndex, slot.Generation, descriptor,
+                    _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount), slot.Index,
+                    slot.VisualRevision);
+                minimum = Math.Min(minimum, descriptor.AcquisitionIndex);
+                maximum = Math.Max(maximum, descriptor.AcquisitionIndex);
+            }
+            state = new(_visualRevision, _visualWrapGeneration, _sampleCount, _bucketSamples, count == 0 ? null :
+                new(minimum, maximum));
+            return count;
+        }
+    }
+
+    internal bool IsVisualStateCurrent(ulong revision, ulong wrapGeneration)
+    {
+        lock (_gate) { return _leasesAllowed && _visualRevision == revision && _visualWrapGeneration == wrapGeneration; }
     }
 
     internal Task CloseAsync()
@@ -388,17 +444,22 @@ internal sealed class BScanTraceStore
         private readonly ulong _generation;
 
         internal BScanTraceLease(BScanTraceStore store, int slot, ulong generation,
-            BScanTraceDescriptor descriptor, ReadOnlyMemory<short> samples)
+            BScanTraceDescriptor descriptor, ReadOnlyMemory<short> samples, ReadOnlyMemory<BScanIndexedMinMax> index,
+            ulong visualRevision = 0)
         {
             _store = store;
             _slot = slot;
             _generation = generation;
             Descriptor = descriptor;
             Samples = samples;
+            Index = index;
+            VisualRevision = visualRevision;
         }
 
         internal BScanTraceDescriptor Descriptor { get; }
         internal ReadOnlyMemory<short> Samples { get; }
+        internal ReadOnlyMemory<BScanIndexedMinMax> Index { get; }
+        internal ulong VisualRevision { get; }
         public void Dispose() => Interlocked.Exchange(ref _store, null)?.ReleaseLease(_slot, _generation);
     }
 
@@ -415,10 +476,12 @@ internal sealed class BScanTraceStore
         internal BScanTraceDescriptor? Descriptor;
         internal ulong Generation;
         internal ulong IndexedGeneration;
+        internal ulong VisualRevision;
+        internal ulong AcceptedWrapGeneration;
         internal int Leases;
         internal bool Committed;
         internal bool Writing;
-        internal BScanMinMax[] Index { get; } = new BScanMinMax[bucketCount];
+        internal BScanIndexedMinMax[] Index { get; } = new BScanIndexedMinMax[bucketCount];
     }
 
     internal sealed class StoreWriteReservation
@@ -470,6 +533,14 @@ internal readonly record struct StoreWriteResult(StoreWriteKind Kind, BScanTrace
 }
 internal enum BScanResidence { Available, NotAvailable, Evicted }
 internal readonly record struct BScanIndexCandidate(BScanTraceIdentity Identity, ulong Generation);
+internal readonly record struct BScanIndexedMinMax(
+    short Minimum, ushort MinimumOffset, short Maximum, ushort MaximumOffset);
+internal readonly record struct BScanStoreVisualState(
+    ulong StoreRevision,
+    ulong WrapGeneration,
+    int SampleCount,
+    int IndexBucketSamples,
+    BScanAcquisitionRange? ResidentRange);
 internal readonly record struct StoreStatistics(
     ulong Accepted, ulong RejectedPinned, ulong Evicted, ulong Superseded,
     int ActiveLeases, int MaximumLeases, int BlocksRented, int BlocksReturned,

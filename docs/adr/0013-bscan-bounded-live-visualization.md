@@ -1,6 +1,6 @@
 # ADR 0013 — B-Scan en vivo acotado, selección exacta y ventana secundaria
 
-Fecha: 2026-09-22. Estado: Aceptado; Fases 1 y 2 implementadas y fases 3–5 pendientes.
+Fecha: 2026-09-22. Estado: Aceptado; Fases 1–3 implementadas y fases 4–5 pendientes.
 Trazabilidad: R01–R09, R13 y R14; concreta Q12 y la parte visual de Q13. Complementa
 [ADR 0006](0006-session-window-lifecycle.md), [ADR 0007](0007-frame-source-ownership.md),
 [ADR 0008](0008-latest-only-visual-delivery.md), [ADR 0009](0009-reusable-scan-visualization-controls.md)
@@ -228,6 +228,25 @@ Run distinta, base incorrecta, versión saltada, wrap, región expulsada, zoom/p
 nivel fuerzan resincronización. Core produce una región coherente bajo leases sin mantener la puerta
 del store durante rasterización costosa y valida identidad/revisión antes de publicarla. Un resultado
 obsoleto se descarta. WPF recrea bitmap solo por dimensión física, DPI, formato o run.
+
+La Fase 3 distingue la revisión de admisión interna de la revisión visual publicada. Esta última avanza
+al confirmar cada índice y es la que ocupan `BaseStoreRevision` y `StoreRevision` en el protocolo
+visual: una columna todavía no indexada no puede declararse representada. El nombre se conserva como
+revisión del store visual, pero nunca identifica una traza ni sustituye su `BScanTraceIdentity`.
+`WrapGeneration` publicado corresponde al contenido indexado, no a trabajo RF todavía pendiente.
+
+La región neutral usa `BipolarIntensity8`: `0` significa exclusivamente NoData, `1` representa
+`short.MinValue`, `128` representa cero y `255` representa `short.MaxValue`; los intervalos negativos
+y positivos se mapean monótonamente. La reducción escoge el mayor valor absoluto y, en empate, la
+primera columna por `AcquisitionIndex` y la primera muestra. Los gaps permanecen NoData y no se
+interpolan. El raster se obtiene mediante `IBScanRasterRegionProvider`; la notificación observable solo
+transporta metadata versionada, evitando compartir ownership entre varios observadores.
+
+El viewport espacial conserva un origen `ulong` y offsets `decimal`; resta el origen antes de cualquier
+conversión de raster y limita zoom a 4096× con al menos una columna visible. Core admite como máximo dos
+owners raster simultáneos. El presupuesto visual contabiliza índice posicional compacto, scratch,
+metadata y dos raster 8-bit máximos; además carga la longitud real devuelta por el pool antes de
+transferir un owner. Un owner ya transferido continúa válido tras wrap y se libera explícitamente.
 
 ## Interacción, inspección y accesibilidad
 

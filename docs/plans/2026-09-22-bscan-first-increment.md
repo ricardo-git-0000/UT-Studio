@@ -1,6 +1,6 @@
 # Plan del primer incremento B-Scan reutilizable
 
-Estado: diseño aprobado; Fases 0–2 completadas. Las fases 3–5 requieren autorización separada.
+Estado: diseño aprobado; Fases 0–3 completadas. Las fases 4–5 requieren autorización separada.
 La fuente normativa es [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
 
 ## Reglas comunes
@@ -57,6 +57,12 @@ pruebas Core y documentación de rendimiento solo para resultados medidos. Sin P
 
 Salida: dirty nunca aplicado sobre base incompatible; saltos/wrap/cambios de región fuerzan resync;
 ingestión, índice, sustitución y publicación medidos por separado; consumidor lento no causa crecimiento.
+
+Implementada con viewport de origen entero y offsets decimales, raster bipolar neutral 8-bit,
+revisión visual que avanza al confirmar el índice, snapshots/update latest-only a 30 Hz y proveedor
+pull de regiones con ownership explícito y máximo de dos owners. Las regiones se revalidan contra run,
+revisión y wrap después de rasterizar; incompatibilidades fuerzan full refresh y los gaps quedan NoData.
+No incorpora ViewModel, control WPF, selección A/B ni composición, que permanecen en Fases 4 y 5.
 
 ## Fase 4 — Presentation
 

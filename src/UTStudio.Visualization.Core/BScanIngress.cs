@@ -37,6 +37,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     internal Action? AfterWorkerFailure { get; set; }
     internal Action? BeforeProviderCopy { get; set; }
     internal Action? AfterProviderCopy { get; set; }
+    internal event Action? VisualStateChanged;
 
     public BScanIngress(BScanOptions? options = null, TimeProvider? timeProvider = null)
         : this(options, timeProvider, SharedShortArrayPool.Instance, SharedTraceCopyOwnerPool.Instance) { }
@@ -316,7 +317,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
 
     private async Task IndexLoopAsync(BScanTraceStore store, SemaphoreSlim wake, CancellationToken token)
     {
-        var buckets = new BScanMinMax[store.BucketCount];
+        var buckets = new BScanIndexedMinMax[store.BucketCount];
         var candidates = new BScanIndexCandidate[store.Capacity];
         while (true)
         {
@@ -335,8 +336,12 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
                     if (!token.IsCancellationRequested) { store.RecordSuperseded(); }
                     continue;
                 }
-                BuildIndex(lease.Samples.Span, _options.IndexBucketSamples, buckets);
-                if (store.CommitIndex(identity, generation, buckets)) { AfterIndexCommit?.Invoke(identity); }
+                BuildIndexedIndex(lease.Samples.Span, _options.IndexBucketSamples, buckets);
+                if (store.CommitIndex(identity, generation, buckets))
+                {
+                    AfterIndexCommit?.Invoke(identity);
+                    NotifyVisualStateChanged();
+                }
             }
         }
     }
@@ -371,8 +376,66 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         }
     }
 
+    private static void BuildIndexedIndex(ReadOnlySpan<short> samples, int bucketSamples,
+        Span<BScanIndexedMinMax> destination)
+    {
+        int required = checked((samples.Length + bucketSamples - 1) / bucketSamples);
+        if (destination.Length < required) { throw new ArgumentException("Index destination is too short.", nameof(destination)); }
+        for (int bucket = 0; bucket < required; bucket++)
+        {
+            int start = checked(bucket * bucketSamples);
+            ReadOnlySpan<short> source = samples.Slice(start, Math.Min(bucketSamples, samples.Length - start));
+            short minimum = source[0], maximum = source[0];
+            int minimumOffset = start, maximumOffset = start;
+            for (int index = 1; index < source.Length; index++)
+            {
+                if (source[index] < minimum) { minimum = source[index]; minimumOffset = start + index; }
+                if (source[index] > maximum) { maximum = source[index]; maximumOffset = start + index; }
+            }
+            destination[bucket] = new(minimum, checked((ushort)minimumOffset),
+                maximum, checked((ushort)maximumOffset));
+        }
+    }
+
+    private void NotifyVisualStateChanged()
+    {
+        Delegate[] observers = VisualStateChanged?.GetInvocationList() ?? [];
+        foreach (Action observer in observers)
+        {
+            try { observer(); }
+            catch { /* Visual observers cannot terminate the indexing worker. */ }
+        }
+    }
+
     internal BScanMinMax[]? CopyIndexForDiagnostics(BScanTraceIdentity identity) => _store?.CopyIndex(identity);
     internal int PendingWorkerSignals => _wake?.CurrentCount ?? 0;
+    internal int VisualCapacity { get { lock (_gate) { return _store?.Capacity ?? 0; } } }
+    internal long VisualBytesReserved { get { lock (_gate) { return _store?.VisualLogicalBytes ?? 0; } } }
+    internal BScanOptions Options => _options;
+    internal ConventionalUtFrameMetadata? CurrentMetadata { get { lock (_gate) { return _open ? _metadata : null; } } }
+    internal int CaptureVisualLeases(Span<BScanTraceStore.BScanTraceLease?> destination,
+        out ConventionalUtFrameMetadata? metadata, out BScanStoreVisualState state)
+    {
+        BScanTraceStore? store;
+        lock (_gate)
+        {
+            store = _open ? _store : null;
+            metadata = store is null ? null : _metadata;
+        }
+        if (store is null) { state = default; return 0; }
+        return store.CaptureVisualLeases(destination, out state);
+    }
+
+    internal bool IsVisualStateCurrent(ConventionalUtFrameMetadata metadata, ulong revision, ulong wrapGeneration)
+    {
+        BScanTraceStore? store;
+        lock (_gate)
+        {
+            if (!_open || _metadata != metadata) { return false; }
+            store = _store;
+        }
+        return store is not null && store.IsVisualStateCurrent(revision, wrapGeneration);
+    }
 
     private static bool IsCompatible(ConventionalUtFrameMetadata expected, ConventionalUtFrameMetadata actual) =>
         expected.SourceId == actual.SourceId && expected.RunId == actual.RunId &&

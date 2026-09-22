@@ -1,0 +1,218 @@
+using BenchmarkDotNet.Attributes;
+using UTStudio.Domain.Acquisition;
+using UTStudio.Visualization.Core;
+
+namespace UTStudio.Benchmarks;
+
+/// <summary>Diagnostic benchmarks; results are not throughput guarantees.</summary>
+[MemoryDiagnoser]
+public class BScanFullRasterBenchmarks
+{
+    [Params(256, 1024)] public int RasterSize { get; set; }
+    private BScanVisualBenchmarkFixture _fixture = null!;
+
+    [GlobalSetup]
+    public void Setup() => _fixture = BScanVisualBenchmarkFixture.Create(128, 2048, RasterSize);
+
+    [GlobalCleanup]
+    public void Cleanup() => _fixture.Dispose();
+
+    [Benchmark(Description = "B-Scan full neutral raster with temporal/spatial reduction")]
+    public int FullRaster() => _fixture.RenderFull();
+}
+
+[MemoryDiagnoser]
+public class BScanBipolarMappingBenchmarks
+{
+    private readonly short[] _samples = BenchmarkData.Samples(65_535);
+
+    [Benchmark(OperationsPerInvoke = 65_535, Description = "B-Scan bipolar Int16 to neutral byte")]
+    public byte Map()
+    {
+        byte result = 0;
+        foreach (short sample in _samples) { result ^= BScanBipolarIntensity8.Map(sample); }
+        return result;
+    }
+}
+
+[MemoryDiagnoser]
+public class BScanIncrementalRasterBenchmarks
+{
+    [Params(1, 8)] public int DirtyColumns { get; set; }
+    private BScanVisualBenchmarkFixture _fixture = null!;
+    [IterationSetup] public void Setup() => _fixture = BScanVisualBenchmarkFixture.CreateIncremental(DirtyColumns, wrap: false);
+    [IterationCleanup] public void Cleanup() => _fixture.Dispose();
+    [Benchmark(Description = "B-Scan incremental contiguous columns")]
+    public int Incremental() => _fixture.RenderPrepared();
+}
+
+[MemoryDiagnoser]
+public class BScanWrapIncrementalBenchmarks
+{
+    private BScanVisualBenchmarkFixture _fixture = null!;
+    [IterationSetup] public void Setup() => _fixture = BScanVisualBenchmarkFixture.CreateIncremental(1, wrap: true);
+    [IterationCleanup] public void Cleanup() => _fixture.Dispose();
+    [Benchmark(Description = "B-Scan incremental request after ring wrap")]
+    public int IncrementalAfterWrap() => _fixture.RenderPrepared();
+}
+
+[MemoryDiagnoser]
+public class BScanReductionBenchmarks
+{
+    private BScanVisualBenchmarkFixture _temporal = null!;
+    private BScanVisualBenchmarkFixture _spatial = null!;
+    [IterationSetup]
+    public void Setup()
+    {
+        _temporal = BScanVisualBenchmarkFixture.Create(1, 65_535, 256);
+        _spatial = BScanVisualBenchmarkFixture.Create(256, 2048, 64);
+    }
+    [IterationCleanup] public void Cleanup() { _temporal.Dispose(); _spatial.Dispose(); }
+    [Benchmark(Description = "B-Scan temporal min/max reduction")]
+    public int TemporalReduction() => _temporal.RenderFull();
+    [Benchmark(Description = "B-Scan spatial multi-column reduction")]
+    public int SpatialReduction() => _spatial.RenderFull();
+}
+
+[MemoryDiagnoser]
+public class BScanPublicationAdmissionBenchmarks
+{
+    private BScanVisualBenchmarkFixture _withoutObserver = null!;
+    private BScanVisualBenchmarkFixture _withObserver = null!;
+    [IterationSetup]
+    public void Setup()
+    {
+        _withoutObserver = BScanVisualBenchmarkFixture.Create(16, 2048, 256);
+        _withObserver = BScanVisualBenchmarkFixture.Create(16, 2048, 256, subscribe: true);
+    }
+    [IterationCleanup] public void Cleanup() { _withoutObserver.Dispose(); _withObserver.Dispose(); }
+    [Benchmark(Description = "B-Scan coalesced publication admission without observer")]
+    public void CoalesceWithoutObserver() => _withoutObserver.RequestBurst();
+    [Benchmark(Description = "B-Scan coalesced publication admission with healthy observer")]
+    public void CoalesceWithObserver() => _withObserver.RequestBurst();
+    [Benchmark(Description = "B-Scan superseded candidate admission")]
+    public void SupersedeCandidate() => _withObserver.RequestSupersession();
+}
+
+internal sealed class BScanVisualBenchmarkFixture : IDisposable
+{
+    private readonly BScanIngress _ingress;
+    private readonly BScanVisualDelivery _delivery;
+    private readonly BScanRenderRequest _request;
+    private BScanRenderRequest _preparedRequest;
+    private BScanRasterRegion? _measuredRegion;
+    private IDisposable? _subscription;
+    private ulong _sequence;
+
+    private BScanVisualBenchmarkFixture(BScanIngress ingress, BScanVisualDelivery delivery,
+        BScanRenderRequest request)
+    { _ingress = ingress; _delivery = delivery; _request = request; _preparedRequest = request; }
+
+    internal static BScanVisualBenchmarkFixture Create(int columns, int samples, int rasterSize,
+        bool subscribe = false, int? initialColumns = null)
+    {
+        int initial = initialColumns ?? columns;
+        var options = new BScanOptions(32L * 1024 * 1024, 16L * 1024 * 1024,
+            columns, columns, 64);
+        var ingress = new BScanIngress(options);
+        var metadata = BenchmarkData.Metadata(samples);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int remaining = initial;
+        ingress.AfterIndexCommit = _ => { if (Interlocked.Decrement(ref remaining) == 0) { indexed.TrySetResult(); } };
+        ingress.OpenRun(metadata);
+        short[] data = BenchmarkData.Samples(samples);
+        for (int column = 0; column < initial; column++)
+        {
+            ingress.Accept(metadata, (ulong)column, (ulong)column, TimeSpan.FromTicks(column), null, data);
+        }
+        indexed.Task.WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult();
+        var delivery = new BScanVisualDelivery(ingress);
+        var range = new BScanAcquisitionRange(0, (ulong)columns - 1);
+        var time = ScanTimeViewportOperations.Create(metadata.Configuration.FirstSampleOffsetSeconds,
+            metadata.Configuration.FirstSampleOffsetSeconds + samples / metadata.Configuration.SampleRateHz);
+        var request = new BScanRenderRequest(metadata.RunId, BScanSpatialViewportOperations.Reset(range),
+            time, rasterSize, rasterSize, 1);
+        var fixture = new BScanVisualBenchmarkFixture(ingress, delivery, request) { _sequence = (ulong)initial };
+        if (subscribe) { fixture._subscription = delivery.Subscribe(new Observer()); }
+        return fixture;
+    }
+
+    internal static BScanVisualBenchmarkFixture CreateIncremental(int dirtyColumns, bool wrap)
+    {
+        const int capacity = 16;
+        BScanVisualBenchmarkFixture fixture = Create(capacity, 2048, 256,
+            initialColumns: wrap ? capacity : 4);
+        using BScanRasterRegion baseline = fixture.GetRegion(fixture._request);
+        BScanVisualSnapshot snapshot = baseline.Snapshot;
+        int additions = wrap ? 1 : dirtyColumns;
+        fixture.AddColumns(additions);
+        fixture._preparedRequest = fixture._request with
+        {
+            DisplayedSnapshotVersion = snapshot.SnapshotVersion,
+            DisplayedStoreRevision = snapshot.StoreRevision,
+            DisplayedWrapGeneration = wrap ? snapshot.WrapGeneration + 1 : snapshot.WrapGeneration
+        };
+        return fixture;
+    }
+
+    internal int RenderFull()
+    {
+        _measuredRegion = GetRegion(_request);
+        return _measuredRegion.Pixels.Length;
+    }
+
+    internal int RenderPrepared()
+    {
+        _measuredRegion = GetRegion(_preparedRequest);
+        return _measuredRegion.Pixels.Length;
+    }
+
+    internal void RequestBurst()
+    {
+        _delivery.RequestRender(_request);
+        _delivery.RequestRender(_request with { PixelWidth = 255 });
+        _delivery.RequestRender(_request);
+    }
+
+    internal void RequestSupersession()
+    {
+        _delivery.RequestRender(_request with { PixelWidth = 255 });
+        _delivery.RequestRender(_request with { PixelWidth = 256 });
+    }
+
+    private BScanRasterRegion GetRegion(BScanRenderRequest request)
+    {
+        BScanRasterResult result = _delivery.GetRegionAsync(request).AsTask().GetAwaiter().GetResult();
+        if (result.Kind != BScanRasterResultKind.Available)
+        { throw new InvalidOperationException(result.Error ?? result.Kind.ToString()); }
+        return result.Region!;
+    }
+
+    private void AddColumns(int count)
+    {
+        short[] data = BenchmarkData.Samples(2048);
+        for (int index = 0; index < count; index++)
+        {
+            var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+            ulong sequence = _sequence++;
+            _ingress.Accept(BenchmarkData.Metadata(2048), sequence, sequence, TimeSpan.FromTicks((long)sequence), null, data);
+            indexed.Task.WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult();
+        }
+    }
+
+    public void Dispose()
+    {
+        _measuredRegion?.Dispose();
+        _subscription?.Dispose();
+        _delivery.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _ingress.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    private sealed class Observer : IObserver<BScanVisualUpdate>
+    {
+        public void OnNext(BScanVisualUpdate value) { }
+        public void OnError(Exception error) { }
+        public void OnCompleted() { }
+    }
+}
