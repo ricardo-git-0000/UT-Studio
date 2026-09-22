@@ -43,6 +43,14 @@ public sealed class CoordinatesTests
     }
 
     [TestMethod]
+    public void ZoomedMappingClipsSegmentsInsteadOfCollapsingEveryOutsidePoint()
+    {
+        AScanPoint[] points = [new(0, -100), new(10, 0), new(20, 100), new(30, 0)];
+        PlotCoordinate[] mapped = AScanCoordinates.Map(points, 12, 18, 120, 100);
+        CollectionAssert.AreEqual(new[] { new PlotCoordinate(0, 40), new PlotCoordinate(120, 10) }, mapped);
+    }
+
+    [TestMethod]
     public void RefreshAdmissionUsesActualTimeWithoutCatchUp()
     {
         var clock = new ManualClock();

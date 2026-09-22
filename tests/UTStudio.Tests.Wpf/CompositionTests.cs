@@ -1,4 +1,5 @@
 using System.Windows.Threading;
+using System.Windows.Input;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using UTStudio.Acquisition.Simulator;
@@ -91,6 +92,32 @@ public sealed class CompositionTests
             Assert.AreEqual(SessionPhase.Running, services.GetRequiredService<IApplicationSession>().Snapshot.Phase);
             await runtime.Shutdown.ShutdownAsync();
             Assert.AreEqual(SessionPhase.Disposed, session.Snapshot.Phase);
+        }
+        finally { await runtime.Shutdown.ShutdownAsync(); }
+    });
+
+    [TestMethod]
+    public Task NavigationKeyBindingsTargetTheExactViewportCommands() => StaTest.Run(async () =>
+    {
+        var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
+        try
+        {
+            var window = runtime.Host.Services.GetRequiredService<MainWindow>();
+            var vm = (AScanViewModel)window.DataContext;
+            window.Show();
+            window.UpdateLayout();
+            AssertBinding(Key.Home, ModifierKeys.None, vm.ResetViewportCommand);
+            AssertBinding(Key.Add, ModifierKeys.None, vm.ZoomInCommand);
+            AssertBinding(Key.Subtract, ModifierKeys.None, vm.ZoomOutCommand);
+            AssertBinding(Key.Left, ModifierKeys.Alt, vm.PanLeftCommand);
+            AssertBinding(Key.Right, ModifierKeys.Alt, vm.PanRightCommand);
+
+            void AssertBinding(Key key, ModifierKeys modifiers, System.Windows.Input.ICommand expected)
+            {
+                var binding = window.InputBindings.OfType<KeyBinding>().Single(item =>
+                    item.Key == key && item.Modifiers == modifiers);
+                Assert.AreSame(expected, binding.Command);
+            }
         }
         finally { await runtime.Shutdown.ShutdownAsync(); }
     });

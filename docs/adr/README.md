@@ -14,5 +14,6 @@ Aceptado identifica decisiones aprobadas, sin autorizar paquetes ni implementaci
 - [0009-reusable-scan-visualization-controls](0009-reusable-scan-visualization-controls.md): Renderizadores de scan específicos y reutilizables por plataforma.
 - [0010-ascan-manual-cursor-measurements](0010-ascan-manual-cursor-measurements.md): Ejes físicos y cursores manuales aproximados sobre puntos visuales A-Scan.
 - [0011-shared-physical-time-viewport](0011-shared-physical-time-viewport.md): Zoom temporal neutral compartible entre A-Scan y futuros B-Scan.
+- [0012-shared-scan-time-navigation](0012-shared-scan-time-navigation.md): navegación temporal reutilizable, identidad latest-only, ciclo de vida y sincronización bidireccional entre scans.
 
 Renderizadores de otros scans, paquetes adicionales y benchmarks pendientes; véanse [plan](../plans/2026-09-09-first-vertical-increment.md) y [cuestiones](../requirements/open-questions.md).

@@ -4,6 +4,13 @@
         xmlns:controls="clr-namespace:UTStudio.Visualization.Wpf.Controls;assembly=UTStudio.Visualization.Wpf"
         Title="UT-Studio · A-Scan simulado" Height="680" Width="1100" MinHeight="420" MinWidth="640"
         Background="#152235" Foreground="#E6EDF6">
+    <Window.InputBindings>
+        <KeyBinding Key="Home" Command="{Binding ResetViewportCommand}" />
+        <KeyBinding Key="Add" Command="{Binding ZoomInCommand}" />
+        <KeyBinding Key="Subtract" Command="{Binding ZoomOutCommand}" />
+        <KeyBinding Key="Left" Modifiers="Alt" Command="{Binding PanLeftCommand}" />
+        <KeyBinding Key="Right" Modifiers="Alt" Command="{Binding PanRightCommand}" />
+    </Window.InputBindings>
     <Grid Margin="24">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -20,7 +27,8 @@
             <StackPanel x:Name="Interactions" Orientation="Horizontal" HorizontalAlignment="Right">
                 <Button Content="Cursores" Command="{Binding ToggleCursorsCommand}" MinWidth="90" Padding="16,8" Margin="16,0,8,0" />
                 <Button Content="Restablecer" Command="{Binding ResetCursorsCommand}" MinWidth="100" Padding="16,8" Margin="0,0,8,0" />
-                <Button Content="Restablecer zoom" Click="OnResetZoom" MinWidth="125" Padding="16,8" Margin="0,0,8,0" />
+                <Button Content="Restablecer zoom" Command="{Binding ResetViewportCommand}" MinWidth="125" Padding="16,8" Margin="0,0,8,0"
+                        AutomationProperties.HelpText="Restablece el rango temporal visible; atajo Home" />
                 <Button Content="Start" Command="{Binding StartCommand}" MinWidth="90" Padding="16,8" Margin="0,0,8,0" />
                 <Button Content="Stop" Command="{Binding StopCommand}" MinWidth="90" Padding="16,8" />
             </StackPanel>
@@ -34,11 +42,20 @@
             <TextBlock Text="{Binding Metadata.Configuration.PhysicalChannelId.Value, TargetNullValue=—}" />
         </StackPanel>
         <controls:AScanControl x:Name="Scan" Grid.Row="2" Snapshot="{Binding AScan}" CursorState="{Binding Cursors}"
-                               TimeViewport="{Binding TimeViewport}" CursorActivated="OnCursorActivated"
+                               ViewportBinding="{Binding ViewportBinding}" CursorActivated="OnCursorActivated"
                                CursorMoveRequested="OnCursorMoveRequested" TimeZoomRequested="OnTimeZoomRequested"
-                               TimePanRequested="OnTimePanRequested" />
+                               TimePanRequested="OnTimePanRequested" TimeResetRequested="OnTimeResetRequested" />
         <StackPanel Grid.Row="3" Margin="0,12,0,0">
             <TextBlock Text="Zoom temporal: rueda sobre el gráfico · desplazar: botón central o Mayús + arrastre izquierdo." Foreground="#AEBFD4" />
+            <StackPanel Orientation="Horizontal" AutomationProperties.Name="Rango visible A-Scan">
+                <TextBlock Text="Vista: " FontWeight="SemiBold" />
+                <TextBlock Text="{Binding TimeViewport.VisibleMinimumSeconds, StringFormat={}{0:0.#########} s, TargetNullValue=—}" />
+                <TextBlock Text=" – " />
+                <TextBlock Text="{Binding TimeViewport.VisibleMaximumSeconds, StringFormat={}{0:0.#########} s, TargetNullValue=—}" />
+                <TextBlock Text="   RF: −100…+100 %" />
+                <TextBlock Text="   Zoom: " />
+                <TextBlock Text="{Binding TimeViewport.ZoomFactor, StringFormat={}{0:0.##}×, TargetNullValue=—}" />
+            </StackPanel>
             <TextBlock Text="Medida manual aproximada sobre los puntos visuales reducidos; no representa precisión de muestra original." Foreground="#AEBFD4" />
             <StackPanel Orientation="Horizontal">
                 <TextBlock Text="A: " FontWeight="SemiBold" />

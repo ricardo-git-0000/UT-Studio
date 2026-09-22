@@ -47,4 +47,34 @@ public sealed class ScanTimeViewportTests
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => ScanTimeViewportOperations.Zoom(viewport, 0.5, 0));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => ScanTimeViewportOperations.Pan(viewport, double.NaN));
     }
+
+    [TestMethod]
+    public void ZoomAnchorIsInvariantAndLimitsSaturate()
+    {
+        var viewport = ScanTimeViewportOperations.Create(-50e-6, 50e-6);
+        const double anchor = -17e-6;
+        double ratio = (anchor - viewport.VisibleMinimumSeconds) / viewport.VisibleSpanSeconds;
+        var zoomed = ScanTimeViewportOperations.Zoom(viewport, anchor, 2.75);
+        double coordinateAfter = (anchor - zoomed.VisibleMinimumSeconds) / zoomed.VisibleSpanSeconds;
+        Assert.AreEqual(ratio, coordinateAfter, 1e-12);
+
+        for (int i = 0; i < 100; i++) { zoomed = ScanTimeViewportOperations.Zoom(zoomed, anchor, 2); }
+        Assert.AreEqual(viewport.DomainSpanSeconds / ScanTimeViewportOperations.MaximumZoomFactor,
+            zoomed.VisibleSpanSeconds, 1e-15);
+        for (int i = 0; i < 100; i++) { zoomed = ScanTimeViewportOperations.Zoom(zoomed, anchor, .5); }
+        Assert.IsTrue(zoomed.IsReset);
+    }
+
+    [TestMethod]
+    public void LinearTransformRoundTripsTimeAndReversedAmplitudeAxis()
+    {
+        Assert.IsTrue(LinearAxisTransform.TryDataToCoordinate(-10e-6, -50e-6, 50e-6, 64, 500, out double x));
+        Assert.IsTrue(LinearAxisTransform.TryCoordinateToData(x, 64, 500, -50e-6, 50e-6, out double time));
+        Assert.AreEqual(-10e-6, time, 1e-15);
+
+        Assert.IsTrue(LinearAxisTransform.TryDataToCoordinate(25, -100, 100, 200, -200, out double y));
+        Assert.IsTrue(LinearAxisTransform.TryCoordinateToData(y, 200, -200, -100, 100, out double amplitude));
+        Assert.AreEqual(25, amplitude, 1e-12);
+        Assert.IsFalse(LinearAxisTransform.TryDataToCoordinate(0, 0, 1, 0, 0, out _));
+    }
 }

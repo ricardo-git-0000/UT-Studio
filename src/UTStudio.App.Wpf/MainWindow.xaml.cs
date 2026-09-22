@@ -72,9 +72,10 @@ public partial class MainWindow : Window
         if (DataContext is AScanViewModel viewModel) { viewModel.PanTime(args.DeltaSeconds); }
     }
 
-    private void OnResetZoom(object sender, RoutedEventArgs args)
+    private void OnTimeResetRequested(object? sender, EventArgs args)
     {
-        if (DataContext is AScanViewModel viewModel) { viewModel.ResetTimeZoom(); }
+        if (DataContext is AScanViewModel viewModel && viewModel.ResetViewportCommand.CanExecute(null))
+        { viewModel.ResetViewportCommand.Execute(null); }
     }
 
     // WPF requires a void Closing event. Every asynchronous failure is caught and logged.

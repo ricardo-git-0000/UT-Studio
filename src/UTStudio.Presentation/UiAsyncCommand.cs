@@ -18,8 +18,13 @@ internal sealed class UiAsyncCommand : ObservableObject, IAsyncRelayCommand
     private readonly object _gate = new();
     private CancellationTokenSource? _cancellation;
     private Task _cancellationCallbacks = Task.CompletedTask;
+    private bool _cancellationStarted;
+    private Task? _closeCompletion;
+    private TaskCompletionSource? _refreshDrain;
+    private bool _refreshRequested;
     private int _reserved;
-    private bool _available, _running, _cancelled;
+    private int _closing;
+    private bool _available, _publishedCanExecute, _running, _cancelled;
     private Task? _executionTask;
 
     internal UiAsyncCommand(UiLifetime lifetime, Func<CancellationToken, Task> execute,
@@ -33,22 +38,31 @@ internal sealed class UiAsyncCommand : ObservableObject, IAsyncRelayCommand
     }
 
     // Initial hydration is silent, before the ViewModel is exposed to bindings.
-    internal void Initialize() => _available = _canExecute();
+    internal void Initialize() => _publishedCanExecute = _available = _canExecute();
     public Task? ExecutionTask => _executionTask;
     public bool IsRunning => _running;
     public bool CanBeCanceled => _running && !_cancelled;
     public bool IsCancellationRequested => _cancelled;
     public event EventHandler? CanExecuteChanged;
-    public bool CanExecute(object? parameter) => !_lifetime.IsClosed && _available;
+    public bool CanExecute(object? parameter) => !_lifetime.IsClosed && Volatile.Read(ref _closing) == 0 && _available;
     public void Execute(object? parameter) => _ = ExecuteAsync(parameter);
 
     public Task ExecuteAsync(object? parameter)
     {
-        if (_lifetime.IsClosed || Interlocked.CompareExchange(ref _reserved, 1, 0) != 0) { return Task.CompletedTask; }
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var cancellation = new CancellationTokenSource();
-        lock (_gate) { _cancellation = cancellation; _cancellationCallbacks = Task.CompletedTask; }
-        _ = Task.Run(() => RunAsync(completion, cancellation));
+        TaskCompletionSource completion;
+        CancellationTokenSource cancellation;
+        lock (_gate)
+        {
+            if (_lifetime.IsClosed || _closing != 0 || _reserved != 0) { return Task.CompletedTask; }
+            _reserved = 1;
+            completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            cancellation = new();
+            _cancellation = cancellation;
+            _cancellationCallbacks = Task.CompletedTask;
+            _cancellationStarted = false;
+            _closeCompletion = completion.Task;
+        }
+        _ = Observe(RunAsync(completion, cancellation));
         return completion.Task;
     }
 
@@ -60,7 +74,7 @@ internal sealed class UiAsyncCommand : ObservableObject, IAsyncRelayCommand
         {
             await _lifetime.InvokeAsync(() =>
             {
-                if (!_canExecute()) { return; }
+                if (Volatile.Read(ref _closing) != 0 || !_canExecute()) { return; }
                 admitted = true;
                 _running = true;
                 _cancelled = false;
@@ -99,9 +113,14 @@ internal sealed class UiAsyncCommand : ObservableObject, IAsyncRelayCommand
                 }
                 catch (Exception error) { dispatchError ??= error; }
             }
-            Interlocked.Exchange(ref _reserved, 0);
-            if (dispatchError is null) { completion.TrySetResult(); }
-            else { completion.TrySetException(dispatchError); _ = completion.Task.Exception; }
+            lock (_gate)
+            {
+                if (dispatchError is null) { completion.TrySetResult(); }
+                else { completion.TrySetException(dispatchError); }
+                _reserved = 0;
+                _closeCompletion = null;
+            }
+            if (dispatchError is not null) { _ = completion.Task.Exception; }
         }
     }
 
@@ -115,20 +134,103 @@ internal sealed class UiAsyncCommand : ObservableObject, IAsyncRelayCommand
 
     internal Task CancelPending()
     {
+        CancellationTokenSource? cancellation = null;
+        TaskCompletionSource? completion = null;
         lock (_gate)
         {
-            if (_cancellation is { IsCancellationRequested: false }) { _cancellationCallbacks = _cancellation.CancelAsync(); }
-            return _cancellationCallbacks;
+            if (_cancellation is { IsCancellationRequested: false } pending && !_cancellationStarted)
+            {
+                _cancellationStarted = true;
+                cancellation = pending;
+                completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                _cancellationCallbacks = completion.Task;
+            }
+            else { return _cancellationCallbacks; }
+        }
+        _ = CompleteCancellationAsync(cancellation, completion);
+        return completion.Task;
+    }
+
+    internal void DisableForClose()
+    {
+        lock (_gate) { _closing = 1; }
+        _ = Observe(RequestRefresh(allowClosing: true));
+    }
+
+    internal async Task FinishForCloseAsync()
+    {
+        Task cancellation = CancelPending();
+        Task? completion;
+        Task refresh;
+        lock (_gate)
+        {
+            completion = _closeCompletion;
+            refresh = _refreshDrain?.Task ?? Task.CompletedTask;
+        }
+        await Task.WhenAll(cancellation, completion ?? Task.CompletedTask, refresh).ConfigureAwait(false);
+    }
+
+    public void NotifyCanExecuteChanged() => _ = Observe(RequestRefresh());
+
+    private Task RequestRefresh(bool allowClosing = false)
+    {
+        TaskCompletionSource? drain = null;
+        lock (_gate)
+        {
+            if (_lifetime.IsClosed || (_closing != 0 && !allowClosing))
+            { return _refreshDrain?.Task ?? Task.CompletedTask; }
+            _refreshRequested = true;
+            if (_refreshDrain is not null) { return _refreshDrain.Task; }
+            drain = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _refreshDrain = drain;
+        }
+        _ = ObserveRefreshDispatchAsync(_lifetime.InvokeAsync(() => DrainRefresh(drain)), drain);
+        return drain.Task;
+    }
+
+    private void DrainRefresh(TaskCompletionSource drain)
+    {
+        while (true)
+        {
+            lock (_gate)
+            {
+                if (!ReferenceEquals(_refreshDrain, drain)) { return; }
+                if (!_refreshRequested)
+                {
+                    _refreshDrain = null;
+                    drain.TrySetResult();
+                    return;
+                }
+                _refreshRequested = false;
+            }
+            bool available = Volatile.Read(ref _closing) == 0 && !_lifetime.IsClosed && _canExecute();
+            _available = available;
+            if (available == _publishedCanExecute) { continue; }
+            _publishedCanExecute = available;
+            try { CanExecuteChanged?.Invoke(this, EventArgs.Empty); }
+            catch (Exception error) { _reportError(error); }
         }
     }
 
-    public void NotifyCanExecuteChanged() => _ = Observe(_lifetime.InvokeAsync(Refresh));
-    internal void Refresh()
+    private async Task ObserveRefreshDispatchAsync(Task dispatch, TaskCompletionSource drain)
     {
-        _available = _canExecute();
-        if (_lifetime.IsClosed) { return; }
-        try { CanExecuteChanged?.Invoke(this, EventArgs.Empty); }
-        catch (Exception error) { _reportError(error); }
+        try { await dispatch.ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_refreshDrain, drain))
+                { _refreshRequested = false; _refreshDrain = null; }
+            }
+            drain.TrySetException(error);
+            _ = drain.Task.Exception;
+        }
+    }
+
+    private static async Task CompleteCancellationAsync(CancellationTokenSource cancellation, TaskCompletionSource completion)
+    {
+        try { await cancellation.CancelAsync().ConfigureAwait(false); completion.TrySetResult(); }
+        catch (Exception error) { completion.TrySetException(error); _ = completion.Task.Exception; }
     }
 
     private void NotifyState()

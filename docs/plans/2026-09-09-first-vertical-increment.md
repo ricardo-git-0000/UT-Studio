@@ -151,6 +151,8 @@ App retira StartupUri, inicia Host y resuelve/muestra MainWindow con OnMainWindo
 
 [AScanControl](../../src/UTStudio.Visualization.Wpf/Controls/AScanControl.cs) consume snapshots independientes y dibuja mediante DrawingContext/StreamGeometry, sin elemento visual por punto. Desde la extracción aceptada en [ADR 0009](../adr/0009-reusable-scan-visualization-controls.md), el control y AScanCoordinates viven en `UTStudio.Visualization.Wpf`; App.Wpf solo los aloja desde XAML. Escala horizontal al tamaño disponible, etiquetas en microsegundos, escala vertical RF fija ±100 %, línea de cero, clipping y recursos congelados.
 
+El incremento de navegación aprobado en [ADR 0012](../adr/0012-shared-scan-time-navigation.md) añade zoom temporal anclado, pan, reset por comando/doble clic y un viewport físico compartible. La composición puede compartir el coordinador entre futuros A/B-Scan; cada control conserva orientación e interacción propias y valida run/versión contra su snapshot latest-only. RF continúa fija en ±100 %; no se añaden profundidad, gates ni zoom de amplitud.
+
 La adopción de **nuevos datos de señal en OnRender** queda separada por al menos 333.334 ticks, medidos con reloj monotónico en el momento de dibujar. Un tick retrasado no recupera actualizaciones. Los repintados por redimensionamiento pueden reutilizar los mismos datos; borrar una ejecución invalidada es inmediato. Se conserva una referencia pendiente y una mostrada. La consulta visible de métricas usa intervalos mínimos de 200 ms, sin confundir Published con callbacks o frames persistidos. La cadencia no es una garantía de rendimiento sostenido.
 
 ### Cierre y fallos

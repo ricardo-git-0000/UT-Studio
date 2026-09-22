@@ -13,11 +13,12 @@ internal sealed class ManualUiDispatcher : IUiDispatcher
     private readonly object _executionGate = new();
     internal int Pending { get { lock (_executionGate) { return _queue.Count; } } }
     internal bool FailDispatch { get; set; }
+    internal bool AlwaysQueue { get; set; }
     public bool CheckAccess() => ReferenceEquals(_executing, this);
     public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
     {
         if (FailDispatch) { return Task.FromException(new InvalidOperationException("UI unavailable")); }
-        if (CheckAccess()) { cancellationToken.ThrowIfCancellationRequested(); action(); return Task.CompletedTask; }
+        if (CheckAccess() && !AlwaysQueue) { cancellationToken.ThrowIfCancellationRequested(); action(); return Task.CompletedTask; }
         var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_executionGate) { _queue.Enqueue((action, cancellationToken, done)); }
         return done.Task;
@@ -126,6 +127,7 @@ internal sealed class ManualApplicationSession : IApplicationSession
     internal ManualObservable<SessionSnapshot> Updates { get; } = new();
     internal Func<CancellationToken, Task>? StartAction { get; set; }
     internal Func<CancellationToken, Task>? StopAction { get; set; }
+    internal bool EmitSnapshotOnSubscribe { get; init; } = true;
     internal int StartCalls => Volatile.Read(ref _startCalls);
     internal int StopCalls => Volatile.Read(ref _stopCalls);
     internal AcquisitionRunId? LastRun { get; private set; }
@@ -135,7 +137,7 @@ internal sealed class ManualApplicationSession : IApplicationSession
     public IDisposable Subscribe(IObserver<SessionSnapshot> observer)
     {
         var subscription = Updates.Subscribe(observer);
-        observer.OnNext(Snapshot);
+        if (EmitSnapshotOnSubscribe) { observer.OnNext(Snapshot); }
         return subscription;
     }
 

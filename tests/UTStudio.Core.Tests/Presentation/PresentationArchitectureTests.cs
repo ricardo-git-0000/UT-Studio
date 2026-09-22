@@ -39,6 +39,16 @@ public sealed class PresentationArchitectureTests
     }
 
     [TestMethod]
+    public void UiAsyncCommandDoesNotScheduleExecutionWithTaskRun()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "UTStudio.sln"))) { directory = directory.Parent; }
+        Assert.IsNotNull(directory);
+        string source = File.ReadAllText(Path.Combine(directory.FullName, "src", "UTStudio.Presentation", "UiAsyncCommand.cs"));
+        Assert.DoesNotContain("Task.Run(", source, StringComparison.Ordinal);
+    }
+
+    [TestMethod]
     public void SessionSnapshotValidatesBoundaryAndDefensivelyCopiesErrors()
     {
         var errors = new List<UtSourceError> { new("first", "original") };

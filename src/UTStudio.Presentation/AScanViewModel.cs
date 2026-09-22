@@ -25,8 +25,10 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
     private readonly SharedScanTimeViewport _timeViewport;
+    private readonly bool _ownsTimeViewport;
+    private readonly string _viewportConsumerId = $"ascan-{Guid.NewGuid():N}";
     private readonly UiAsyncCommand _start, _stop;
-    private readonly RelayCommand _toggleCursors, _resetCursors;
+    private readonly RelayCommand _toggleCursors, _resetCursors, _resetViewport, _zoomIn, _zoomOut, _panLeft, _panRight;
     private IDisposable? _sessionSubscription, _visualSubscription, _statusSubscription;
     private SessionSnapshot _latestSession;
     private AScanSnapshot? _latestVisual;
@@ -37,6 +39,9 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private UtSourceError? _notificationError;
     private bool _pumpScheduled, _dirty;
     private Task? _disposal;
+    private ScanTimeViewportBinding? _publishedViewportBinding;
+    private int _closing;
+    private bool IsClosing => Volatile.Read(ref _closing) != 0;
 
     public AScanViewModel(IApplicationSession session, IObservable<AScanSnapshot> visualFeed,
         IUiDispatcher dispatcher, ConventionalAcquisitionConfiguration configuration,
@@ -52,16 +57,26 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _newRun = newRun ?? (() => new AcquisitionRunId(Guid.NewGuid()));
         _readStatistics = readVisualStatistics;
         _lifetime = new UiLifetime(dispatcher);
+        _ownsTimeViewport = timeViewport is null;
         _timeViewport = timeViewport ?? new SharedScanTimeViewport(dispatcher);
         _timeViewport.PropertyChanged += OnTimeViewportChanged;
         _latestSession = session.Snapshot;
         _state = new(_latestSession, null, null, null, null);
-        _start = new(_lifetime, StartAsync, () => _state.Session.CanStart && !_start!.IsRunning && !_stop!.IsRunning,
+        _start = new(_lifetime, StartAsync, () => !IsClosing && _state.Session.CanStart && !_start!.IsRunning && !_stop!.IsRunning,
             ReportCommandError, RefreshCommands);
-        _stop = new(_lifetime, StopAsync, () => (_state.Session.CanStop || _start.IsRunning) && !_stop!.IsRunning,
+        _stop = new(_lifetime, StopAsync, () => !IsClosing && (_state.Session.CanStop || _start.IsRunning) && !_stop!.IsRunning,
             ReportCommandError, RefreshCommands);
-        _toggleCursors = new(ToggleCursors, () => _state.Cursors is not null);
-        _resetCursors = new(ResetCursors, () => _state.AScan is not null && _state.Cursors is not null);
+        _toggleCursors = new(ToggleCursors, () => !IsClosing && !_lifetime.IsClosed && _state.Cursors is not null);
+        _resetCursors = new(ResetCursors, () => !IsClosing && !_lifetime.IsClosed && _state.AScan is not null && _state.Cursors is not null);
+        _resetViewport = new(ResetTimeZoom, () => !IsClosing && !_lifetime.IsClosed && TimeViewport is { IsReset: false });
+        _zoomIn = new(() => ZoomAtCenter(1.2), () => !IsClosing && !_lifetime.IsClosed &&
+            TimeViewport is { } viewport && viewport.VisibleSpanSeconds >
+                viewport.DomainSpanSeconds / ScanTimeViewportOperations.MaximumZoomFactor * (1 + 1e-12));
+        _zoomOut = new(() => ZoomAtCenter(1 / 1.2), () => !IsClosing && !_lifetime.IsClosed && TimeViewport is { IsReset: false });
+        _panLeft = new(() => PanByFraction(-.1), () => !IsClosing && !_lifetime.IsClosed && TimeViewport is { } viewport &&
+            viewport.VisibleMinimumSeconds > viewport.DomainMinimumSeconds);
+        _panRight = new(() => PanByFraction(.1), () => !IsClosing && !_lifetime.IsClosed && TimeViewport is { } viewport &&
+            viewport.VisibleMaximumSeconds < viewport.DomainMaximumSeconds);
         _start.Initialize();
         _stop.Initialize();
         try { _sessionSubscription = session.Subscribe(new Observer<SessionSnapshot>(ReceiveSession, ReceiveError)); }
@@ -84,16 +99,44 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public AScanDeliveryStatus? VisualStatus => _state.VisualStatus;
     public AScanCursorState? Cursors => _state.Cursors;
     public ScanTimeViewport? TimeViewport => _timeViewport.Viewport;
+    public ScanTimeViewportBinding? ViewportBinding => _state.AScan is { } snapshot &&
+        _timeViewport.RunId == snapshot.Metadata.RunId && _timeViewport.Viewport is { } viewport
+        ? new(snapshot.Metadata.RunId, snapshot.Version, viewport) : null;
     public UtSourceError? VisualError => _state.VisualStatus?.TerminalError ?? _state.Session.VisualError ?? _state.VisualStatistics?.LastError;
     public UtSourceError? NotificationError => _notificationError;
     public IAsyncRelayCommand StartCommand => _start;
     public IAsyncRelayCommand StopCommand => _stop;
     public IRelayCommand ToggleCursorsCommand => _toggleCursors;
     public IRelayCommand ResetCursorsCommand => _resetCursors;
+    public IRelayCommand ResetViewportCommand => _resetViewport;
+    public IRelayCommand ZoomInCommand => _zoomIn;
+    public IRelayCommand ZoomOutCommand => _zoomOut;
+    public IRelayCommand PanLeftCommand => _panLeft;
+    public IRelayCommand PanRightCommand => _panRight;
 
-    public void ZoomTime(double anchorSeconds, double factor) => _timeViewport.Zoom(anchorSeconds, factor);
-    public void PanTime(double deltaSeconds) => _timeViewport.Pan(deltaSeconds);
-    public void ResetTimeZoom() => _timeViewport.Reset();
+    public void ZoomTime(double anchorSeconds, double factor)
+    {
+        if (!IsClosing) { _lifetime.Post(() => { if (!IsClosing) { _timeViewport.Zoom(anchorSeconds, factor); } }); }
+    }
+    public void PanTime(double deltaSeconds)
+    {
+        if (!IsClosing) { _lifetime.Post(() => { if (!IsClosing) { _timeViewport.Pan(deltaSeconds); } }); }
+    }
+    public void ResetTimeZoom()
+    {
+        if (!IsClosing) { _lifetime.Post(() => { if (!IsClosing) { _timeViewport.Reset(); } }); }
+    }
+
+    private void ZoomAtCenter(double factor)
+    {
+        if (TimeViewport is not { } viewport) { return; }
+        ZoomTime((viewport.VisibleMinimumSeconds + viewport.VisibleMaximumSeconds) / 2, factor);
+    }
+
+    private void PanByFraction(double fraction)
+    {
+        if (TimeViewport is { } viewport) { PanTime(viewport.VisibleSpanSeconds * fraction); }
+    }
 
     public void ActivateCursor(AScanCursorId cursor) => _lifetime.Post(() =>
     {
@@ -222,6 +265,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private void ApplyLatest()
     {
+        if (IsClosing) { return; }
         SessionSnapshot session;
         AScanSnapshot? visual;
         AScanDeliveryStatistics? statistics;
@@ -244,17 +288,25 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         AScanCursorState? cursors = current is null ? null : _state.Cursors is null || _state.AScan?.Metadata.RunId != current.Metadata.RunId
             ? AScanCursorMeasurements.Create(current)
             : AScanCursorMeasurements.Reconcile(_state.Cursors, current);
-        if (current is not null) { _timeViewport.ReconcileDomain(current.MinimumTimeSeconds, current.MaximumTimeSeconds); }
-        if (ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors)))
-        { RefreshCommands(); }
+        if (current is not null)
+        {
+            _timeViewport.ReconcileDomainDeferred(_viewportConsumerId, current.Metadata.RunId, current.Version,
+                current.MinimumTimeSeconds, current.MaximumTimeSeconds);
+        }
+        else if (_state.AScan is not null) { _timeViewport.RemoveConsumerDeferred(_viewportConsumerId); }
+        bool changed = ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors));
+        _timeViewport.PublishDeferredChanges();
+        PublishViewportBindingIfChanged();
+        if (changed) { RefreshCommands(); }
     }
 
     private bool ReplaceState(AScanViewState state)
     {
-        if (_lifetime.IsClosed || state == _state) { return false; }
+        if (IsClosing || _lifetime.IsClosed || state == _state) { return false; }
         _state = state;
         foreach (string name in new[] { nameof(State), nameof(Session), nameof(AScan), nameof(Points), nameof(Metadata),
-            nameof(VisualStatistics), nameof(VisualStatus), nameof(Cursors), nameof(ReceivedFrames), nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
+            nameof(VisualStatistics), nameof(VisualStatus), nameof(Cursors), nameof(ReceivedFrames),
+            nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
         {
             OnPropertyChanged(name);
         }
@@ -263,21 +315,26 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private void RefreshCommands()
     {
-        if (_lifetime.IsClosed) { return; }
-        _start.Refresh();
-        _stop.Refresh();
+        if (IsClosing || _lifetime.IsClosed) { return; }
+        _start.NotifyCanExecuteChanged();
+        _stop.NotifyCanExecuteChanged();
         _toggleCursors.NotifyCanExecuteChanged();
         _resetCursors.NotifyCanExecuteChanged();
+        _resetViewport.NotifyCanExecuteChanged();
+        _zoomIn.NotifyCanExecuteChanged();
+        _zoomOut.NotifyCanExecuteChanged();
+        _panLeft.NotifyCanExecuteChanged();
+        _panRight.NotifyCanExecuteChanged();
     }
 
     private void ReportCommandError(Exception error)
     {
-        if (!_lifetime.IsClosed) { ReplaceState(_state with { CommandError = Describe("presentation.command", error) }); }
+        if (!IsClosing && !_lifetime.IsClosed) { ReplaceState(_state with { CommandError = Describe("presentation.command", error) }); }
     }
 
     protected override void OnPropertyChanged(PropertyChangedEventArgs e)
     {
-        if (_lifetime.IsClosed) { return; }
+        if (IsClosing || _lifetime.IsClosed) { return; }
         try { base.OnPropertyChanged(e); }
         catch (Exception error)
         {
@@ -290,21 +347,46 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private void OnTimeViewportChanged(object? sender, PropertyChangedEventArgs args)
     {
-        if (args.PropertyName == nameof(SharedScanTimeViewport.Viewport)) { OnPropertyChanged(nameof(TimeViewport)); }
+        if (args.PropertyName is nameof(SharedScanTimeViewport.Viewport) or nameof(SharedScanTimeViewport.RunId))
+        {
+            OnPropertyChanged(nameof(TimeViewport));
+            PublishViewportBindingIfChanged();
+            RefreshCommands();
+        }
+    }
+
+    private void PublishViewportBindingIfChanged()
+    {
+        ScanTimeViewportBinding? current = ViewportBinding;
+        if (EqualityComparer<ScanTimeViewportBinding?>.Default.Equals(_publishedViewportBinding, current)) { return; }
+        _publishedViewportBinding = current;
+        OnPropertyChanged(nameof(ViewportBinding));
     }
 
     public ValueTask DisposeAsync()
     {
+        TaskCompletionSource? completion = null;
+        Task disposal;
         lock (_gate)
         {
             if (_disposal is null)
             {
-                _lifetime.Close();
-                _latestVisual = null;
-                _disposal = Task.Run(CloseAsync);
+                completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                _disposal = completion.Task;
+                Volatile.Write(ref _closing, 1);
+                _start.DisableForClose();
+                _stop.DisableForClose();
             }
-            return new ValueTask(_disposal);
+            disposal = _disposal;
         }
+        if (completion is not null) { _ = CompleteCloseAsync(completion); }
+        return new ValueTask(disposal);
+    }
+
+    private async Task CompleteCloseAsync(TaskCompletionSource completion)
+    {
+        try { await CloseAsync().ConfigureAwait(false); completion.TrySetResult(); }
+        catch (Exception error) { completion.TrySetException(error); }
     }
 
     private async Task CloseAsync()
@@ -316,11 +398,45 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             try { subscription?.Dispose(); }
             catch (Exception error) { errors.Add(error); }
         }
-        try { await Task.WhenAll(_start.CancelPending(), _stop.CancelPending()).ConfigureAwait(false); }
+        Task commandCompletion = Task.WhenAll(_start.FinishForCloseAsync(), _stop.FinishForCloseAsync());
+        try { await commandCompletion.ConfigureAwait(false); }
+        catch (Exception error) { errors.Add(error); }
+        try
+        {
+            await _lifetime.InvokeAsync(() =>
+            {
+                _latestVisual = null;
+                NotifyRelayCommandsClosed();
+                _lifetime.Close();
+            }).ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            _lifetime.Close();
+            errors.Add(error);
+        }
+        try { await _timeViewport.RemoveConsumerAsync(_viewportConsumerId).ConfigureAwait(false); }
         catch (Exception error) { errors.Add(error); }
         try { await _lifetime.BarrierAsync().ConfigureAwait(false); }
         catch (Exception error) { errors.Add(error); }
+        if (_ownsTimeViewport)
+        {
+            try { await _timeViewport.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) { errors.Add(error); }
+        }
         if (errors.Count != 0) { throw new AggregateException("ViewModel cleanup failed.", errors); }
+    }
+
+    private void NotifyRelayCommandsClosed()
+    {
+        foreach (RelayCommand command in new[]
+        {
+            _toggleCursors, _resetCursors, _resetViewport, _zoomIn, _zoomOut, _panLeft, _panRight
+        })
+        {
+            try { command.NotifyCanExecuteChanged(); }
+            catch { } // A failing observer must not prevent the remaining commands or cleanup from closing.
+        }
     }
 
     private static UtSourceError Describe(string code, Exception error) =>

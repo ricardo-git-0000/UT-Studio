@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
@@ -38,6 +39,503 @@ public sealed class AScanViewModelTests
         Assert.IsTrue(ui.RunLast());
         Assert.AreEqual(100e-6, shared.Viewport.VisibleMaximumSeconds, 1e-15);
         Assert.IsTrue(notifications.All(access => access));
+    }
+
+    [TestMethod]
+    public async Task SharedViewportIntersectsConsumersSynchronizesAndInvalidatesPendingWorkOnClose()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var run = NewRun();
+        Task register = ui.InvokeAsync(() =>
+        {
+            shared.ReconcileDomain("a", run, 1, 0, 100e-6);
+            shared.ReconcileDomain("b", run, 4, 20e-6, 80e-6);
+        });
+        await ui.DriveAsync(register);
+        Assert.AreEqual(20e-6, shared.Viewport!.DomainMinimumSeconds, 1e-15);
+        Assert.AreEqual(80e-6, shared.Viewport.DomainMaximumSeconds, 1e-15);
+
+        shared.Zoom(50e-6, 2);
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(30e-6, shared.Viewport.VisibleSpanSeconds, 1e-15);
+        shared.RemoveConsumer("b");
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(0, shared.Viewport.DomainMinimumSeconds, 1e-15);
+        Assert.AreEqual(100e-6, shared.Viewport.DomainMaximumSeconds, 1e-15);
+
+        var nextRun = NewRun();
+        shared.ReconcileDomain("a", nextRun, 1, -40e-6, 40e-6);
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(nextRun, shared.RunId);
+        Assert.IsTrue(shared.Viewport!.IsReset);
+        shared.ReconcileDomain("b", run, 99, 0, 10e-6); // Late snapshot from the retired run.
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(nextRun, shared.RunId);
+        Assert.AreEqual(-40e-6, shared.Viewport.DomainMinimumSeconds, 1e-15);
+
+        var stable = shared.Viewport;
+        shared.Pan(10e-6);
+        Task close = shared.DisposeAsync().AsTask();
+        await ui.DriveAsync(close);
+        Assert.IsTrue(shared.IsClosed);
+        Assert.IsNull(shared.Viewport);
+        Assert.AreNotSame(stable, shared.Viewport);
+    }
+
+    [TestMethod]
+    public async Task ViewportNotificationUsesTheSnapshotWhoseDomainWasReconciled()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var shared = new SharedScanTimeViewport(ui);
+        var vm = new AScanViewModel(session, feed, ui, Configuration, timeViewport: shared);
+        try
+        {
+            var run = NewRun();
+            session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+            feed.Emit(Visual(run, 1));
+            await ui.DriveUntilAsync(() => vm.ViewportBinding?.SnapshotVersion == 1);
+
+            var observed = new List<ScanTimeViewportBinding>();
+            int sharedViewportNotifications = 0;
+            bool reentered = false;
+            shared.PropertyChanged += (_, args) =>
+            {
+                if (args.PropertyName == nameof(SharedScanTimeViewport.Viewport)) { sharedViewportNotifications++; }
+            };
+            vm.PropertyChanged += (_, args) =>
+            {
+                if (args.PropertyName == nameof(AScanViewModel.ViewportBinding) && vm.ViewportBinding is { } binding)
+                { observed.Add(binding); }
+                if (!reentered && args.PropertyName == nameof(AScanViewModel.AScan) && vm.AScan?.Version == 2)
+                {
+                    reentered = true;
+                    var viewport = vm.TimeViewport!;
+                    vm.ZoomTime((viewport.VisibleMinimumSeconds + viewport.VisibleMaximumSeconds) / 2, 2);
+                }
+            };
+            var wider = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), 16, 50_000_000);
+            feed.Emit(new AScanProjector().Project(
+                new(ManualApplicationSession.Source, run, wider, DateTimeOffset.UnixEpoch), 2, TimeSpan.Zero,
+                new short[wider.SampleCount], 2));
+            await ui.DriveUntilAsync(() => vm.ViewportBinding?.SnapshotVersion == 2);
+
+            Assert.IsFalse(observed.Any(binding => binding.SnapshotVersion == 1 &&
+                binding.Viewport.DomainMaximumSeconds == vm.AScan!.MaximumTimeSeconds));
+            Assert.IsFalse(observed.Any(binding => binding.SnapshotVersion == 2 &&
+                binding.Viewport.DomainMaximumSeconds != vm.AScan!.MaximumTimeSeconds));
+            Assert.AreEqual(vm.AScan!.MaximumTimeSeconds, vm.ViewportBinding!.Viewport.DomainMaximumSeconds, 1e-15);
+            Assert.AreEqual(1, sharedViewportNotifications);
+            Assert.HasCount(1, observed);
+            Assert.IsGreaterThan(1, vm.TimeViewport!.ZoomFactor);
+        }
+        finally
+        {
+            await ui.DriveAsync(vm.DisposeAsync().AsTask());
+            await ui.DriveAsync(shared.DisposeAsync().AsTask());
+        }
+    }
+
+    [TestMethod]
+    public async Task ViewportBindingNotifiesOncePerDistinctCompleteValueWithoutTransientPairs()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var shared = new SharedScanTimeViewport(ui);
+        var vm = new AScanViewModel(session, feed, ui, Configuration, timeViewport: shared);
+        var observed = new List<ScanTimeViewportBinding?>();
+        vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName != nameof(AScanViewModel.ViewportBinding)) { return; }
+            var value = vm.ViewportBinding;
+            if (value is not null)
+            {
+                Assert.IsNotNull(vm.AScan);
+                Assert.AreEqual(vm.AScan.Metadata.RunId, value.RunId);
+                Assert.AreEqual(vm.AScan.Version, value.SnapshotVersion);
+            }
+            observed.Add(value);
+        };
+        try
+        {
+            var run = NewRun();
+            session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+            feed.Emit(Visual(run, 1));
+            await ui.DriveUntilAsync(() => vm.ViewportBinding?.SnapshotVersion == 1);
+            Assert.HasCount(1, observed);
+
+            feed.Emit(Visual(run, 1));
+            while (ui.RunNext()) { }
+            Assert.HasCount(1, observed);
+
+            feed.Emit(Visual(run, 2, sequence: 2));
+            await ui.DriveUntilAsync(() => vm.ViewportBinding?.SnapshotVersion == 2);
+            Assert.HasCount(2, observed);
+
+            var viewport = shared.Viewport!;
+            shared.Zoom((viewport.DomainMinimumSeconds + viewport.DomainMaximumSeconds) / 2, 2);
+            Assert.IsTrue(ui.RunNext());
+            Assert.HasCount(3, observed);
+
+            shared.ReconcileDomain("peer", run, 1, 1, 2);
+            Assert.IsTrue(ui.RunNext());
+            Assert.IsNull(vm.ViewportBinding);
+            Assert.HasCount(4, observed);
+            shared.ReconcileDomain("peer", run, 1, 1, 2);
+            Assert.IsTrue(ui.RunNext());
+            Assert.HasCount(4, observed);
+
+            shared.ReconcileDomain("peer", run, 2, vm.AScan!.MinimumTimeSeconds,
+                (vm.AScan.MinimumTimeSeconds + vm.AScan.MaximumTimeSeconds) / 2);
+            Assert.IsTrue(ui.RunNext());
+            Assert.IsNotNull(vm.ViewportBinding);
+            Assert.HasCount(5, observed);
+            await ui.DriveAsync(shared.RemoveConsumerAsync("peer"));
+            Assert.HasCount(6, observed);
+
+            var nextRun = NewRun();
+            session.Set(ManualApplicationSession.Create(2, SessionPhase.Running, nextRun, canStop: true));
+            feed.Emit(Visual(nextRun, 3));
+            await ui.DriveUntilAsync(() => vm.ViewportBinding?.RunId == nextRun);
+            Assert.HasCount(7, observed);
+            Assert.IsTrue(observed.Zip(observed.Skip(1), (left, right) => left != right).All(distinct => distinct));
+        }
+        finally
+        {
+            await ui.DriveAsync(vm.DisposeAsync().AsTask());
+            await ui.DriveAsync(shared.DisposeAsync().AsTask());
+        }
+    }
+
+    [TestMethod]
+    public async Task ClosingOnUiPublishesOnlyEffectiveCommandTransitionsAndNothingLate()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var vm = new AScanViewModel(session, feed, ui, Configuration);
+        var commands = Commands(vm);
+        var counts = commands.ToDictionary(command => command, _ => 0);
+        var access = new List<bool>();
+        foreach (var command in commands)
+        {
+            command.CanExecuteChanged += (_, _) =>
+            {
+                counts[command]++;
+                access.Add(ui.CheckAccess());
+                Assert.IsFalse(command.CanExecute(null));
+                command.Execute(null);
+            };
+        }
+
+        Task? close = null;
+        await ui.DriveAsync(ui.InvokeAsync(() => close = vm.DisposeAsync().AsTask()));
+        await ui.DriveAsync(close!);
+        Assert.AreEqual(1, counts[vm.StartCommand]);
+        Assert.AreEqual(0, counts[vm.StopCommand]);
+        Assert.IsTrue(commands.Skip(2).All(command => counts[command] == 1));
+        Assert.IsTrue(access.All(value => value));
+        int eventCount = counts.Values.Sum();
+        session.Set(ManualApplicationSession.Create(1, SessionPhase.Idle, canStart: true));
+        feed.Emit(Visual(NewRun(), 1));
+        foreach (var command in commands) { command.Execute(null); }
+        while (ui.RunNext()) { }
+        Assert.AreEqual(eventCount, counts.Values.Sum());
+        Assert.IsTrue(commands.All(command => !command.CanExecute(null)));
+        Assert.AreSame(close, vm.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task ConcurrentNonUiCloseSharesCompletionAndRaisesOneFinalCommandEvent()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var vm = new AScanViewModel(session, new ManualObservable<AScanSnapshot>(), ui, Configuration);
+        var commands = Commands(vm);
+        var counts = commands.ToDictionary(command => command, _ => 0);
+        foreach (var command in commands) { command.CanExecuteChanged += (_, _) => counts[command]++; }
+
+        Task<object>[] callers = Enumerable.Range(0, 8)
+            .Select(_ => Task.Run(() => (object)vm.DisposeAsync().AsTask()))
+            .ToArray();
+        await Task.WhenAll(callers);
+        Task close = (Task)callers[0].Result;
+        Assert.IsTrue(callers.All(caller => ReferenceEquals(close, caller.Result)));
+        await vm.StartCommand.ExecuteAsync(null);
+        Assert.AreEqual(0, session.StartCalls);
+        await ui.DriveAsync(close);
+        Assert.AreEqual(1, counts[vm.StartCommand]);
+        Assert.AreEqual(0, counts[vm.StopCommand]);
+        Assert.IsTrue(commands.Skip(2).All(command => counts[command] == 1));
+        Assert.IsTrue(commands.All(command => !command.CanExecute(null)));
+        Assert.AreSame(close, vm.DisposeAsync().AsTask());
+        while (ui.RunNext()) { }
+        Assert.AreEqual(1, counts[vm.StartCommand]);
+        Assert.AreEqual(0, counts[vm.StopCommand]);
+        Assert.IsTrue(commands.Skip(2).All(command => counts[command] == 1));
+    }
+
+    [TestMethod]
+    public async Task ClosingActiveCommandCompletesItsUiStateBeforeFinalCommandNotification()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var entered = Signal();
+        var never = Signal();
+        session.StartAction = async token =>
+        {
+            entered.TrySetResult();
+            await never.Task.WaitAsync(token);
+        };
+        var vm = new AScanViewModel(session, new ManualObservable<AScanSnapshot>(), ui, Configuration);
+        Task start = vm.StartCommand.ExecuteAsync(null);
+        await ui.DriveAsync(entered.Task);
+        Assert.IsTrue(vm.StartCommand.IsRunning);
+        var commands = Commands(vm);
+        var counts = commands.ToDictionary(command => command, _ => 0);
+        foreach (var command in commands)
+        {
+            command.CanExecuteChanged += (_, _) =>
+            {
+                counts[command]++;
+                Assert.IsTrue(ui.CheckAccess());
+            };
+        }
+
+        Task close = vm.DisposeAsync().AsTask();
+        Assert.IsFalse(vm.StartCommand.CanExecute(null));
+        Assert.IsFalse(vm.StopCommand.CanExecute(null));
+        await ui.DriveAsync(close);
+        await ui.DriveAsync(start);
+        Assert.IsFalse(vm.StartCommand.IsRunning);
+        Assert.IsFalse(vm.StartCommand.CanBeCanceled);
+        Assert.IsFalse(vm.StartCommand.IsCancellationRequested);
+        Assert.IsTrue(vm.StartCommand.ExecutionTask?.IsCompleted);
+        Assert.AreEqual(0, counts[vm.StartCommand]);
+        Assert.AreEqual(1, counts[vm.StopCommand]);
+        Assert.IsTrue(commands.Skip(2).All(command => counts[command] == 1));
+        while (ui.RunNext()) { }
+        Assert.AreEqual(0, counts[vm.StartCommand]);
+        Assert.AreEqual(1, counts[vm.StopCommand]);
+        Assert.IsTrue(commands.Skip(2).All(command => counts[command] == 1));
+    }
+
+    [TestMethod]
+    public async Task PendingRefreshAndCloseShareOneSemanticNotificationInEitherDispatcherOrder()
+    {
+        await Verify(reverse: false);
+        await Verify(reverse: true);
+
+        static async Task Verify(bool reverse)
+        {
+            var ui = new ManualUiDispatcher { AlwaysQueue = true };
+            var session = new ManualApplicationSession { EmitSnapshotOnSubscribe = false };
+            var vm = new AScanViewModel(session, new ManualObservable<AScanSnapshot>(), ui, Configuration);
+            int startEvents = 0, stopEvents = 0;
+            var access = new List<bool>();
+            vm.StartCommand.CanExecuteChanged += (_, _) => { startEvents++; access.Add(ui.CheckAccess()); };
+            vm.StopCommand.CanExecuteChanged += (_, _) => { stopEvents++; access.Add(ui.CheckAccess()); };
+
+            vm.StartCommand.NotifyCanExecuteChanged();
+            vm.StartCommand.NotifyCanExecuteChanged();
+            vm.StartCommand.NotifyCanExecuteChanged();
+            Assert.AreEqual(1, ui.Pending);
+            Task close = vm.DisposeAsync().AsTask();
+            Assert.IsFalse(close.IsCompleted);
+            Assert.AreEqual(2, ui.Pending); // One shared Start drain and one terminal Stop drain.
+
+            Assert.IsTrue(reverse ? ui.RunLast() : ui.RunNext());
+            Assert.IsTrue(reverse ? ui.RunLast() : ui.RunNext());
+            await ui.DriveAsync(close);
+            Assert.AreEqual(1, startEvents);
+            Assert.AreEqual(0, stopEvents);
+            Assert.IsTrue(access.All(value => value));
+
+            int stableEvents = startEvents + stopEvents;
+            vm.StartCommand.NotifyCanExecuteChanged();
+            vm.StopCommand.NotifyCanExecuteChanged();
+            while (ui.RunNext()) { }
+            Assert.AreEqual(stableEvents, startEvents + stopEvents);
+            Assert.AreSame(close, vm.DisposeAsync().AsTask());
+        }
+    }
+
+    [TestMethod]
+    public async Task NormalCommandCompletionConcurrentWithCloseConvergesBeforeDisposeCompletes()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var entered = Signal();
+        var release = Signal();
+        session.StartAction = _ =>
+        {
+            entered.TrySetResult();
+            return release.Task;
+        };
+        var vm = new AScanViewModel(session, new ManualObservable<AScanSnapshot>(), ui, Configuration);
+        Task start = vm.StartCommand.ExecuteAsync(null);
+        await ui.DriveAsync(entered.Task);
+        int startEvents = 0, stopEvents = 0;
+        vm.StartCommand.CanExecuteChanged += (_, _) => startEvents++;
+        vm.StopCommand.CanExecuteChanged += (_, _) => stopEvents++;
+
+        Task close = vm.DisposeAsync().AsTask();
+        Assert.IsFalse(close.IsCompleted);
+        release.TrySetResult();
+        await ui.DriveAsync(close);
+        await ui.DriveAsync(start);
+        Assert.IsFalse(vm.StartCommand.IsRunning);
+        Assert.AreEqual(0, startEvents);
+        Assert.AreEqual(1, stopEvents);
+        int stableEvents = startEvents + stopEvents;
+        while (ui.RunNext()) { }
+        Assert.AreEqual(stableEvents, startEvents + stopEvents);
+    }
+
+    private static IRelayCommand[] Commands(AScanViewModel vm) =>
+    [
+        vm.StartCommand, vm.StopCommand, vm.ToggleCursorsCommand, vm.ResetCursorsCommand,
+        vm.ResetViewportCommand, vm.ZoomInCommand, vm.ZoomOutCommand, vm.PanLeftCommand, vm.PanRightCommand
+    ];
+
+    [TestMethod]
+    public async Task InactiveViewModelRemovesItsDomainFromSharedViewport()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var shared = new SharedScanTimeViewport(ui);
+        var vm = new AScanViewModel(session, feed, ui, Configuration, timeViewport: shared);
+        var run = NewRun();
+        session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+        feed.Emit(Visual(run, 1));
+        await ui.DriveUntilAsync(() => vm.TimeViewport is not null);
+        shared.ReconcileDomain("peer", run, 1, -1, 1);
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(vm.AScan!.MinimumTimeSeconds, shared.Viewport!.DomainMinimumSeconds, 1e-15);
+
+        session.Set(ManualApplicationSession.Create(2, SessionPhase.Idle, run, canStart: true));
+        await ui.DriveUntilAsync(() => vm.AScan is null);
+        Assert.AreEqual(-1, shared.Viewport!.DomainMinimumSeconds);
+        Assert.AreEqual(1, shared.Viewport.DomainMaximumSeconds);
+        await ui.DriveAsync(vm.DisposeAsync().AsTask());
+        await ui.DriveAsync(shared.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task SharedViewportEmptyIntersectionRecoversByUpdateRemovalAndRunRules()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var run = NewRun();
+        Task initial = ui.InvokeAsync(() =>
+        {
+            shared.ReconcileDomain("a", run, 1, 0, 10);
+            shared.ReconcileDomain("b", run, 1, 20, 30);
+        });
+        await ui.DriveAsync(initial);
+        Assert.IsNull(shared.Viewport); // Empty intersection is represented by absence, never an invalid range.
+
+        shared.ReconcileDomain("b", run, 1, 5, 15); // Same version is stale.
+        Assert.IsTrue(ui.RunNext());
+        Assert.IsNull(shared.Viewport);
+        shared.ReconcileDomain("b", run, 2, 5, 15);
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(5, shared.Viewport!.DomainMinimumSeconds);
+        Assert.AreEqual(10, shared.Viewport.DomainMaximumSeconds);
+        Assert.IsTrue(double.IsFinite(shared.Viewport.DomainSpanSeconds));
+        Assert.IsGreaterThan(0, shared.Viewport.DomainSpanSeconds);
+
+        shared.ReconcileDomain("b", run, 3, 20, 30);
+        Assert.IsTrue(ui.RunNext());
+        Assert.IsNull(shared.Viewport);
+        await ui.DriveAsync(shared.RemoveConsumerAsync("b"));
+        Assert.AreEqual(0, shared.Viewport!.DomainMinimumSeconds);
+        Assert.AreEqual(10, shared.Viewport.DomainMaximumSeconds);
+
+        var nextRun = NewRun();
+        shared.ReconcileDomain("b", nextRun, 1, -5, 5);
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(nextRun, shared.RunId);
+        Assert.AreEqual(-5, shared.Viewport!.DomainMinimumSeconds);
+        shared.ReconcileDomain("a", run, 99, 0, 10);
+        Assert.IsTrue(ui.RunNext());
+        Assert.AreEqual(nextRun, shared.RunId); // Retired run cannot reactivate the group.
+        Assert.AreEqual(-5, shared.Viewport.DomainMinimumSeconds);
+        await ui.DriveAsync(shared.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task ViewportCommandsRespectLimitsUiAffinityAndClose()
+    {
+        var ui = new ManualUiDispatcher();
+        var session = new ManualApplicationSession();
+        var feed = new ManualObservable<AScanSnapshot>();
+        var shared = new SharedScanTimeViewport(ui);
+        var vm = new AScanViewModel(session, feed, ui, Configuration, timeViewport: shared);
+        Assert.IsFalse(vm.ResetViewportCommand.CanExecute(null));
+        Assert.IsFalse(vm.ZoomInCommand.CanExecute(null));
+        Assert.IsFalse(vm.ZoomOutCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanLeftCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanRightCommand.CanExecute(null));
+        var run = NewRun();
+        session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
+        feed.Emit(Visual(run, 1));
+        await ui.DriveUntilAsync(() => vm.TimeViewport is not null);
+        shared.ReconcileDomain("peer", run, 1, vm.TimeViewport!.DomainMinimumSeconds,
+            vm.TimeViewport.DomainMaximumSeconds);
+        Assert.IsTrue(ui.RunNext());
+
+        Assert.IsTrue(vm.ZoomInCommand.CanExecute(null));
+        Assert.IsFalse(vm.ZoomOutCommand.CanExecute(null));
+        Assert.IsFalse(vm.ResetViewportCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanLeftCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanRightCommand.CanExecute(null));
+
+        await Task.Run(() => vm.ZoomInCommand.Execute(null));
+        Assert.IsTrue(ui.RunNext());
+        Assert.IsGreaterThan(1, vm.TimeViewport!.ZoomFactor);
+        Assert.IsTrue(vm.ZoomOutCommand.CanExecute(null));
+        Assert.IsTrue(vm.ResetViewportCommand.CanExecute(null));
+        Assert.IsTrue(vm.PanLeftCommand.CanExecute(null));
+        Assert.IsTrue(vm.PanRightCommand.CanExecute(null));
+
+        vm.PanTime(-1);
+        Assert.IsTrue(ui.RunNext());
+        Assert.IsFalse(vm.PanLeftCommand.CanExecute(null));
+        Assert.IsTrue(vm.PanRightCommand.CanExecute(null));
+
+        int guard = 0;
+        while (vm.ZoomInCommand.CanExecute(null) && guard++ < 100)
+        {
+            vm.ZoomInCommand.Execute(null);
+            Assert.IsTrue(ui.RunNext());
+        }
+        Assert.IsFalse(vm.ZoomInCommand.CanExecute(null));
+        Assert.AreEqual(ScanTimeViewportOperations.MaximumZoomFactor, vm.TimeViewport!.ZoomFactor, 1e-9);
+
+        vm.ResetViewportCommand.Execute(null);
+        Assert.IsTrue(ui.RunNext());
+        Assert.IsTrue(vm.TimeViewport.IsReset);
+        Assert.IsFalse(vm.ResetViewportCommand.CanExecute(null));
+        Assert.IsFalse(vm.ZoomOutCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanLeftCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanRightCommand.CanExecute(null));
+
+        await ui.DriveAsync(vm.DisposeAsync().AsTask());
+        Assert.IsFalse(vm.ResetViewportCommand.CanExecute(null));
+        Assert.IsFalse(vm.ZoomInCommand.CanExecute(null));
+        Assert.IsFalse(vm.ZoomOutCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanLeftCommand.CanExecute(null));
+        Assert.IsFalse(vm.PanRightCommand.CanExecute(null));
+        var stable = shared.Viewport;
+        await Task.Run(() => { vm.ZoomTime(0, 2); vm.PanTime(1); vm.ResetTimeZoom(); });
+        while (ui.RunNext()) { }
+        Assert.AreSame(stable, shared.Viewport);
+        await ui.DriveAsync(shared.DisposeAsync().AsTask());
     }
 
     [TestMethod]
@@ -479,6 +977,10 @@ public sealed class AScanViewModelTests
             releaseCallback.TrySetResult();
             await Assert.ThrowsExactlyAsync<AggregateException>(() => ui.DriveAsync(close));
             await ui.DriveAsync(start);
+            Assert.IsFalse(vm.StartCommand.IsRunning);
+            Assert.IsFalse(vm.StartCommand.CanBeCanceled);
+            Assert.IsTrue(vm.StartCommand.IsCancellationRequested);
+            Assert.IsTrue(vm.StartCommand.ExecutionTask?.IsCompleted);
         }
         finally
         {

@@ -26,6 +26,7 @@ public sealed class DesktopRuntime
     private AScanVisualDelivery? _visual;
     private ApplicationSession? _session;
     private AScanViewModel? _viewModel;
+    private SharedScanTimeViewport? _timeViewport;
     private bool _viewModelReleased;
     public IHost Host => _host ?? throw new InvalidOperationException("Host initialization failed.", InitializationError);
     public Exception? InitializationError { get; private set; }
@@ -36,6 +37,7 @@ public sealed class DesktopRuntime
         Shutdown = new ShutdownCoordinator([
             new("ViewModel y sesión: cancelar, drenar y desconectar", ReleaseSessionAsync,
                 () => _viewModelReleased && (_session is null || _session.Snapshot.Phase == SessionPhase.Disposed)),
+            new("Liberar viewport temporal compartido", () => _timeViewport?.DisposeAsync().AsTask() ?? Task.CompletedTask),
             new("Liberar fuente", () => _source?.DisposeAsync().AsTask() ?? Task.CompletedTask,
                 () => (_session is null || _session.Snapshot.Phase == SessionPhase.Disposed) &&
                     _source?.State.Connection == UtConnectionState.Disconnected),
@@ -78,7 +80,7 @@ public sealed class DesktopRuntime
             var visual = runtime._visual = new AScanVisualDelivery(timeProvider: clock);
             checkpoint?.Invoke("visual");
             var session = runtime._session = new ApplicationSession(source, visual);
-            var timeViewport = new SharedScanTimeViewport(dispatcher);
+            var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, SimulatorUtFrameSource.DefaultConfiguration,
                 readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges, timeViewport: timeViewport);
             // Instance registrations, including aliases, are borrowed and never disposed by DI.

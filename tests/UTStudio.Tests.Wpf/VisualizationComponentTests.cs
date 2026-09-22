@@ -1,5 +1,7 @@
+using System.ComponentModel;
 using System.IO;
 using System.Windows;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Input;
@@ -114,6 +116,7 @@ public sealed class VisualizationComponentTests
             Assert.IsTrue(control.BeginCursorDrag(new Point(x, 120)));
             Assert.IsTrue(control.IsMouseCaptured);
             Assert.AreEqual(AScanCursorId.A, control.DraggingCursor);
+            Assert.IsFalse(control.BeginPan(new Point(300, 120)));
             control.ContinueCursorDrag(new Point(10_000, 120));
             Assert.AreEqual(snapshot.MaximumTimeSeconds, requested!.TimeSeconds);
             control.EndCursorDrag();
@@ -304,6 +307,328 @@ public sealed class VisualizationComponentTests
         finally { host.Close(); }
         return Task.CompletedTask;
     });
+
+    [TestMethod]
+    public Task ViewportBindingMatchesDisplayedRunAndVersionAndResetAvoidsCursors() => StaTest.Run(async () =>
+    {
+        var clock = new ManualClock();
+        var run = new AcquisitionRunId(Guid.Parse("44444444-4444-4444-4444-444444444444"));
+        var snapshot = Snapshot(5, run);
+        var full = ScanTimeViewportOperations.Create(snapshot.MinimumTimeSeconds, snapshot.MaximumTimeSeconds);
+        var zoomed = ScanTimeViewportOperations.Zoom(full,
+            (full.DomainMinimumSeconds + full.DomainMaximumSeconds) / 2, 2);
+        var control = new AScanControl(clock)
+        {
+            Snapshot = snapshot,
+            CursorState = AScanCursorMeasurements.Create(snapshot),
+            ViewportBinding = new(run, 5, zoomed)
+        };
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+        control.Measure(new Size(640, 300));
+        control.Arrange(new Rect(0, 0, 640, 300));
+        new RenderTargetBitmap(640, 300, 96, 96, PixelFormats.Pbgra32).Render(control);
+
+        int resets = 0;
+        control.TimeResetRequested += (_, _) => resets++;
+        Assert.IsTrue(control.RequestTimeReset(new Point(500, 120)));
+        Assert.AreEqual(1, resets);
+        double cursorX = 64;
+        Assert.IsFalse(control.RequestTimeReset(new Point(cursorX, 120)));
+
+        var future = ScanTimeViewportOperations.Zoom(full, full.DomainMaximumSeconds, 2);
+        control.ViewportBinding = new(run, 6, future);
+        ScanTimeZoomRequestedEventArgs? request = null;
+        control.TimeZoomRequested += (_, args) => request = args;
+        Assert.IsTrue(control.RequestTimeZoom(new Point(64 + (640 - 84) / 2d, 120), 120));
+        Assert.AreEqual((zoomed.VisibleMinimumSeconds + zoomed.VisibleMaximumSeconds) / 2,
+            request!.AnchorSeconds, 1e-15);
+        control.Snapshot = Snapshot(6, run);
+        clock.Advance(AScanVisualDelivery.MinimumPublicationInterval + TimeSpan.FromTicks(1));
+        control.RefreshSnapshot();
+        await Dispatcher.Yield(DispatcherPriority.Render);
+        new RenderTargetBitmap(640, 300, 96, 96, PixelFormats.Pbgra32).Render(control);
+        request = null;
+        Assert.IsTrue(control.RequestTimeZoom(new Point(64 + (640 - 84) / 2d, 120), 120));
+        Assert.AreEqual((future.VisibleMinimumSeconds + future.VisibleMaximumSeconds) / 2,
+            request!.AnchorSeconds, 1e-15);
+        control.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent));
+    });
+
+    [TestMethod]
+    public Task DirectTimeViewportTracksEverySuccessiveValueAcrossLoadCycle() => StaTest.Run(async () =>
+    {
+        var snapshot = Snapshot();
+        var clock = new ManualClock();
+        var full = ScanTimeViewportOperations.Create(snapshot.MinimumTimeSeconds, snapshot.MaximumTimeSeconds);
+        var beforeLoad = ScanTimeViewportOperations.Zoom(full, full.DomainMinimumSeconds, 2);
+        var control = new AScanControl(clock) { Snapshot = snapshot, TimeViewport = beforeLoad };
+        var host = new Window { Content = control, Width = 640, Height = 300, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
+        try
+        {
+            host.Show();
+            host.UpdateLayout();
+            Render(control);
+            AssertAnchor(beforeLoad);
+
+            ScanTimeViewport[] successive =
+            [
+                ScanTimeViewportOperations.Zoom(full, full.DomainMinimumSeconds, 4),
+                ScanTimeViewportOperations.Zoom(full, full.DomainMaximumSeconds, 3),
+                ScanTimeViewportOperations.Zoom(full, (full.DomainMinimumSeconds + full.DomainMaximumSeconds) / 2, 8)
+            ];
+            foreach (var viewport in successive)
+            {
+                control.TimeViewport = viewport;
+                Render(control);
+                AssertAnchor(viewport);
+            }
+
+            host.Content = null;
+            host.UpdateLayout();
+            await Dispatcher.Yield(DispatcherPriority.Loaded);
+            var afterUnload = ScanTimeViewportOperations.Zoom(full, full.DomainMaximumSeconds, 6);
+            control.TimeViewport = afterUnload;
+            clock.Advance(AScanVisualDelivery.MinimumPublicationInterval);
+            host.Content = control;
+            host.UpdateLayout();
+            Render(control);
+            AssertAnchor(afterUnload);
+        }
+        finally { host.Close(); }
+
+        void AssertAnchor(ScanTimeViewport viewport)
+        {
+            ScanTimeZoomRequestedEventArgs? request = null;
+            EventHandler<ScanTimeZoomRequestedEventArgs> handler = (_, args) => request = args;
+            control.TimeZoomRequested += handler;
+            double x = 64 + (control.ActualWidth - 84) * .25;
+            Assert.IsTrue(control.RequestTimeZoom(new Point(x, 120), 120));
+            control.TimeZoomRequested -= handler;
+            Assert.AreEqual(viewport.VisibleMinimumSeconds + viewport.VisibleSpanSeconds * .25,
+                request!.AnchorSeconds, 1e-15);
+        }
+
+        static void Render(AScanControl target) => new RenderTargetBitmap(
+            (int)target.ActualWidth, (int)target.ActualHeight, 96, 96, PixelFormats.Pbgra32).Render(target);
+    });
+
+    [TestMethod]
+    public Task ViewportBindingEffectiveSourceSelectsDirectOrCoordinatedMode() => StaTest.Run(async () =>
+    {
+        var snapshot = Snapshot();
+        var full = ScanTimeViewportOperations.Create(snapshot.MinimumTimeSeconds, snapshot.MaximumTimeSeconds);
+        var direct = ScanTimeViewportOperations.Zoom(full, full.DomainMinimumSeconds, 4);
+        var coordinated = ScanTimeViewportOperations.Zoom(full, full.DomainMaximumSeconds, 4);
+        var binding = new ScanTimeViewportBinding(snapshot.Metadata.RunId, snapshot.Version, coordinated);
+        var control = new AScanControl { Snapshot = snapshot, TimeViewport = direct };
+        var host = new Window { Content = control, Width = 640, Height = 300, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
+        try
+        {
+            host.Show();
+            host.UpdateLayout();
+            Render();
+            AssertViewport(direct);
+
+            control.ViewportBinding = null;
+            AssertViewport(full);
+            control.ClearValue(AScanControl.ViewportBindingProperty);
+            AssertViewport(direct);
+
+            control.ViewportBinding = binding;
+            AssertViewport(coordinated);
+            control.ClearValue(AScanControl.ViewportBindingProperty);
+
+            var localSource = new ViewportBindingSource();
+            BindingOperations.SetBinding(control, AScanControl.ViewportBindingProperty,
+                new Binding(nameof(ViewportBindingSource.Value)) { Source = localSource });
+            AssertViewport(full);
+            localSource.Value = binding;
+            await Dispatcher.Yield(DispatcherPriority.DataBind);
+            AssertViewport(coordinated);
+            localSource.Value = null;
+            await Dispatcher.Yield(DispatcherPriority.DataBind);
+            AssertViewport(full);
+            BindingOperations.ClearBinding(control, AScanControl.ViewportBindingProperty);
+            AssertViewport(direct);
+
+            var literalStyle = new Style(typeof(AScanControl));
+            literalStyle.Setters.Add(new Setter(AScanControl.ViewportBindingProperty, binding));
+            control.Style = literalStyle;
+            AssertViewport(coordinated);
+
+            var styleSource = new ViewportBindingSource();
+            var bindingStyle = new Style(typeof(AScanControl));
+            bindingStyle.Setters.Add(new Setter(AScanControl.ViewportBindingProperty,
+                new Binding(nameof(ViewportBindingSource.Value)) { Source = styleSource }));
+            control.Style = bindingStyle;
+            AssertViewport(full);
+            styleSource.Value = binding;
+            await Dispatcher.Yield(DispatcherPriority.DataBind);
+            AssertViewport(coordinated);
+            styleSource.Value = null;
+            await Dispatcher.Yield(DispatcherPriority.DataBind);
+            AssertViewport(full);
+
+            var nullStyle = new Style(typeof(AScanControl));
+            nullStyle.Setters.Add(new Setter(AScanControl.ViewportBindingProperty, null));
+            control.Style = nullStyle;
+            AssertViewport(full);
+            control.Style = null;
+            AssertViewport(direct);
+
+            var incompatibleStyle = new Style(typeof(AScanControl));
+            incompatibleStyle.Setters.Add(new Setter(AScanControl.ViewportBindingProperty,
+                new ScanTimeViewportBinding(snapshot.Metadata.RunId, snapshot.Version + 1, coordinated)));
+            control.Style = incompatibleStyle;
+            AssertViewport(full);
+        }
+        finally { host.Close(); }
+
+        void AssertViewport(ScanTimeViewport expected)
+        {
+            Render();
+            ScanTimeZoomRequestedEventArgs? request = null;
+            EventHandler<ScanTimeZoomRequestedEventArgs> handler = (_, args) => request = args;
+            control.TimeZoomRequested += handler;
+            Assert.IsTrue(control.RequestTimeZoom(new Point(64 + (control.ActualWidth - 84) * .25, 120), 120));
+            control.TimeZoomRequested -= handler;
+            Assert.AreEqual(expected.VisibleMinimumSeconds + expected.VisibleSpanSeconds * .25,
+                request!.AnchorSeconds, 1e-15);
+        }
+
+        void Render() => new RenderTargetBitmap((int)control.ActualWidth, (int)control.ActualHeight,
+            96, 96, PixelFormats.Pbgra32).Render(control);
+    });
+
+    [TestMethod]
+    public Task RoutedMouseEventsHonorModifiersResetPanCursorPriorityAndCaptureLoss() => StaTest.Run(() =>
+    {
+        Point position = new(300, 120);
+        ModifierKeys modifiers = ModifierKeys.None;
+        int clickCount = 1;
+        var snapshot = Snapshot();
+        var full = ScanTimeViewportOperations.Create(snapshot.MinimumTimeSeconds, snapshot.MaximumTimeSeconds);
+        var control = new AScanControl(TimeProvider.System, () => modifiers, _ => position, _ => clickCount)
+        { Snapshot = snapshot, CursorState = AScanCursorMeasurements.Create(snapshot), TimeViewport = full };
+        var host = new Window { Content = control, Width = 640, Height = 300, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
+        try
+        {
+            host.Show();
+            host.UpdateLayout();
+            new RenderTargetBitmap((int)control.ActualWidth, (int)control.ActualHeight, 96, 96,
+                PixelFormats.Pbgra32).Render(control);
+            int zooms = 0, pans = 0, resets = 0;
+            control.TimeZoomRequested += (_, args) =>
+            { zooms++; control.TimeViewport = ScanTimeViewportOperations.Zoom(control.TimeViewport!, args.AnchorSeconds, args.Factor); };
+            control.TimePanRequested += (_, args) =>
+            { pans++; control.TimeViewport = ScanTimeViewportOperations.Pan(control.TimeViewport!, args.DeltaSeconds); };
+            control.TimeResetRequested += (_, _) =>
+            { resets++; control.TimeViewport = ScanTimeViewportOperations.Reset(control.TimeViewport!); };
+
+            var plainWheel = Wheel(120);
+            control.RaiseEvent(plainWheel);
+            Assert.IsTrue(plainWheel.Handled);
+            Assert.AreEqual(1, zooms);
+            Assert.IsGreaterThan(1, control.TimeViewport!.ZoomFactor);
+
+            modifiers = ModifierKeys.Control;
+            var controlWheel = Wheel(120);
+            control.RaiseEvent(controlWheel);
+            Assert.IsFalse(controlWheel.Handled);
+            modifiers = ModifierKeys.Shift;
+            var shiftWheel = Wheel(120);
+            control.RaiseEvent(shiftWheel);
+            Assert.IsFalse(shiftWheel.Handled);
+            Assert.AreEqual(1, zooms);
+
+            modifiers = ModifierKeys.None;
+            clickCount = 2;
+            position = new(340, 120);
+            var doubleClick = Left(UIElement.MouseLeftButtonDownEvent);
+            control.RaiseEvent(doubleClick);
+            Assert.IsTrue(doubleClick.Handled);
+            Assert.AreEqual(1, resets);
+            Assert.IsTrue(control.TimeViewport!.IsReset);
+
+            control.TimeViewport = ScanTimeViewportOperations.Zoom(full,
+                (full.DomainMinimumSeconds + full.DomainMaximumSeconds) / 2, 2);
+            modifiers = ModifierKeys.Shift;
+            clickCount = 1;
+            position = new(350, 120);
+            control.RaiseEvent(Left(UIElement.MouseLeftButtonDownEvent));
+            Assert.IsTrue(control.IsMouseCaptured);
+            position = new(410, 120);
+            control.RaiseEvent(Move());
+            Assert.AreEqual(1, pans);
+            control.RaiseEvent(Left(Mouse.MouseUpEvent));
+            Assert.IsFalse(control.IsMouseCaptured);
+
+            control.TimeViewport = full;
+            position = new(64 + (control.ActualWidth - 84) * .25, 120);
+            int pansBeforeCursor = pans;
+            control.RaiseEvent(Left(UIElement.MouseLeftButtonDownEvent));
+            Assert.AreEqual(AScanCursorId.A, control.DraggingCursor);
+            Assert.AreEqual(pansBeforeCursor, pans);
+            Mouse.Capture(null);
+            Assert.IsNull(control.DraggingCursor);
+            Assert.IsFalse(control.IsMouseCaptured);
+            position = new(500, 120);
+            control.RaiseEvent(Move());
+            Assert.AreEqual(pansBeforeCursor, pans);
+
+            control.CursorState = control.CursorState! with { IsVisible = false };
+            control.TimeViewport = ScanTimeViewportOperations.Zoom(full,
+                (full.DomainMinimumSeconds + full.DomainMaximumSeconds) / 2, 2);
+            position = new(350, 120);
+            control.RaiseEvent(Left(UIElement.MouseLeftButtonDownEvent));
+            Assert.IsTrue(control.IsMouseCaptured);
+            Mouse.Capture(null);
+            int pansBeforeLostCaptureMove = pans;
+            position = new(450, 120);
+            control.RaiseEvent(Move());
+            Assert.AreEqual(pansBeforeLostCaptureMove, pans);
+        }
+        finally { host.Close(); }
+        return Task.CompletedTask;
+
+        static MouseWheelEventArgs Wheel(int delta)
+        {
+            var args = new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, delta);
+            args.RoutedEvent = Mouse.MouseWheelEvent;
+            return args;
+        }
+
+        static MouseButtonEventArgs Left(RoutedEvent routedEvent)
+        {
+            var args = new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left);
+            args.RoutedEvent = routedEvent;
+            return args;
+        }
+
+        static MouseEventArgs Move()
+        {
+            var args = new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount);
+            args.RoutedEvent = Mouse.MouseMoveEvent;
+            return args;
+        }
+    });
+
+    private sealed class ViewportBindingSource : INotifyPropertyChanged
+    {
+        private ScanTimeViewportBinding? _value;
+        public ScanTimeViewportBinding? Value
+        {
+            get => _value;
+            set
+            {
+                if (_value == value) { return; }
+                _value = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Value)));
+            }
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+    }
 
     private static AScanSnapshot Snapshot(ulong version = 0, AcquisitionRunId? runId = null, short[]? samples = null)
     {
