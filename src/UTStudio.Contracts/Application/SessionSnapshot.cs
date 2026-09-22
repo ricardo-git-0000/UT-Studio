@@ -11,7 +11,7 @@ public sealed class SessionSnapshot
         AcquisitionRunId? runId, long receivedFrames, long releasedFrames, ulong? lastSequence,
         ConventionalUtFrameMetadata? lastMetadata, UtSourceError? primaryError,
         IEnumerable<UtSourceError> cleanupErrors, long additionalErrorCount, UtSourceError? visualError = null,
-        bool canStart = false, bool canStop = false)
+        bool canStart = false, bool canStop = false, SessionIntegrityStatistics? integrity = null)
     {
         if (!Enum.IsDefined(phase)) { throw new ArgumentOutOfRangeException(nameof(phase)); }
         if (!sourceId.IsValid) { throw new ArgumentException("Invalid source identifier.", nameof(sourceId)); }
@@ -36,6 +36,7 @@ public sealed class SessionSnapshot
         VisualError = visualError;
         CanStart = canStart;
         CanStop = canStop;
+        Integrity = integrity ?? SessionIntegrityStatistics.Empty;
     }
 
     public ulong Version { get; }
@@ -54,4 +55,6 @@ public sealed class SessionSnapshot
     /// <summary>Admission decided by the session; Faulted alone does not prove resources are released.</summary>
     public bool CanStart { get; }
     public bool CanStop { get; }
+    /// <summary>Integrity counters for this run; they reset when a new run is created.</summary>
+    public SessionIntegrityStatistics Integrity { get; }
 }

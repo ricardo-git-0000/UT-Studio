@@ -20,10 +20,10 @@ internal sealed class ManualSessionSource : IUtFrameSource
     internal ManualStep Start { get; } = new();
     internal ManualStep Disconnect { get; } = new();
     internal ManualStep Rollback { get; } = new();
-    internal TaskCompletionSource StopEntered { get; } = Signal();
-    internal TaskCompletionSource Producer { get; } = Signal();
-    internal TaskCompletionSource Released { get; } = Signal();
-    internal Channel<ConventionalUtFrame> Channel { get; } = System.Threading.Channels.Channel.CreateBounded<ConventionalUtFrame>(
+    internal TaskCompletionSource StopEntered { get; private set; } = Signal();
+    internal TaskCompletionSource Producer { get; private set; } = Signal();
+    internal TaskCompletionSource Released { get; private set; } = Signal();
+    internal Channel<ConventionalUtFrame> Channel { get; private set; } = System.Threading.Channels.Channel.CreateBounded<ConventionalUtFrame>(
         new BoundedChannelOptions(4) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true, AllowSynchronousContinuations = false });
     internal bool HoldProducer { get; set; }
     internal bool HoldReleaseBarrier { get; set; }
@@ -63,6 +63,25 @@ internal sealed class ManualSessionSource : IUtFrameSource
             throw;
         }
 
+        if (Run is not null)
+        {
+            lock (_gate)
+            {
+                _sealed = false;
+                _outstanding = 0;
+                StopEntered = Signal();
+                Producer = Signal();
+                Released = Signal();
+                Channel = System.Threading.Channels.Channel.CreateBounded<ConventionalUtFrame>(
+                    new BoundedChannelOptions(4)
+                    {
+                        FullMode = BoundedChannelFullMode.Wait,
+                        SingleReader = true,
+                        AllowSynchronousContinuations = false
+                    });
+            }
+        }
+
         var metadata = new ConventionalUtFrameMetadata(SourceId, runId, _configuration!, DateTimeOffset.UnixEpoch);
         Run = new UtAcquisitionRun(metadata, Channel.Reader, Producer.Task, Released.Task);
         State = new(State.Version + 1, UtConnectionState.Connected, UtAcquisitionState.Running);
@@ -97,15 +116,18 @@ internal sealed class ManualSessionSource : IUtFrameSource
     }
 
     internal CountingOwner QueueFrame(ulong sequence, ConventionalUtFrameMetadata? metadata = null,
-        Action? beforeReturn = null, Exception? releaseError = null)
+        Action? beforeReturn = null, Exception? releaseError = null, ulong? acquisitionIndex = null,
+        TimeSpan? elapsed = null, ScanSpatialCoordinate? spatialCoordinate = null)
     {
-        var (frame, owner) = CreateFrame(sequence, metadata, beforeReturn, releaseError);
+        var (frame, owner) = CreateFrame(sequence, metadata, beforeReturn, releaseError,
+            acquisitionIndex, elapsed, spatialCoordinate);
         if (!Channel.Writer.TryWrite(frame)) { frame.Dispose(); throw new InvalidOperationException("Test channel is full."); }
         return owner;
     }
 
     internal (ConventionalUtFrame Frame, CountingOwner Owner) CreateFrame(ulong sequence,
-        ConventionalUtFrameMetadata? metadata = null, Action? beforeReturn = null, Exception? releaseError = null)
+        ConventionalUtFrameMetadata? metadata = null, Action? beforeReturn = null, Exception? releaseError = null,
+        ulong? acquisitionIndex = null, TimeSpan? elapsed = null, ScanSpatialCoordinate? spatialCoordinate = null)
     {
         lock (_gate)
         {
@@ -120,7 +142,8 @@ internal sealed class ManualSessionSource : IUtFrameSource
             lock (_gate) { _outstanding--; TryRelease(); }
             if (releaseError is not null) { throw releaseError; }
         });
-        return (new ConventionalUtFrame(metadata, sequence, TimeSpan.FromTicks((long)sequence), owner), owner);
+        return (new ConventionalUtFrame(metadata, sequence, acquisitionIndex ?? sequence,
+            elapsed ?? TimeSpan.FromTicks(unchecked((long)sequence)), spatialCoordinate, owner), owner);
     }
 
     private void TryRelease()

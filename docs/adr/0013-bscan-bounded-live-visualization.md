@@ -1,6 +1,6 @@
 # ADR 0013 — B-Scan en vivo acotado, selección exacta y ventana secundaria
 
-Fecha: 2026-09-22. Estado: Aceptado; implementación pendiente y dividida en fases.
+Fecha: 2026-09-22. Estado: Aceptado; Fase 1 implementada y fases 2–5 pendientes.
 Trazabilidad: R01–R09, R13 y R14; concreta Q12 y la parte visual de Q13. Complementa
 [ADR 0006](0006-session-window-lifecycle.md), [ADR 0007](0007-frame-source-ownership.md),
 [ADR 0008](0008-latest-only-visual-delivery.md), [ADR 0009](0009-reusable-scan-visualization-controls.md)
@@ -64,15 +64,15 @@ timestamp aceptado. Duplicados y descensos no reducen el máximo observado. `ulo
 sin calcular `previous + 1`; cualquier secuencia posterior es inválida.
 
 Los diagnósticos distinguen `AcquisitionMissingFrames`, `DuplicateFramesRejected`,
-`OutOfOrderFramesRejected`, `DescendingTimestampFramesRejected`, rechazos de índice, rechazos B por
+`OutOfOrderFramesRejected`, `TimestampRegressionsRejected`, `InvalidAcquisitionIndexFramesRejected`, rechazos B por
 causa, trabajo visual sustituido, publicaciones, renderizados y expulsiones. Un frame ausente antes de
 Application, uno recibido pero no admitido por B, una actualización visual coalescida y una expulsión
 normal del ring nunca comparten significado ni contador.
 
 ## Contratos públicos previstos
 
-La Fase 1 añadirá en Domain `ScanSpatialCoordinate`, `ScanSpatialUnit` y `ScanAxisId`. Contracts
-ampliará `ConventionalUtFrame` y el préstamo visual, conceptualmente:
+La Fase 1 añade en Domain `ScanSpatialCoordinate`, `ScanSpatialUnit` y `ScanAxisId`. Contracts
+amplía `ConventionalUtFrame` y el préstamo visual:
 
 ```csharp
 public ulong AcquisitionIndex { get; }
@@ -98,7 +98,8 @@ se añade a Contracts: pertenece a Visualization.Core y conserva el grafo de ref
 
 `ApplicationSession` continúa como único lector del `ChannelReader`. Un fan-out visual síncrono invoca
 primero A y después B y presta el mismo `ReadOnlySpan<short>` a ramas aisladas en `OpenRun`, `Accept`
-y `CloseRun`. Así el coste B no retrasa la admisión A del mismo frame más allá del retorno posterior
+y `CloseRun`. `OpenRun` completa antes de que puedan comenzar `Accept` o `CloseRun`; un `CloseRun`
+sí puede solaparse con un `Accept` ya admitido y debe invalidar su resultado. Así el coste B no retrasa la admisión A del mismo frame más allá del retorno posterior
 del fan-out. Un fallo de
 una rama la diagnostica y cierra una vez para esa run sin impedir invocar o continuar la sana. Tampoco
 cambia la liberación exactamente una vez del frame por Application. Este fan-out no es el futuro

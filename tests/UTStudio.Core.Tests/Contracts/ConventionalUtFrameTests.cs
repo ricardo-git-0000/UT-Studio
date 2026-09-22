@@ -17,12 +17,15 @@ public sealed class ConventionalUtFrameTests
         short[] samples = [short.MinValue, 0, short.MaxValue, 123];
         var owner = new CountingMemoryOwner(samples);
         ReadOnlyMemory<short> expectedMemory = owner.Memory[..3];
-        using var frame = new ConventionalUtFrame(Metadata(), ulong.MaxValue, TimeSpan.Zero, owner);
+        var coordinate = new ScanSpatialCoordinate(-12.5, ScanSpatialUnit.Millimetres, new ScanAxisId("scan-x"));
+        using var frame = new ConventionalUtFrame(Metadata(), ulong.MaxValue, 42, TimeSpan.Zero, coordinate, owner);
 
         Assert.AreEqual(3, frame.Samples.Length);
         CollectionAssert.AreEqual(new short[] { short.MinValue, 0, short.MaxValue }, frame.Samples.ToArray());
         Assert.IsTrue(frame.Samples.Equals(expectedMemory));
         Assert.AreEqual(ulong.MaxValue, frame.Sequence);
+        Assert.AreEqual(42UL, frame.AcquisitionIndex);
+        Assert.AreEqual(coordinate, frame.SpatialCoordinate);
         Assert.AreEqual(TimeSpan.Zero, frame.ElapsedSinceRunStart);
         Assert.AreEqual(0, owner.DisposeCount);
     }
@@ -31,9 +34,9 @@ public sealed class ConventionalUtFrameTests
     public void ShortMemoryIsRejectedWithoutAdoptingOrDisposingOwner()
     {
         var owner = new CountingMemoryOwner([1, 2]);
-        Assert.ThrowsExactly<ArgumentException>(() => new ConventionalUtFrame(Metadata(), 0, TimeSpan.Zero, owner));
+        Assert.ThrowsExactly<ArgumentException>(() => new ConventionalUtFrame(Metadata(), 0, 0, TimeSpan.Zero, null, owner));
         Assert.AreEqual(0, owner.DisposeCount);
-        using (var valid = new ConventionalUtFrame(Metadata(2), 0, TimeSpan.Zero, owner))
+        using (var valid = new ConventionalUtFrame(Metadata(2), 0, 0, TimeSpan.Zero, null, owner))
         {
             Assert.AreEqual(2, valid.Samples.Length);
         }
@@ -46,14 +49,26 @@ public sealed class ConventionalUtFrameTests
     {
         var owner = new CountingMemoryOwner([1, 2, 3]);
         Assert.ThrowsExactly<ArgumentNullException>(
-            () => new ConventionalUtFrame(null!, 0, TimeSpan.Zero, owner));
+            () => new ConventionalUtFrame(null!, 0, 0, TimeSpan.Zero, null, owner));
         Assert.ThrowsExactly<ArgumentNullException>(
-            () => new ConventionalUtFrame(Metadata(), 0, TimeSpan.Zero, null!));
+            () => new ConventionalUtFrame(Metadata(), 0, 0, TimeSpan.Zero, null, null!));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(
-            () => new ConventionalUtFrame(Metadata(), 0, TimeSpan.FromTicks(-1), owner));
+            () => new ConventionalUtFrame(Metadata(), 0, 0, TimeSpan.FromTicks(-1), null, owner));
         Assert.AreEqual(0, owner.DisposeCount);
         owner.Dispose();
         Assert.AreEqual(1, owner.DisposeCount);
+    }
+
+    [TestMethod]
+    public void InvalidDefaultSpatialCoordinateDoesNotTransferOwnership()
+    {
+        var owner = new CountingMemoryOwner([1, 2, 3]);
+
+        Assert.ThrowsExactly<ArgumentException>(() =>
+            new ConventionalUtFrame(Metadata(), 0, 0, TimeSpan.Zero, default(ScanSpatialCoordinate), owner));
+
+        Assert.AreEqual(0, owner.DisposeCount);
+        owner.Dispose();
     }
 
     [TestMethod]
@@ -61,7 +76,7 @@ public sealed class ConventionalUtFrameTests
     {
         var owner = new CountingMemoryOwner([1, 2, 3]) { ThrowOnMemoryAccess = true };
         Assert.ThrowsExactly<InvalidOperationException>(
-            () => new ConventionalUtFrame(Metadata(), 0, TimeSpan.Zero, owner));
+            () => new ConventionalUtFrame(Metadata(), 0, 0, TimeSpan.Zero, null, owner));
         Assert.AreEqual(0, owner.DisposeCount);
         owner.Dispose();
         Assert.AreEqual(1, owner.DisposeCount);
@@ -72,7 +87,7 @@ public sealed class ConventionalUtFrameTests
     {
         var owner = new CountingMemoryOwner([1, 2, 3]);
         var metadata = Metadata();
-        var frame = new ConventionalUtFrame(metadata, 0, TimeSpan.Zero, owner);
+        var frame = new ConventionalUtFrame(metadata, 0, 0, TimeSpan.Zero, null, owner);
         frame.Dispose();
         frame.Dispose();
 
@@ -85,7 +100,7 @@ public sealed class ConventionalUtFrameTests
     public async Task ConcurrentDisposeInvokesOwnerExactlyOnce()
     {
         var owner = new CountingMemoryOwner([1, 2, 3]);
-        var frame = new ConventionalUtFrame(Metadata(), 0, TimeSpan.Zero, owner);
+        var frame = new ConventionalUtFrame(Metadata(), 0, 0, TimeSpan.Zero, null, owner);
         var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var tasks = Enumerable.Range(0, 32).Select(_ => Task.Run(async () =>
         {
@@ -103,7 +118,7 @@ public sealed class ConventionalUtFrameTests
     public void FailingOwnerDisposalPropagatesWithoutRetry()
     {
         var owner = new CountingMemoryOwner([1, 2, 3]) { ThrowOnDispose = true };
-        var frame = new ConventionalUtFrame(Metadata(), 0, TimeSpan.Zero, owner);
+        var frame = new ConventionalUtFrame(Metadata(), 0, 0, TimeSpan.Zero, null, owner);
         Assert.ThrowsExactly<InvalidOperationException>(() => frame.Dispose());
         frame.Dispose();
 

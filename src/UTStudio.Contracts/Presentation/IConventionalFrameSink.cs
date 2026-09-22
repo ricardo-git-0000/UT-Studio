@@ -6,14 +6,15 @@ namespace UTStudio.Contracts.Presentation;
 /// <remarks>
 /// One Application reader calls Accept synchronously. Samples are borrowed only until it returns;
 /// do not retain aliases or the frame owner. Copy/project before returning. Open/Close are bounded,
-/// nonblocking operations without external callbacks. Close may overlap Accept and must invalidate
-/// its pending result. Exceptions disable only this visual branch; Application still releases the frame.
+/// nonblocking operations without external callbacks. OpenRun completes before Accept or CloseRun can
+/// start. Close may overlap an already admitted Accept and must invalidate its pending result.
+/// Exceptions disable only this visual branch; Application still releases the frame.
 /// The source and sink are disposed by their external owners after the session closes its run.
 /// </remarks>
 public interface IConventionalFrameSink
 {
     void OpenRun(AcquisitionRunId runId);
-    void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
-        ReadOnlySpan<short> samples);
+    void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
+        TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples);
     void CloseRun(AcquisitionRunId runId);
 }

@@ -85,7 +85,7 @@ public sealed class AScanProjectorTests
     {
         var samples = new short[] { short.MinValue, 0, short.MaxValue, -100 };
         var owner = new ArrayOwner(samples);
-        var frame = new ConventionalUtFrame(Metadata(4), 0, TimeSpan.Zero, owner);
+        var frame = new ConventionalUtFrame(Metadata(4), 0, 0, TimeSpan.Zero, null, owner);
         AScanSnapshot snapshot;
         try { snapshot = new AScanProjector().Project(frame.Metadata, frame.Sequence, frame.ElapsedSinceRunStart, frame.Samples.Span); }
         finally { frame.Dispose(); }

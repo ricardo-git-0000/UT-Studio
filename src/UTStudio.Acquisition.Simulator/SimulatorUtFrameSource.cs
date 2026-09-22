@@ -216,7 +216,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
                 token.ThrowIfCancellationRequested();
                 var elapsed = _time.GetElapsedTime(context.OriginTimestamp);
                 SyntheticRfGenerator.Fill(owner.Memory.Span, context.Metadata.Configuration, _options, sequence, token);
-                frame = new ConventionalUtFrame(context.Metadata, sequence, elapsed, owner);
+                frame = new ConventionalUtFrame(context.Metadata, sequence, sequence, elapsed, null, owner);
                 tracked?.Generated();
                 owner = null;
                 var write = context.Metrics is { } instrumentation ? instrumentation.WriteAsync(context.Channel.Writer, frame, token) : context.Channel.Writer.WriteAsync(frame, token);

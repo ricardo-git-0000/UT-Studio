@@ -27,7 +27,7 @@ public sealed class UtAcquisitionRunTests
         var released = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var run = new UtAcquisitionRun(metadata, channel.Reader, producer.Task, released.Task);
         var owner = new CountingMemoryOwner([1, 2, 3]);
-        using var frame = new ConventionalUtFrame(metadata, 0, TimeSpan.Zero, owner);
+        using var frame = new ConventionalUtFrame(metadata, 0, 0, TimeSpan.Zero, null, owner);
 
         Assert.AreSame(metadata, run.Metadata);
         Assert.AreSame(channel.Reader, run.Frames);

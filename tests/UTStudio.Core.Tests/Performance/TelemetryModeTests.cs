@@ -70,11 +70,11 @@ public sealed class TelemetryModeTests
         short[] samples = [0, 100, -200, 300, -400, 500, -600, 700];
         sink.OpenRun(metadata.RunId);
         telemetry.BeginWindow();
-        sink.Accept(metadata, 0, TimeSpan.Zero, samples);
+        sink.Accept(metadata, 0, 0, TimeSpan.Zero, null, samples);
         var first = await observer.NextAsync();
-        sink.Accept(metadata, 1, TimeSpan.FromTicks(1), samples);
+        sink.Accept(metadata, 1, 1, TimeSpan.FromTicks(1), null, samples);
         var timer = await clock.NextTimerAsync();
-        sink.Accept(metadata, 2, TimeSpan.FromTicks(2), samples);
+        sink.Accept(metadata, 2, 2, TimeSpan.FromTicks(2), null, samples);
         Assert.IsTrue(delivery.Statistics.HasPending);
         Assert.AreEqual(1L, delivery.Statistics.Replaced);
         timer.Fire();

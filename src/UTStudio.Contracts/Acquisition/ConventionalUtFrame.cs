@@ -18,12 +18,18 @@ public sealed class ConventionalUtFrame : IDisposable
     public ConventionalUtFrame(
         ConventionalUtFrameMetadata metadata,
         ulong sequence,
+        ulong acquisitionIndex,
         TimeSpan elapsedSinceRunStart,
+        ScanSpatialCoordinate? spatialCoordinate,
         IMemoryOwner<short> sampleOwner)
     {
         ArgumentNullException.ThrowIfNull(metadata);
         ArgumentNullException.ThrowIfNull(sampleOwner);
         ArgumentOutOfRangeException.ThrowIfLessThan(elapsedSinceRunStart, TimeSpan.Zero);
+        if (spatialCoordinate is { IsValid: false })
+        {
+            throw new ArgumentException("The spatial coordinate is invalid.", nameof(spatialCoordinate));
+        }
         var memory = sampleOwner.Memory;
         if (memory.Length < metadata.Configuration.SampleCount)
         {
@@ -33,7 +39,9 @@ public sealed class ConventionalUtFrame : IDisposable
         _samples = memory[..metadata.Configuration.SampleCount];
         Metadata = metadata;
         Sequence = sequence;
+        AcquisitionIndex = acquisitionIndex;
         ElapsedSinceRunStart = elapsedSinceRunStart;
+        SpatialCoordinate = spatialCoordinate;
         _sampleOwner = sampleOwner;
     }
 
@@ -42,8 +50,14 @@ public sealed class ConventionalUtFrame : IDisposable
     /// <summary>Producer sequence, starting at zero per run. Ordering is enforced by the source.</summary>
     public ulong Sequence { get; }
 
+    /// <summary>Synthetic acquisition ordinal; it is not a physical distance.</summary>
+    public ulong AcquisitionIndex { get; }
+
     /// <summary>Nonnegative monotonic time of the trigger relative to the run origin.</summary>
     public TimeSpan ElapsedSinceRunStart { get; }
+
+    /// <summary>Optional physical position. The initial simulator publishes no coordinate.</summary>
+    public ScanSpatialCoordinate? SpatialCoordinate { get; }
 
     /// <summary>Only the valid signed RF samples, in digital counts. Throws after disposal.</summary>
     public ReadOnlyMemory<short> Samples

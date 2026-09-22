@@ -7,11 +7,11 @@ namespace UTStudio.LoadTests;
 internal sealed class InstrumentedFrameSink(IConventionalFrameSink inner, LoadTelemetry telemetry) : IConventionalFrameSink
 {
     public void OpenRun(AcquisitionRunId runId) => inner.OpenRun(runId);
-    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
-        ReadOnlySpan<short> samples)
+    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
+        TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
     {
         telemetry.PrepareFrame(sequence);
-        inner.Accept(metadata, sequence, elapsedSinceRunStart, samples);
+        inner.Accept(metadata, sequence, acquisitionIndex, elapsedSinceRunStart, spatialCoordinate, samples);
     }
     public void CloseRun(AcquisitionRunId runId) => inner.CloseRun(runId);
 }

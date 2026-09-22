@@ -131,7 +131,7 @@ public sealed class MeasurementTests
         {
             metrics.Offer();
             var owner = metrics.Track(new Owner());
-            var frame = new ConventionalUtFrame(metadata, i, TimeSpan.Zero, owner);
+            var frame = new ConventionalUtFrame(metadata, i, i, TimeSpan.Zero, null, owner);
             owner.Generated();
             await metrics.WriteAsync(channel.Writer, frame, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(10));
         }

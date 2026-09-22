@@ -460,6 +460,7 @@ public sealed class ApplicationSessionTests
         Assert.AreEqual(second, session.Snapshot.RunId);
         Assert.AreEqual(0UL, session.Snapshot.LastSequence);
         Assert.AreEqual(1L, session.Snapshot.ReleasedFrames);
+        Assert.AreEqual(SessionIntegrityStatistics.Empty, session.Snapshot.Integrity);
         Assert.AreEqual(UtConnectionState.Disconnected, source.State.Connection);
     }
 

@@ -41,7 +41,7 @@ public class BufferAndFrameBenchmarks
         IMemoryOwner<short>? owner = await _pool.RentAsync(CancellationToken.None);
         try
         {
-            using var frame = new ConventionalUtFrame(_metadata, 7, TimeSpan.FromTicks(7), owner);
+            using var frame = new ConventionalUtFrame(_metadata, 7, 7, TimeSpan.FromTicks(7), null, owner);
             owner = null;
             return frame.Sequence;
         }

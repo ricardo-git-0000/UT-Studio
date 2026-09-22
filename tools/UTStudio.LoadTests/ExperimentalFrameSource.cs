@@ -183,8 +183,8 @@ internal sealed class ExperimentalFrameSource : IUtFrameSource
                     owner = tracked = _telemetry.Counters.Track(owner);
                     context.WaitReason = ExperimentalWaitReason.None;
                     Fill(owner.Memory.Span, sequence, token);
-                    frame = new ConventionalUtFrame(context.Metadata, sequence,
-                        Stopwatch.GetElapsedTime(origin), owner);
+                    frame = new ConventionalUtFrame(context.Metadata, sequence, sequence,
+                        Stopwatch.GetElapsedTime(origin), null, owner);
                     tracked.Generated();
                     owner = null;
                     var write = _telemetry.Counters.WriteAsync(context.Channel.Writer, frame, token);

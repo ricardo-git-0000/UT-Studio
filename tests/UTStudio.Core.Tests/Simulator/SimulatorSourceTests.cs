@@ -32,6 +32,8 @@ public sealed class SimulatorSourceTests
         await simulation.StartAsync();
         var first = await simulation.ReadAsync();
         Assert.AreEqual(0UL, first.Sequence);
+        Assert.AreEqual(first.Sequence, first.AcquisitionIndex);
+        Assert.IsNull(first.SpatialCoordinate);
         Assert.AreEqual(TimeSpan.Zero, first.ElapsedSinceRunStart);
         Assert.AreEqual(2048, first.Samples.Length);
         Assert.AreEqual(50_000_000d, first.Metadata.Configuration.SampleRateHz);
@@ -43,6 +45,8 @@ public sealed class SimulatorSourceTests
 
         var second = await simulation.ReadAsync();
         Assert.AreEqual(1UL, second.Sequence);
+        Assert.AreEqual(second.Sequence, second.AcquisitionIndex);
+        Assert.IsNull(second.SpatialCoordinate);
         Assert.AreEqual(TimeSpan.FromMilliseconds(1010), second.ElapsedSinceRunStart);
         Assert.AreSame(first.Metadata, second.Metadata);
         _ = await simulation.Clock.NextTimerAsync();

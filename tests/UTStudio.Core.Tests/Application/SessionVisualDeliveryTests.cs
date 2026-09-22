@@ -118,7 +118,8 @@ public sealed class SessionVisualDeliveryTests
         {
             if (failure == "Open") { throw new InvalidOperationException("visual opening failed"); }
         }
-        public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart, ReadOnlySpan<short> samples)
+        public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
+            TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
         {
             AcceptCalls++;
             Assert.AreEqual(metadata.Configuration.SampleCount, samples.Length);

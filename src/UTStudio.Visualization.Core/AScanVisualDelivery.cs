@@ -134,8 +134,8 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         }
     }
 
-    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
-        ReadOnlySpan<short> samples)
+    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
+        TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
     {
         ArgumentNullException.ThrowIfNull(metadata);
         long generation;
@@ -193,6 +193,10 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
             if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
         }
     }
+
+    /// <summary>Compatibility adapter for direct A-Scan consumers without spatial frame metadata.</summary>
+    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
+        ReadOnlySpan<short> samples) => Accept(metadata, sequence, sequence, elapsedSinceRunStart, null, samples);
 
     public void CloseRun(AcquisitionRunId runId)
     {

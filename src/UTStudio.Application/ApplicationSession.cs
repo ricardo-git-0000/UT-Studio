@@ -195,8 +195,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                         lock (_gate) { operation.ReceivedFrames++; }
                         if (!drainOnly)
                         {
-                            InspectFrame(operation, run, frame);
-                            DeliverVisual(operation, frame);
+                            if (InspectFrame(operation, run, frame)) { DeliverVisual(operation, frame); }
                         }
                     }
                     catch (Exception error)
@@ -228,7 +227,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     }
 
     /// <summary>Only immutable metadata is retained; sample ownership remains with this reader.</summary>
-    private void InspectFrame(Operation operation, UtAcquisitionRun run, ConventionalUtFrame frame)
+    private bool InspectFrame(Operation operation, UtAcquisitionRun run, ConventionalUtFrame frame)
     {
         var metadata = frame.Metadata;
         var expected = run.Metadata.Configuration;
@@ -242,17 +241,69 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
         lock (_gate)
         {
-            bool sequenceValid = operation.LastSequence is { } previous
-                ? previous != ulong.MaxValue && frame.Sequence == previous + 1
-                : frame.Sequence == 0;
-            if (!sequenceValid || frame.ElapsedSinceRunStart < operation.LastElapsed)
+            bool integrityChanged = false;
+            if (operation.LastObservedSequence is not { } previousSequence)
             {
-                throw new InvalidOperationException("The frame sequence or monotonic timestamp is invalid.");
+                if (frame.Sequence != 0)
+                {
+                    operation.OutOfOrderFramesRejected++;
+                    Publish(operation, _snapshot.Phase);
+                    return false;
+                }
+            }
+            else if (frame.Sequence == previousSequence)
+            {
+                operation.DuplicateFramesRejected++;
+                Publish(operation, _snapshot.Phase);
+                return false;
+            }
+            else if (frame.Sequence < previousSequence)
+            {
+                operation.OutOfOrderFramesRejected++;
+                Publish(operation, _snapshot.Phase);
+                return false;
+            }
+            else
+            {
+                ulong missing = frame.Sequence - previousSequence - 1;
+                if (missing != 0)
+                {
+                    operation.AcquisitionMissingFrames = checked(operation.AcquisitionMissingFrames + missing);
+                    integrityChanged = true;
+                }
+            }
+
+            operation.LastObservedSequence = frame.Sequence;
+
+            if (operation.LastObservedAcquisitionIndex is not { } previousIndex)
+            {
+                if (frame.AcquisitionIndex != 0)
+                {
+                    operation.InvalidAcquisitionIndexFramesRejected++;
+                    Publish(operation, _snapshot.Phase);
+                    return false;
+                }
+            }
+            else if (frame.AcquisitionIndex <= previousIndex)
+            {
+                operation.InvalidAcquisitionIndexFramesRejected++;
+                Publish(operation, _snapshot.Phase);
+                return false;
+            }
+
+            operation.LastObservedAcquisitionIndex = frame.AcquisitionIndex;
+            if (frame.ElapsedSinceRunStart < operation.LastElapsed)
+            {
+                operation.TimestampRegressionsRejected++;
+                Publish(operation, _snapshot.Phase);
+                return false;
             }
 
             operation.LastSequence = frame.Sequence;
             operation.LastElapsed = frame.ElapsedSinceRunStart;
             operation.LastMetadata = metadata;
+            if (integrityChanged) { Publish(operation, _snapshot.Phase); }
+            return true;
         }
     }
 
@@ -271,7 +322,11 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
         // Borrow only during this call. CloseRun may invalidate the projection concurrently.
         // The frame is always released by ConsumeAsync's finally, including when Accept throws.
-        try { _visualSink!.Accept(frame.Metadata, frame.Sequence, frame.ElapsedSinceRunStart, frame.Samples.Span); }
+        try
+        {
+            _visualSink!.Accept(frame.Metadata, frame.Sequence, frame.AcquisitionIndex,
+                frame.ElapsedSinceRunStart, frame.SpatialCoordinate, frame.Samples.Span);
+        }
         catch (Exception error)
         {
             lock (_gate)
@@ -454,7 +509,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _snapshot = new SessionSnapshot(_snapshot.Version + 1, phase, _source.SourceId, operation.RunId,
             operation.ReceivedFrames, operation.ReleasedFrames, operation.LastSequence, operation.LastMetadata,
             operation.PrimaryError, operation.CleanupErrors, operation.AdditionalErrorCount, operation.VisualError,
-            canStart: _active is null && !_disposing, canStop: _active is { CleanupRequested: false } && !_disposing);
+            canStart: _active is null && !_disposing, canStop: _active is { CleanupRequested: false } && !_disposing,
+            integrity: operation.Integrity);
         _publisher.Publish(_snapshot, complete);
     }
 
@@ -463,7 +519,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _snapshot = new SessionSnapshot(_snapshot.Version + 1, phase, _source.SourceId, _snapshot.RunId,
             _snapshot.ReceivedFrames, _snapshot.ReleasedFrames, _snapshot.LastSequence, _snapshot.LastMetadata,
             error, _snapshot.CleanupErrors, _snapshot.AdditionalErrorCount, _snapshot.VisualError,
-            canStart: _active is null && !_disposing, canStop: _active is { CleanupRequested: false } && !_disposing);
+            canStart: _active is null && !_disposing, canStop: _active is { CleanupRequested: false } && !_disposing,
+            integrity: _snapshot.Integrity);
         _publisher.Publish(_snapshot, complete);
     }
 
@@ -492,9 +549,18 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal long ReceivedFrames;
         internal long ReleasedFrames;
         internal ulong? LastSequence;
+        internal ulong? LastObservedSequence;
+        internal ulong? LastObservedAcquisitionIndex;
         internal TimeSpan LastElapsed;
         internal ConventionalUtFrameMetadata? LastMetadata;
         internal bool VisualOpened;
         internal UtSourceError? VisualError;
+        internal ulong AcquisitionMissingFrames;
+        internal ulong DuplicateFramesRejected;
+        internal ulong OutOfOrderFramesRejected;
+        internal ulong TimestampRegressionsRejected;
+        internal ulong InvalidAcquisitionIndexFramesRejected;
+        internal SessionIntegrityStatistics Integrity => new(AcquisitionMissingFrames, DuplicateFramesRejected,
+            OutOfOrderFramesRejected, TimestampRegressionsRejected, InvalidAcquisitionIndexFramesRejected);
     }
 }

@@ -1,7 +1,7 @@
 # Plan del primer incremento B-Scan reutilizable
 
-Estado: diseño aprobado; Fase 0 documental completada. La implementación requiere autorización por
-fase. La fuente normativa es [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
+Estado: diseño aprobado; Fases 0 y 1 completadas. Las fases 2–5 requieren autorización separada.
+La fuente normativa es [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
 
 ## Reglas comunes
 
