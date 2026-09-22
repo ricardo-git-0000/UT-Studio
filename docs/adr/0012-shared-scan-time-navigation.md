@@ -1,6 +1,6 @@
 # ADR 0012 — Navegación temporal compartida y reutilizable
 
-Fecha: 2026-09-22. Estado: Aceptado e implementado para A-Scan; contrato preparado para B-Scan.
+Fecha: 2026-09-22. Estado: Aceptado e implementado para A-Scan; integración B-Scan aprobada y pendiente.
 Amplía [ADR 0011](0011-shared-physical-time-viewport.md) y conserva las fronteras de
 [ADR 0009](0009-reusable-scan-visualization-controls.md) y la identidad visual de
 [ADR 0010](0010-ascan-manual-cursor-measurements.md).
@@ -31,6 +31,11 @@ Los ViewModels exponen el viewport asociado a su snapshot local mediante `RunId`
 No se referencian entre sí. Una intención procedente de A-Scan o B-Scan modifica el mismo coordinador,
 por lo que la sincronización es bidireccional y física, no basada en píxeles.
 
+El coordinador conserva dominios por consumidor y un intervalo común, pero no fabrica una identidad
+visual común. AScanViewModel y BScanViewModel crearán bindings separados con sus propias versiones;
+esas versiones pueden diferir y nunca se comparan entre sí. A presenta el tiempo horizontalmente y B
+verticalmente. El viewport espacial B es independiente.
+
 `Visualization.Wpf` adapta coordenadas neutrales a DIP. `AScanControl` conserva el viewport compatible
 con el snapshot realmente admitido por latest-only; un viewport de otra run o versión no sustituye al
 mostrado. El control sigue siendo reutilizable mediante DependencyProperties y eventos, sin conocer
@@ -55,7 +60,7 @@ pendientes y establece una barrera UI. Una instancia privada creada por `AScanVi
 
 ## Consecuencias
 
-- El futuro B-Scan puede orientar el tiempo horizontal o verticalmente sin cambiar el contrato.
+- El B-Scan aprobado orientará el tiempo verticalmente sin cambiar el contrato neutral.
 - No hay dependencia A-Scan ↔ B-Scan ni bucles de notificación entre ViewModels.
 - Snapshot, cursores y viewport no se mezclan entre identidades visuales.
 - La intersección vacía deja el grupo sin viewport hasta disponer de dominios compatibles.
@@ -64,4 +69,4 @@ pendientes y establece una barrera UI. Una instancia privada creada por `AScanVi
 ## Aplazado
 
 Zoom de amplitud, selección de área, gestos táctiles, profundidad, velocidad de material, gates,
-implementación del B-Scan y sincronización de ejes distintos del tiempo.
+implementación de las fases B-Scan y sincronización de ejes distintos del tiempo.

@@ -23,7 +23,16 @@ Fuera de v1 inicial: 3D, integración PLC Panasonic/Mewtocol, robot Universal Ro
 
 ## Alcance confirmado del primer incremento (2026-09-11)
 
-Varias ventanas y rectificadas siguen siendo requisitos de producto, no capacidades de este incremento. Inicialmente RF bipolar `ReadOnlyMemory<short>`, sesión Application y A-Scan en MainWindow. Cerrar MainWindow solicita salida ordenada; secundarias futuras no detendrán sesión. Sin bandeja, OnExplicitShutdown, ejecución sin ventanas ni scopes genéricos. Diseño en [ADR 0006](../adr/0006-session-window-lifecycle.md), [ADR 0007](../adr/0007-frame-source-ownership.md) y [ADR 0008](../adr/0008-latest-only-visual-delivery.md); implementación pendiente según [plan](../plans/2026-09-09-first-vertical-increment.md).
+Este alcance histórico introdujo RF bipolar `ReadOnlyMemory<short>`, sesión Application y A-Scan en MainWindow; esas capacidades y el cierre principal están implementados. Rectificadas y ventanas adicionales seguían entonces pendientes. Sin bandeja, OnExplicitShutdown, ejecución sin ventanas ni scopes genéricos. Diseño en [ADR 0006](../adr/0006-session-window-lifecycle.md), [ADR 0007](../adr/0007-frame-source-ownership.md) y [ADR 0008](../adr/0008-latest-only-visual-delivery.md).
+
+## Alcance B-Scan confirmado (2026-09-22)
+
+El primer B-Scan convencional usa RF bipolar, eje X por índice sintético adimensional y eje Y temporal.
+Debe mantener memoria acotada, discontinuidades observables, selección exacta hacia A-Scan Live/Selected,
+navegación temporal común y ventana secundaria cerrable sin detener sesión. Una selección confirmada
+sobrevive a la expulsión de su columna; nueva run la invalida. Encoder, distancia física, archivo,
+profundidad, gates y PA quedan fuera. Diseño en [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md)
+y ejecución en el [plan por fases](../plans/2026-09-22-bscan-first-increment.md).
 
 ## Aceptación de la fase documental inicial (histórico)
 Configuración y once perfiles presentes; reglas de escritor único; documentación de requisitos, arquitectura y ADR enlazada; cinco áreas revisadas en paralelo por especialistas; pendientes explícitos; sin implementación, proyectos C#, paquetes ni commit.

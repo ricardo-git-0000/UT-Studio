@@ -12,11 +12,11 @@ No asumir respuestas ni bloquear la fase documental por estas incógnitas. Resol
 | Q06 | Formato nativo, bloques, compresión, integridad, durabilidad y ventana recuperable; crudo/procesado a conservar | ut_storage_formats |
 | Q07 | Formatos externos prioritarios y archivos de ejemplo autorizados | ut_storage_formats |
 | Q08 | Informe: contenido, PDF/A, firmas, imágenes, plantilla corporativa y licencia | pdf_reporting |
-| Q09 | Renderizador y benchmarks CPU/GPU/memoria pendientes; A-Scan de puntos, máximo 1.024/min-max y 30 Hz aceptados (ADR 0008) | ut_visualization |
+| Q09 | Benchmarks CPU/memoria pendientes; A-Scan y B-Scan usan límites de 30 Hz distintos y configurables. GPU y ajustes de índice/tiles siguen abiertos (ADR 0008/0013) | ut_visualization |
 | Q10 | MSTest 4.0.2 aprobado/presente desde 2026-09-10; mocking, CI, hardware/duración de benchmarks y paquetes adicionales pendientes | quality_reviewer |
 | Q11 | Instalación, actualización y plataformas Linux realmente requeridas | solution_architect |
-| Q12 | Sesión Application, cierre MainWindow=salida y snapshots iniciales resueltos (ADR 0006/0008); inspecciones concurrentes y propiedad/presupuesto de primera secundaria pendientes, sin scopes genéricos ahora | wpf_mvvm_specialist |
-| Q13 | Flujo inicial recibido -> Application -> latest-only resuelto (ADR 0007/0008); fan-out, ownership compartido, orden y relación con persistencia pendientes | solution_architect |
+| Q12 | Primera secundaria BScanWindow, propiedad, presupuesto y cierre resueltos en ADR 0013; otras inspecciones/ventanas concurrentes permanecen abiertas | wpf_mvvm_specialist |
+| Q13 | Fan-out visual A/B por copia propia resuelto en ADR 0013; ownership, orden y backpressure de procesamiento/persistencia siguen pendientes | solution_architect |
 
 La representación binaria de rectificadas reales sigue abierta; inicialmente solo RF bipolar `ReadOnlyMemory<short>`. Véanse [ADR 0007](../adr/0007-frame-source-ownership.md), [ADR 0008](../adr/0008-latest-only-visual-delivery.md) y [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 

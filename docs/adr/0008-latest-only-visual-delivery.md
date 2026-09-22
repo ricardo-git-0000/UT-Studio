@@ -1,6 +1,6 @@
 # ADR 0008 — Entrega A-Scan latest-only y publicación visual acotada
 
-Fecha original: 2026-09-11. Revisado: 2026-09-16.
+Fecha original: 2026-09-11. Revisado: 2026-09-22.
 Estado: entrega neutral implementada; cancelación estricta por suscriptor y diagnóstico terminal independiente corregidos según la petición del usuario del 2026-09-15.
 Trazabilidad: R01, R02, R06–R08 y R13; complementa [ADR 0005](0005-initial-solution-structure.md), [ADR 0006](0006-session-window-lifecycle.md) y [ADR 0007](0007-frame-source-ownership.md).
 
@@ -14,9 +14,9 @@ Esta revisión prevalece para la rama visual sobre las referencias anteriores a 
 
 `Simulador -> Channel -> ApplicationSession -> IConventionalFrameSink.Accept -> AScanProjector -> AScanSnapshot -> mailbox latest-only -> publicación observable`.
 
-- ApplicationSession conserva el único lector de UtAcquisitionRun.Frames.
+- ApplicationSession conserva el único lector de UtAcquisitionRun.Frames. El B-Scan aprobado añadirá un fan-out visual síncrono, ordenado y aislado por rama; no añadirá otro lector.
 - La sesión recibe opcionalmente [IConventionalFrameSink](../../src/UTStudio.Contracts/Presentation/IConventionalFrameSink.cs); un puerto nulo conserva el comportamiento sin entrega visual. Application no referencia Visualization.Core.
-- Accept recibe metadatos, secuencia, tiempo transcurrido y `ReadOnlySpan<short>` prestado durante la llamada síncrona. El sink no puede retener el span, aliases a su almacenamiento ni el frame propietario. Debe producir sus datos propios antes de retornar.
+- Accept recibe metadatos y datos per-frame, incluido `AcquisitionIndex` y posición opcional cuando se implemente la Fase 1, además del `ReadOnlySpan<short>` prestado. Ninguna rama puede retener span, aliases ni owner. A conserva su proyección latest-only; B solo copia al ring propio dentro de Accept y difiere índice, tiles y publicación. Un fallo B no cierra A y viceversa. Véase [ADR 0013](0013-bscan-bounded-live-visualization.md).
 - ApplicationSession conserva el frame y lo libera en finally, también si falla la transformación o entrega. Ninguna espera de observadores conserva muestras UT.
 - [AScanVisualDelivery](../../src/UTStudio.Visualization.Core/AScanVisualDelivery.cs) implementa el puerto y proyecta fuera del bloqueo del mailbox. Confirma el resultado solo si la ejecución y generación siguen vigentes. Sin suscriptores evita proyección y acumulación.
 - El mailbox retiene solamente un snapshot independiente pendiente. Una entrada sustituye al pendiente anterior; descartarlo elimina una referencia visual, no devuelve un owner UT.
@@ -24,7 +24,7 @@ Esta revisión prevalece para la rama visual sobre las referencias anteriores a 
 
 CloseRun invalida generación, pendiente y snapshot actual. Una proyección síncrona ya iniciada puede terminar, pero su resultado invalidado no entra al mailbox. La sesión mantiene drenaje y liberación, observa productor y consumidor y espera AllFramesReleased. La barrera no depende de callbacks visuales.
 
-La pérdida latest-only se permite exclusivamente en la rama visual. No define ni condiciona la futura distribución a procesamiento o persistencia sin pérdida silenciosa.
+La pérdida latest-only se permite exclusivamente en representación visual. En A sustituye snapshots; en B coalesce trabajo/publicaciones y obliga a resincronizar si salta una revisión, sin borrar silenciosamente columnas ya admitidas por el ring. No define ni condiciona la futura distribución a procesamiento o persistencia sin pérdida silenciosa.
 
 ## Snapshot, escalas y reducción
 

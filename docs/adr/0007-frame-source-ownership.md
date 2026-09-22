@@ -1,6 +1,6 @@
 # ADR 0007 — Contrato de fuente y ownership exclusivo de frames RF
 
-Fecha: 2026-09-11. Estado: Aceptado por el usuario; implementación pendiente.
+Fecha: 2026-09-11. Revisado: 2026-09-22. Estado: contrato inicial implementado; extensión B-Scan pendiente.
 Trazabilidad: R02–R07 y R13; concreta [ADR 0002](0002-bounded-pipeline.md) y [ADR 0005](0005-initial-solution-structure.md). Cierre: [ADR 0006](0006-session-window-lifecycle.md).
 
 ## Contexto
@@ -24,7 +24,9 @@ Domain define identidades, configuración y metadatos inmutables compartidos dur
 | FirstSampleOffsetSeconds | Tiempo finito respecto al disparo; inicial 0 |
 | RunStartedAtUtc | Origen civil informativo, no gobierna orden ni duración |
 
-Cada frame añade Sequence de tipo ulong desde cero por ejecución y ElapsedSinceRunStart, tiempo monotónico del disparo. La secuencia se asigna al producir y no se renumera por descarte visual. Cambiar configuración exige parar e iniciar otra ejecución.
+Cada frame añade Sequence de tipo ulong desde cero por ejecución, `AcquisitionIndex` obligatorio y ElapsedSinceRunStart. El índice es un ordinal sintético adimensional, empieza en cero, crece estrictamente y no se renumera por rechazo visual o expulsión. En el simulador coincide inicialmente con Sequence. La propiedad opcional `ScanSpatialCoordinate?`, prevista en Fase 1, viajará atómicamente con el frame; será `null` en el simulador y no añade todavía procedencia, calidad ni calibración. Sequence sigue siendo identidad/integridad y AcquisitionIndex orden espacial: no son intercambiables. Cambiar configuración exige parar e iniciar otra ejecución.
+
+La política B-Scan aprobada sustituirá en Fase 1 el rechazo terminal actual de toda discontinuidad: un gap ascendente acepta el frame actual y cuenta ausentes; secuencia duplicada, descendente, timestamp descendente o índice inválido rechazan y liberan ese frame, lo contabilizan y permiten continuar. Watermarks separados impiden contar después como ausente un frame recibido pero rechazado por timestamp. Una configuración incompatible sí es terminal y exige nueva run. Véase [ADR 0013](0013-bscan-bounded-live-visualization.md).
 
 Muestras en cuentas digitales Int16 de -32.768 a 32.767, sin calibración a voltios. Tiempo de muestra: `offset + i / fs`; último punto: `offset + (N - 1) / fs`. Sin profundidad, geometría ni phased array. El contrato inicial no afirma que short represente futuras rectificadas ni fija su codificación, rango o conversión.
 
@@ -56,11 +58,11 @@ Application registra una cancelación para la operación de inicio completa, inc
 
 1. Productor reserva y genera.
 2. Escritura aceptada transfiere al Channel. Si no se acepta, libera el productor. No decidir ownership solo por un token cancelado después de escribir exitosamente.
-3. Application adquiere al leer; libera o transfiere al mailbox latest.
-4. Sustituir libera el pendiente; extraer transfiere al único coordinador Presentation.
-5. El coordinador transforma a almacenamiento visual independiente y libera en finally antes de esperar UI.
+3. Application adquiere al leer y presta las muestras síncronamente a la rama visual.
+4. Cada delivery produce almacenamiento visual independiente antes de retornar; Application libera el frame en `finally`.
+5. El fan-out B-Scan aprobado no comparte ownership UT: sus leases pertenecen exclusivamente a la copia de su ring. Persistencia y procesamiento futuros requieren contratos lossless distintos.
 
-Publicar/sustituir/extraer/cerrar mailbox son atómicos. Cerrar rechaza y libera publicaciones tardías e impide nuevas extracciones; el frame ya extraído sigue perteneciendo al transformador. Sin interés visual se libera, no se acumula.
+Los mailboxes visuales contienen snapshots o copias independientes, nunca frames UT. Application libera siempre el frame en `finally` después del préstamo síncrono. Cerrar una entrega invalida publicaciones tardías sin transferir ownership de adquisición.
 
 El pool se sella frente a reservas durante parada, sincronizado con reservas concurrentes. AllFramesReleased solo termina tras sellado y cero reservas vivas; no termina porque el pool esté vacío antes del primer frame. La barrera no exige acceso a Presentation/Dispatcher. No iniciar otro run/pool mientras la limpieza anterior esté pendiente.
 

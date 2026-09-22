@@ -15,5 +15,6 @@ Aceptado identifica decisiones aprobadas, sin autorizar paquetes ni implementaci
 - [0010-ascan-manual-cursor-measurements](0010-ascan-manual-cursor-measurements.md): Ejes físicos y cursores manuales aproximados sobre puntos visuales A-Scan.
 - [0011-shared-physical-time-viewport](0011-shared-physical-time-viewport.md): Zoom temporal neutral compartible entre A-Scan y futuros B-Scan.
 - [0012-shared-scan-time-navigation](0012-shared-scan-time-navigation.md): navegación temporal reutilizable, identidad latest-only, ciclo de vida y sincronización bidireccional entre scans.
+- [0013-bscan-bounded-live-visualization](0013-bscan-bounded-live-visualization.md): B-Scan acotado, fan-out, leases, selección exacta, entrega incremental y ventana secundaria.
 
-Renderizadores de otros scans, paquetes adicionales y benchmarks pendientes; véanse [plan](../plans/2026-09-09-first-vertical-increment.md) y [cuestiones](../requirements/open-questions.md).
+Renderizadores C/S/D-Scan, paquetes adicionales y benchmarks siguen pendientes. Véanse el [plan vertical](../plans/2026-09-09-first-vertical-increment.md), el [plan B-Scan](../plans/2026-09-22-bscan-first-increment.md) y las [cuestiones](../requirements/open-questions.md).

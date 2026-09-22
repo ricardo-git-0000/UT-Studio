@@ -1,7 +1,7 @@
 # ADR 0006 — Cierre de MainWindow y parada ordenada de aplicación
 
-Fecha original: 2026-09-09. Revisado: 2026-09-12.
-Estado: Aceptado por el usuario con correcciones; implementación funcional pendiente.
+Fecha original: 2026-09-09. Revisado: 2026-09-22.
+Estado: cierre MainWindow implementado; extensión BScanWindow aceptada y pendiente.
 Trazabilidad: R02, R06–R08 y R13; Q12/Q13 en [cuestiones abiertas](../requirements/open-questions.md).
 
 ## Contexto y sustitución
@@ -13,8 +13,8 @@ La revisión del usuario del 2026-09-11 sustituye expresamente la decisión ante
 - Cerrar MainWindow solicita parada ordenada, desconexión, liberación de recursos, parada y liberación del Host y cierre de la aplicación, también con adquisición activa.
 - No implementar bandeja, `OnExplicitShutdown` ni ejecución sin ventanas.
 - La composición usa `OnMainWindowClose`. En el primer evento Closing cancela el cierre sincrónicamente y observa una única tarea de salida asíncrona. MainWindow permanece abierta durante la limpieza; solicitudes repetidas se unen a esa tarea. Solo tras completarla se programa una única finalización mediante Dispatcher: dentro de esa operación se autoriza y reemite Close; el segundo Closing permite terminar WPF. Incluso si la tarea ya estaba completada, Close nunca se reemite dentro de la primera pila de Closing. No bloquear el Dispatcher con esperas síncronas.
-- Una futura ventana secundaria liberará sus suscripciones y estado al cerrarse sin detener la sesión. Cerrar MainWindow seguirá significando salir aunque haya secundarias abiertas.
-- No crear infraestructura genérica de scopes por ventana. La primera secundaria exigirá concretar propiedad, suscripciones y presupuesto antes de implementarse.
+- La primera secundaria aprobada será `BScanWindow`. Poseerá su ViewModel, suscripción e identidad de consumidor temporal, pero tomará prestados sesión, deliveries, store y coordinadores de composición. Cerrarla cancelará sus operaciones, retirará el consumidor y cruzará su barrera UI sin detener sesión ni A-Scan.
+- No crear infraestructura genérica de scopes por ventana. Cerrar MainWindow seguirá significando salir aunque BScanWindow esté abierta: primero cerrará secundarias y ViewModels y después sesión, deliveries/stores, coordinadores y Host. El detalle normativo está en [ADR 0013](0013-bscan-bounded-live-visualization.md).
 
 ## Orden de parada y salida
 
@@ -49,4 +49,4 @@ La ejecución sin ventanas de la versión anterior queda sustituida por decisió
 
 Probar Channel lleno, productor bloqueado, transformación activa, error del consumidor, inicio pendiente y solicitudes repetidas. Usar fuente doble con Connect/Configure/Start bloqueados para verificar que salida cancela antes de esperar exclusión y observa rollback; cubrir la carrera entre registrar inicio y solicitar salida. Verificar devolución exactamente una vez, barrera independiente del Dispatcher y diagnóstico a cinco segundos sin terminar proceso ni permitir reinicio. Integración real de Closing/Host/MainWindow en Windows; coordinación neutral en Core.Tests.
 
-Quedan pendientes renderizado, paquetes adicionales y benchmarks. La propiedad de ventanas secundarias se concretará al incorporarlas. Persistencia y ownership compartido quedan fuera. No se han ejecutado pruebas funcionales por esta decisión documental.
+Quedan pendientes la implementación de BScanWindow, paquetes adicionales y benchmarks. Persistencia y otras secundarias continúan fuera. No se han ejecutado pruebas funcionales por esta decisión documental.
