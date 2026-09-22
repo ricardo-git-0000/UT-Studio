@@ -1,6 +1,6 @@
 # ADR 0013 — B-Scan en vivo acotado, selección exacta y ventana secundaria
 
-Fecha: 2026-09-22. Estado: Aceptado; Fase 1 implementada y fases 2–5 pendientes.
+Fecha: 2026-09-22. Estado: Aceptado; Fases 1 y 2 implementadas y fases 3–5 pendientes.
 Trazabilidad: R01–R09, R13 y R14; concreta Q12 y la parte visual de Q13. Complementa
 [ADR 0006](0006-session-window-lifecycle.md), [ADR 0007](0007-frame-source-ownership.md),
 [ADR 0008](0008-latest-only-visual-delivery.md), [ADR 0009](0009-reusable-scan-visualization-controls.md)
@@ -78,6 +78,7 @@ amplía `ConventionalUtFrame` y el préstamo visual:
 public ulong AcquisitionIndex { get; }
 public ScanSpatialCoordinate? SpatialCoordinate { get; }
 
+void IConventionalFrameSink.OpenRun(ConventionalUtFrameMetadata metadata);
 void IConventionalFrameSink.Accept(
     ConventionalUtFrameMetadata metadata,
     ulong sequence,
@@ -85,6 +86,7 @@ void IConventionalFrameSink.Accept(
     TimeSpan elapsedSinceRunStart,
     ScanSpatialCoordinate? spatialCoordinate,
     ReadOnlySpan<short> samples);
+ValueTask IConventionalFrameSink.WaitForCloseAsync(AcquisitionRunId runId);
 ```
 
 La identidad visual en Visualization.Core será `(SourceId, RunId, PhysicalChannelId, Sequence)`.
@@ -131,6 +133,10 @@ Liberar el último lease vuelve a habilitar el slot. Se publican `ActiveReadLeas
 impide nuevos leases, cancela operaciones propias y espera asíncronamente que `ActiveReadLeases` llegue
 a cero antes de devolver arrays. Los cinco segundos de cierre siguen siendo solo diagnóstico: no
 autorizan reutilizar memoria aún leída.
+
+El puerto abre con metadata completa para reservar antes del primer préstamo. `CloseRun` invalida de
+forma acotada y `WaitForCloseAsync` es la barrera que Application cruza antes de admitir otra run; una
+arena retirada no coexiste así con otra reserva de 32 MiB en la misma instancia.
 
 ## Presupuestos de memoria
 
@@ -244,6 +250,11 @@ paleta usa cero neutro y familias distinguibles para negativos/positivos, con cl
 futura desde archivo. Devuelve `Available`, `NotAvailable`, `Evicted`, `Cancelled` o `Faulted`; no se
 implementa archivo ahora. `Evicted` significa que una identidad conocida ya no reside. En una selección
 ya confirmada, Evicted es solo estado de residencia B y no invalida el snapshot A.
+
+La implementación live conserva tombstones acotadas a la capacidad efectiva del ring. Una identidad
+expulsada más antigua que esa ventana vuelve a `NotAvailable`; no se infiere `Evicted` desde Sequence,
+porque gaps y rechazos B nunca residieron. Las copias exactas independientes están limitadas a dos;
+una tercera solicitud espera de forma cancelable antes de fijar un slot.
 
 Existe como máximo una resolución activa para el grupo A/B. Una solicitud nueva cancela la anterior y
 vence mediante generación monotónica. Se valida identidad, run, slot y generaciones antes y después de

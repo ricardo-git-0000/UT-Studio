@@ -119,6 +119,12 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         return waiter.Completion.Task;
     }
 
+    public void OpenRun(ConventionalUtFrameMetadata metadata)
+    {
+        ArgumentNullException.ThrowIfNull(metadata);
+        OpenRun(metadata.RunId);
+    }
+
     public void OpenRun(AcquisitionRunId runId)
     {
         if (!runId.IsValid) { throw new ArgumentException("Invalid run identifier.", nameof(runId)); }

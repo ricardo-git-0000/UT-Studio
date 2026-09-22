@@ -53,7 +53,7 @@ public sealed class ConventionalFrameSinkFanOutTests
         var coordinate = new ScanSpatialCoordinate(3.5, ScanSpatialUnit.Millimetres, new ScanAxisId("scan-x"));
         short[] samples = [1, -2, 3];
 
-        fanOut.OpenRun(RunId);
+        fanOut.OpenRun(Metadata);
         fanOut.Accept(Metadata, 7, 11, TimeSpan.FromTicks(13), coordinate, samples);
         fanOut.CloseRun(RunId);
         fanOut.CloseRun(RunId);
@@ -82,7 +82,7 @@ public sealed class ConventionalFrameSinkFanOutTests
         var a = new ManualSink("A", calls) { FailAccept = failing is "A" or "Both" };
         var b = new ManualSink("B", calls) { FailAccept = failing is "B" or "Both" };
         var fanOut = new ConventionalFrameSinkFanOut(a, b);
-        fanOut.OpenRun(RunId);
+        fanOut.OpenRun(Metadata);
 
         fanOut.Accept(Metadata, 0, 0, TimeSpan.Zero, null, new short[3]);
         fanOut.Accept(Metadata, 1, 1, TimeSpan.FromTicks(1), null, new short[3]);
@@ -105,7 +105,7 @@ public sealed class ConventionalFrameSinkFanOutTests
         var b = new ManualSink("B", calls) { FailClose = true };
         var fanOut = new ConventionalFrameSinkFanOut(a, b);
 
-        fanOut.OpenRun(RunId);
+        fanOut.OpenRun(Metadata);
         fanOut.Accept(Metadata, 0, 0, TimeSpan.Zero, null, new short[3]);
         fanOut.CloseRun(RunId);
         fanOut.CloseRun(RunId);
@@ -129,13 +129,14 @@ public sealed class ConventionalFrameSinkFanOutTests
         var a = new ManualSink("A", calls);
         var b = new ManualSink("B", calls);
         var fanOut = new ConventionalFrameSinkFanOut(a, b);
-        fanOut.OpenRun(RunId);
+        fanOut.OpenRun(Metadata);
         fanOut.CloseRun(RunId);
         var second = new AcquisitionRunId(Guid.Parse("20000000-0000-0000-0000-000000000002"));
 
-        fanOut.OpenRun(second);
-        fanOut.Accept(new ConventionalUtFrameMetadata(new UtSourceId("fanout"), second,
-            Metadata.Configuration, DateTimeOffset.UnixEpoch), 0, 0, TimeSpan.Zero, null, new short[3]);
+        var secondMetadata = new ConventionalUtFrameMetadata(new UtSourceId("fanout"), second,
+            Metadata.Configuration, DateTimeOffset.UnixEpoch);
+        fanOut.OpenRun(secondMetadata);
+        fanOut.Accept(secondMetadata, 0, 0, TimeSpan.Zero, null, new short[3]);
         fanOut.CloseRun(second);
 
         Assert.AreEqual(1, a.AcceptCount);
@@ -154,7 +155,7 @@ public sealed class ConventionalFrameSinkFanOutTests
         var a = new BlockingSink("A", calls, acceptEntered, allowAcceptToReturn);
         var b = new ManualSink("B", calls);
         var fanOut = new ConventionalFrameSinkFanOut(a, b);
-        fanOut.OpenRun(RunId);
+        fanOut.OpenRun(Metadata);
         Exception? acceptError = null;
         var acceptThread = new Thread(() =>
         {
@@ -189,7 +190,7 @@ public sealed class ConventionalFrameSinkFanOutTests
         internal ScanSpatialCoordinate? Coordinate { get; private set; }
         internal short[] CopiedForAssertion { get; private set; } = [];
 
-        public void OpenRun(AcquisitionRunId runId)
+        public void OpenRun(ConventionalUtFrameMetadata metadata)
         {
             calls.Enqueue($"{id}.Open");
             if (FailOpen) { throw new InvalidOperationException($"{id} open"); }
@@ -225,7 +226,7 @@ public sealed class ConventionalFrameSinkFanOutTests
         internal int AcceptCount;
         internal int CloseCount;
 
-        public void OpenRun(AcquisitionRunId runId) => calls.Enqueue($"{id}.Open");
+        public void OpenRun(ConventionalUtFrameMetadata metadata) => calls.Enqueue($"{id}.Open");
 
         public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
             TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)

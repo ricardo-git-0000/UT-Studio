@@ -23,11 +23,11 @@ public sealed class ConventionalFrameSinkFanOut : IConventionalFrameSink
 
     public IReadOnlyList<VisualBranchDiagnostics> Diagnostics => [_aScan.GetDiagnostics(), _bScan.GetDiagnostics()];
 
-    public void OpenRun(AcquisitionRunId runId)
+    public void OpenRun(ConventionalUtFrameMetadata metadata)
     {
-        if (!runId.IsValid) { throw new ArgumentException("Invalid run identifier.", nameof(runId)); }
-        _aScan.Open(runId);
-        _bScan.Open(runId);
+        ArgumentNullException.ThrowIfNull(metadata);
+        _aScan.Open(metadata);
+        _bScan.Open(metadata);
     }
 
     public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
@@ -45,6 +45,11 @@ public sealed class ConventionalFrameSinkFanOut : IConventionalFrameSink
         _bScan.Close(runId);
     }
 
+    public async ValueTask WaitForCloseAsync(AcquisitionRunId runId)
+    {
+        await Task.WhenAll(_aScan.WaitForCloseAsync(runId), _bScan.WaitForCloseAsync(runId)).ConfigureAwait(false);
+    }
+
     private sealed class Branch(string id, IConventionalFrameSink sink)
     {
         private readonly object _gate = new();
@@ -53,8 +58,9 @@ public sealed class ConventionalFrameSinkFanOut : IConventionalFrameSink
         private ulong _failureCount;
         private VisualBranchFailure? _firstFailure, _latestFailure;
 
-        internal void Open(AcquisitionRunId runId)
+        internal void Open(ConventionalUtFrameMetadata metadata)
         {
+            AcquisitionRunId runId = metadata.RunId;
             lock (_gate)
             {
                 if (_runId == runId && (_open || _disabled || _closed)) { return; }
@@ -67,7 +73,7 @@ public sealed class ConventionalFrameSinkFanOut : IConventionalFrameSink
 
             try
             {
-                sink.OpenRun(runId);
+                sink.OpenRun(metadata);
                 lock (_gate) { if (!_closed) { _open = true; } }
             }
             catch (Exception error)
@@ -105,6 +111,12 @@ public sealed class ConventionalFrameSinkFanOut : IConventionalFrameSink
             try { sink.CloseRun(runId); }
             catch (Exception error) { Record(VisualBranchOperation.Close, error); }
             finally { lock (_gate) { if (_runId == runId) { _runId = null; } } }
+        }
+
+        internal async Task WaitForCloseAsync(AcquisitionRunId runId)
+        {
+            try { await sink.WaitForCloseAsync(runId).ConfigureAwait(false); }
+            catch (Exception error) { Record(VisualBranchOperation.Close, error); }
         }
 
         private void Record(VisualBranchOperation operation, Exception error)

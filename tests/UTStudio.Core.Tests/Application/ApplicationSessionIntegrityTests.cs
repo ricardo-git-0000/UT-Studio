@@ -212,7 +212,7 @@ public sealed class ApplicationSessionIntegrityTests
         internal ConcurrentQueue<TimeSpan> Elapsed { get; } = new();
         internal ConcurrentQueue<ScanSpatialCoordinate?> Coordinates { get; } = new();
         internal ConcurrentQueue<short> FirstSamples { get; } = new();
-        public void OpenRun(AcquisitionRunId runId) { }
+        public void OpenRun(ConventionalUtFrameMetadata metadata) { }
         public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
             TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
         {

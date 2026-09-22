@@ -8,13 +8,15 @@ namespace UTStudio.Contracts.Presentation;
 /// do not retain aliases or the frame owner. Copy/project before returning. Open/Close are bounded,
 /// nonblocking operations without external callbacks. OpenRun completes before Accept or CloseRun can
 /// start. Close may overlap an already admitted Accept and must invalidate its pending result.
+/// WaitForCloseAsync is the asynchronous cleanup barrier crossed before another run.
 /// Exceptions disable only this visual branch; Application still releases the frame.
 /// The source and sink are disposed by their external owners after the session closes its run.
 /// </remarks>
 public interface IConventionalFrameSink
 {
-    void OpenRun(AcquisitionRunId runId);
+    void OpenRun(ConventionalUtFrameMetadata metadata);
     void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
         TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples);
     void CloseRun(AcquisitionRunId runId);
+    ValueTask WaitForCloseAsync(AcquisitionRunId runId) => ValueTask.CompletedTask;
 }

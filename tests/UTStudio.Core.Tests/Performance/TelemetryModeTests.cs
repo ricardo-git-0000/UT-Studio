@@ -68,7 +68,7 @@ public sealed class TelemetryModeTests
         var sink = new InstrumentedFrameSink(delivery, telemetry);
         var metadata = Metadata(8);
         short[] samples = [0, 100, -200, 300, -400, 500, -600, 700];
-        sink.OpenRun(metadata.RunId);
+        sink.OpenRun(metadata);
         telemetry.BeginWindow();
         sink.Accept(metadata, 0, 0, TimeSpan.Zero, null, samples);
         var first = await observer.NextAsync();

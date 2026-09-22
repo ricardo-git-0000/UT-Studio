@@ -6,7 +6,7 @@ namespace UTStudio.LoadTests;
 /// <summary>Marks entry into the visual branch; the borrowed span is forwarded synchronously and never retained.</summary>
 internal sealed class InstrumentedFrameSink(IConventionalFrameSink inner, LoadTelemetry telemetry) : IConventionalFrameSink
 {
-    public void OpenRun(AcquisitionRunId runId) => inner.OpenRun(runId);
+    public void OpenRun(ConventionalUtFrameMetadata metadata) => inner.OpenRun(metadata);
     public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
         TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
     {

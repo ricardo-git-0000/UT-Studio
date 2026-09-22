@@ -114,7 +114,7 @@ public sealed class SessionVisualDeliveryTests
     {
         internal int AcceptCalls { get; private set; }
         internal int CloseCalls { get; private set; }
-        public void OpenRun(AcquisitionRunId runId)
+        public void OpenRun(ConventionalUtFrameMetadata metadata)
         {
             if (failure == "Open") { throw new InvalidOperationException("visual opening failed"); }
         }

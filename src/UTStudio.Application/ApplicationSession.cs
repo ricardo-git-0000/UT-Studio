@@ -113,7 +113,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 if (!operation.CleanupRequested && _visualSink is not null)
                 {
                     operation.VisualOpened = true;
-                    try { _visualSink.OpenRun(operation.RunId); }
+                    try { _visualSink.OpenRun(run.Metadata); }
                     catch (Exception error) { RecordVisualError(operation, error); CloseVisual(operation); }
                 }
                 operation.Consumer = Task.Run(() => ConsumeAsync(operation, run));
@@ -349,6 +349,13 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private static void RecordVisualError(Operation operation, Exception error) =>
         operation.VisualError ??= Describe("session.visual", error);
 
+    private async Task WaitForVisualCloseAsync(Operation operation)
+    {
+        if (_visualSink is null) { return; }
+        try { await _visualSink.WaitForCloseAsync(operation.RunId).ConfigureAwait(false); }
+        catch (Exception error) { lock (_gate) { RecordVisualError(operation, error); } }
+    }
+
     private async Task SuperviseProducerAsync(Operation operation, UtAcquisitionRun run)
     {
         try { await run.ProducerCompletion.ConfigureAwait(false); }
@@ -374,6 +381,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 await ObserveAsync(operation, () => run.ProducerCompletion, "session.producer").ConfigureAwait(false);
                 await operation.Supervisor.ConfigureAwait(false);
                 await ObserveAsync(operation, () => operation.Consumer, "session.reader").ConfigureAwait(false);
+                await WaitForVisualCloseAsync(operation).ConfigureAwait(false);
                 lock (_gate) { Publish(operation, SessionPhase.AwaitingFramesReleased); }
                 operation.ResourcesReleased = await ObserveAsync(operation, () => run.AllFramesReleased, "session.barrier").ConfigureAwait(false);
             }
