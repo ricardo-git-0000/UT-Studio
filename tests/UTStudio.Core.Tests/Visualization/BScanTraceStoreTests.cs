@@ -164,7 +164,10 @@ public sealed class BScanTraceStoreTests
         Task close = store.CloseAsync();
         Assert.IsFalse(close.IsCompleted);
         reservation.Destination.Span.Fill(4);
-        Assert.AreEqual(StoreWriteKind.Closed, reservation.Commit(new(Identity(0), 0, TimeSpan.Zero,
+        BScanTraceIdentity identity = Identity(0);
+        var metadata = new ConventionalUtFrameMetadata(identity.SourceId, identity.RunId,
+            new(identity.PhysicalChannelId, 2, 1), DateTimeOffset.UnixEpoch);
+        Assert.AreEqual(StoreWriteKind.Closed, reservation.Commit(new(metadata, identity, 0, TimeSpan.Zero,
             2, 1, 0, null, 0, 0)).Kind);
         await close.WaitAsync(TimeSpan.FromSeconds(10));
 
@@ -177,7 +180,9 @@ public sealed class BScanTraceStoreTests
         var reservation = store.BeginWrite(samples.Length);
         Assert.AreEqual(StoreWriteKind.Accepted, reservation.Kind);
         samples.CopyTo(reservation.Destination);
-        var descriptor = new BScanTraceDescriptor(identity, identity.Sequence, TimeSpan.Zero,
+        var metadata = new ConventionalUtFrameMetadata(identity.SourceId, identity.RunId,
+            new(identity.PhysicalChannelId, samples.Length, 10_000_000), DateTimeOffset.UnixEpoch);
+        var descriptor = new BScanTraceDescriptor(metadata, identity, identity.Sequence, TimeSpan.Zero,
             samples.Length, 50_000_000, 0, null, 0, 0);
         Assert.AreEqual(StoreWriteKind.Accepted, reservation.Commit(descriptor).Kind);
     }

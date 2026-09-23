@@ -105,6 +105,8 @@ public static class BScanBipolarIntensity8
 
 public readonly record struct BScanVisualRevision(ulong SnapshotVersion, ulong StoreRevision, ulong WrapGeneration);
 public readonly record struct BScanRasterRectangle(int X, int Y, int Width, int Height);
+public readonly record struct BScanStreamIdentity(UtSourceId SourceId, AcquisitionRunId RunId,
+    PhysicalChannelId PhysicalChannelId);
 
 [Flags]
 public enum BScanFullRefreshReason
@@ -135,10 +137,13 @@ public sealed record BScanRenderRequest(
     ulong RenderConfigurationVersion,
     ulong? DisplayedSnapshotVersion = null,
     ulong? DisplayedStoreRevision = null,
-    ulong? DisplayedWrapGeneration = null)
+    ulong? DisplayedWrapGeneration = null,
+    string ConsumerId = "default",
+    BScanDisplayedVisualIdentity? Displayed = null)
 {
     public BScanRenderRequest Validate()
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ConsumerId);
         if (!RunId.IsValid) { throw new ArgumentException("A valid run is required.", nameof(RunId)); }
         ArgumentOutOfRangeException.ThrowIfLessThan(PixelWidth, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(PixelWidth, 1024);
@@ -154,6 +159,12 @@ public sealed record BScanRenderRequest(
         return this;
     }
 }
+
+public readonly record struct BScanRenderSignature(BScanSpatialViewport SpatialViewport,
+    ScanTimeViewport TimeViewport, int PixelWidth, int PixelHeight, ulong RenderConfigurationVersion);
+
+public sealed record BScanDisplayedVisualIdentity(BScanStreamIdentity Stream, BScanVisualRevision Revision,
+    BScanRenderSignature Render);
 
 public sealed record BScanVisualSnapshot(
     AcquisitionRunId RunId,
@@ -173,16 +184,29 @@ public sealed record BScanVisualSnapshot(
     BScanRasterRectangle AffectedRegion,
     bool HasDiscontinuities,
     bool RequiresFullRefresh,
-    BScanFullRefreshReason FullRefreshReason);
+    BScanFullRefreshReason FullRefreshReason)
+{
+    public string ConsumerId { get; init; } = "default";
+    public BScanStreamIdentity Stream { get; init; }
+}
 
 public sealed record BScanVisualUpdate(BScanVisualSnapshot Snapshot);
 
-public enum BScanRasterResultKind { Available, NotAvailable, Stale, Cancelled, Faulted }
+public enum BScanRasterResultKind { Available, NotAvailable, Stale, ResourceLimit, Cancelled, Faulted }
 
 public interface IBScanRasterRegionProvider
 {
     ValueTask<BScanRasterResult> GetRegionAsync(BScanRenderRequest request,
         CancellationToken cancellationToken = default);
+}
+
+/// <summary>Neutral metadata and raster source used by Presentation.</summary>
+public interface IBScanVisualSource : IObservable<BScanVisualUpdate>, IBScanRasterRegionProvider
+{
+    BScanVisualDiagnostics Diagnostics { get; }
+    bool RegisterConsumer(string consumerId) => true;
+    void UnregisterConsumer(string consumerId) { }
+    void RequestRender(BScanRenderRequest request);
 }
 
 public sealed class BScanRasterResult
@@ -195,6 +219,7 @@ public sealed class BScanRasterResult
     internal static BScanRasterResult Available(BScanRasterRegion region) => new(BScanRasterResultKind.Available, region, null);
     internal static BScanRasterResult NotAvailable() => new(BScanRasterResultKind.NotAvailable, null, null);
     internal static BScanRasterResult Stale() => new(BScanRasterResultKind.Stale, null, null);
+    internal static BScanRasterResult ResourceLimit(string error) => new(BScanRasterResultKind.ResourceLimit, null, error);
     internal static BScanRasterResult Cancelled() => new(BScanRasterResultKind.Cancelled, null, null);
     internal static BScanRasterResult Faulted(Exception error) => new(BScanRasterResultKind.Faulted, null,
         string.IsNullOrWhiteSpace(error.Message) ? error.GetType().Name : error.Message);

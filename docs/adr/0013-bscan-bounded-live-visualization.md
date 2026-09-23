@@ -1,6 +1,6 @@
 # ADR 0013 — B-Scan en vivo acotado, selección exacta y ventana secundaria
 
-Fecha: 2026-09-22. Estado: Aceptado; Fases 1–3 implementadas y fases 4–5 pendientes.
+Fecha: 2026-09-22. Estado: Aceptado; Fases 1–4 implementadas y Fase 5 pendiente.
 Trazabilidad: R01–R09, R13 y R14; concreta Q12 y la parte visual de Q13. Complementa
 [ADR 0006](0006-session-window-lifecycle.md), [ADR 0007](0007-frame-source-ownership.md),
 [ADR 0008](0008-latest-only-visual-delivery.md), [ADR 0009](0009-reusable-scan-visualization-controls.md)
@@ -90,7 +90,8 @@ ValueTask IConventionalFrameSink.WaitForCloseAsync(AcquisitionRunId runId);
 ```
 
 La identidad visual en Visualization.Core será `(SourceId, RunId, PhysicalChannelId, Sequence)`.
-`BScanTraceDescriptor` añadirá `AcquisitionIndex`, elapsed, muestreo, posición opcional, segmento y
+`BScanTraceDescriptor` conserva además la `ConventionalUtFrameMetadata` original y añade
+`AcquisitionIndex`, elapsed, muestreo, posición opcional, segmento y
 discontinuidades. `IBScanTraceProvider.GetTraceAsync(identity, cancellationToken)` devolverá un
 `BScanTraceResult` discriminado. `BScanSnapshot`, `BScanRasterRegionSnapshot` y
 `BScanVisualUpdate` llevarán siempre identidad local, versión y revisión. Ningún contrato visual B
@@ -210,11 +211,15 @@ pueden repintar inmediatamente el mismo estado; WPF no garantiza la frecuencia r
 Se miden columnas ingeridas/indexadas, trabajo sustituido, publicaciones, aplicaciones al bitmap y
 renders por separado.
 
-`Visualization.Core` produce `BScanRasterRegionSnapshot` neutral con run, versión local, revisión base
-y resultante, rectángulo, dimensiones, formato y payload propio. Presentation posee su almacenamiento,
-publica el estado en UI y no lo devuelve hasta sustituirlo y cruzar una barrera que impide nuevos
-callbacks sobre la región anterior. El control copia sincrónicamente el payload a su bitmap durante la
-admisión del cambio y no retiene su memoria. `BScanControl` no consulta el store, no coordina trabajo
+`Visualization.Core` produce `BScanRasterRegion` neutral con identidad de stream y consumidor, versión
+local, revisión base y resultante, rectángulo, dimensiones, formato y payload propio. Presentation
+retiene internamente como máximo la región visible y un candidato y publica únicamente un token opaco
+y metadata. `TryCopyPresentedRegion` valida token, stream, run y generación y copia sincrónicamente solo
+`AffectedRegion`, fila a fila, a una superficie proporcionada por el adaptador. Un token antiguo devuelve
+`false` y solicita fuera de la puerta una recuperación full coalescida; un destino insuficiente lanza
+`ArgumentException`. El estado observable no contiene arrays, `Memory`, owners ni `IDisposable`, por lo
+que los estados históricos no retienen raster ni generan una copia LOH por publicación. `BScanControl`
+no consulta el store, no coordina trabajo
 asíncrono y no referencia Application ni Presentation. Zoom/resize emite una intención neutral;
 Presentation solicita y publica otra región.
 
@@ -224,7 +229,7 @@ Cada columna confirmada incrementa `StoreRevision`. Una actualización contiene 
 snapshot, revisión base, revisión resultante, rango residente, dirty range, generación de wrap y marca
 de refresco completo. Un dirty range solo se aplica si la revisión mostrada coincide con la base.
 
-Run distinta, base incorrecta, versión saltada, wrap, región expulsada, zoom/pan, resize, DPI, paleta o
+Run/stream distinto, base no reconstruible, wrap, región expulsada, zoom/pan, resize, DPI, paleta o
 nivel fuerzan resincronización. Core produce una región coherente bajo leases sin mantener la puerta
 del store durante rasterización costosa y valida identidad/revisión antes de publicarla. Un resultado
 obsoleto se descarta. WPF recrea bitmap solo por dimensión física, DPI, formato o run.
@@ -242,11 +247,21 @@ primera columna por `AcquisitionIndex` y la primera muestra. Los gaps permanecen
 interpolan. El raster se obtiene mediante `IBScanRasterRegionProvider`; la notificación observable solo
 transporta metadata versionada, evitando compartir ownership entre varios observadores.
 
+La coalescencia normal no fuerza full refresh. Cada consumidor publica su propia base mostrada; Delivery
+une las revisiones `(base, target]` todavía residentes, aunque haya 1, 8, 33, 100 o más revisiones entre
+publicaciones. Las bases de consumidores rápidos y lentos son independientes. Si falta una revisión,
+hubo wrap o cambió la firma de render, se produce full refresh. `SnapshotVersion` es local al consumidor
+y no se usa para probar continuidad del store.
+
 El viewport espacial conserva un origen `ulong` y offsets `decimal`; resta el origen antes de cualquier
-conversión de raster y limita zoom a 4096× con al menos una columna visible. Core admite como máximo dos
-owners raster simultáneos. El presupuesto visual contabiliza índice posicional compacto, scratch,
-metadata y dos raster 8-bit máximos; además carga la longitud real devuelta por el pool antes de
-transferir un owner. Un owner ya transferido continúa válido tras wrap y se libera explícitamente.
+conversión de raster y limita zoom a 4096× con al menos una columna visible. Core admite inicialmente dos
+consumidores raster configurables y dos owners por consumidor. Los consumidores se registran por
+`consumerId`; el presupuesto visual global inicial de 16 MiB descuenta la reserva fija y carga la
+longitud real del owner antes de transferirlo. Cada consumidor tiene además un techo proporcional que
+impide monopolizar el presupuesto. Una solicitud no admitida devuelve `ResourceLimit`; el cierre libera
+owners y desregistra la cuota. Un owner transferido continúa válido tras wrap hasta su liberación.
+Mientras Presentation está en reset espacial, el viewport sigue el rango residente que crece o avanza.
+El primer zoom o pan desactiva ese autoajuste; `ResetSpatial` lo reactiva.
 
 ## Interacción, inspección y accesibilidad
 

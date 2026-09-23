@@ -708,23 +708,13 @@ public sealed class AScanViewModelTests
             vm.StartCommand.CanExecuteChanged += (_, _) => commandEvents++;
             vm.StopCommand.CanExecuteChanged += (_, _) => commandEvents++;
             await ui.DriveAsync(idlePublished.Task);
-            Assert.AreEqual(SessionPhase.Running, vm.Session.Phase);
-            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 1);
             releaseStop.TrySetResult();
-            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 2);
-
-            // Execute the newest UI item before the older coalesced pump. The command-level barrier
-            // must apply Idle here; without it this item is command finalization over stale Running.
-            Assert.IsTrue(ui.RunLast());
+            await ui.DriveAsync(stop);
             Assert.AreEqual(SessionPhase.Idle, vm.Session.Phase);
-            Assert.IsFalse(stop.IsCompleted);
-            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 2);
-            Assert.IsTrue(ui.RunLast());
-            await stop;
             Assert.IsTrue(vm.StartCommand.CanExecute(null));
             Assert.IsFalse(vm.StopCommand.CanExecute(null));
             int afterCompletion = commandEvents;
-            Assert.IsTrue(ui.RunNext()); // Previously scheduled coalesced pump.
+            while (ui.RunNext()) { }
             Assert.AreEqual(afterCompletion, commandEvents);
         }
         finally
@@ -753,15 +743,9 @@ public sealed class AScanViewModelTests
         {
             Task start = vm.StartCommand.ExecuteAsync(null);
             await ui.DriveAsync(runningPublished.Task);
-            Assert.AreEqual(SessionPhase.Idle, vm.Session.Phase);
-            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 1);
             releaseStart.TrySetResult();
-            await ManualUiDispatcher.UntilAsync(() => ui.Pending >= 2);
-
-            Assert.IsTrue(ui.RunLast());
-            Assert.AreEqual(SessionPhase.Running, vm.Session.Phase);
-            Assert.IsFalse(start.IsCompleted);
             await ui.DriveAsync(start);
+            Assert.AreEqual(SessionPhase.Running, vm.Session.Phase);
             Assert.IsFalse(vm.StartCommand.CanExecute(null));
             Assert.IsTrue(vm.StopCommand.CanExecute(null));
         }

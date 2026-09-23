@@ -1,6 +1,6 @@
 # Plan del primer incremento B-Scan reutilizable
 
-Estado: diseño aprobado; Fases 0–3 completadas. Las fases 4–5 requieren autorización separada.
+Estado: diseño aprobado; Fases 0–4 completadas. La Fase 5 requiere autorización separada.
 La fuente normativa es [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
 
 ## Reglas comunes
@@ -74,6 +74,16 @@ aprobados en Visualization.Core y pruebas Core/Presentation. Sin control WPF.
 
 Salida: una resolución global; sustitución atómica y fallo conservador; live continúa bajo Selected;
 versiones A/B diferentes y orden inverso; ninguna mutación fuera de `IUiDispatcher` ni callback tardío.
+
+Implementada con coordinador global latest-selection-wins, metadata original en la copia exacta,
+modos A-Scan `NoData`/`Live`/`Selected`, retorno inmediato al último live compatible y un
+`BScanViewModel` neutral. Cada B registra su propio consumidor temporal y fabrica el binding con su
+versión local. El estado B publica solo token y descriptor; el ViewModel retiene internamente el owner
+pooled y ofrece copia síncrona validada de `AffectedRegion`, sin arrays raster en estados históricos ni
+`IDisposable` para la vista. Delivery acumula incrementales desde la base mostrada de cada consumidor y
+aplica cuota global de 16 MiB por bytes rentados, con dos consumidores y dos owners por consumidor. En
+reset espacial sigue el rango residente; tras zoom o pan conserva y limita
+la vista hasta otro reset. Control, eventos WPF y composición permanecen en Fase 5.
 
 ## Fase 5 — WPF y composición
 

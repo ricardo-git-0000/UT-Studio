@@ -25,10 +25,12 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
     private readonly SharedScanTimeViewport _timeViewport;
+    private readonly BScanSelectionCoordinator? _selectionCoordinator;
     private readonly bool _ownsTimeViewport;
     private readonly string _viewportConsumerId = $"ascan-{Guid.NewGuid():N}";
     private readonly UiAsyncCommand _start, _stop;
-    private readonly RelayCommand _toggleCursors, _resetCursors, _resetViewport, _zoomIn, _zoomOut, _panLeft, _panRight;
+    private readonly RelayCommand _toggleCursors, _resetCursors, _resetViewport, _zoomIn, _zoomOut, _panLeft, _panRight,
+        _returnToLive;
     private IDisposable? _sessionSubscription, _visualSubscription, _statusSubscription;
     private SessionSnapshot _latestSession;
     private AScanSnapshot? _latestVisual;
@@ -41,12 +43,14 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private Task? _disposal;
     private ScanTimeViewportBinding? _publishedViewportBinding;
     private int _closing;
+    private AScanSnapshot? _returnedSelection;
     private bool IsClosing => Volatile.Read(ref _closing) != 0;
 
     public AScanViewModel(IApplicationSession session, IObservable<AScanSnapshot> visualFeed,
         IUiDispatcher dispatcher, ConventionalAcquisitionConfiguration configuration,
         Func<AcquisitionRunId>? newRun = null, Func<AScanDeliveryStatistics>? readVisualStatistics = null,
-        IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null)
+        IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null,
+        BScanSelectionCoordinator? selectionCoordinator = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(visualFeed);
@@ -59,7 +63,9 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _lifetime = new UiLifetime(dispatcher);
         _ownsTimeViewport = timeViewport is null;
         _timeViewport = timeViewport ?? new SharedScanTimeViewport(dispatcher);
+        _selectionCoordinator = selectionCoordinator;
         _timeViewport.PropertyChanged += OnTimeViewportChanged;
+        if (_selectionCoordinator is not null) { _selectionCoordinator.PropertyChanged += OnSelectionChanged; }
         _latestSession = session.Snapshot;
         _state = new(_latestSession, null, null, null, null);
         _start = new(_lifetime, StartAsync, () => !IsClosing && _state.Session.CanStart && !_start!.IsRunning && !_stop!.IsRunning,
@@ -77,6 +83,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             viewport.VisibleMinimumSeconds > viewport.DomainMinimumSeconds);
         _panRight = new(() => PanByFraction(.1), () => !IsClosing && !_lifetime.IsClosed && TimeViewport is { } viewport &&
             viewport.VisibleMaximumSeconds < viewport.DomainMaximumSeconds);
+        _returnToLive = new(ReturnToLive, () => !IsClosing && !_lifetime.IsClosed &&
+            (_state.DisplayMode == AScanDisplayMode.Selected || _state.Selection?.IsPending == true));
         _start.Initialize();
         _stop.Initialize();
         try { _sessionSubscription = session.Subscribe(new Observer<SessionSnapshot>(ReceiveSession, ReceiveError)); }
@@ -98,6 +106,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public UtSourceError? Error => _state.CommandError ?? _state.FeedError ?? _state.Session.PrimaryError;
     public AScanDeliveryStatus? VisualStatus => _state.VisualStatus;
     public AScanCursorState? Cursors => _state.Cursors;
+    public AScanDisplayMode DisplayMode => _state.DisplayMode;
+    public BScanSelectionState? Selection => _state.Selection;
     public ScanTimeViewport? TimeViewport => _timeViewport.Viewport;
     public ScanTimeViewportBinding? ViewportBinding => _state.AScan is { } snapshot &&
         _timeViewport.RunId == snapshot.Metadata.RunId && _timeViewport.Viewport is { } viewport
@@ -113,6 +123,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public IRelayCommand ZoomOutCommand => _zoomOut;
     public IRelayCommand PanLeftCommand => _panLeft;
     public IRelayCommand PanRightCommand => _panRight;
+    public IRelayCommand ReturnToLiveCommand => _returnToLive;
 
     public void ZoomTime(double anchorSeconds, double factor)
     {
@@ -137,6 +148,18 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     {
         if (TimeViewport is { } viewport) { PanTime(viewport.VisibleSpanSeconds * fraction); }
     }
+
+    public void ReturnToLive() => _lifetime.Post(() =>
+    {
+        if (IsClosing) { return; }
+        _selectionCoordinator?.CancelPending();
+        if (_state.DisplayMode != AScanDisplayMode.Selected) { return; }
+        _returnedSelection = _state.Selection?.Snapshot;
+        AScanSnapshot? live = _state.LatestCompatibleLive;
+        ReplaceVisibleSnapshot(live, live is null ? AScanDisplayMode.NoData : AScanDisplayMode.Live,
+            _state.Selection);
+        RefreshCommands();
+    });
 
     public void ActivateCursor(AScanCursorId cursor) => _lifetime.Post(() =>
     {
@@ -192,12 +215,14 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private void ReceiveSession(SessionSnapshot snapshot)
     {
+        bool schedule;
         lock (_gate)
         {
             if (_lifetime.IsClosed || snapshot.Version < _latestSession.Version) { return; }
             _latestSession = snapshot;
-            Schedule();
+            schedule = MarkDirtyUnderLock();
         }
+        if (schedule) { SchedulePump(); }
     }
 
     private void ReceiveVisual(AScanSnapshot snapshot)
@@ -205,60 +230,74 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         AScanDeliveryStatistics? statistics = null;
         try { if (!_lifetime.IsClosed) { statistics = _readStatistics?.Invoke(); } }
         catch (Exception error) { ReceiveError(error); }
+        bool schedule;
         lock (_gate)
         {
             if (_lifetime.IsClosed || (_latestVisual is { } previous && snapshot.Version <= previous.Version)) { return; }
             _latestVisual = snapshot;
             _latestStatistics = statistics;
-            Schedule();
+            schedule = MarkDirtyUnderLock();
         }
+        if (schedule) { SchedulePump(); }
     }
 
     private void ReceiveError(Exception error)
     {
+        bool schedule;
         lock (_gate)
         {
             if (_lifetime.IsClosed) { return; }
             _feedError = Describe("presentation.feed", error);
-            Schedule();
+            schedule = MarkDirtyUnderLock();
         }
+        if (schedule) { SchedulePump(); }
     }
 
     private void ReceiveStatus(AScanDeliveryStatus status)
     {
+        bool schedule;
         lock (_gate)
         {
             if (_lifetime.IsClosed || (_latestStatus is { } previous && status.Version <= previous.Version)) { return; }
             _latestStatus = status;
-            Schedule();
+            schedule = MarkDirtyUnderLock();
         }
+        if (schedule) { SchedulePump(); }
     }
 
     // Must hold _gate. No callback captures a historical snapshot; the UI action reads latest.
-    private void Schedule()
+    private bool MarkDirtyUnderLock()
     {
         _dirty = true;
-        if (_pumpScheduled) { return; }
+        if (_pumpScheduled) { return false; }
         _pumpScheduled = true;
-        _ = Task.Run(PumpAsync);
+        return true;
     }
 
-    private async Task PumpAsync()
+    private void SchedulePump() => _ = ObservePumpAsync(_lifetime.EnqueueAsync(PumpOnUi));
+
+    private void PumpOnUi()
     {
-        try
+        while (true)
         {
-            while (true)
+            if (IsClosing || _lifetime.IsClosed)
             {
-                await _lifetime.InvokeAsync(ApplyLatest).ConfigureAwait(false);
-                lock (_gate)
-                {
-                    if (_lifetime.IsClosed || !_dirty) { _pumpScheduled = false; return; }
-                }
+                lock (_gate) { _dirty = false; _pumpScheduled = false; }
+                return;
+            }
+            ApplyLatest();
+            lock (_gate)
+            {
+                if (_lifetime.IsClosed || !_dirty) { _pumpScheduled = false; return; }
             }
         }
+    }
+
+    private async Task ObservePumpAsync(Task dispatch)
+    {
+        try { await dispatch.ConfigureAwait(false); }
         catch (Exception error)
         {
-            // Preserve for a later successful dispatch; never mutate bindings on this worker thread.
             lock (_gate) { _feedError = Describe("presentation.dispatch", error); _pumpScheduled = false; }
         }
     }
@@ -280,21 +319,30 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             error = _feedError;
             status = _latestStatus;
         }
-        AScanSnapshot? current = _state.AScan;
-        if (session.Phase != SessionPhase.Running || current?.Metadata.RunId != session.RunId) { current = null; }
+        AScanSnapshot? live = _state.LatestCompatibleLive;
+        if (session.Phase != SessionPhase.Running || live?.Metadata.RunId != session.RunId) { live = null; }
         if (session.Phase == SessionPhase.Running && visual is not null && visual.Metadata.RunId == session.RunId &&
-            visual.Metadata.SourceId == session.SourceId) { current = visual; }
-        if (status?.TerminalError is not null) { current = null; }
+            visual.Metadata.SourceId == session.SourceId) { live = visual; }
+        if (status?.TerminalError is not null) { live = null; }
+        bool runChanged = _state.Session.RunId != session.RunId;
+        if (runChanged) { _returnedSelection = null; _ = _selectionCoordinator?.SetRunAsync(session.RunId); }
+        BScanSelectionState? selection = runChanged ? null : _selectionCoordinator?.State ?? _state.Selection;
+        bool selected = !runChanged && _state.DisplayMode == AScanDisplayMode.Selected &&
+            selection?.Snapshot is not null && selection.RunId == session.RunId;
+        AScanSnapshot? current = selected ? selection!.Snapshot : live;
+        AScanDisplayMode mode = current is null ? AScanDisplayMode.NoData : selected
+            ? AScanDisplayMode.Selected : AScanDisplayMode.Live;
         AScanCursorState? cursors = current is null ? null : _state.Cursors is null || _state.AScan?.Metadata.RunId != current.Metadata.RunId
             ? AScanCursorMeasurements.Create(current)
             : AScanCursorMeasurements.Reconcile(_state.Cursors, current);
-        if (current is not null)
+        if (live is not null)
         {
-            _timeViewport.ReconcileDomainDeferred(_viewportConsumerId, current.Metadata.RunId, current.Version,
-                current.MinimumTimeSeconds, current.MaximumTimeSeconds);
+            _timeViewport.ReconcileDomainDeferred(_viewportConsumerId, live.Metadata.RunId, live.Version,
+                live.MinimumTimeSeconds, live.MaximumTimeSeconds);
         }
         else if (_state.AScan is not null) { _timeViewport.RemoveConsumerDeferred(_viewportConsumerId); }
-        bool changed = ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors));
+        bool changed = ReplaceState(new(session, current, statistics, _state.CommandError, error, status, cursors,
+            mode, live, selection));
         _timeViewport.PublishDeferredChanges();
         PublishViewportBindingIfChanged();
         if (changed) { RefreshCommands(); }
@@ -306,7 +354,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _state = state;
         foreach (string name in new[] { nameof(State), nameof(Session), nameof(AScan), nameof(Points), nameof(Metadata),
             nameof(VisualStatistics), nameof(VisualStatus), nameof(Cursors), nameof(ReceivedFrames),
-            nameof(ReleasedFrames), nameof(Error), nameof(VisualError) })
+            nameof(ReleasedFrames), nameof(Error), nameof(VisualError), nameof(DisplayMode), nameof(Selection) })
         {
             OnPropertyChanged(name);
         }
@@ -325,6 +373,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _zoomOut.NotifyCanExecuteChanged();
         _panLeft.NotifyCanExecuteChanged();
         _panRight.NotifyCanExecuteChanged();
+        _returnToLive.NotifyCanExecuteChanged();
     }
 
     private void ReportCommandError(Exception error)
@@ -353,6 +402,37 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             PublishViewportBindingIfChanged();
             RefreshCommands();
         }
+    }
+
+    private void OnSelectionChanged(object? sender, PropertyChangedEventArgs args)
+    {
+        if (args.PropertyName != nameof(BScanSelectionCoordinator.State)) { return; }
+        _lifetime.Post(() =>
+        {
+            if (IsClosing || _selectionCoordinator?.State is not { } selection ||
+                selection.RunId != _state.Session.RunId) { return; }
+            if (selection.LastResult == BScanTraceResultKind.Available && selection.Snapshot is { } selected &&
+                !ReferenceEquals(selected, _returnedSelection) && IsCompatibleSelection(selected))
+            { ReplaceVisibleSnapshot(selected, AScanDisplayMode.Selected, selection); }
+            else { ReplaceState(_state with { Selection = selection }); }
+            RefreshCommands();
+        });
+    }
+
+    private bool IsCompatibleSelection(AScanSnapshot selected) => _state.LatestCompatibleLive is { } live &&
+        selected.Metadata.SourceId == live.Metadata.SourceId && selected.Metadata.RunId == live.Metadata.RunId &&
+        selected.Metadata.Configuration.PhysicalChannelId == live.Metadata.Configuration.PhysicalChannelId &&
+        selected.MinimumTimeSeconds == live.MinimumTimeSeconds && selected.MaximumTimeSeconds == live.MaximumTimeSeconds;
+
+    private void ReplaceVisibleSnapshot(AScanSnapshot? snapshot, AScanDisplayMode mode,
+        BScanSelectionState? selection)
+    {
+        AScanCursorState? cursors = snapshot is null ? null : _state.Cursors is null ||
+            _state.AScan?.Metadata.RunId != snapshot.Metadata.RunId
+            ? AScanCursorMeasurements.Create(snapshot)
+            : AScanCursorMeasurements.Reconcile(_state.Cursors, snapshot);
+        ReplaceState(_state with { AScan = snapshot, DisplayMode = mode, Selection = selection, Cursors = cursors });
+        PublishViewportBindingIfChanged();
     }
 
     private void PublishViewportBindingIfChanged()
@@ -393,6 +473,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     {
         List<Exception> errors = [];
         _timeViewport.PropertyChanged -= OnTimeViewportChanged;
+        if (_selectionCoordinator is not null) { _selectionCoordinator.PropertyChanged -= OnSelectionChanged; }
         foreach (var subscription in new[] { _sessionSubscription, _visualSubscription, _statusSubscription })
         {
             try { subscription?.Dispose(); }
@@ -431,7 +512,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     {
         foreach (RelayCommand command in new[]
         {
-            _toggleCursors, _resetCursors, _resetViewport, _zoomIn, _zoomOut, _panLeft, _panRight
+            _toggleCursors, _resetCursors, _resetViewport, _zoomIn, _zoomOut, _panLeft, _panRight, _returnToLive
         })
         {
             try { command.NotifyCanExecuteChanged(); }

@@ -11,7 +11,9 @@ public sealed class BScanOptions
         int maximumColumns = 1024,
         int minimumColumns = 128,
         int indexBucketSamples = 64,
-        TimeSpan? acceptDiagnosticBudget = null)
+        TimeSpan? acceptDiagnosticBudget = null,
+        int maximumRasterConsumers = 2,
+        int maximumRasterOwnersPerConsumer = 2)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(traceMemoryBudgetBytes, sizeof(short));
         ArgumentOutOfRangeException.ThrowIfLessThan(visualMemoryBudgetBytes, 1);
@@ -20,6 +22,8 @@ public sealed class BScanOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(minimumColumns, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(minimumColumns, maximumColumns);
         ArgumentOutOfRangeException.ThrowIfLessThan(indexBucketSamples, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maximumRasterConsumers, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maximumRasterOwnersPerConsumer, 1);
         var budget = acceptDiagnosticBudget ?? TimeSpan.FromMilliseconds(1);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(budget, TimeSpan.Zero);
         TraceMemoryBudgetBytes = traceMemoryBudgetBytes;
@@ -28,6 +32,8 @@ public sealed class BScanOptions
         MinimumColumns = minimumColumns;
         IndexBucketSamples = indexBucketSamples;
         AcceptDiagnosticBudget = budget;
+        MaximumRasterConsumers = maximumRasterConsumers;
+        MaximumRasterOwnersPerConsumer = maximumRasterOwnersPerConsumer;
     }
 
     public long TraceMemoryBudgetBytes { get; }
@@ -36,4 +42,6 @@ public sealed class BScanOptions
     public int MinimumColumns { get; }
     public int IndexBucketSamples { get; }
     public TimeSpan AcceptDiagnosticBudget { get; }
+    public int MaximumRasterConsumers { get; }
+    public int MaximumRasterOwnersPerConsumer { get; }
 }

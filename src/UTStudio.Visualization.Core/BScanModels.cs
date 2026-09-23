@@ -13,6 +13,7 @@ public readonly record struct BScanTraceIdentity(
 }
 
 public sealed record BScanTraceDescriptor(
+    ConventionalUtFrameMetadata Metadata,
     BScanTraceIdentity Identity,
     ulong AcquisitionIndex,
     TimeSpan ElapsedSinceRunStart,

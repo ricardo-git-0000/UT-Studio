@@ -256,7 +256,7 @@ public sealed class BScanVisualPublicationTests
         Task<BScanRasterResult> waiting = harness.Delivery.GetRegionAsync(harness.Request(2)).AsTask();
         Task close = harness.Delivery.DisposeAsync().AsTask();
 
-        Assert.AreEqual(BScanRasterResultKind.NotAvailable,
+        Assert.AreEqual(BScanRasterResultKind.ResourceLimit,
             (await waiting.WaitAsync(TimeSpan.FromSeconds(10))).Kind);
         await close.WaitAsync(TimeSpan.FromSeconds(10));
         first.Dispose();

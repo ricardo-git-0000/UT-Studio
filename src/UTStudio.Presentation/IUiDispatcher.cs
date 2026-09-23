@@ -10,4 +10,7 @@ public interface IUiDispatcher
 {
     bool CheckAccess();
     Task InvokeAsync(Action action, CancellationToken cancellationToken = default);
+    /// <summary>Queues after the current UI callback even when the caller already has UI access.</summary>
+    Task EnqueueAsync(Action action, CancellationToken cancellationToken = default) =>
+        InvokeAsync(action, cancellationToken);
 }

@@ -8,6 +8,62 @@ namespace UTStudio.Core.Tests.Visualization;
 public sealed class BScanVisualProtocolTests
 {
     [TestMethod]
+    [DataRow(1)]
+    [DataRow(8)]
+    [DataRow(33)]
+    [DataRow(100)]
+    public async Task CoalescedRevisionsRemainIncrementalWhileTheirBaseIsResident(int revisions)
+    {
+        await using Harness harness = await Harness.CreateAsync(128);
+        using BScanRasterRegion baseline = await harness.RenderAsync(harness.Request());
+        for (int index = 1; index <= revisions; index++)
+        { await harness.AddAsync((ulong)index, (ulong)index, [(short)index, 0, 0, 0]); }
+
+        using BScanRasterRegion accumulated = await harness.RenderAsync(harness.From(baseline.Snapshot));
+
+        Assert.IsFalse(accumulated.Snapshot.RequiresFullRefresh);
+        Assert.AreEqual(baseline.Snapshot.StoreRevision, accumulated.Snapshot.BaseStoreRevision);
+        Assert.AreEqual(baseline.Snapshot.StoreRevision + (ulong)revisions,
+            accumulated.Snapshot.StoreRevision);
+        Assert.AreEqual(1UL, accumulated.Snapshot.DirtyRange.FirstAcquisitionIndex);
+        Assert.AreEqual((ulong)revisions, accumulated.Snapshot.DirtyRange.LastAcquisitionIndex);
+    }
+
+    [TestMethod]
+    public async Task FastAndSlowConsumersAdvanceFromIndependentResidentBases()
+    {
+        await using Harness harness = await Harness.CreateAsync(128);
+        Assert.IsTrue(harness.Delivery.RegisterConsumer("fast"));
+        Assert.IsTrue(harness.Delivery.RegisterConsumer("slow"));
+        BScanVisualSnapshot fastBase;
+        BScanVisualSnapshot slowBase;
+        using (BScanRasterRegion region = await harness.RenderAsync(harness.Request() with { ConsumerId = "fast" }))
+        { fastBase = region.Snapshot; }
+        using (BScanRasterRegion region = await harness.RenderAsync(harness.Request() with { ConsumerId = "slow" }))
+        { slowBase = region.Snapshot; }
+
+        for (int index = 1; index <= 8; index++)
+        { await harness.AddAsync((ulong)index, (ulong)index, [(short)index, 0, 0, 0]); }
+        BScanVisualSnapshot fastEight;
+        using (BScanRasterRegion region = await harness.RenderAsync(
+            harness.From(fastBase) with { ConsumerId = "fast" }))
+        { Assert.IsFalse(region.Snapshot.RequiresFullRefresh); fastEight = region.Snapshot; }
+
+        for (int index = 9; index <= 33; index++)
+        { await harness.AddAsync((ulong)index, (ulong)index, [(short)index, 0, 0, 0]); }
+        using BScanRasterRegion slow = await harness.RenderAsync(
+            harness.From(slowBase) with { ConsumerId = "slow" });
+        using BScanRasterRegion fast = await harness.RenderAsync(
+            harness.From(fastEight) with { ConsumerId = "fast" });
+
+        Assert.IsFalse(slow.Snapshot.RequiresFullRefresh);
+        Assert.AreEqual(slowBase.StoreRevision, slow.Snapshot.BaseStoreRevision);
+        Assert.IsFalse(fast.Snapshot.RequiresFullRefresh);
+        Assert.AreEqual(fastEight.StoreRevision, fast.Snapshot.BaseStoreRevision);
+        Assert.AreEqual(slow.Snapshot.StoreRevision, fast.Snapshot.StoreRevision);
+    }
+
+    [TestMethod]
     public async Task FirstPublicationHasExactInitialReason()
     {
         await using Harness harness = await Harness.CreateAsync();
@@ -27,14 +83,13 @@ public sealed class BScanVisualProtocolTests
     }
 
     [TestMethod]
-    public async Task SnapshotVersionGapHasExactReason()
+    public async Task SnapshotVersionGapAloneDoesNotForceFullRefresh()
     {
         await using Harness harness = await Harness.CreateAsync();
         using BScanRasterRegion baseline = await harness.RenderAsync(harness.Request());
-        using BScanRasterRegion region = await harness.RenderAsync(harness.From(baseline.Snapshot) with
+        BScanRasterResult result = await harness.Delivery.GetRegionAsync(harness.From(baseline.Snapshot) with
         { DisplayedSnapshotVersion = baseline.Snapshot.SnapshotVersion + 1 });
-        AssertFull(region.Snapshot, BScanFullRefreshReason.SnapshotVersionGap,
-            baseline.Snapshot.StoreRevision, baseline.Snapshot.StoreRevision, harness.Metadata.RunId);
+        Assert.AreEqual(BScanRasterResultKind.NotAvailable, result.Kind);
     }
 
     [TestMethod]

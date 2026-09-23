@@ -55,6 +55,12 @@ internal sealed class UiLifetime(IUiDispatcher dispatcher)
 
     internal Task BarrierAsync() => dispatcher.CheckAccess() ? Task.CompletedTask : dispatcher.InvokeAsync(() => { });
 
+    internal Task EnqueueAsync(Action action)
+    {
+        if (IsClosed) { return Task.CompletedTask; }
+        return dispatcher.EnqueueAsync(() => { if (!IsClosed) { action(); } });
+    }
+
     private void ApplyNextIntention()
     {
         Action? action;

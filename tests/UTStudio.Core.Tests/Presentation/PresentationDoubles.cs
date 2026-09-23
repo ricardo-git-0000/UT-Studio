@@ -24,6 +24,14 @@ internal sealed class ManualUiDispatcher : IUiDispatcher
         return done.Task;
     }
 
+    public Task EnqueueAsync(Action action, CancellationToken cancellationToken = default)
+    {
+        if (FailDispatch) { return Task.FromException(new InvalidOperationException("UI unavailable")); }
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_executionGate) { _queue.Enqueue((action, cancellationToken, done)); }
+        return done.Task;
+    }
+
     internal bool RunNext()
     {
         lock (_executionGate)
