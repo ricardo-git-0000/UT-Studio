@@ -57,3 +57,8 @@ evitaron capturas de bootstrap redundantes por columna, conservando el rebind au
 La Tanda 2 cerró el ciclo de vida contractual: bloqueo UI inicial también desde hilo no UI; cierre B y A
 secuenciales antes de sesión; cleanup completo por etapas; Host no dispuesto sin confirmación; ventana
 principal visible en diagnóstico; y errores principal/secundarios con ruta global e interna estructurada.
+
+La Tanda 3 está [definida](../plans/2026-09-26-bscan-tanda-3-acceptance.md), pero no ejecutada. Su
+propósito es aceptar el incremento existente mediante recorrido manual, estabilidad, accesibilidad,
+matriz automatizada y rendimiento diagnóstico. Duración, ciclos, umbral de tendencia de memoria,
+hardware y herramientas de medición permanecen como decisiones explícitas del usuario.

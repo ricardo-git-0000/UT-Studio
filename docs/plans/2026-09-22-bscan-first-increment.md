@@ -120,6 +120,11 @@ admisión, `WaitForDrainAsync` espera workers, callbacks, operaciones, leases y 
 `DisposeAsync` destruye solo tras drenaje confirmado. Las devoluciones fallidas del store se propagan
 después de intentar todos los bloques y los owners raster prestados nunca se liberan por fuerza.
 
+La [Tanda 3](2026-09-26-bscan-tanda-3-acceptance.md) queda definida exclusivamente como cierre y
+aceptación: recorrido visual manual, estabilidad, accesibilidad, matriz automatizada, rendimiento
+diagnóstico y preparación para merge fast-forward. No amplía el producto ni autoriza todavía su
+ejecución, nuevos tests o commits.
+
 ## Validación transversal
 
 - Identidad, configuración, gaps, duplicados, descensos, índices y timestamps.
