@@ -205,6 +205,7 @@ public interface IBScanVisualSource : IObservable<BScanVisualUpdate>, IBScanRast
 {
     BScanVisualDiagnostics Diagnostics { get; }
     bool RegisterConsumer(string consumerId) => true;
+    void RequestBootstrap(string consumerId) { }
     void UnregisterConsumer(string consumerId) { }
     void RequestRender(BScanRenderRequest request);
 }

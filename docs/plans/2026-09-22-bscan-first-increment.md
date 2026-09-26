@@ -1,6 +1,6 @@
 # Plan del primer incremento B-Scan reutilizable
 
-Estado: diseño aprobado; Fases 0–4 completadas. La Fase 5 requiere autorización separada.
+Estado: diseño aprobado; Fases 0–5 implementadas.
 La fuente normativa es [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
 
 ## Reglas comunes
@@ -95,6 +95,30 @@ cierre, accesibilidad, DPI y resize. Proyectos previstos: Visualization.Wpf, App
 Salida: Visualization.Wpf solo referencia Core; sin elementos por muestra/columna ni bitmap propio
 duplicado; eventos WPF STA y prioridad selección/pan; cerrar B conserva A/sesión; cerrar Main espera
 barreras; DPI 96/144 y controles estrechos validados.
+
+La Fase 5 queda implementada con `BScanControl` y conversión LUT a staging BGRA32 pooled acotado.
+Los full se publican mediante bitmap candidato y los incrementales mediante backup/rollback de la región;
+ningún callback externo se ejecuta durante `WriteableBitmap.Lock`. App.Wpf visita síncronamente la región
+neutral bajo token y adapta las intenciones. El pico activo WPF máximo es aproximadamente 12 MiB por
+control a 1.024×1.024, independiente del presupuesto neutral de 16 MiB.
+La ventana B puede cerrarse/reabrirse mientras ingress y delivery continúan. La selección resuelve
+`AcquisitionIndex` en el store y nunca presupone que coincide con `Sequence`. Los ejes usan ticks
+neutrales 1/2/5. La localización de discontinuidades queda aplazada hasta disponer de metadata neutral
+tipada y acotada; este incremento conserva el aviso global.
+
+La integración productiva detectó y corrigió el bootstrap de consumidores: registrar B con un store ya
+activo, o indexar la primera columna después del registro, encola metadata inicial y permite solicitar
+el full sin depender de una fuente visual de pruebas.
+
+La Tanda 2 endurece exclusivamente ciclo de vida y cierre: todas las etapas B se intentan una vez,
+los fallos conservan principal y secundarios, A cierra antes de disponer la sesión y Host solo se
+dispone tras cleanup obligatorio confirmado. El timeout de cinco segundos sigue siendo diagnóstico;
+un fallo no confirmado mantiene MainWindow visible y `Completed=false`. No anticipa la Tanda 3.
+
+La corrección consolidada de Tandas 1 y 2 materializa productivamente tres fases: `Stop` cierra
+admisión, `WaitForDrainAsync` espera workers, callbacks, operaciones, leases y owners, y
+`DisposeAsync` destruye solo tras drenaje confirmado. Las devoluciones fallidas del store se propagan
+después de intentar todos los bloques y los owners raster prestados nunca se liberan por fuerza.
 
 ## Validación transversal
 

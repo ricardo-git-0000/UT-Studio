@@ -75,6 +75,31 @@ public sealed class BScanPresentationTests
     }
 
     [TestMethod]
+    public async Task Unresolvable_latest_selection_cancels_suspended_resolution_and_preserves_visible_selection()
+    {
+        var ui = new ManualUiDispatcher();
+        var provider = new PendingTraceProvider();
+        var coordinator = new BScanSelectionCoordinator(ui, provider, new AScanProjector());
+        AcquisitionRunId run = new(Guid.NewGuid());
+        await Drive(ui, coordinator.SetRunAsync(run));
+        BScanTraceIdentity identity = Identity(run, 1);
+        Task old = coordinator.SelectAsync("b", identity);
+        await ui.DriveUntilAsync(() => provider.Requests.Count == 1);
+
+        Task unavailable = coordinator.SelectAsync("b", run, 999);
+        await ui.DriveAsync(unavailable);
+        Assert.AreEqual(BScanTraceResultKind.NotAvailable, coordinator.State.LastResult);
+        Assert.IsFalse(coordinator.State.IsPending);
+
+        provider.Complete(0, Available(identity, 1, [1, 2, 3]));
+        await ui.DriveAsync(old);
+        Assert.IsNull(coordinator.State.Identity);
+        Assert.AreEqual(BScanTraceResultKind.NotAvailable, coordinator.State.LastResult);
+        Assert.AreEqual(1, provider.ReturnedOwners);
+        await Drive(ui, coordinator.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
     public async Task BScanUsesLocalVersionAndSharedViewportAndRemovesOnlyItsConsumer()
     {
         var ui = new ManualUiDispatcher();
@@ -263,6 +288,123 @@ public sealed class BScanPresentationTests
             typeof(IDisposable).IsAssignableFrom(property.PropertyType)));
     }
 
+    [TestMethod]
+    [DataRow("subscription")]
+    [DataRow("time-viewport-events")]
+    [DataRow("selection-events")]
+    [DataRow("selection-cancel")]
+    [DataRow("raster-cancel")]
+    [DataRow("raster-operations")]
+    [DataRow("ui-state")]
+    [DataRow("time-viewport-consumer")]
+    [DataRow("visible-region")]
+    [DataRow("raster-consumer")]
+    [DataRow("ui-barrier")]
+    [DataRow("ui-lifetime")]
+    public async Task BScanCloseAttemptsEveryStageWhenOneStageFails(string failingStage)
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var source = new ManualBScanSource();
+        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider(), new AScanProjector());
+        List<string> visited = [];
+        var failure = new InvalidOperationException(failingStage);
+        var vm = new BScanViewModel(source, shared, coordinator, ui, stage =>
+        {
+            visited.Add(stage);
+            if (stage == failingStage) { throw failure; }
+        });
+
+        CleanupFailureException error = await Assert.ThrowsAsync<CleanupFailureException>(
+            () => Drive(ui, vm.DisposeAsync().AsTask()));
+
+        Assert.AreSame(failure, error.PrimaryError);
+        Assert.AreEqual(failingStage, error.PrimaryFailure.Stage);
+        CollectionAssert.AreEqual(new[] { "subscription", "time-viewport-events", "selection-events",
+            "selection-cancel", "raster-cancel", "raster-operations", "ui-state", "time-viewport-consumer", "visible-region",
+            "raster-consumer", "ui-barrier", "ui-lifetime" }, visited);
+        Assert.IsFalse(source.HasConsumer);
+        Assert.IsFalse(source.HasObserver);
+        Assert.AreSame(vm.DisposeAsync().AsTask(), vm.DisposeAsync().AsTask());
+        await Drive(ui, coordinator.DisposeAsync().AsTask());
+        await Drive(ui, shared.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task BScanClosePreservesPrimaryAndOrderedSecondaryFailures()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var source = new ManualBScanSource();
+        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider(), new AScanProjector());
+        var primary = new InvalidOperationException("primary");
+        var secondary = new InvalidOperationException("secondary");
+        var vm = new BScanViewModel(source, shared, coordinator, ui, stage =>
+        {
+            if (stage == "subscription") { throw primary; }
+            if (stage == "ui-barrier") { throw secondary; }
+        });
+
+        CleanupFailureException error = await Assert.ThrowsAsync<CleanupFailureException>(
+            () => Drive(ui, vm.DisposeAsync().AsTask()));
+
+        Assert.AreSame(primary, error.PrimaryError);
+        Assert.AreEqual("subscription", error.PrimaryFailure.Stage);
+        Assert.HasCount(1, error.SecondaryErrors);
+        Assert.AreSame(secondary, error.SecondaryErrors[0]);
+        Assert.AreEqual("ui-barrier", error.SecondaryFailures[0].Stage);
+        await Drive(ui, coordinator.DisposeAsync().AsTask());
+        await Drive(ui, shared.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task RealCleanupDependenciesFailAfterBalancingAndLaterStagesStillRun()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var source = new ManualBScanSource { FailSubscriptionDispose = true, FailUnregisterConsumer = true };
+        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider(), new AScanProjector());
+        var vm = new BScanViewModel(source, shared, coordinator, ui);
+
+        CleanupFailureException error = await Assert.ThrowsAsync<CleanupFailureException>(
+            () => Drive(ui, vm.DisposeAsync().AsTask()));
+
+        Assert.AreEqual("subscription", error.PrimaryFailure.Stage);
+        Assert.AreEqual("raster-consumer", error.SecondaryFailures.Single().Stage);
+        Assert.AreEqual(1, source.SubscriptionDisposeAttempts);
+        Assert.AreEqual(1, source.UnregisterAttempts);
+        Assert.IsFalse(source.HasObserver);
+        Assert.IsFalse(source.HasConsumer);
+        Assert.AreSame(vm.DisposeAsync().AsTask(), vm.DisposeAsync().AsTask());
+        await Drive(ui, coordinator.DisposeAsync().AsTask());
+        await Drive(ui, shared.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task BScanCloseFromNonUiConcurrentCallersSharesTaskAndRunsStagesOnce()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var source = new ManualBScanSource();
+        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider(), new AScanProjector());
+        Dictionary<string, int> calls = [];
+        var vm = new BScanViewModel(source, shared, coordinator, ui, stage =>
+        { lock (calls) { calls[stage] = calls.GetValueOrDefault(stage) + 1; } });
+        Task? first = null, second = null;
+
+        await Task.WhenAll(
+            Task.Run(() => { first = vm.DisposeAsync().AsTask(); }),
+            Task.Run(() => { second = vm.DisposeAsync().AsTask(); }));
+        Assert.AreSame(first, second);
+        await Drive(ui, first!);
+
+        Assert.HasCount(12, calls);
+        Assert.IsTrue(calls.Values.All(count => count == 1));
+        Assert.AreSame(first, vm.DisposeAsync().AsTask());
+        await Drive(ui, coordinator.DisposeAsync().AsTask());
+        await Drive(ui, shared.DisposeAsync().AsTask());
+    }
+
     private static async Task Drive(ManualUiDispatcher ui, Task task) => await ui.DriveAsync(task);
     private static BScanTraceIdentity Identity(AcquisitionRunId run, ulong sequence) =>
         new(new("selection-test"), run, new(0), sequence);
@@ -338,13 +480,32 @@ public sealed class BScanPresentationTests
         private string? _consumerId;
         internal Func<BScanRenderRequest, BScanRasterResult>? RegionFactory { get; set; }
         internal int ReturnedRegions { get; set; }
+        internal bool HasConsumer => _consumerId is not null;
+        internal bool HasObserver => _observer is not null;
+        internal bool FailSubscriptionDispose { get; init; }
+        internal bool FailUnregisterConsumer { get; init; }
+        internal int SubscriptionDisposeAttempts { get; private set; }
+        internal int UnregisterAttempts { get; private set; }
         public BScanVisualDiagnostics Diagnostics => new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, new(0, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero),
             BScanVisualCloseState.Open, 0, null);
         public IDisposable Subscribe(IObserver<BScanVisualUpdate> observer)
-        { _observer = observer; return new Subscription(() => _observer = null); }
+        {
+            _observer = observer;
+            return new Subscription(() =>
+            {
+                SubscriptionDisposeAttempts++;
+                _observer = null;
+                if (FailSubscriptionDispose) { throw new InvalidOperationException("subscription cleanup failed"); }
+            });
+        }
         public bool RegisterConsumer(string consumerId) { _consumerId = consumerId; return true; }
-        public void UnregisterConsumer(string consumerId) { if (_consumerId == consumerId) { _consumerId = null; } }
+        public void UnregisterConsumer(string consumerId)
+        {
+            UnregisterAttempts++;
+            if (_consumerId == consumerId) { _consumerId = null; }
+            if (FailUnregisterConsumer) { throw new InvalidOperationException("consumer cleanup failed"); }
+        }
         internal void Emit(BScanVisualSnapshot snapshot) => _observer?.OnNext(new(snapshot with
         { ConsumerId = _consumerId ?? throw new InvalidOperationException("No consumer registered.") }));
         public void RequestRender(BScanRenderRequest request) { }

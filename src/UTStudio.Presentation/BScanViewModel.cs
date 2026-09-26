@@ -34,13 +34,21 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private Task? _disposal;
     private int _recoveryPosted;
     private long _observerErrors;
+    // Deterministic post-operation seam for cleanup actions (such as event detachment) that cannot
+    // fail through their production contract. Real fallible dependencies are tested separately.
+    private readonly Action<string>? _afterCleanupStage;
 
     public BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
         BScanSelectionCoordinator selection, IUiDispatcher dispatcher)
+        : this(source, timeViewport, selection, dispatcher, null) { }
+
+    internal BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
+        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Action<string>? afterCleanupStage)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _timeViewport = timeViewport ?? throw new ArgumentNullException(nameof(timeViewport));
         _selection = selection ?? throw new ArgumentNullException(nameof(selection));
+        _afterCleanupStage = afterCleanupStage;
         if (!_source.RegisterConsumer(_consumerId))
         { throw new InvalidOperationException("The B-Scan raster consumer limit has been reached."); }
         _lifetime = new(dispatcher ?? throw new ArgumentNullException(nameof(dispatcher)));
@@ -57,11 +65,18 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         _panSpatialRight = Command(() => PanSpatial(.1m), CanPanSpatialRight);
         _resetSpatial = Command(ResetSpatial, () => HasSpatial() && !_state.IsSpatialAutoFit);
         _resetAll = Command(ResetAll, () => HasTime() || HasSpatial());
-        _refresh = Command(() => RequestRefresh(force: true), HasRenderableState);
+        _refresh = Command(() => RequestRefresh(force: true, full: true), HasRenderableState);
         _cancelSelection = Command(() => _selection.Cancel(_consumerId), () => _state.Selection.IsPending);
         try { _subscription = _source.Subscribe(new Observer(this)); }
         catch
         {
+            _source.UnregisterConsumer(_consumerId);
+            throw;
+        }
+        try { _source.RequestBootstrap(_consumerId); }
+        catch
+        {
+            _subscription.Dispose();
             _source.UnregisterConsumer(_consumerId);
             throw;
         }
@@ -146,8 +161,20 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         await selection.ConfigureAwait(false);
     }
 
+    public async Task SelectColumnAsync(ulong acquisitionIndex)
+    {
+        Task selection = Task.CompletedTask;
+        await _lifetime.InvokeAsync(() =>
+        {
+            if (IsClosing || _state.RunId is not { } run || _state.ResidentRange is not { } resident ||
+                acquisitionIndex < resident.First || acquisitionIndex > resident.Last) { return; }
+            selection = _selection.SelectAsync(_consumerId, run, acquisitionIndex);
+        }).ConfigureAwait(false);
+        await selection.ConfigureAwait(false);
+    }
+
     public void CancelSelection() => _lifetime.Post(() => _selection.Cancel(_consumerId));
-    public void Refresh() => _lifetime.Post(() => RequestRefresh(force: true));
+    public void Refresh() => _lifetime.Post(() => RequestRefresh(force: true, full: true));
     public void ReportAcquisitionError(string? error) => _lifetime.Post(() =>
         ReplaceState(_state with { AcquisitionError = error }));
     public void ReportIngressError(string? error) => _lifetime.Post(() =>
@@ -185,8 +212,22 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             }
         }
         if (stale && !IsClosing && Interlocked.Exchange(ref _recoveryPosted, 1) == 0)
-        { _lifetime.Post(() => RequestRefresh(force: true)); }
+        { _lifetime.Post(() => RequestRefresh(force: true, full: true)); }
         return !stale;
+    }
+
+    public bool TryVisitPresentedRegion(BScanPresentedRegionToken token, BScanIntensityVisitor visitor)
+    {
+        ArgumentNullException.ThrowIfNull(visitor);
+        lock (_gate)
+        {
+            if (IsClosing || _visibleRegion is null || _state.Region is not { } descriptor ||
+                descriptor.Token != token || descriptor.PresentationGeneration != _rasterGeneration ||
+                descriptor.Snapshot != _visibleRegion.Snapshot)
+            { return false; }
+            visitor(_visibleRegion.Pixels.Span, descriptor.Stride);
+            return true;
+        }
     }
 
     private SafeRelayCommand Command(Action execute, Func<bool> canExecute) =>
@@ -282,14 +323,15 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         RequestRefresh();
     }
 
-    private void RequestRefresh(bool force = false)
+    private void RequestRefresh(bool force = false, bool full = false)
     {
         if (!HasRenderableState() || _latestMetadata is null || _timeViewport.Viewport is not { } time) { return; }
         var request = new BScanRenderRequest(_latestMetadata.RunId, _state.SpatialViewport!.Value, time,
             _pixelWidth, _pixelHeight, _renderConfigurationVersion,
-            _state.DisplayedRevision?.SnapshotVersion, _state.DisplayedRevision?.StoreRevision,
-            _state.DisplayedRevision?.WrapGeneration, _consumerId,
-            _state.Region is { } displayed ? new(displayed.Snapshot.Stream,
+            full ? null : _state.DisplayedRevision?.SnapshotVersion,
+            full ? null : _state.DisplayedRevision?.StoreRevision,
+            full ? null : _state.DisplayedRevision?.WrapGeneration, _consumerId,
+            !full && _state.Region is { } displayed ? new(displayed.Snapshot.Stream,
                 _state.DisplayedRevision!.Value, new(displayed.Snapshot.SpatialViewport,
                     displayed.Snapshot.TimeViewport, displayed.Snapshot.RasterWidth,
                     displayed.Snapshot.RasterHeight, displayed.Snapshot.RenderConfigurationVersion)) : null);
@@ -369,7 +411,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                 managed.Snapshot.BaseStoreRevision != displayed.StoreRevision)
             {
                 ReplaceState(_state with { RequiresFullRefresh = true });
-                RequestRefresh();
+                RequestRefresh(force: true, full: true);
                 return;
             }
             BScanViewState nextState;
@@ -409,6 +451,14 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                 { ReplaceState(_state with { BScanVisualError = visualError }); }
             }).ConfigureAwait(false);
         }
+        else if (managed is null && result?.Kind == BScanRasterResultKind.Stale)
+        {
+            await _lifetime.InvokeAsync(() =>
+            {
+                if (!IsClosing && generation == _rasterGeneration && request.RunId == _state.RunId)
+                { RequestRefresh(force: true); }
+            }).ConfigureAwait(false);
+        }
         lock (_gate) { if (generation == _rasterGeneration) { _rasterCancellation = null; } }
     }
 
@@ -444,7 +494,12 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                     identity.PhysicalChannelId == stream.PhysicalChannelId;
             }
             if (!compatible) { return; }
-            ReplaceState(_state with { Selection = selection, SelectionError = selection.SelectionError });
+            ReplaceState(_state with
+            {
+                Selection = selection,
+                SelectedColumn = selection.Identity ?? _state.SelectedColumn,
+                SelectionError = selection.SelectionError
+            });
             RefreshCommands();
         });
     }
@@ -468,7 +523,6 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     public ValueTask DisposeAsync()
     {
         TaskCompletionSource? completion = null;
-        CancellationTokenSource? cancellation = null;
         lock (_gate)
         {
             if (_disposal is null)
@@ -477,52 +531,53 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                 completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 _disposal = completion.Task;
                 _rasterGeneration++;
-                cancellation = _rasterCancellation;
             }
         }
         if (completion is not null)
-        {
-            try { cancellation?.Cancel(); }
-            catch { Interlocked.Increment(ref _observerErrors); }
-            _ = CloseAsync(completion);
-        }
+        { _ = CloseAsync(completion); }
         return new(_disposal!);
     }
 
     private async Task CloseAsync(TaskCompletionSource completion)
     {
-        Exception? failure = null;
-        try
+        List<CleanupStageFailure> failures = [];
+        void Capture(string stage, Action action)
         {
-            try { _subscription.Dispose(); } catch (Exception error) { failure = error; }
-            _timeViewport.PropertyChanged -= OnTimeViewportChanged;
-            _selection.PropertyChanged -= OnSelectionChanged;
-            _selection.Cancel(_consumerId);
-            Task[] rasters;
-            lock (_gate) { rasters = [.. _rasterOperations]; }
-            try { await Task.WhenAll(rasters).ConfigureAwait(false); } catch { }
-            await _lifetime.InvokeAsync(() =>
-            {
-                foreach (SafeRelayCommand command in Commands) { command.NotifyCanExecuteChanged(); }
-                _state = _state with { Phase = BScanViewPhase.Closed, Region = null };
-                OnPropertyChanged(nameof(State));
-                OnPropertyChanged(nameof(Phase));
-            }).ConfigureAwait(false);
+            try { action(); _afterCleanupStage?.Invoke(stage); }
+            catch (Exception error) { failures.Add(new(stage, error)); }
         }
-        catch (Exception error) { failure ??= error; }
-        finally
+        async Task CaptureAsync(string stage, Func<Task> action)
         {
-            try { await _timeViewport.RemoveConsumerAsync(_consumerId).ConfigureAwait(false); }
-            catch (Exception error) { failure ??= error; }
-            BScanRasterRegion? visible;
-            lock (_gate) { visible = _visibleRegion; _visibleRegion = null; }
-            try { visible?.Dispose(); } catch (Exception error) { failure ??= error; }
-            try { _source.UnregisterConsumer(_consumerId); } catch (Exception error) { failure ??= error; }
-            try { await _lifetime.BarrierAsync().ConfigureAwait(false); } catch (Exception error) { failure ??= error; }
-            _lifetime.Close();
-            if (failure is null) { completion.TrySetResult(); }
-            else { completion.TrySetException(failure); }
+            try { await action().ConfigureAwait(false); _afterCleanupStage?.Invoke(stage); }
+            catch (Exception error) { failures.Add(new(stage, error)); }
         }
+
+        Capture("subscription", _subscription.Dispose);
+        Capture("time-viewport-events", () => _timeViewport.PropertyChanged -= OnTimeViewportChanged);
+        Capture("selection-events", () => _selection.PropertyChanged -= OnSelectionChanged);
+        Capture("selection-cancel", () => _selection.Cancel(_consumerId));
+        CancellationTokenSource? rasterCancellation;
+        lock (_gate) { rasterCancellation = _rasterCancellation; }
+        Capture("raster-cancel", () => rasterCancellation?.Cancel());
+        Task[] rasters;
+        lock (_gate) { rasters = [.. _rasterOperations]; }
+        await CaptureAsync("raster-operations", () => Task.WhenAll(rasters)).ConfigureAwait(false);
+        await CaptureAsync("ui-state", () => _lifetime.InvokeAsync(() =>
+        {
+            foreach (SafeRelayCommand command in Commands) { command.NotifyCanExecuteChanged(); }
+            _state = _state with { Phase = BScanViewPhase.Closed, Region = null };
+            OnPropertyChanged(nameof(State));
+            OnPropertyChanged(nameof(Phase));
+        })).ConfigureAwait(false);
+        await CaptureAsync("time-viewport-consumer", () => _timeViewport.RemoveConsumerAsync(_consumerId)).ConfigureAwait(false);
+        BScanRasterRegion? visible;
+        lock (_gate) { visible = _visibleRegion; _visibleRegion = null; }
+        Capture("visible-region", () => visible?.Dispose());
+        Capture("raster-consumer", () => _source.UnregisterConsumer(_consumerId));
+        await CaptureAsync("ui-barrier", _lifetime.BarrierAsync).ConfigureAwait(false);
+        Capture("ui-lifetime", _lifetime.Close);
+        if (failures.Count == 0) { completion.TrySetResult(); }
+        else { completion.TrySetException(new CleanupFailureException("B-Scan ViewModel cleanup failed.", failures[0], failures.Skip(1).ToArray())); }
     }
 
     private static string Message(Exception error) => string.IsNullOrWhiteSpace(error.Message)

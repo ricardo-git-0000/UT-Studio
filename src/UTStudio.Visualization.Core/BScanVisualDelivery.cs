@@ -30,8 +30,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private readonly Dictionary<string, long> _consumerOwnerBytes = [];
     private readonly Dictionary<string, BScanVisualSnapshot> _currentByConsumer = [];
     private readonly HashSet<string> _consumers = [];
+    private readonly HashSet<string> _bootstrapConsumers = [];
     private readonly HashSet<string> _retiringConsumers = [];
     private long _requestGeneration;
+    private long _renderRequests;
+    private long _fullIdentityRequests;
     private bool _coalesced;
     private readonly HashSet<string> _recoveryConsumers = [];
     private bool _disposed;
@@ -40,6 +43,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private ulong _snapshotVersion;
     private int _regionOperations;
     private TaskCompletionSource? _regionDrain;
+    private TaskCompletionSource? _ownerDrain;
     private long _activeOwnerBytes;
     private int _activeOwners;
     private int _maximumOwners;
@@ -51,9 +55,15 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private ulong _incrementalRefreshes, _staleCandidates, _cancelledCandidates, _observerErrors;
     private ulong _observerCallbacksStarted, _observerCallbacksCompleted;
     private bool _closed;
+    private Task? _drain;
     private string? _lastError;
     internal Action? BeforeRasterCandidateValidation { get; set; }
     internal Action? BeforeMetadataCandidateValidation { get; set; }
+    internal int ActiveConsumerCount { get { lock (_gate) { return _consumers.Count; } } }
+    internal int PendingBootstrapCount { get { lock (_gate) { return _bootstrapConsumers.Count; } } }
+    internal int RetainedSnapshotCount { get { lock (_gate) { return _currentByConsumer.Count; } } }
+    internal long RenderRequestCount => Interlocked.Read(ref _renderRequests);
+    internal long FullIdentityRequestCount => Interlocked.Read(ref _fullIdentityRequests);
 
     public BScanVisualDelivery(BScanIngress ingress, TimeProvider? timeProvider = null)
         : this(ingress, timeProvider, SharedByteOwnerPool.Instance) { }
@@ -78,7 +88,49 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             _consumers.Add(consumerId);
             _consumerOwners[consumerId] = 0;
             _consumerOwnerBytes[consumerId] = 0;
-            return true;
+        }
+        return true;
+    }
+
+    public void RequestBootstrap(string consumerId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(consumerId);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_consumers.Contains(consumerId))
+            { throw new InvalidOperationException("The raster consumer is not registered."); }
+            if (!_bootstrapConsumers.Add(consumerId)) { return; }
+        }
+        QueueBootstrap(consumerId);
+    }
+
+    private void QueueBootstrap(string consumerId)
+    {
+        BScanTraceStore.BScanTraceLease?[] leases =
+            ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Rent(_ingress.VisualCapacity);
+        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.VisualCapacity),
+            out ConventionalUtFrameMetadata? metadata, out BScanStoreVisualState state);
+        try
+        {
+            if (metadata is null || count == 0 || state.ResidentRange is not { } resident) { return; }
+            lock (_gate)
+            {
+                if (!_consumers.Contains(consumerId)) { return; }
+                if (_lastRequests.TryGetValue(consumerId, out BScanRenderRequest? current) &&
+                    current.RunId == metadata.RunId) { _bootstrapConsumers.Remove(consumerId); return; }
+                _bootstrapConsumers.Add(consumerId);
+            }
+            double minimum = metadata.Configuration.FirstSampleOffsetSeconds;
+            double maximum = minimum + metadata.Configuration.SampleCount / metadata.Configuration.SampleRateHz;
+            RequestRender(new(metadata.RunId, BScanSpatialViewportOperations.Reset(resident),
+                ScanTimeViewportOperations.Create(minimum, maximum), 1, 1, 0, ConsumerId: consumerId));
+        }
+        catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException) { }
+        finally
+        {
+            for (int index = 0; index < count; index++) { leases[index]?.Dispose(); }
+            ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Return(leases, clearArray: true);
         }
     }
 
@@ -91,6 +143,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             _pending.Remove(consumerId);
             _lastRequests.Remove(consumerId);
             _pendingGenerations.Remove(consumerId);
+            _currentByConsumer.Remove(consumerId);
+            _bootstrapConsumers.Remove(consumerId);
             if (_consumerOwners.GetValueOrDefault(consumerId) == 0)
             {
                 _consumerOwners.Remove(consumerId); _consumerOwnerBytes.Remove(consumerId);
@@ -127,8 +181,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             { _consumers.Add("default"); _consumerOwners["default"] = 0; _consumerOwnerBytes["default"] = 0; }
             if (!_consumers.Contains(request.ConsumerId))
             { throw new InvalidOperationException("The raster consumer is not registered."); }
+            Interlocked.Increment(ref _renderRequests);
+            if (request.DisplayedSnapshotVersion is null) { Interlocked.Increment(ref _fullIdentityRequests); }
             if (_pending.ContainsKey(request.ConsumerId)) { _coalesced = true; _updatesCoalesced++; }
             _lastRequests[request.ConsumerId] = request;
+            _bootstrapConsumers.Remove(request.ConsumerId);
             _pending[request.ConsumerId] = request;
             _pendingGenerations[request.ConsumerId] = ++_requestGeneration;
             if (_wake.CurrentCount == 0) { _wake.Release(); }
@@ -143,6 +200,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             ObjectDisposedException.ThrowIf(_disposed, this);
             var subscription = new Subscription(this, observer);
             _subscriptions.Add(subscription);
+            foreach (BScanVisualSnapshot snapshot in _currentByConsumer.Values)
+            { subscription.Offer(new(snapshot)); }
             return subscription;
         }
     }
@@ -277,10 +336,15 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 request.DisplayedStoreRevision.GetValueOrDefault(), state.StoreRevision);
             var snapshot = CreateSnapshot(metadata, request, state, version, dirty,
                 new(x, 0, width, request.PixelHeight), full, reason, leases, count);
+            bool active;
             lock (_gate)
             {
-                if (!_disposed) { _currentByConsumer[request.ConsumerId] = snapshot; _recoveryConsumers.Remove(request.ConsumerId); }
+                active = !_disposed && _consumers.Contains(request.ConsumerId) &&
+                    !_retiringConsumers.Contains(request.ConsumerId);
+                if (active) { _currentByConsumer[request.ConsumerId] = snapshot; _recoveryConsumers.Remove(request.ConsumerId); }
             }
+            if (!active)
+            { owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes); return BScanRasterResult.NotAvailable(); }
             return BScanRasterResult.Available(new(snapshot, x, 0, width, request.PixelHeight,
                 owner, () => ReleaseOwner(request.ConsumerId, actualBytes)));
         }
@@ -467,14 +531,18 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                         ? MinimumPublicationInterval - _clock.GetElapsedTime(last, _clock.GetTimestamp()) : TimeSpan.Zero;
                 }
                 if (remaining > TimeSpan.Zero) { await DelayAsync(remaining, _shutdown.Token).ConfigureAwait(false); }
-                KeyValuePair<string, BScanRenderRequest>[] batch;
+                (string ConsumerId, BScanRenderRequest Request, long Generation)[] batch;
                 lock (_gate)
                 {
-                    batch = [.. _pending];
+                    batch =
+                    [
+                        .. _pending.Select(item => (item.Key, item.Value,
+                            _pendingGenerations.GetValueOrDefault(item.Key))),
+                    ];
                     _pending.Clear();
                 }
-                foreach ((string consumerId, BScanRenderRequest request) in batch)
-                { PublishMetadata(request, _pendingGenerations.GetValueOrDefault(consumerId)); }
+                foreach ((_, BScanRenderRequest request, long generation) in batch)
+                { PublishMetadata(request, generation); }
             }
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
@@ -555,6 +623,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private void OnVisualStateChanged()
     {
+        AcquisitionRunId? currentRun = _ingress.CurrentMetadata?.RunId;
+        string[] bootstrap;
         lock (_gate)
         {
             if (_disposed) { return; }
@@ -565,8 +635,17 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 _pending[consumerId] = request;
                 _pendingGenerations[consumerId] = ++_requestGeneration;
             }
+            bootstrap =
+            [
+                .. _consumers.Where(consumer =>
+                    _bootstrapConsumers.Contains(consumer) ||
+                    currentRun is { } run &&
+                    _lastRequests.TryGetValue(consumer, out BScanRenderRequest? request) &&
+                    request.RunId != run),
+            ];
             if (_pending.Count != 0 && _wake.CurrentCount == 0) { _wake.Release(); }
         }
+        foreach (string consumer in bootstrap) { QueueBootstrap(consumer); }
     }
 
     private async Task DelayAsync(TimeSpan due, CancellationToken token)
@@ -583,6 +662,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private void DiscardOwner(string consumerId, long bytes)
     {
+        TaskCompletionSource? drain = null;
         lock (_gate)
         {
             _activeOwnerBytes -= bytes;
@@ -596,7 +676,9 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 { _consumerOwners.Remove(consumerId); _consumerOwnerBytes.Remove(consumerId); _consumers.Remove(consumerId); }
             }
             else { _consumerOwners[consumerId] = remaining; }
+            if (_activeOwners == 0) { drain = _ownerDrain; }
         }
+        drain?.TrySetResult();
     }
 
     private void EndRegionOperation()
@@ -610,29 +692,63 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     {
         lock (_gate)
         {
-            if (_disposal is null)
-            {
-                _disposed = true;
-                _ingress.VisualStateChanged -= OnVisualStateChanged;
-                _pending.Clear();
-                _lastRequests.Clear();
-                _currentByConsumer.Clear();
-                Subscription[] subscriptions = [.. _subscriptions];
-                _subscriptions.Clear();
-                Task regions = _regionOperations == 0 ? Task.CompletedTask :
-                    (_regionDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
-                _disposal = DisposeCoreAsync(subscriptions, regions);
-            }
+            _disposal ??= DisposeCoreAsync();
             return new(_disposal);
         }
     }
 
-    private async Task DisposeCoreAsync(Subscription[] subscriptions, Task regions)
+    internal void Stop()
     {
-        await _shutdown.CancelAsync().ConfigureAwait(false);
-        await Task.WhenAll(subscriptions.Select(subscription => subscription.Detach())).ConfigureAwait(false);
-        try { await _worker.ConfigureAwait(false); } catch (OperationCanceledException) { }
-        await regions.ConfigureAwait(false);
+        lock (_gate)
+        {
+            if (_disposed) { return; }
+            _disposed = true;
+            _ingress.VisualStateChanged -= OnVisualStateChanged;
+            _pending.Clear();
+            _lastRequests.Clear();
+            _currentByConsumer.Clear();
+            Subscription[] subscriptions = [.. _subscriptions];
+            _subscriptions.Clear();
+            Task regions = _regionOperations == 0 ? Task.CompletedTask :
+                (_regionDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            Task owners = _activeOwners == 0 ? Task.CompletedTask :
+                (_ownerDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            _drain = DrainCoreAsync(subscriptions, regions, owners);
+        }
+    }
+
+    internal Task WaitForDrainAsync(CancellationToken cancellationToken = default)
+    {
+        Stop();
+        Task drain;
+        lock (_gate) { drain = _drain!; }
+        return cancellationToken.CanBeCanceled ? drain.WaitAsync(cancellationToken) : drain;
+    }
+
+    private async Task DrainCoreAsync(Subscription[] subscriptions, Task regions, Task owners)
+    {
+        List<Exception> failures = [];
+        try { await _shutdown.CancelAsync().ConfigureAwait(false); }
+        catch (Exception error) { failures.Add(error); }
+        foreach (Task callback in subscriptions.Select(subscription => subscription.Detach()))
+        {
+            try { await callback.ConfigureAwait(false); }
+            catch (Exception error) { failures.Add(error); }
+        }
+        try { await _worker.ConfigureAwait(false); }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
+        catch (Exception error) { failures.Add(error); }
+        try { await regions.ConfigureAwait(false); }
+        catch (Exception error) { failures.Add(error); }
+        try { await owners.ConfigureAwait(false); }
+        catch (Exception error) { failures.Add(error); }
+        if (failures.Count != 0) { throw new AggregateException("B-Scan visual drain failed.", failures); }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        Stop();
+        await WaitForDrainAsync().ConfigureAwait(false);
         _shutdown.Dispose();
         _wake.Dispose();
         lock (_gate) { _closed = true; }

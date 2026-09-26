@@ -135,6 +135,36 @@ public sealed class BScanVisualDeliveryTests
     }
 
     [TestMethod]
+    public async Task StopBlocksAdmissionAndDrainWaitsForTransferredOwnerWithoutForcingRelease()
+    {
+        var ingress = new BScanIngress(Options(2, 2));
+        ConventionalUtFrameMetadata metadata = Metadata(2);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+        ingress.OpenRun(metadata);
+        var delivery = new BScanVisualDelivery(ingress);
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[] { 1, 2 });
+        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        BScanRasterRegion owner = (await delivery.GetRegionAsync(Request(metadata.RunId, new(0, 1), 2, 2))).Region!;
+
+        delivery.Stop();
+        Task first = delivery.WaitForDrainAsync();
+        Task second = delivery.WaitForDrainAsync();
+        Assert.AreSame(first, second);
+        Assert.IsFalse(first.IsCompleted);
+        Assert.AreEqual(1, delivery.Diagnostics.ActiveRasterOwners);
+        Assert.AreEqual(BScanRasterResultKind.NotAvailable,
+            (await delivery.GetRegionAsync(Request(metadata.RunId, new(0, 1), 2, 2))).Kind);
+
+        owner.Dispose();
+        await first.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
+        await Task.WhenAll(delivery.DisposeAsync().AsTask(), delivery.DisposeAsync().AsTask());
+        Assert.AreEqual(BScanVisualCloseState.Closed, delivery.Diagnostics.CloseState);
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task ObservablePublishesMetadataOnlyAndFailingObserverDoesNotStopPeer()
     {
         var ingress = new BScanIngress(Options(2, 2));

@@ -1,7 +1,7 @@
 # ADR 0006 — Cierre de MainWindow y parada ordenada de aplicación
 
 Fecha original: 2026-09-09. Revisado: 2026-09-22.
-Estado: cierre MainWindow implementado; extensión BScanWindow aceptada y pendiente.
+Estado: cierre MainWindow y extensión BScanWindow implementados.
 Trazabilidad: R02, R06–R08 y R13; Q12/Q13 en [cuestiones abiertas](../requirements/open-questions.md).
 
 ## Contexto y sustitución
@@ -29,6 +29,19 @@ Antes de esperar la exclusión de operaciones, la salida marca atómicamente que
 5. Vaciar definitivamente el mailbox y esperar `AllFramesReleased`: pool sellado frente a nuevas reservas y todos los buffers devueltos. El coordinador visual libera en finally antes de esperar UI. Application espera esta barrera neutral sin depender de Presentation.
 6. Desconectar la fuente. Invalidar callbacks y liberar suscripciones y recursos visuales. Detener y liberar el Host; finalmente permitir el cierre de MainWindow y la terminación WPF.
 
+La composición WPF concreta este orden global sin paralelizar A-Scan con la sesión: bloquear aperturas
+e interacciones; cerrar adaptador, ViewModel, consumidor y barrera B; cerrar A y sus callbacks; parar y
+disponer `ApplicationSession`; esperar productor, consumidor y ramas visuales; esperar workers,
+callbacks, leases y owners; disponer deliveries, stores, coordinadores, viewport y fuente; detener Host;
+y disponer Host solo si todo el cleanup obligatorio anterior está confirmado. Cada etapa se intenta como
+máximo una vez y las solicitudes concurrentes comparten la misma tarea.
+
+Las ramas visuales productivas separan internamente `Stop`, `WaitForDrainAsync` y `DisposeAsync`.
+`Stop` cierra admisión y solicita parada sin destruir primitivas; la espera cruza workers, callbacks,
+operaciones, leases y owners reales; solo una espera confirmada habilita la disposición. Un owner
+transferido nunca se recupera por fuerza. Los fallos al devolver bloques del store se agregan después
+de intentar todos los bloques, mantienen el store sin cierre confirmado y alcanzan al coordinador.
+
 El sellado del pool y las reservas se sincronizan; no se concede una reserva tras sellar. No esperar tareas manteniendo bloqueos de mailbox/pool. El [ADR 0007](0007-frame-source-ownership.md) define ownership y rollback; el [ADR 0008](0008-latest-only-visual-delivery.md), la entrega visual.
 
 Parar desde UI limpia la ejecución y deja la aplicación abierta; desconexión y parada del Host forman parte de salir. Una desuscripción visual no solicita por sí sola parada. Liberar sin interés visual durante arranque, fallo o cierre no habilita funcionamiento sin ventanas.
@@ -36,6 +49,11 @@ Parar desde UI limpia la ejecución y deja la aplicación abierta; desconexión 
 ## Timeout, errores y cancelación
 
 Cinco segundos es un umbral exclusivamente diagnóstico. Si se supera, MainWindow sigue abierta e informa la fase pendiente; la limpieza continúa observada. No matar el proceso, devolver buffers aún en uso, destruir el Host prematuramente ni declarar completada la salida. Una solicitud repetida no duplica limpieza. Si una fase falla y no se acredita su resolución, se mantiene cierre pendiente y diagnóstico.
+
+El estado de cierre conserva estructuradamente el primer fallo y los posteriores en orden. Un fallo
+histórico puede coexistir con `Completed=true` solo cuando la liberación afectada se confirma. Ante un
+fallo no confirmado, `Completed` permanece falso, no se dispone Host y MainWindow conserva visible la
+ruta diagnóstica.
 
 Los fallos al cancelar o disponer el temporizador diagnóstico se registran separadamente y no alteran el resultado principal del cierre: no convierten una limpieza correcta en fallo ni sustituyen una excepción real de limpieza. Las tareas diagnósticas se observan también cuando la limpieza falla. Estas garantías y la finalización diferida están cubiertas por pruebas WPF deterministas de robustez del cierre.
 
@@ -49,4 +67,5 @@ La ejecución sin ventanas de la versión anterior queda sustituida por decisió
 
 Probar Channel lleno, productor bloqueado, transformación activa, error del consumidor, inicio pendiente y solicitudes repetidas. Usar fuente doble con Connect/Configure/Start bloqueados para verificar que salida cancela antes de esperar exclusión y observa rollback; cubrir la carrera entre registrar inicio y solicitar salida. Verificar devolución exactamente una vez, barrera independiente del Dispatcher y diagnóstico a cinco segundos sin terminar proceso ni permitir reinicio. Integración real de Closing/Host/MainWindow en Windows; coordinación neutral en Core.Tests.
 
-Quedan pendientes la implementación de BScanWindow, paquetes adicionales y benchmarks. Persistencia y otras secundarias continúan fuera. No se han ejecutado pruebas funcionales por esta decisión documental.
+Persistencia, otras ventanas secundarias y paquetes adicionales continúan fuera. La ventana B y el
+cierre global se validan mediante pruebas WPF deterministas; los benchmarks siguen siendo diagnósticos.

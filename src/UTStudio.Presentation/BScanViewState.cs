@@ -6,6 +6,7 @@ namespace UTStudio.Presentation;
 public enum BScanViewPhase { NoData, Ready, Closing, Closed }
 
 public readonly record struct BScanPresentedRegionToken(Guid Value);
+public delegate void BScanIntensityVisitor(ReadOnlySpan<byte> pixels, int stride);
 
 /// <summary>Immutable metadata for a region retained internally by the ViewModel.</summary>
 public sealed record BScanPresentedRegion(

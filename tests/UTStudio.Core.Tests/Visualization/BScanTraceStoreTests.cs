@@ -103,6 +103,7 @@ public sealed class BScanTraceStoreTests
 
         Assert.AreEqual(2, pool.ReturnCount);
         Assert.IsEmpty(pool.Outstanding);
+        Assert.IsFalse(store.Statistics.Closed);
         await Assert.ThrowsExactlyAsync<AggregateException>(() => store.CloseAsync());
         Assert.AreEqual(2, pool.ReturnCount);
     }

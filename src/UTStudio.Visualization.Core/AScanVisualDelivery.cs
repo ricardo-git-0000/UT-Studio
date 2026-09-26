@@ -29,6 +29,8 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     internal Action? BeforeSubscriptionWait { get; set; }
     private readonly Task _worker;
     private Task? _disposal;
+    private Task? _drain;
+    private Subscription[]? _stoppedSubscriptions;
     private bool _disposed;
     private bool _failed;
     private AcquisitionRunId? _runId;
@@ -228,44 +230,80 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     }
 
     /// <summary>Stops this publisher permanently. Cancellation abandons only the caller's wait.</summary>
-    public Task StopAsync(CancellationToken cancellationToken = default) => DisposeAsync().AsTask().WaitAsync(cancellationToken);
+    public Task StopAsync(CancellationToken cancellationToken = default) => WaitForDrainAsync(cancellationToken);
 
     public ValueTask DisposeAsync()
     {
         lock (_gate)
         {
-            if (_disposal is null)
-            {
-                _disposed = true;
-                FailDiagnosticWaitersUnderLock(new ObjectDisposedException(nameof(AScanVisualDelivery)));
-                Invalidate();
-                _runId = null;
-                var subscriptions = _subscriptions.ToArray();
-                var cancellations = subscriptions.Select(subscription => subscription.Detach()).ToArray();
-                _subscriptions.Clear();
-                var cancellation = _shutdown.CancelAsync();
-                _disposal = Task.Run(() => DisposeCoreAsync(Task.WhenAll(cancellations.Append(cancellation)), subscriptions));
-            }
+            _disposal ??= DisposeCoreAsync();
             return new ValueTask(_disposal);
         }
     }
 
-    private async Task DisposeCoreAsync(Task cancellation, Subscription[] subscriptions)
+    internal void Stop()
     {
-        try { await Task.WhenAll(cancellation, _worker).ConfigureAwait(false); }
-        catch (Exception error)
+        lock (_gate)
         {
-            lock (_gate) { _lastError = Describe("visual.cleanup", error); }
+            if (_disposed) { return; }
+            _disposed = true;
+            FailDiagnosticWaitersUnderLock(new ObjectDisposedException(nameof(AScanVisualDelivery)));
+            Invalidate();
+            _runId = null;
+            _stoppedSubscriptions = [.. _subscriptions];
+            _subscriptions.Clear();
+            _drain = Task.Run(() => DrainCoreAsync(_stoppedSubscriptions));
         }
-        finally
+    }
+
+    internal Task WaitForDrainAsync(CancellationToken cancellationToken = default)
+    {
+        Stop();
+        Task drain;
+        lock (_gate) { drain = _drain!; }
+        return cancellationToken.CanBeCanceled ? drain.WaitAsync(cancellationToken) : drain;
+    }
+
+    private async Task DrainCoreAsync(Subscription[] subscriptions)
+    {
+        List<Exception> failures = [];
+        try { await _shutdown.CancelAsync().ConfigureAwait(false); }
+        catch (Exception error) { failures.Add(error); }
+        foreach (Task callback in subscriptions.Select(subscription => subscription.Detach()))
         {
-            foreach (var subscription in subscriptions) { subscription.WaitForCallback(); }
-            if (_diagnosticFullCleanupRequested)
-            { await Task.WhenAll(subscriptions.Select(subscription => subscription.DiagnosticCleanup)).ConfigureAwait(false); }
-            _status.Dispose();
-            _shutdown.Dispose();
-            _wake.Dispose();
+            try { await callback.ConfigureAwait(false); }
+            catch (Exception error) { failures.Add(error); }
         }
+        try { await _worker.ConfigureAwait(false); }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
+        catch (Exception error) { failures.Add(error); }
+        foreach (var subscription in subscriptions)
+        {
+            try { subscription.WaitForCallback(); }
+            catch (Exception error) { failures.Add(error); }
+        }
+        if (_diagnosticFullCleanupRequested)
+        {
+            foreach (Task cleanup in subscriptions.Select(subscription => subscription.DiagnosticCleanup))
+            {
+                try { await cleanup.ConfigureAwait(false); }
+                catch (Exception error) { failures.Add(error); }
+            }
+        }
+        if (failures.Count != 0)
+        {
+            lock (_gate) { _lastError = Describe("visual.cleanup", failures[0]); }
+            throw new AggregateException("A-Scan visual drain failed.", failures);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        Stop();
+        await WaitForDrainAsync().ConfigureAwait(false);
+        _status.Dispose();
+        _shutdown.Dispose();
+        _wake.Dispose();
     }
 
     private async Task PublishLoopAsync()

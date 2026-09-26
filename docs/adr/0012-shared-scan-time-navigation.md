@@ -1,6 +1,6 @@
 # ADR 0012 — Navegación temporal compartida y reutilizable
 
-Fecha: 2026-09-22. Estado: Aceptado e implementado para A-Scan y Presentation B-Scan; WPF B pendiente.
+Fecha: 2026-09-22. Estado: Aceptado e implementado para A-Scan y B-Scan.
 Amplía [ADR 0011](0011-shared-physical-time-viewport.md) y conserva las fronteras de
 [ADR 0009](0009-reusable-scan-visualization-controls.md) y la identidad visual de
 [ADR 0010](0010-ascan-manual-cursor-measurements.md).
@@ -61,7 +61,7 @@ pendientes y establece una barrera UI. Una instancia privada creada por `AScanVi
 ## Consecuencias
 
 - El B-Scan orienta lógicamente el tiempo en vertical sin cambiar el contrato neutral; su adaptación
-  WPF se completa en la Fase 5.
+  WPF reside en `BScanControl` y App.Wpf.
 - No hay dependencia A-Scan ↔ B-Scan ni bucles de notificación entre ViewModels.
 - Snapshot, cursores y viewport no se mezclan entre identidades visuales.
 - La intersección vacía deja el grupo sin viewport hasta disponer de dominios compatibles.

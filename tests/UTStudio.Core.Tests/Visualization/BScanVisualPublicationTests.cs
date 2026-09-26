@@ -258,9 +258,10 @@ public sealed class BScanVisualPublicationTests
 
         Assert.AreEqual(BScanRasterResultKind.ResourceLimit,
             (await waiting.WaitAsync(TimeSpan.FromSeconds(10))).Kind);
-        await close.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsFalse(close.IsCompleted);
         first.Dispose();
         second.Dispose();
+        await close.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.AreEqual(0, harness.Delivery.Diagnostics.ActiveRasterOwners);
     }
 

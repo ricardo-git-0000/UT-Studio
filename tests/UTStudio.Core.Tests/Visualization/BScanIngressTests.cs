@@ -214,7 +214,10 @@ public sealed class BScanIngressTests
         {
             try { selected.SetResult(ingress.GetTraceAsync(Identity(metadata, 0)).AsTask().GetAwaiter().GetResult()); }
             catch (Exception error) { selected.SetException(error); }
-        }) { IsBackground = true };
+        })
+        {
+            IsBackground = true
+        };
         thread.Start();
         Assert.IsTrue(copyEntered.Wait(TimeSpan.FromSeconds(10)));
 
@@ -275,11 +278,38 @@ public sealed class BScanIngressTests
         ingress.CloseRun(RunId);
         ingress.CloseRun(RunId);
 
-        await Task.WhenAll(ingress.DisposeAsync().AsTask(), ingress.DisposeAsync().AsTask())
-            .WaitAsync(TimeSpan.FromSeconds(10));
+        Task first = ingress.DisposeAsync().AsTask();
+        Task second = ingress.DisposeAsync().AsTask();
+        await Assert.ThrowsExactlyAsync<AggregateException>(() => first.WaitAsync(TimeSpan.FromSeconds(10)));
+        await Assert.ThrowsExactlyAsync<AggregateException>(() => second.WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.AreEqual(pool.RentCount, pool.ReturnCount);
         Assert.IsTrue(ingress.Diagnostics.IsClosed);
+    }
+
+    [TestMethod]
+    public async Task FailedBlockReturnFaultsSharedDrainAndIsNeverRetried()
+    {
+        var pool = new DeterministicShortPool();
+        pool.ThrowOnReturns.Add(1);
+        var ingress = new BScanIngress(Options(65), null, pool, new DeterministicOwnerPool());
+        var metadata = Metadata(10);
+        ingress.OpenRun(metadata);
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[10]);
+
+        ingress.Stop();
+        Task first = ingress.WaitForDrainAsync();
+        Task second = ingress.WaitForDrainAsync();
+        AggregateException failure = await Assert.ThrowsExactlyAsync<AggregateException>(() => first);
+        await Assert.ThrowsExactlyAsync<AggregateException>(() => second);
+
+        Assert.AreSame(first, second);
+        Assert.IsGreaterThanOrEqualTo(1, failure.Flatten().InnerExceptions.Count);
+        Assert.AreEqual(pool.RentCount, pool.ReturnCount);
+        Assert.IsFalse(ingress.Diagnostics.IsClosed);
+        int attempts = pool.ReturnCount;
+        await Assert.ThrowsExactlyAsync<AggregateException>(() => ingress.DisposeAsync().AsTask());
+        Assert.AreEqual(attempts, pool.ReturnCount);
     }
 
     [TestMethod]
@@ -301,7 +331,10 @@ public sealed class BScanIngressTests
         {
             try { copyResult.TrySetResult(ingress.GetTraceAsync(Identity(metadata, 0)).AsTask().GetAwaiter().GetResult()); }
             catch (Exception error) { copyResult.TrySetException(error); }
-        }) { IsBackground = true };
+        })
+        {
+            IsBackground = true
+        };
         copyThread.Start();
         Assert.IsTrue(copyEntered.Wait(TimeSpan.FromSeconds(10)));
 

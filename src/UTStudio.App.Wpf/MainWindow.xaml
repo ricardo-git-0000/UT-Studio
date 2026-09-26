@@ -29,6 +29,8 @@
                 <Button Content="Restablecer" Command="{Binding ResetCursorsCommand}" MinWidth="100" Padding="16,8" Margin="0,0,8,0" />
                 <Button Content="Restablecer zoom" Command="{Binding ResetViewportCommand}" MinWidth="125" Padding="16,8" Margin="0,0,8,0"
                         AutomationProperties.HelpText="Restablece el rango temporal visible; atajo Home" />
+                <Button Content="B-Scan" Click="OnOpenBScan" MinWidth="80" Padding="12,8" Margin="0,0,8,0" />
+                <Button Content="Live" Command="{Binding ReturnToLiveCommand}" MinWidth="70" Padding="12,8" Margin="0,0,8,0" />
                 <Button Content="Start" Command="{Binding StartCommand}" MinWidth="90" Padding="16,8" Margin="0,0,8,0" />
                 <Button Content="Stop" Command="{Binding StopCommand}" MinWidth="90" Padding="16,8" />
             </StackPanel>
@@ -40,6 +42,8 @@
             <TextBlock Text="{Binding AScan.Sequence, TargetNullValue=—}" />
             <TextBlock Text="   Canal: " Margin="20,0,0,0" />
             <TextBlock Text="{Binding Metadata.Configuration.PhysicalChannelId.Value, TargetNullValue=—}" />
+            <TextBlock Text="   Modo: " Margin="20,0,0,0" />
+            <TextBlock Text="{Binding DisplayMode}" FontWeight="SemiBold" />
         </StackPanel>
         <controls:AScanControl x:Name="Scan" Grid.Row="2" Snapshot="{Binding AScan}" CursorState="{Binding Cursors}"
                                ViewportBinding="{Binding ViewportBinding}" CursorActivated="OnCursorActivated"

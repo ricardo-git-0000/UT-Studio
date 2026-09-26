@@ -22,6 +22,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     private CancellationTokenSource _lifetimeCancellation = new();
     private Task? _worker;
     private Task? _closeTask;
+    private Task? _drainTask;
     private Task? _disposeTask;
     private bool _open;
     private bool _disposed;
@@ -245,6 +246,17 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         }
     }
 
+    public bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex,
+        out BScanTraceIdentity identity)
+    {
+        lock (_gate)
+        {
+            if (_disposed || !_open || _metadata?.RunId != runId || _store is null)
+            { identity = default; return false; }
+            return _store.TryResolveIdentity(acquisitionIndex, out identity);
+        }
+    }
+
     public BScanDiagnostics Diagnostics
     {
         get
@@ -270,33 +282,61 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         }
     }
 
-    private async Task DisposeCoreAsync()
+    internal void Stop()
     {
-        Task close;
-        Task providers;
         lock (_gate)
         {
             if (_disposed) { return; }
             _disposed = true;
             _lifetimeCancellation.Cancel();
             if (_open) { CloseRun(_metadata!.RunId); }
-            close = _closeTask ?? Task.CompletedTask;
-            providers = _providerOperations == 0 ? Task.CompletedTask :
-                (_providerDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            _drainTask ??= DrainCoreAsync(
+                _closeTask ?? Task.CompletedTask,
+                _providerOperations == 0 ? Task.CompletedTask :
+                    (_providerDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task);
         }
-        await Task.WhenAll(close, providers).ConfigureAwait(false);
+    }
+
+    internal Task WaitForDrainAsync(CancellationToken cancellationToken = default)
+    {
+        Stop();
+        Task drain;
+        lock (_gate) { drain = _drainTask!; }
+        return cancellationToken.CanBeCanceled ? drain.WaitAsync(cancellationToken) : drain;
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        Stop();
+        await WaitForDrainAsync().ConfigureAwait(false);
         _lifetimeCancellation.Dispose();
+    }
+
+    private static async Task DrainCoreAsync(Task close, Task providers)
+    {
+        List<Exception> failures = [];
+        try { await close.ConfigureAwait(false); }
+        catch (Exception error) { AddFailures(failures, error); }
+        try { await providers.ConfigureAwait(false); }
+        catch (Exception error) { AddFailures(failures, error); }
+        if (failures.Count != 0) { throw new AggregateException("B-Scan ingress drain failed.", failures); }
     }
 
     private async Task CloseCoreAsync(BScanTraceStore store, Task worker, SemaphoreSlim wake,
         CancellationTokenSource cancellation)
     {
+        List<Exception> failures = [];
         try { await worker.ConfigureAwait(false); }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
-        catch (Exception error) { lock (_gate) { _workerError ??= Message(error); } }
+        catch (Exception error)
+        {
+            lock (_gate) { _workerError ??= Message(error); }
+            failures.Add(error);
+        }
         try { await store.CloseAsync().ConfigureAwait(false); }
         catch (Exception error)
         {
+            AddFailures(failures, error);
             lock (_gate)
             {
                 IEnumerable<Exception> errors = error is AggregateException aggregate
@@ -313,6 +353,13 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
             wake.Dispose();
             cancellation.Dispose();
         }
+        if (failures.Count != 0) { throw new AggregateException("B-Scan run cleanup failed.", failures); }
+    }
+
+    private static void AddFailures(List<Exception> failures, Exception error)
+    {
+        if (error is AggregateException aggregate) { failures.AddRange(aggregate.Flatten().InnerExceptions); }
+        else { failures.Add(error); }
     }
 
     private async Task IndexLoopAsync(BScanTraceStore store, SemaphoreSlim wake, CancellationToken token)

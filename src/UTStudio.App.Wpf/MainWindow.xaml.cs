@@ -15,22 +15,32 @@ public partial class MainWindow : Window
     private readonly VisualMetrics _metrics;
     private readonly DispatcherTimer _statusTimer;
     private readonly RefreshGate _metricsGate;
+    private readonly BScanWindowManager _bScanWindows;
     private bool _closing, _allowClose;
 
-    public MainWindow(AScanViewModel viewModel, ShutdownCoordinator shutdown, VisualMetrics metrics,
+    public MainWindow(AScanViewModel viewModel, ShutdownCoordinator shutdown, BScanWindowManager bScanWindows,
+        ShutdownInteractionGate interactionGate, VisualMetrics metrics,
         TimeProvider clock, ILogger<MainWindow> logger)
     {
         InitializeComponent();
         DataContext = viewModel;
         _shutdown = shutdown;
+        _bScanWindows = bScanWindows;
         _logger = logger;
         _metrics = metrics;
         _metricsGate = new RefreshGate(clock, TimeSpan.FromMilliseconds(200));
+        interactionGate.Register(() => IsEnabled = false);
         _statusTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromMilliseconds(100) };
         _statusTimer.Tick += UpdateStatus;
         Loaded += (_, _) => _statusTimer.Start();
         Closed += (_, _) => _statusTimer.Stop();
         Closing += OnClosing;
+    }
+
+    private async void OnOpenBScan(object sender, RoutedEventArgs args)
+    {
+        try { await _bScanWindows.OpenAsync(this); }
+        catch (Exception error) { _logger.LogError(error, "B-Scan window failed to open"); ShutdownText.Text = error.Message; }
     }
 
     internal void UpdateStatus(object? sender, EventArgs args)
@@ -85,11 +95,12 @@ public partial class MainWindow : Window
         args.Cancel = true;
         if (_closing) { return; }
         _closing = true;
-        Interactions.IsEnabled = false;
+        IsEnabled = false;
         ShutdownText.Text = "Cerrando: liberando suscripciones y deteniendo adquisición…";
         try
         {
             await _shutdown.ShutdownAsync();
+            if (!_shutdown.Status.Completed) { return; }
             // Always unwind Closing first, even when shutdown was already completed.
             // _closing admits only this one final-close operation.
             await Dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(() =>
@@ -100,7 +111,7 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
-            _logger.LogError(error, "Shutdown remains pending; MainWindow stays open");
+            _logger.LogError(error, "Shutdown remains pending because mandatory cleanup was not confirmed");
             UpdateStatus(null, EventArgs.Empty);
         }
     }

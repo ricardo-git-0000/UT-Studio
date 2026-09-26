@@ -117,6 +117,39 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         return completion.Task;
     }
 
+    public Task SelectAsync(string ownerId, AcquisitionRunId runId, ulong acquisitionIndex)
+    {
+        if (!_provider.TryResolveIdentity(runId, acquisitionIndex, out BScanTraceIdentity identity))
+        {
+            CancellationTokenSource? cancellation;
+            long generation;
+            lock (_gate)
+            {
+                if (IsClosed || _activeRun != runId) { return Task.CompletedTask; }
+                generation = ++_generation;
+                cancellation = _activeCancellation;
+                _activeCancellation = null;
+                _activeOwnerId = null;
+            }
+            try { cancellation?.Cancel(); }
+            catch { Interlocked.Increment(ref _observerErrors); }
+            return PublishUnavailableAsync(ownerId, runId, generation);
+        }
+        return SelectAsync(ownerId, identity);
+    }
+
+    private Task PublishUnavailableAsync(string ownerId, AcquisitionRunId runId, long generation) => _dispatcher.InvokeAsync(() =>
+    {
+        if (IsClosed || _activeRun != runId || Volatile.Read(ref _generation) != generation) { return; }
+        ReplaceState(_state with
+        {
+            LastResult = BScanTraceResultKind.NotAvailable,
+            SelectionError = null,
+            IsPending = false,
+            RequestOwnerId = ownerId
+        });
+    });
+
     public void Cancel(string ownerId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
@@ -186,7 +219,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         _ = _dispatcher.InvokeAsync(() =>
         {
-            if (IsClosed || _selectedOwnerId != ownerId || _state.RunId != runId ||
+            if (IsClosed || _state.RunId != runId ||
                 _state.AcquisitionIndex is not { } index) { return; }
             if (_residencyVersions.TryGetValue(ownerId, out var previous) && previous.RunId == runId &&
                 snapshotVersion <= previous.Version) { return; }

@@ -308,6 +308,20 @@ internal sealed class BScanTraceStore
         }
     }
 
+    internal bool TryResolveIdentity(ulong acquisitionIndex, out BScanTraceIdentity identity)
+    {
+        lock (_gate)
+        {
+            foreach (Slot slot in _slots)
+            {
+                if (slot.Committed && !slot.Writing && slot.Descriptor?.AcquisitionIndex == acquisitionIndex)
+                { identity = slot.Descriptor.Identity; return true; }
+            }
+        }
+        identity = default;
+        return false;
+    }
+
     internal void RecordSuperseded()
     {
         lock (_gate) { _superseded++; }
@@ -396,7 +410,7 @@ internal sealed class BScanTraceStore
                 }
                 catch (Exception error) { errors.Add(error); }
             }
-            _returned = true;
+            _returned = errors.Count == 0 && BlocksReturned == BlocksRented;
             if (errors.Count != 0) { throw new AggregateException(errors); }
         }
     }

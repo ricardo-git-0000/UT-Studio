@@ -96,7 +96,7 @@ public sealed class ShutdownRobustnessTests
     });
 
     [TestMethod]
-    public Task FailedShutdownKeepsWindowVisibleAndDoesNotRepeatCleanup() => StaTest.Run(async () =>
+    public Task FailedShutdownKeepsShellVisibleAndDoesNotRepeatCleanup() => StaTest.Run(async () =>
     {
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
         int calls = 0;
@@ -108,12 +108,12 @@ public sealed class ShutdownRobustnessTests
         {
             window.Show();
             window.Close();
-            await DiagnosticWait.Until(() => ((TextBlock)window.FindName("ShutdownText")).Text.Contains(failure.Message),
-                "shutdown failure displayed by MainWindow");
-            window.Close();
+            await DiagnosticWait.Until(() => coordinator.Status.PrimaryFailure is not null, "cleanup failure published");
             await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
             Assert.IsTrue(window.IsVisible);
             Assert.IsFalse(coordinator.Status.Completed);
+            window.UpdateStatus(null, EventArgs.Empty);
+            StringAssert.Contains(window.ShutdownText.Text, "unconfirmed cleanup");
             Assert.AreEqual(1, calls);
             var error = await Assert.ThrowsAsync<InvalidOperationException>(() => DiagnosticWait.For(coordinator.ShutdownAsync()));
             Assert.AreSame(failure, error);
@@ -127,6 +127,8 @@ public sealed class ShutdownRobustnessTests
 
     private static MainWindow CreateWindow(DesktopRuntime runtime, ShutdownCoordinator coordinator) => new(
         runtime.Host.Services.GetRequiredService<AScanViewModel>(), coordinator,
+        runtime.Host.Services.GetRequiredService<BScanWindowManager>(),
+        runtime.Host.Services.GetRequiredService<ShutdownInteractionGate>(),
         runtime.Host.Services.GetRequiredService<VisualMetrics>(), new ManualClock(), NullLogger<MainWindow>.Instance);
 
     // Test-only teardown after assertions, including the intentionally unconfirmed-failure case.

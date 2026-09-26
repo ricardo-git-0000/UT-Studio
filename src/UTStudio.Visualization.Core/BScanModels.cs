@@ -86,4 +86,6 @@ public sealed class BScanTraceResult
 public interface IBScanTraceProvider
 {
     ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity, CancellationToken cancellationToken = default);
+    bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex, out BScanTraceIdentity identity)
+    { identity = default; return false; }
 }

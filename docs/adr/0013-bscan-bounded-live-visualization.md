@@ -1,6 +1,6 @@
 # ADR 0013 — B-Scan en vivo acotado, selección exacta y ventana secundaria
 
-Fecha: 2026-09-22. Estado: Aceptado; Fases 1–4 implementadas y Fase 5 pendiente.
+Fecha: 2026-09-22. Estado: Aceptado; Fases 1–5 implementadas.
 Trazabilidad: R01–R09, R13 y R14; concreta Q12 y la parte visual de Q13. Complementa
 [ADR 0006](0006-session-window-lifecycle.md), [ADR 0007](0007-frame-source-ownership.md),
 [ADR 0008](0008-latest-only-visual-delivery.md), [ADR 0009](0009-reusable-scan-visualization-controls.md)
@@ -192,9 +192,14 @@ La tabla no afirma que todos los escenarios quepan en los defaults: con 32 MiB d
 queda limitado aproximadamente a 256 columnas. El presupuesto visual excluye RF y suma las demás
 categorías; nunca supera ≈10,379 MiB en estos escenarios lógicos.
 
-No hay bitmap posterior propio ni staging de imagen completa. El refresco completo escribe directamente
-en el `BackBuffer`. Copias internas del compositor WPF son overhead de plataforma medible, pero no
-controlable por el presupuesto. Presentation rechaza antes de solicitarla una región cuyas dimensiones
+WPF mantiene un solo bitmap visible. Antes de bloquearlo materializa `AffectedRegion` en staging BGRA32
+rentado. Un refresco completo usa además un bitmap candidato y lo publica solo tras completarlo; un
+incremental conserva un backup pooled del rectángulo y restaura byte a byte ante un fallo controlado.
+No se ejecutan callbacks externos con el bitmap bloqueado y la identidad avanza solo después del commit.
+El peor pico activo a 1.024×1.024 es aproximadamente 12 MiB por control: 4 MiB visible, 4 MiB staging
+y 4 MiB de candidato full o backup incremental. Este presupuesto WPF es independiente de los 16 MiB
+neutrales; `ArrayPool` puede retener buckets después de devolverlos. Las copias del compositor son
+overhead de plataforma no controlable. Presentation rechaza antes de solicitarla una región cuyas dimensiones
 y buffers contables excedan 16 MiB; WPF aplica además el mismo límite de píxeles antes de recrear el
 bitmap. Una configuración imposible o con menos de un bloque/columna efectiva falla antes de iniciar.
 
@@ -214,14 +219,20 @@ renders por separado.
 `Visualization.Core` produce `BScanRasterRegion` neutral con identidad de stream y consumidor, versión
 local, revisión base y resultante, rectángulo, dimensiones, formato y payload propio. Presentation
 retiene internamente como máximo la región visible y un candidato y publica únicamente un token opaco
-y metadata. `TryCopyPresentedRegion` valida token, stream, run y generación y copia sincrónicamente solo
-`AffectedRegion`, fila a fila, a una superficie proporcionada por el adaptador. Un token antiguo devuelve
+y metadata. `TryVisitPresentedRegion` valida token, stream, run y generación y expone síncronamente solo
+`AffectedRegion` al adaptador; este convierte a staging WPF fuera del lock del bitmap. Un token antiguo devuelve
 `false` y solicita fuera de la puerta una recuperación full coalescida; un destino insuficiente lanza
 `ArgumentException`. El estado observable no contiene arrays, `Memory`, owners ni `IDisposable`, por lo
 que los estados históricos no retienen raster ni generan una copia LOH por publicación. `BScanControl`
 no consulta el store, no coordina trabajo
 asíncrono y no referencia Application ni Presentation. Zoom/resize emite una intención neutral;
 Presentation solicita y publica otra región.
+
+El registro de un consumidor nuevo inicia además una petición bootstrap mínima cuando el store ya tiene
+estado visual. Si la primera columna llega después del registro, `VisualStateChanged` inicia la misma
+petición. La entrega conserva el último snapshot por consumidor y lo reproduce a una suscripción tardía.
+Esto rompe el ciclo en el que Presentation necesitaba metadata para pedir render y Delivery necesitaba
+una petición para publicar metadata; la primera región visible sigue siendo un full coherente.
 
 ## Revisiones y resincronización
 
@@ -336,6 +347,24 @@ para permitir reabrir la ventana con datos recientes. MainWindow cierra secundar
 sesión, workers/deliveries, selección, viewport y Host. Si la sesión termina primero, no se admiten
 selecciones nuevas; una ya materializada puede mostrarse como histórica.
 
+El cierre propietario de B intenta de forma independiente adaptador, ViewModel, retirada del consumidor,
+estado UI, liberación de región y barrera. Conserva el primer error y los secundarios sin omitir etapas;
+llamadas repetidas o concurrentes comparten resultado. Si `Show()` falla, la composición ejecuta ese
+mismo cierre antes de devolver el fallo. Una factory interna permite pruebas productivas con fuente
+controlada y opciones de ring pequeñas sin introducir contratos de prueba en Core o Presentation.
+
+El cierre de composición usa tres transiciones internas monotónicas: cerrar admisión y solicitar
+parada, esperar el drenaje real, y destruir recursos. La barrera B espera worker, callbacks,
+operaciones raster y todos los owners transferidos; estos últimos solo los libera su propietario.
+El ingress intenta devolver todos los bloques una vez y propaga conjuntamente cualquier devolución
+fallida, que nunca se contabiliza como cierre confirmado. La fase destructiva no comienza si la
+barrera anterior falla o permanece pendiente.
+
+En WPF, Presentation conserva el owner pooled y publica un token. App.Wpf realiza una visita síncrona
+neutral a `BipolarIntensity8` bajo ese token y Visualization.Wpf convierte únicamente `AffectedRegion`
+a staging local BGRA32 antes del commit transaccional. La vista no recibe `IDisposable`. La continuidad incremental
+se valida con stream, wrap, revisión base y configuración de render, no comparando versiones A/B.
+
 ## Riesgos y aplazado
 
 Copiar hasta 131.070 bytes dentro de `Accept` puede afectar al lector; los percentiles deben medirse
@@ -346,3 +375,8 @@ a benchmark.
 Se aplazan proveedor de archivo real, recuperación de expulsadas, encoder, procedencia/calidad,
 calibración, eje X físico, pirámide LOD completa, GPU, paquetes externos, profundidad, gates y
 sincronización espacial entre grupos.
+
+La discontinuidad localizada queda aplazada: el contrato actual solo aporta `HasDiscontinuities` y no
+distingue de forma autoritativa gaps de secuencia, saltos espaciales, rechazo o wrap. Su futura metadata
+será neutral, tipada, agrupada por viewport y acotada; no se inferirá del raster. Los ticks adaptativos
+sí se resuelven en Core con offsets relativos, pasos 1/2/5 y cantidad máxima, dejando el formato en WPF.
