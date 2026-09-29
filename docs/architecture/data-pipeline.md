@@ -54,6 +54,19 @@ En live convencional, ApplicationSession entrega a un fan-out aislado: AScanVisu
 BScanIngress recibe B. BScanVisualDelivery publica regiones latest-only; BScanViewModel conserva el
 owner y App.Wpf copia por filas al WriteableBitmap. Cerrar B retira solo su consumidor.
 
+El remuestreo B-Scan propuesto no altera ese flujo ni el store. Tras la formación B específica se
+separarán intensidad neutral, máscara `NoData` autoritativa y procedencia; un servicio 2D neutral podrá
+remuestrear antes de la LUT. Modo, parámetros, geometría fuente/destino y política de máscara formarán
+parte de la firma. Los kernels no cruzarán segmentos ni tratarán el sentinel cero como intensidad. Un
+cambio de firma cancelará el candidato y causará una sola recuperación full; los incrementales deberán
+incluir halo o degradar explícitamente a full. Véanse [ADR 0014](../adr/0014-bscan-selectable-resampling.md)
+y su [plan](../plans/2026-09-29-bscan-interpolation-modes.md).
+
+GP/Kriging no forma parte de esta etapa visual: estimaría datos ausentes, exigiría coordenadas físicas,
+incertidumbre y procedencia `SpatialEstimated`, y tendrá una rama/módulo posterior si se aprueba. La
+selección B→A continúa consultando el rango residente y el proveedor de trazas adquiridas, nunca el
+raster remuestreado o reconstruido.
+
 ## Saturación e integridad
 Visualización sustituye snapshots independientes pendientes mediante latest-only y cuenta esas sustituciones; no descarta frames del Channel de adquisición. Las futuras ramas de procesamiento y almacenamiento no descartan silenciosamente. Si el dispositivo permite pausar de forma segura, la coordinación puede usarlo; si se desconoce, no usar bloqueo del receptor como política de backpressure; emitir fallo observable y coordinar parada conforme a capacidades. Saturación/disco lleno produce estado de fallo observable, discontinuidad registrada y parada conforme a capacidades reales.
 Acotar ventana y plazo de reordenación/ensamblado. Detectar pérdidas, duplicados, overrun, paquetes fuera de orden e imágenes incompletas. Decidir si estas últimas se rechazan o conservan marcadas; nunca tratarlas como completas.

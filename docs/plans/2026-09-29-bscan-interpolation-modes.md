@@ -1,0 +1,124 @@
+# Plan de implementación de modos de remuestreo B-Scan
+
+Estado: propuesto; implementación no autorizada. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
+
+## Alcance, propiedad y reglas
+
+El plan añade remuestreo visual seleccionable sin modificar adquisición, RF, store, identidades ni
+selección exacta. El agente principal es propietario de los archivos de cada fase; revisores son solo
+lectura. No se añaden paquetes. Cada fase preserva los presupuestos, latest-only, cierre y fronteras del
+ADR 0013. Kriging/GP no forma parte de las fases 1–4.
+
+## Fase 0 — Documentación y aprobación
+
+Entregables: ADR 0014, este plan y cambios limitados en arquitectura, pipeline, requisitos e índice ADR.
+
+Criterios: distinción remuestreo/reconstrucción inequívoca; decisiones pendientes explícitas; enlaces y
+`git diff --check` correctos; ningún cambio de código/proyecto/paquete; aprobación del usuario de los
+parámetros y presupuestos que condicionan implementación.
+
+## Fase 1 — Contrato neutral, máscara, None y Nearest
+
+Alcance previsto: modelos Scan2D en Visualization.Core; máscara/procedencia; firma estructural; servicio
+cancelable; adaptación interna de B; `None` y `Nearest`, inicialmente full. Sin UI de usuario todavía.
+
+Aceptación:
+
+- `None` es byte a byte idéntico al comportamiento actual en full e incremental;
+- Nearest usa centros, tie hacia índice menor, singletons y bordes definidos;
+- valores `short.MinValue`, cero y `short.MaxValue` conservan el mapping canónico;
+- gaps/NoData nunca participan como cero ni se cruzan;
+- firma antigua, token cancelado, run/revisión/viewport/tamaño obsoleto no confirman;
+- memoria y owners permanecen dentro de cuota y llegan a cero al cierre.
+
+## Fase 2 — Bilinear y Bicubic
+
+Implementar full con máscara conservadora y después incremental con halos 1/2. Bicubic usa el parámetro
+aprobado, acumulación determinista, normalización y clamp final.
+
+Aceptación: vectores exactos de constantes, rampas, impulsos y bordes; ausencia de overshoot en bilinear;
+overshoot bicubic controlado; full = composición de incrementales; gaps no cerrados; dirty expandido;
+cambio rápido de modo/zoom/resize produce una sola full vigente; sin starvation de Stop/cierre.
+
+## Fase 3 — Lanczos
+
+Implementar Lanczos separable con radio aprobado (propuesta `a=3`), tabla/pesos acotados y halo. Primero
+full; incremental solo después de probar equivalencia y disponibilidad del vecindario.
+
+Aceptación: `sinc(0)=1`, constantes conservadas, impulso/ringing documentado, normalización y clamp
+deterministas; full/incremental equivalentes; 1/8/33/100 columnas medidos; degradación solo por cadencia
+latest-only, nunca por cambio silencioso de kernel.
+
+## Fase 4 — UI, preferencia y aceptación
+
+Añadir selector, parámetros aprobados, estado visible, teclado/UIA, validación y errores. La transición
+de opciones/viewport/resolución/revisión es atómica. Resolver y probar la política de persistencia.
+
+Aceptación: default/fallback `None`; modo visible durante live y run detenida; edición inválida conserva
+último valor; cambio genera exactamente una recuperación full; LUT se aplica después del remuestreo;
+WPF no interpola BGRA; selección sigue devolviendo traza adquirida; DPI 96/120/144/192, resize, zoom,
+pan, Stop y shutdown correctos; suscripciones, CTS, owners y buffers terminan a cero.
+
+## Fase separada — Reconstrucción GP/Kriging
+
+Solo se planificará tras aprobar requisitos físicos/NDT, ADR propio, coordenadas calibradas, modelo,
+incertidumbre, UX de estimados y presupuesto. No reutiliza el enum de remuestreo como si fuese otro
+kernel gráfico.
+
+## Matriz de pruebas
+
+| Área | Casos mínimos |
+| --- | --- |
+| Vectores | 1×1, 1×N, N×1, 2×2 y rejillas pequeñas con resultado exacto por modo |
+| Señal | constantes, rampas, impulsos, bordes, bipolar y los tres extremos short |
+| Integridad | `NoData` aislado, franjas, gaps de índices, segmentos, wrap y expulsión |
+| Protocolo | full/incremental 1/8/33/100, halos, base incompatible y recuperación full |
+| Concurrencia | cancelación en cada fila/bloque, cambio de modo, stale tokens, resize/zoom/pan y nueva run |
+| UI | DPI, teclado/UIA, errores, estado aplicando, modo visible, Stop y shutdown |
+| Exactitud | selección B→A y medidas adquiridas nunca usan una celda derivada |
+| Recursos | cuotas, pico de owners/bytes, pool, ausencia de fugas y balances cero |
+| Visual | fixtures sintéticos pequeños y revisados; comparación por intensidades/máscaras, no solo screenshots |
+| Arquitectura | Core/Presentation sin WPF; interpoladores sin tipos B; Wpf solo referencia Core |
+
+La aritmética esperada se prueba con tolerancia explícita solo donde haya coma flotante; identidad,
+máscaras, `None`, Nearest y determinismo son exactos. No se actualizan golden files sin explicar la
+diferencia semántica.
+
+## Benchmarks y presupuesto
+
+Ejecutar Release en hardware registrado para 256×256 y 1024×1024; full e incrementales 1/8/33/100;
+cada modo con constante, ruido determinista, gaps y peor caso de máscara. Registrar warm-up, iteraciones,
+p50/p95/máximo, CPU, asignaciones, bytes/owners activos y pico, cancelación y throughput. Separar
+formación B, remuestreo, LUT y commit WPF.
+
+Objetivos iniciales del ADR 0014 son hipótesis. El incremento no sale si excede 16 MiB neutrales contando
+coexistencia real, si un incremental difiere del full o si Stop/cierre pierde capacidad de respuesta. Si
+no alcanza 30 Hz, la aceptación permite menor cadencia efectiva latest-only con diagnóstico y último
+raster válido; no permite cambiar modo o ocultar gaps.
+
+## Migración incremental y compatibilidad futura
+
+No renombrar inicialmente APIs B. Introducir adaptadores internos y sustituir paso a paso la formación
+directa. Generalizar solo raster, máscara/procedencia, firmas, transformaciones, kernels, buffers y
+métricas. Mantener formación, ejes, selección y sincronización en B. No extraer proyecto, viewport
+universal o superficie pública hasta que C-Scan aporte requisitos y un segundo uso real.
+
+## Criterios de salida transversales
+
+- cero P1/P2; P3 resueltos o aceptados;
+- build Release y suites Core/WPF sin warnings ni flakiness;
+- `dotnet format --verify-no-changes`, `git diff --check` y pruebas de arquitectura correctas;
+- resultados de benchmark documentados como experimento o baseline aprobada, sin confundirlos;
+- memoria, cancelación, responsiveness y balances acreditados;
+- documentación sincronizada y sin fixtures reales/secretos;
+- no commit, stage o integración sin autorización expresa.
+
+## Decisiones requeridas antes de Fase 1
+
+1. Aprobar que Kriging/GP queda separado como reconstrucción.
+2. Aprobar política conservadora: todos los taps requeridos válidos y ningún cruce de segmento.
+3. Aprobar Keys `a=-0.5` y Lanczos `a=3`, o sustituirlos.
+4. Aprobar semántica de `None` compatible y `Nearest` como remuestreo explícito desde rejilla neutral.
+5. Aprobar composición en Visualization.Core sin proyecto `Scan2D.Core` todavía.
+6. Decidir persistencia en Fase 4; propuesta: preferencia UI versionada, nunca metadata de adquisición.
+7. Aprobar hardware, metodología y objetivos de tiempo/memoria antes de convertirlos en gates.

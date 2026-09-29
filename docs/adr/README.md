@@ -16,5 +16,6 @@ Aceptado identifica decisiones aprobadas, sin autorizar paquetes ni implementaci
 - [0011-shared-physical-time-viewport](0011-shared-physical-time-viewport.md): Zoom temporal neutral compartible entre A-Scan y futuros B-Scan.
 - [0012-shared-scan-time-navigation](0012-shared-scan-time-navigation.md): navegación temporal reutilizable, identidad latest-only, ciclo de vida y sincronización bidireccional entre scans.
 - [0013-bscan-bounded-live-visualization](0013-bscan-bounded-live-visualization.md): B-Scan acotado, fan-out, leases, selección exacta, entrega incremental y ventana secundaria.
+- [0014-bscan-selectable-resampling](0014-bscan-selectable-resampling.md): propuesta de remuestreo visual seleccionable, máscara/procedencia 2D y separación de reconstrucción GP/Kriging.
 
-Renderizadores C/S/D-Scan, paquetes adicionales y benchmarks siguen pendientes. Véanse el [plan vertical](../plans/2026-09-09-first-vertical-increment.md), el [plan B-Scan](../plans/2026-09-22-bscan-first-increment.md) y las [cuestiones](../requirements/open-questions.md).
+Renderizadores C/S/D-Scan, paquetes adicionales y benchmarks siguen pendientes. Véanse el [plan vertical](../plans/2026-09-09-first-vertical-increment.md), el [plan B-Scan](../plans/2026-09-22-bscan-first-increment.md), el [plan de remuestreo B-Scan](../plans/2026-09-29-bscan-interpolation-modes.md) y las [cuestiones](../requirements/open-questions.md).

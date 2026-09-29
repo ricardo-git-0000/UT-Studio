@@ -71,6 +71,13 @@ El B-Scan mantiene la frontera reutilizable: Core define raster/viewports neutra
 dibuja y emite intenciones; Presentation posee estado y memoria pooled; App.Wpf adapta y posee la
 ventana. Los ViewModels A/B no se referencian y comparten coordinadores neutrales.
 
+El [ADR 0014 propuesto](../adr/0014-bscan-selectable-resampling.md) prepara remuestreo 2D reutilizable
+sin anticipar C-Scan. `Visualization.Core` alojará por composición modelos pequeños de raster, máscara,
+procedencia, firma e interpoladores neutrales; B-Scan conservará formación RF, identidad, ejes y
+selección exacta. No se crea aún un proyecto `Scan2D.Core`, una clase base de scans ni un control WPF
+universal. La separación en proyecto o una superficie común se reconsiderarán cuando los requisitos
+C-Scan aporten un segundo consumidor real.
+
 ## Proyectos aplazados y fuentes futuras
 
 No crear todavía SignalProcessing, Storage, Acquisition.GigE, Acquisition.Pcie, Reporting/Reporting.Pdf, PLC, Robot, Avalonia ni 3D. Se aplazan Acquisition.Core, importadores y componentes C/S/D-Scan. El primer incremento B-Scan se implementó por las fases del [plan aprobado](../plans/2026-09-22-bscan-first-increment.md). Cada scan mantiene su propio componente; no habrá un control universal.
@@ -83,4 +90,4 @@ SignalProcessing, Storage y Visualization.Core mantendrán dependencias neutrale
 
 Q12: propiedad de la primera secundaria B-Scan resuelta por ADR 0013; concurrencia de otras inspecciones sigue abierta. Q13: fan-out visual por copia propia resuelto para A/B; procesamiento, persistencia y su ownership continúan abiertos. Q06 conserva datos crudos/procesados y durabilidad.
 
-Pendientes mocking/CI y paquetes adicionales (Q10), renderizadores de otros scans y benchmarks (Q09), y futuras integraciones. ChannelCapacity=4 y BufferCount=8 son internos configurables del simulador sujetos a benchmarks, no del contrato general. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).
+Pendientes mocking/CI y paquetes adicionales (Q10), renderizadores de otros scans y benchmarks (Q09), y futuras integraciones. Los modos visuales B-Scan y su separación de GP/Kriging están propuestos en ADR 0014 y no implementados. ChannelCapacity=4 y BufferCount=8 son internos configurables del simulador sujetos a benchmarks, no del contrato general. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).
