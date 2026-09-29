@@ -31,6 +31,10 @@ internal static class SyntheticRfGenerator
         SimulatorOptions options, ulong sequence, CancellationToken cancellationToken)
     {
         ulong random = Mix(options.Seed ^ Mix(sequence));
+        double acquisitionPeriod = configuration.SampleCount / configuration.SampleRateHz;
+        double echoShift = sequence % (ulong)configuration.SampleCount / configuration.SampleRateHz;
+        double firstEcho = Wrap(configuration.FirstSampleOffsetSeconds, acquisitionPeriod, 10e-6 + echoShift);
+        double secondEcho = Wrap(configuration.FirstSampleOffsetSeconds, acquisitionPeriod, 25e-6 + echoShift);
         for (int i = 0; i < samples.Length; i++)
         {
             if ((i & 255) == 0)
@@ -39,12 +43,28 @@ internal static class SyntheticRfGenerator
             }
 
             double time = configuration.FirstSampleOffsetSeconds + i / configuration.SampleRateHz;
-            double signal = Pulse(time - 10e-6, 0.6) + Pulse(time - 25e-6, 0.3);
+            double signal = Pulse(CircularDelta(time, firstEcho, acquisitionPeriod), 0.6) +
+                Pulse(CircularDelta(time, secondEcho, acquisitionPeriod), 0.3);
             random = Mix(random);
             double noise = ((random >> 11) * (1.0 / (1UL << 53)) * 2 - 1) * options.NoiseAmplitude;
             double counts = Math.Round((signal + noise) * 32768, MidpointRounding.ToEven);
             samples[i] = (short)Math.Clamp(counts, short.MinValue, short.MaxValue);
         }
+    }
+
+    private static double Wrap(double first, double period, double value)
+    {
+        double relative = (value - first) % period;
+        if (relative < 0) { relative += period; }
+        return first + relative;
+    }
+
+    private static double CircularDelta(double time, double center, double period)
+    {
+        double delta = time - center;
+        if (delta < -period / 2) { delta += period; }
+        else if (delta >= period / 2) { delta -= period; }
+        return delta;
     }
 
     private static double Pulse(double delta, double amplitude)

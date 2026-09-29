@@ -1,5 +1,6 @@
 using System.Windows.Threading;
 using System.Windows.Input;
+using System.Windows.Media.Imaging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using UTStudio.Acquisition.Simulator;
@@ -13,6 +14,8 @@ using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Wpf.Controls;
+using UTStudio.Visualization.Wpf.Rendering;
 
 namespace UTStudio.Tests.Wpf;
 
@@ -96,6 +99,68 @@ public sealed class CompositionTests
         }
         finally { await runtime.Shutdown.ShutdownAsync(); }
     });
+
+    [TestMethod]
+    public Task Productive_simulator_started_before_opening_bscan_presents_live_raster() => StaTest.Run(async () =>
+    {
+        var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
+            ["--Simulator:AScansPerSecond=100"]);
+        var services = runtime.Host.Services;
+        var aScan = services.GetRequiredService<AScanViewModel>();
+        var windows = services.GetRequiredService<BScanWindowManager>();
+        try
+        {
+            await runtime.Host.StartAsync();
+            await aScan.StartCommand.ExecuteAsync(null);
+            await DiagnosticWait.Until(() => aScan.AScan is not null, "productive simulator A-Scan");
+
+            await windows.OpenAsync();
+            BScanWindow window = windows.ActiveWindow!;
+            var bScan = (BScanViewModel)window.DataContext;
+            await DiagnosticWait.Until(() => bScan.State.Region is not null, "productive simulator B-Scan raster");
+            var control = (BScanControl)window.FindName("Scan");
+
+            Assert.AreEqual(BScanViewPhase.Ready, bScan.State.Phase);
+            Assert.IsNull(bScan.State.BScanIngressError);
+            Assert.IsNull(bScan.State.BScanVisualError);
+            Assert.IsNotNull(bScan.State.Region);
+            Assert.IsNotNull(control.RasterSource);
+            Assert.IsNotNull(control.Snapshot);
+            await DiagnosticWait.Until(() => control.RasterSource is BitmapSource { PixelWidth: > 1, PixelHeight: > 1 },
+                "productive simulator sized B-Scan raster");
+            AssertRasterContainsSignal(control);
+
+            await DiagnosticWait.Until(() => aScan.AScan?.Sequence >= 100,
+                "productive simulator mature B-Scan store");
+            await window.CloseOwnedAsync();
+            await windows.OpenAsync();
+            BScanWindow reopened = windows.ActiveWindow!;
+            var reopenedViewModel = (BScanViewModel)reopened.DataContext;
+            var reopenedControl = (BScanControl)reopened.FindName("Scan");
+            await DiagnosticWait.Until(() => reopenedViewModel.State.Region is not null &&
+                reopenedControl.RasterSource is not null, "reopened productive simulator B-Scan raster");
+            await DiagnosticWait.Until(() => reopenedControl.RasterSource is BitmapSource
+            { PixelWidth: > 1, PixelHeight: > 1 }, "reopened productive simulator sized B-Scan raster");
+            AssertRasterContainsSignal(reopenedControl);
+        }
+        finally { await runtime.Shutdown.ShutdownAsync(); }
+    });
+
+    private static void AssertRasterContainsSignal(BScanControl control)
+    {
+        var bitmap = (WriteableBitmap)control.RasterSource!;
+        byte[] pixels = new byte[bitmap.BackBufferStride * bitmap.PixelHeight];
+        bitmap.CopyPixels(pixels, bitmap.BackBufferStride, 0);
+        var colors = Enumerable.Range(0, pixels.Length / 4)
+            .Select(index => (B: pixels[index * 4], G: pixels[index * 4 + 1],
+                R: pixels[index * 4 + 2], A: pixels[index * 4 + 3]))
+            .Distinct()
+            .Take(3)
+            .ToArray();
+        Assert.IsGreaterThanOrEqualTo(2, colors.Length, "B-Scan raster is uniformly colored.");
+        var noData = BScanPalette.GetColor(BScanBipolarIntensity8.NoData);
+        Assert.IsTrue(colors.Any(color => color != (noData.B, noData.G, noData.R, noData.A)));
+    }
 
     [TestMethod]
     public Task Internal_factory_composes_controlled_source_and_small_productive_ring() => StaTest.Run(async () =>

@@ -1,3 +1,4 @@
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using UTStudio.App.Wpf;
 using UTStudio.App.Wpf.Services;
@@ -131,6 +132,111 @@ public sealed class BScanProductiveIntegrationTests
     });
 
     [TestMethod]
+    public Task Fixed_live_window_keeps_publishing_without_resize() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync();
+        for (ulong column = 0; column < 12; column++)
+        {
+            try { await fixture.AddAndPublishAsync(column); }
+            catch (TimeoutException error)
+            {
+                throw new AssertFailedException($"Column {column}; state={fixture.ViewModel.State.StoreRevision}; " +
+                    $"displayed={fixture.ViewModel.State.DisplayedRevision?.StoreRevision}; " +
+                    $"builds={fixture.Delivery.Diagnostics.RasterRegionsBuilt}; " +
+                    $"full={fixture.Delivery.Diagnostics.FullRefreshesBuilt}; " +
+                    $"incremental={fixture.Delivery.Diagnostics.IncrementalUpdatesBuilt}; " +
+                    $"stale={fixture.Delivery.Diagnostics.VisualBuildsSuperseded}; " +
+                    $"region={fixture.ViewModel.State.Region?.Snapshot.StoreRevision}; " +
+                    $"control={fixture.Control.AppliedSnapshot?.StoreRevision}; " +
+                    $"visualError={fixture.ViewModel.State.BScanVisualError}; " +
+                    $"uiError={fixture.ViewModel.State.UiInteractionError}", error);
+            }
+            var bitmap = (WriteableBitmap)fixture.Control.RasterSource!;
+            Assert.AreEqual(128, bitmap.PixelWidth);
+            Assert.AreEqual(16, bitmap.PixelHeight);
+            Assert.AreEqual(column + 1, fixture.Control.AppliedSnapshot!.StoreRevision);
+            Assert.AreEqual(512m, fixture.ViewModel.State.SpatialViewport!.Value.Span);
+        }
+
+        Assert.IsGreaterThan(1UL, fixture.Delivery.Diagnostics.IncrementalUpdatesBuilt);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
+    public Task Full_live_ring_scrolls_one_column_without_rebuilding_the_complete_raster() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512);
+        await fixture.WaitForRevisionAsync(512);
+        await DiagnosticWait.Until(() => fixture.Control.AppliedSnapshot is
+        { RasterWidth: 512, RenderConfigurationVersion: 1 },
+            "full live ring has applied its configured raster surface");
+        var bitmap = (WriteableBitmap)fixture.Control.RasterSource!;
+        Assert.AreEqual(512, bitmap.PixelWidth);
+        BScanDisplayedVisualIdentity acknowledged = fixture.Delivery.GetAcknowledgedDisplay(
+            fixture.ViewModel.ConsumerId)!;
+        Assert.AreEqual(512, acknowledged.Render.PixelWidth);
+        Assert.AreEqual(fixture.Control.AppliedSnapshot!.RenderConfigurationVersion,
+            acknowledged.Render.RenderConfigurationVersion);
+        ulong fullBefore = fixture.Delivery.Diagnostics.FullRefreshesBuilt;
+
+        await fixture.AddAndPublishAsync(512);
+
+        Assert.AreSame(bitmap, fixture.Control.RasterSource,
+            $"full={fixture.Control.AppliedSnapshot?.RequiresFullRefresh}; " +
+            $"reason={fixture.Control.AppliedSnapshot?.FullRefreshReason}; " +
+            $"store={fixture.Control.AppliedSnapshot?.StoreRevision}; " +
+            $"shift={fixture.Control.AppliedSnapshot?.HorizontalPixelShift}; " +
+            $"affected={fixture.Control.AppliedSnapshot?.AffectedRegion}");
+        Assert.AreEqual(513UL, fixture.Control.AppliedSnapshot!.StoreRevision);
+        Assert.IsFalse(fixture.Control.AppliedSnapshot.RequiresFullRefresh);
+        Assert.AreEqual(1, fixture.Control.AppliedSnapshot.HorizontalPixelShift);
+        Assert.AreEqual(new BScanRasterRectangle(511, 0, 1, 16),
+            fixture.Control.AppliedSnapshot.AffectedRegion);
+        Assert.AreEqual(fullBefore, fixture.Delivery.Diagnostics.FullRefreshesBuilt);
+        Assert.IsGreaterThan(0UL, fixture.Delivery.Diagnostics.IncrementalUpdatesBuilt);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
+    public Task Reducing_full_live_ring_keeps_incremental_scroll_and_ui_work_bounded() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512);
+        await fixture.WaitForRevisionAsync(512);
+        await DiagnosticWait.Until(() => fixture.Control.AppliedSnapshot is { RasterWidth: 512 },
+            "initial live ring has applied its configured surface");
+
+        fixture.ViewModel.DecreaseLiveWindowCommand.Execute(null);
+        Assert.AreEqual(256m, fixture.ViewModel.State.SpatialViewport!.Value.Span);
+        await DiagnosticWait.Until(() => fixture.ViewModel.LiveWindowColumns == 256 &&
+            fixture.Control.AppliedSnapshot is { RasterWidth: 256, SpatialViewport.Span: 256m },
+            "reduced live ring has applied one neutral pixel per trace");
+        BScanDisplayedVisualIdentity reduced = fixture.Delivery.GetAcknowledgedDisplay(
+            fixture.ViewModel.ConsumerId)!;
+        Assert.AreEqual(256, reduced.Render.PixelWidth);
+        Assert.AreEqual(256m, reduced.Render.SpatialViewport.Span);
+        Assert.AreEqual(256UL, reduced.Render.SpatialViewport.OriginAcquisitionIndex);
+        var bitmap = (WriteableBitmap)fixture.Control.RasterSource!;
+        ulong fullBefore = fixture.Delivery.Diagnostics.FullRefreshesBuilt;
+
+        await fixture.AddAndPublishAsync(512);
+
+        Assert.AreSame(bitmap, fixture.Control.RasterSource,
+            $"full={fixture.Control.AppliedSnapshot?.RequiresFullRefresh}; " +
+            $"reason={fixture.Control.AppliedSnapshot?.FullRefreshReason}; " +
+            $"width={fixture.Control.AppliedSnapshot?.RasterWidth}; " +
+            $"shift={fixture.Control.AppliedSnapshot?.HorizontalPixelShift}; " +
+            $"viewport={fixture.Control.AppliedSnapshot?.SpatialViewport}; " +
+            $"stateViewport={fixture.ViewModel.State.SpatialViewport}; " +
+            $"requiresFull={fixture.ViewModel.State.RequiresFullRefresh}");
+        Assert.IsFalse(fixture.Control.AppliedSnapshot!.RequiresFullRefresh);
+        Assert.AreEqual(1, fixture.Control.AppliedSnapshot.HorizontalPixelShift);
+        Assert.AreEqual(new BScanRasterRectangle(255, 0, 1, 16),
+            fixture.Control.AppliedSnapshot.AffectedRegion);
+        Assert.AreEqual(fullBefore, fixture.Delivery.Diagnostics.FullRefreshesBuilt);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
     public Task Productive_selection_uses_exact_identity_when_acquisition_index_differs_from_sequence() => StaTest.Run(async () =>
     {
         await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
@@ -147,6 +253,39 @@ public sealed class BScanProductiveIntegrationTests
             fixture.Selection.State.Snapshot!.Points.Select(point =>
                 (short)Math.Round(point.AmplitudePercent * 32768 / 100)).ToArray());
         Assert.AreEqual(BScanTraceResultKind.Available, fixture.Selection.State.LastResult);
+        Assert.AreEqual(400UL, fixture.ViewModel.State.Selection.AcquisitionIndex);
+        Assert.AreEqual(400UL, fixture.Control.SelectedAcquisitionIndex);
+    });
+
+    [TestMethod]
+    public Task Frozen_productive_selection_updates_ascan_and_cursor_without_raster_refresh() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
+        await fixture.WaitForRevisionAsync(4);
+        fixture.Ingress.CloseRun(fixture.Metadata.RunId);
+        await fixture.Ingress.WaitForCloseAsync(fixture.Metadata.RunId);
+
+        await fixture.Adapter.SelectColumnAsync(2);
+
+        Assert.AreEqual(2UL, fixture.Selection.State.AcquisitionIndex);
+        Assert.IsNotNull(fixture.Selection.State.Snapshot);
+        Assert.AreEqual(2UL, fixture.Control.SelectedAcquisitionIndex);
+        Assert.IsTrue(fixture.Control.HasSelectionVisual);
+        int width = Math.Max(1, (int)Math.Ceiling(fixture.Control.ActualWidth));
+        int height = Math.Max(1, (int)Math.Ceiling(fixture.Control.ActualHeight));
+        var composed = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
+        composed.Render(fixture.Control);
+        int stride = width * 4;
+        var pixels = new byte[stride * height];
+        composed.CopyPixels(pixels, stride, 0);
+        int cursorPixels = 0;
+        for (int offset = 0; offset < pixels.Length; offset += 4)
+        {
+            if (pixels[offset] == 87 && pixels[offset + 1] == 205 &&
+                pixels[offset + 2] == 255 && pixels[offset + 3] == 255)
+            { cursorPixels++; }
+        }
+        Assert.IsGreaterThan(10, cursorPixels);
     });
 
     [TestMethod]

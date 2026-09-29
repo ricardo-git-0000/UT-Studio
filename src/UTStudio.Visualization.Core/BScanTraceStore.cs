@@ -29,6 +29,7 @@ internal sealed class SharedTraceCopyOwnerPool : ITraceCopyOwnerPool
 
 internal sealed class BScanTraceStore
 {
+    private const int VisualWriteHeadroom = 4;
     private readonly object _gate = new();
     private readonly IShortArrayPool _pool;
     private readonly int _sampleCount;
@@ -70,7 +71,7 @@ internal sealed class BScanTraceStore
             const int indexedBucketBytes = sizeof(short) * 4;
             long fixedVisualBytes = checked(
                 checked((long)_bucketCount * indexedBucketBytes) +
-                checked((long)sampleCount * sizeof(short) * 2) +
+                checked((long)sampleCount * sizeof(short) * VisualWriteHeadroom) +
                 checked(2L * 1024 * 1024));
             long availableVisualBytes = options.VisualMemoryBudgetBytes - fixedVisualBytes;
             long visualBytesPerColumn = checked(128L + checked((long)_bucketCount * indexedBucketBytes));
@@ -347,13 +348,38 @@ internal sealed class BScanTraceStore
                 Slot slot = _slots[slotIndex];
                 if (!slot.Committed || slot.Writing || slot.IndexedGeneration != slot.Generation) { continue; }
                 if (count == destination.Length) { break; }
-                slot.Leases++;
-                _activeLeases++;
-                _maximumLeases = Math.Max(_maximumLeases, _activeLeases);
                 BScanTraceDescriptor descriptor = slot.Descriptor!;
-                destination[count++] = new(this, slotIndex, slot.Generation, descriptor,
-                    _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount), slot.Index,
-                    slot.VisualRevision);
+                if (IsWriteHeadroomSlot(slotIndex))
+                {
+                    short[] samples = ArrayPool<short>.Shared.Rent(_sampleCount);
+                    BScanIndexedMinMax[] index = ArrayPool<BScanIndexedMinMax>.Shared.Rent(_bucketCount);
+                    try
+                    {
+                        _blocks[slot.BlockIndex].Samples.AsSpan(slot.Offset, _sampleCount).CopyTo(samples);
+                        slot.Index.AsSpan().CopyTo(index);
+                        destination[count++] = new(descriptor, samples.AsMemory(0, _sampleCount),
+                            index.AsMemory(0, _bucketCount), slot.VisualRevision, () =>
+                            {
+                                ArrayPool<short>.Shared.Return(samples);
+                                ArrayPool<BScanIndexedMinMax>.Shared.Return(index);
+                            });
+                    }
+                    catch
+                    {
+                        ArrayPool<short>.Shared.Return(samples);
+                        ArrayPool<BScanIndexedMinMax>.Shared.Return(index);
+                        throw;
+                    }
+                }
+                else
+                {
+                    slot.Leases++;
+                    _activeLeases++;
+                    _maximumLeases = Math.Max(_maximumLeases, _activeLeases);
+                    destination[count++] = new(this, slotIndex, slot.Generation, descriptor,
+                        _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount), slot.Index,
+                        slot.VisualRevision);
+                }
                 minimum = Math.Min(minimum, descriptor.AcquisitionIndex);
                 maximum = Math.Max(maximum, descriptor.AcquisitionIndex);
             }
@@ -363,10 +389,33 @@ internal sealed class BScanTraceStore
         }
     }
 
+    private bool IsWriteHeadroomSlot(int slotIndex)
+    {
+        int distance = slotIndex - _nextSlot;
+        if (distance < 0) { distance += _slots.Length; }
+        return distance < Math.Min(VisualWriteHeadroom, _slots.Length);
+    }
+
     internal bool IsVisualStateCurrent(ulong revision, ulong wrapGeneration)
     {
-        lock (_gate) { return _leasesAllowed && _visualRevision == revision && _visualWrapGeneration == wrapGeneration; }
+        lock (_gate)
+        {
+            return HasCompleteVisualStateUnderLock() && _visualRevision == revision &&
+                _visualWrapGeneration == wrapGeneration;
+        }
     }
+
+    internal bool IsBootstrapStateCompatible(ulong revision, ulong wrapGeneration)
+    {
+        lock (_gate)
+        {
+            return HasCompleteVisualStateUnderLock() && _visualRevision >= revision &&
+                _visualWrapGeneration == wrapGeneration;
+        }
+    }
+
+    private bool HasCompleteVisualStateUnderLock() => _leasesAllowed && _activeWriters == 0 &&
+        !_slots.Any(slot => slot.Committed && slot.IndexedGeneration != slot.Generation);
 
     internal Task CloseAsync()
     {
@@ -381,6 +430,17 @@ internal sealed class BScanTraceStore
     internal void StopAccepting()
     {
         lock (_gate) { _accepting = false; }
+    }
+
+    internal bool IsAccepting { get { lock (_gate) { return _accepting; } } }
+
+    internal Task WaitForWritersAsync()
+    {
+        lock (_gate)
+        {
+            return _activeWriters == 0 ? Task.CompletedTask :
+                (_writerDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
     }
 
     private async Task CloseCoreAsync()
@@ -454,6 +514,7 @@ internal sealed class BScanTraceStore
     internal sealed class BScanTraceLease : IDisposable
     {
         private BScanTraceStore? _store;
+        private Action? _releaseDetached;
         private readonly int _slot;
         private readonly ulong _generation;
 
@@ -470,11 +531,25 @@ internal sealed class BScanTraceStore
             VisualRevision = visualRevision;
         }
 
+        internal BScanTraceLease(BScanTraceDescriptor descriptor, ReadOnlyMemory<short> samples,
+            ReadOnlyMemory<BScanIndexedMinMax> index, ulong visualRevision, Action releaseDetached)
+        {
+            Descriptor = descriptor;
+            Samples = samples;
+            Index = index;
+            VisualRevision = visualRevision;
+            _releaseDetached = releaseDetached;
+        }
+
         internal BScanTraceDescriptor Descriptor { get; }
         internal ReadOnlyMemory<short> Samples { get; }
         internal ReadOnlyMemory<BScanIndexedMinMax> Index { get; }
         internal ulong VisualRevision { get; }
-        public void Dispose() => Interlocked.Exchange(ref _store, null)?.ReleaseLease(_slot, _generation);
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _store, null)?.ReleaseLease(_slot, _generation);
+            Interlocked.Exchange(ref _releaseDetached, null)?.Invoke();
+        }
     }
 
     private sealed class Block(short[] samples, int columns)

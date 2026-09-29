@@ -121,4 +121,25 @@ public sealed class SimulatorPoolAndSignalTests
         Assert.ThrowsExactly<OperationCanceledException>(() =>
             SyntheticRfGenerator.Fill(samples, configuration, new SimulatorOptions(), 0, new CancellationToken(true)));
     }
+
+    [TestMethod]
+    public void RfEchoes_move_one_sample_per_frame_and_wrap_continuously_at_acquisition_boundary()
+    {
+        var configuration = SimulatorUtFrameSource.DefaultConfiguration;
+        var options = new SimulatorOptions(noiseAmplitude: 0);
+        var initial = new short[configuration.SampleCount];
+        var shifted = new short[configuration.SampleCount];
+        var wrapped = new short[configuration.SampleCount];
+
+        SyntheticRfGenerator.Fill(initial, configuration, options, 0, default);
+        SyntheticRfGenerator.Fill(shifted, configuration, options, 1, default);
+        SyntheticRfGenerator.Fill(wrapped, configuration, options, 1548, default);
+
+        Assert.AreEqual(initial[502], shifted[503]);
+        Assert.AreEqual(initial[498], shifted[499]);
+        Assert.AreEqual(initial[502], wrapped[2]);
+        Assert.AreEqual(initial[498], wrapped[^2]);
+        Assert.AreEqual(initial[1252], wrapped[752]);
+        Assert.AreEqual(0, wrapped[0]);
+    }
 }

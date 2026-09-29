@@ -395,7 +395,8 @@ public sealed class BScanIngressTests
     public async Task OpeningAnotherRunResetsRunScopedDiagnostics()
     {
         var clock = new IncrementingTimeProvider(TimeSpan.FromMilliseconds(2));
-        var ingress = new BScanIngress(Options(1), clock, new DeterministicShortPool(), new DeterministicOwnerPool());
+        var pool = new DeterministicShortPool();
+        var ingress = new BScanIngress(Options(1), clock, pool, new DeterministicOwnerPool());
         var first = Metadata(3);
         ingress.OpenRun(first);
         ingress.Accept(new ConventionalUtFrameMetadata(first.SourceId, first.RunId, first.Configuration,
@@ -408,11 +409,13 @@ public sealed class BScanIngressTests
         ingress.OpenRun(second);
         BScanDiagnostics reset = ingress.Diagnostics;
 
+        Assert.AreEqual(1, pool.ReturnCount);
         Assert.AreEqual(0UL, reset.BScanColumnsRejectedConfiguration);
         Assert.AreEqual(0UL, reset.BScanAcceptBudgetExceeded);
         Assert.AreEqual(0, reset.AcceptDuration.Count);
         ingress.CloseRun(second.RunId);
         await ingress.DisposeAsync();
+        Assert.AreEqual(pool.RentCount, pool.ReturnCount);
     }
 
     private static BScanOptions Options(int columns) => new(traceMemoryBudgetBytes: 4L * 1024 * 1024,

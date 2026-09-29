@@ -320,15 +320,21 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             status = _latestStatus;
         }
         AScanSnapshot? live = _state.LatestCompatibleLive;
-        if (session.Phase != SessionPhase.Running || live?.Metadata.RunId != session.RunId) { live = null; }
+        bool preservesFrozenRun = session.Phase is SessionPhase.Stopping or
+            SessionPhase.AwaitingFramesReleased or SessionPhase.Disconnecting or SessionPhase.Idle;
+        if (session.Phase == SessionPhase.Running && live?.Metadata.RunId != session.RunId) { live = null; }
+        else if (session.Phase != SessionPhase.Running && !preservesFrozenRun) { live = null; }
         if (session.Phase == SessionPhase.Running && visual is not null && visual.Metadata.RunId == session.RunId &&
             visual.Metadata.SourceId == session.SourceId) { live = visual; }
         if (status?.TerminalError is not null) { live = null; }
-        bool runChanged = _state.Session.RunId != session.RunId;
+        AcquisitionRunId? effectiveRun = session.RunId ?? (preservesFrozenRun
+            ? live?.Metadata.RunId : null);
+        AcquisitionRunId? previousEffectiveRun = _state.Session.RunId ?? _state.LatestCompatibleLive?.Metadata.RunId;
+        bool runChanged = previousEffectiveRun != effectiveRun;
         if (runChanged) { _returnedSelection = null; _ = _selectionCoordinator?.SetRunAsync(session.RunId); }
         BScanSelectionState? selection = runChanged ? null : _selectionCoordinator?.State ?? _state.Selection;
         bool selected = !runChanged && _state.DisplayMode == AScanDisplayMode.Selected &&
-            selection?.Snapshot is not null && selection.RunId == session.RunId;
+            selection?.Snapshot is not null && selection.RunId == effectiveRun;
         AScanSnapshot? current = selected ? selection!.Snapshot : live;
         AScanDisplayMode mode = current is null ? AScanDisplayMode.NoData : selected
             ? AScanDisplayMode.Selected : AScanDisplayMode.Live;
@@ -410,7 +416,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _lifetime.Post(() =>
         {
             if (IsClosing || _selectionCoordinator?.State is not { } selection ||
-                selection.RunId != _state.Session.RunId) { return; }
+                selection.RunId != (_state.Session.RunId ?? _state.LatestCompatibleLive?.Metadata.RunId)) { return; }
             if (selection.LastResult == BScanTraceResultKind.Available && selection.Snapshot is { } selected &&
                 !ReferenceEquals(selected, _returnedSelection) && IsCompatibleSelection(selected))
             { ReplaceVisibleSnapshot(selected, AScanDisplayMode.Selected, selection); }

@@ -25,3 +25,14 @@ Formato comprobado con la [documentación oficial de subagentes](https://learn.c
 Indicar objetivo y requisito/ADR afectado, entradas, lista exclusiva de archivos permitidos (vacía para revisión), dependencias, restricciones, criterio de aceptación y formato de respuesta. Ejemplo: pedir a ut_acquisition revisar data-pipeline.md sin editar y devolver cálculos, riesgos y pendientes.
 El coordinador registra propietario antes de editar. Revisiones independientes en paralelo; cambios compartidos se consolidan secuencialmente por su propietario. Un hallazgo no transfiere propiedad. No editar un archivo ya escrito por otro agente en la misma tarea.
 Contrato compartido: solicitar revisión de solution_architect antes de incorporarlo. El autor ejecuta comprobaciones pertinentes; quality_reviewer evalúa corrección y repository_reviewer revisa diff y archivos nuevos en lectura.
+
+## Revisión de visualización interactiva
+
+Para cambios B-Scan o raster incremental, los encargos deben comprobar además estos límites:
+
+- `solution_architect`: ownership, ciclo de vida del store y coherencia entre capacidad visible, viewport, revisión y petición de raster; un run detenido puede conservarse en lectura hasta ser retirado por el siguiente run o por el cierre global.
+- `ut_visualization`: separar el rango residente autoritativo del rango parcial representado por un incremental; verificar ring acotado, wrap, full de recuperación, desplazamiento entero y correspondencia de una traza por columna neutral cuando la ventana está llena.
+- `wpf_mvvm_specialist`: revisar reentrada de bindings/layout durante cambios de tamaño, prioridad de Stop/cierre y overlays independientes del bitmap. El cursor de selección no debe depender de que ocurra zoom, resize ni otro render del raster.
+- `quality_reviewer`: exigir regresiones con la composición productiva para cambios de tamaño en live, selección congelada sin refresco del raster y capacidad de respuesta de los comandos. No basta una prueba aislada del modelo neutral si el defecto atraviesa Presentation, adaptador y WPF.
+
+La región dirty limita el coste de actualización, pero no redefine el dominio válido de interacción. Una acción del usuario que cambia geometría debe invalidar de inmediato trabajo obsoleto y producir una única resincronización full; el flujo live normal continúa coalesciendo actualizaciones.

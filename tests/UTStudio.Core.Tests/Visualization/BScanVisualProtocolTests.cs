@@ -129,6 +129,36 @@ public sealed class BScanVisualProtocolTests
     }
 
     [TestMethod]
+    public async Task FrozenRunRemainsRenderableAndSelectableUntilRetired()
+    {
+        await using Harness harness = await Harness.CreateAsync(columns: 4);
+        await harness.AddAsync(1, 1, [10, 20, 30, 40]);
+        using BScanRasterRegion baseline = await harness.RenderAsync(harness.Request());
+
+        harness.Ingress.CloseRun(harness.Metadata.RunId);
+        await harness.Ingress.WaitForCloseAsync(harness.Metadata.RunId);
+
+        ScanTimeViewport time = ScanTimeViewportOperations.Zoom(
+            baseline.Snapshot.TimeViewport, .000002, 2);
+        BScanSpatialViewport spatial = BScanSpatialViewportOperations.ZoomAt(
+            baseline.Snapshot.SpatialViewport, new(0, 3), 1m, 2m);
+        using BScanRasterRegion frozen = await harness.RenderAsync(harness.From(baseline.Snapshot) with
+        {
+            TimeViewport = time,
+            SpatialViewport = spatial
+        });
+        Assert.AreEqual(harness.Metadata.RunId, frozen.Snapshot.RunId);
+        Assert.AreEqual(time, frozen.Snapshot.TimeViewport);
+        Assert.AreEqual(spatial, frozen.Snapshot.SpatialViewport);
+        Assert.IsTrue(harness.Ingress.TryResolveIdentity(harness.Metadata.RunId, 1, out BScanTraceIdentity identity));
+        using BScanTraceSnapshot selected = (await harness.Ingress.GetTraceAsync(identity)).Trace!;
+        CollectionAssert.AreEqual(new short[] { 10, 20, 30, 40 }, selected.Samples.ToArray());
+
+        harness.Ingress.Accept(harness.Metadata, 2, 2, TimeSpan.Zero, null, [50, 60, 70, 80]);
+        Assert.AreEqual(1UL, harness.Ingress.Diagnostics.BScanColumnsRejectedClosed);
+    }
+
+    [TestMethod]
     public async Task RasterDimensionChangeHasExactReason()
     {
         await using Harness harness = await Harness.CreateAsync();
@@ -187,6 +217,66 @@ public sealed class BScanVisualProtocolTests
     }
 
     [TestMethod]
+    public async Task Live_window_is_reconciled_with_captured_ring_after_queued_wrap()
+    {
+        await using Harness harness = await Harness.CreateAsync(columns: 4);
+        for (ulong index = 1; index <= 4; index++)
+        {
+            short value = checked((short)(10 + index));
+            await harness.AddAsync(index, index, [value, value, value, value]);
+        }
+        var queuedBeforeWrap = new BScanRenderRequest(harness.Metadata.RunId,
+            new(1, 0, 4), ScanTimeViewportOperations.Create(0, .000004), 4, 4, 1,
+            FollowLiveWindow: true);
+
+        await harness.AddAsync(5, 5, [15, 15, 15, 15]);
+        using BScanRasterRegion region = await harness.RenderAsync(queuedBeforeWrap);
+
+        Assert.AreEqual(new BScanSpatialViewport(2, 0, 4), region.Snapshot.SpatialViewport);
+        Assert.IsTrue(region.Pixels.Span.ToArray().All(pixel => pixel != BScanBipolarIntensity8.NoData));
+    }
+
+    [TestMethod]
+    public async Task Continuous_traces_expand_without_no_data_when_raster_is_wider_than_signal_count()
+    {
+        await using Harness harness = await Harness.CreateAsync(columns: 4);
+        for (ulong index = 1; index <= 3; index++)
+        {
+            short value = checked((short)(20 + index));
+            await harness.AddAsync(index, index, [value, value, value, value]);
+        }
+        var request = new BScanRenderRequest(harness.Metadata.RunId,
+            new(0, 0, 4), ScanTimeViewportOperations.Create(0, .000004), 8, 4, 1);
+
+        using BScanRasterRegion region = await harness.RenderAsync(request);
+
+        Assert.AreEqual(8, region.Width);
+        Assert.IsTrue(region.Pixels.Span.ToArray().All(pixel => pixel != BScanBipolarIntensity8.NoData));
+    }
+
+    [TestMethod]
+    public async Task Full_raster_releases_oldest_slot_before_finishing_remaining_columns()
+    {
+        await using Harness harness = await Harness.CreateAsync(columns: 4);
+        for (ulong index = 1; index <= 3; index++)
+        {
+            await harness.AddAsync(index, index, [11, 12, 13, 14]);
+        }
+        int remainingLeasesAfterSecondColumn = -1;
+        harness.Delivery.AfterRasterColumnReleased = (pixelX, remainingLeases) =>
+        {
+            if (pixelX == 1)
+            { remainingLeasesAfterSecondColumn = remainingLeases; }
+        };
+
+        using BScanRasterRegion region = await harness.RenderAsync(harness.Request());
+
+        Assert.IsGreaterThanOrEqualTo(0, remainingLeasesAfterSecondColumn);
+        Assert.IsLessThan(4, remainingLeasesAfterSecondColumn);
+        harness.Delivery.AfterRasterColumnReleased = null;
+    }
+
+    [TestMethod]
     public async Task ConstructionErrorForcesExactRecoveryOnNextCandidate()
     {
         var pool = new SwitchableBytePool();
@@ -227,6 +317,70 @@ public sealed class BScanVisualProtocolTests
         AssertFull(recovered.Snapshot, BScanFullRefreshReason.Recovery,
             baselineSnapshot.StoreRevision, 3, harness.Metadata.RunId);
         Assert.AreEqual(1, harness.Delivery.Diagnostics.ActiveRasterOwners);
+    }
+
+    [TestMethod]
+    public async Task Bootstrap_candidate_survives_revision_advance_within_same_run_and_wrap()
+    {
+        await using Harness harness = await Harness.CreateAsync(columns: 4);
+        BScanRenderRequest request = harness.Request();
+        var entered = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        harness.Delivery.BeforeRasterCandidateValidation = () => { entered.Set(); release.Wait(); };
+        Task<BScanRasterResult> candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+
+        await harness.AddAsync(1, 1, [4, 5, 6, 7]);
+        release.Set();
+
+        BScanRasterResult result = await candidate.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
+        using BScanRasterRegion region = result.Region!;
+        Assert.IsTrue(region.Snapshot.RequiresFullRefresh);
+        Assert.AreEqual(1UL, region.Snapshot.StoreRevision);
+        Assert.AreEqual(0UL, region.Snapshot.WrapGeneration);
+        harness.Delivery.BeforeRasterCandidateValidation = null;
+    }
+
+    [TestMethod]
+    public async Task Wide_live_window_candidate_survives_concurrent_signal_and_can_continue_sliding()
+    {
+        await using Harness harness = await Harness.CreateAsync(columns: 1024);
+        for (ulong index = 1; index < 1024; index++)
+        {
+            await harness.AddAsync(index, index, [1, 2, 3, 4]);
+        }
+        using BScanRasterRegion baseline = await harness.RenderAsync(harness.Request());
+        await harness.AddAsync(1024, 1024, [4, 5, 6, 7]);
+        BScanRenderRequest request = harness.From(baseline.Snapshot) with
+        {
+            FollowLiveWindow = true,
+            Displayed = new(baseline.Snapshot.Stream,
+                new(baseline.Snapshot.SnapshotVersion, baseline.Snapshot.StoreRevision,
+                    baseline.Snapshot.WrapGeneration),
+                new(baseline.Snapshot.SpatialViewport, baseline.Snapshot.TimeViewport,
+                    baseline.Snapshot.RasterWidth, baseline.Snapshot.RasterHeight,
+                    baseline.Snapshot.RenderConfigurationVersion))
+        };
+        var entered = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        harness.Delivery.BeforeRasterCandidateValidation = () => { entered.Set(); release.Wait(); };
+        Task<BScanRasterResult> candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+
+        await harness.AddAsync(1025, 1025, [8, 9, 10, 11]);
+        release.Set();
+
+        BScanRasterResult result = await candidate.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
+        using BScanRasterRegion region = result.Region!;
+        Assert.AreEqual(1025UL, region.Snapshot.StoreRevision);
+        Assert.AreEqual(new BScanSpatialViewport(1, 0, 1024), region.Snapshot.SpatialViewport);
+        Assert.IsFalse(region.Snapshot.RequiresFullRefresh);
+        Assert.AreEqual(1, region.Snapshot.HorizontalPixelShift);
+        Assert.AreEqual(new BScanRasterRectangle(1023, 0, 1, 4), region.Snapshot.AffectedRegion);
+        Assert.AreEqual(4, region.Pixels.Length);
+        harness.Delivery.BeforeRasterCandidateValidation = null;
     }
 
     [TestMethod]

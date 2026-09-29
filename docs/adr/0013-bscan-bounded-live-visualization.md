@@ -245,6 +245,13 @@ nivel fuerzan resincronización. Core produce una región coherente bajo leases 
 del store durante rasterización costosa y valida identidad/revisión antes de publicarla. Un resultado
 obsoleto se descarta. WPF recrea bitmap solo por dimensión física, DPI, formato o run.
 
+El full de establecimiento de una superficie que todavía no tiene base compatible —bootstrap inicial
+o cambio de dimensiones/configuración— puede publicar la revisión coherente capturada bajo leases aunque
+durante su rasterización avance la revisión visual, siempre que sigan siendo la misma run y generación
+de wrap. Así la apertura, reapertura y resize bajo live no sufren inanición; la siguiente publicación
+alcanza el estado reciente. Cualquier candidato incremental, con base compatible previa, o que cruce
+run o wrap conserva la validación estricta y se descarta como obsoleto.
+
 La Fase 3 distingue la revisión de admisión interna de la revisión visual publicada. Esta última avanza
 al confirmar cada índice y es la que ocupan `BaseStoreRevision` y `StoreRevision` en el protocolo
 visual: una columna todavía no indexada no puede declararse representada. El nombre se conserva como
@@ -271,8 +278,55 @@ consumidores raster configurables y dos owners por consumidor. Los consumidores 
 longitud real del owner antes de transferirlo. Cada consumidor tiene además un techo proporcional que
 impide monopolizar el presupuesto. Una solicitud no admitida devuelve `ResourceLimit`; el cierre libera
 owners y desregistra la cuota. Un owner transferido continúa válido tras wrap hasta su liberación.
-Mientras Presentation está en reset espacial, el viewport sigue el rango residente que crece o avanza.
-El primer zoom o pan desactiva ese autoajuste; `ResetSpatial` lo reactiva.
+Mientras Presentation está en reset espacial, el viewport tiene desde la primera traza la anchura fija
+configurada por el usuario, acotada por la capacidad efectiva del ring. Los controles de tamaño usan
+pasos binarios y solo cambian la ventana visible, sin reasignar el ring. Durante el llenado inicial las
+columnas nuevas ocupan esa superficie
+sin reescalar las anteriores; cuando el ring se llena y hace wrap, la ventana avanza con el rango
+residente y las señales se desplazan. El primer zoom o pan desactiva ese seguimiento; `ResetSpatial` lo
+reactiva.
+
+Una petición marcada como seguimiento live reconcilia su ventana con el rango residente capturado por
+el mismo raster. Esto evita franjas `NoData` cuando el ring avanza mientras la petición espera el
+intervalo de publicación. Los viewports de zoom o pan manual no se reconcilian de esta forma.
+Una captura que coincida con un writer activo o con un slot comprometido todavía sin indexar no puede
+confirmarse como estado visual actual: se descarta como obsoleta y se reintenta después de la
+publicación indexada, sin bloquear al productor.
+Durante un raster completo las leases se liberan incrementalmente, en orden espacial, tan pronto como
+su grupo de trazas queda reducido a una columna de píxeles. En particular, el slot residente más antiguo
+no permanece fijado hasta terminar todo el raster y el productor puede reutilizarlo durante el wrap.
+Además, las cuatro posiciones físicas que el productor reutilizará a continuación se capturan como
+copias visuales acotadas, no como leases del ring. Ese headroom impide que el renderer rechace una
+adquisición al comenzar el wrap. En seguimiento live, una captura coherente puede publicarse aunque la
+revisión avance durante un raster costoso, siempre dentro de la misma run y generación de wrap; queda
+rezagada de forma observable y el refresco coalescido posterior la alcanza. Zoom y pan manuales mantienen
+la barrera estricta. Un cambio de run o generación invalida el candidato, y nunca se fuerza ni se oculta
+la pérdida de una traza productiva.
+Para conservar la respuesta de la UI durante ese desplazamiento, la publicación visual live se agrupa
+a un máximo de 10 Hz cuando la ventana supera 512 trazas; hasta 512 conserva 30 Hz. Esto no limita la
+adquisición ni el indexado: únicamente sustituye estados visuales intermedios por el más reciente.
+Cuando la ventana live está llena, el ancho del raster neutral coincide con el número de trazas visibles
+(para todos los tamaños admitidos hasta 1.024, no solo para ventanas grandes) y se escala en WPF por
+vecino más próximo. Cada publicación incorpora conjuntamente todas
+las revisiones nuevas: Core reduce solo sus columnas y publica `HorizontalPixelShift`; WPF desplaza el
+bitmap existente mediante copias por bloques y aplica únicamente la franja derecha. El RF y el ring de
+adquisición siguen siendo la autoridad y no conocen píxeles, paletas ni WPF. Presentation confirma por
+consumidor la identidad que alcanzó la superficie; una metadata pendiente no puede degradar esa base.
+Resize, DPI, zoom/pan, nueva run o firma incompatible conservan el camino full transaccional.
+El cambio explícito de tamaño de la ventana live es una invalidación geométrica prioritaria. Capacidad,
+viewport y petición se actualizan como un estado coherente antes de notificar propiedades, porque los
+bindings y el layout WPF pueden reentrar durante esa notificación. El trabajo de raster incompatible se
+cancela o sustituye inmediatamente y se permite una única recuperación full; las publicaciones live
+ordinarias continúan coalesciendo y las siguientes revisiones vuelven al desplazamiento incremental.
+Stop, cierre y comandos UI no pueden quedar detrás de una acumulación de renders obsoletos.
+Cada traza continua representa la celda espacial `[i, i + 1)`, no un punto infinitesimal en `i`. Si la
+superficie tiene más píxeles que trazas visibles, la celda se expande por vecino más próximo y no crea
+franjas `NoData`; los huecos negros quedan reservados para discontinuidades reales entre identidades.
+Visualization.Wpf puede importar paletas XML de hasta 1 MiB con `palette/allColors/color` y canales RGB
+enteros 0..255. `allMinColors` define `NoData`; los colores principales se interpolan a las 255
+intensidades de RF y `allMaxColors`, si existe, fija el extremo superior. El parser prohíbe DTD y
+resolución externa. La selección de archivo y el estado de carga pertenecen exclusivamente a WPF; el
+raster neutral conserva intensidades, formato y ownership sin conocer colores ni rutas.
 
 ## Interacción, inspección y accesibilidad
 
@@ -326,6 +380,17 @@ Cualquier estado --cierre--> Closing --> Closed
 El último live continúa actualizándose durante Selected. Zoom/pan no recopian RF. Nueva run cancela
 resolución, selección y viewport incompatibles. Cerrar B no borra una selección confirmada mostrada por
 A; cerrar MainWindow dispone toda selección y espera la barrera.
+
+Detener la adquisición sella la run actual y espera sus escritores e indexado, pero no retira su store.
+La run queda congelada y admite rasterizados posteriores para zoom, pan y resize, además de resolución
+exacta B→A. El último A-Scan live compatible permanece como retorno de `ReturnToLive`. Una nueva run
+retira el store congelado antes de abrir el siguiente; el cierre global lo retira definitivamente.
+El cursor vertical de selección puede situarse con clic y arrastrarse mientras la imagen está congelada.
+Se dibuja como overlay independiente por encima del bitmap y se invalida al cambiar la selección, sin
+esperar zoom, resize ni una nueva publicación raster. El hit testing usa siempre `ResidentRange`, que
+es el dominio autoritativo completo del store; `RepresentedRange` solo describe las columnas incluidas
+en el full o incremental actual y no puede utilizarse para rechazar una selección residente. La petición
+optimista se muestra de inmediato y después se confirma con la traza exacta o se revierte si falla.
 
 ## Viewport compartido, fronteras y ventanas
 

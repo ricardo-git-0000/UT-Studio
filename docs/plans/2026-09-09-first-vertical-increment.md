@@ -36,6 +36,11 @@ La configuración fija por ejecución contiene SourceId, RunId, canal físico, N
 
 Configuración de demostración aprobada: canal 0, offset 0, semilla 1; dos ecos sinusoidales de 5 MHz en 10 y 25 microsegundos, amplitudes 60 % y 30 % FS, envolvente gaussiana con desviación típica 0,35 microsegundos y ruido opcional hasta 1 % FS. Validar portadora menor que fs/2, parámetros finitos y límites de configuración.
 
+Actualización de demostración del 2026-09-27: ambos ecos avanzan una muestra temporal por A-Scan y
+recirculan dentro del rango de adquisición. Conservan separación, forma y amplitud; al cruzar el final,
+la envolvente reaparece de forma continua por el inicio. Es comportamiento sintético visual, no un
+modelo de encoder ni de eje físico.
+
 Inyectar TimeProvider y usar reloj manual en pruebas. Definir algoritmo pseudoaleatorio explícito/versionado, redondeo y saturación. Primer disparo inmediato; tras cada entrega exitosa esperar un período antes del siguiente. Hasta 100/s es un máximo objetivo, no garantía de frecuencia exacta: generación/backpressure añaden retraso. Sin ráfagas para recuperar ticks ni huecos de secuencia por disparos no realizados.
 
 Payload reproducible por configuración/semilla/secuencia en entorno fijo; timestamps también requieren mismo reloj y calendario de consumo. Comparaciones analíticas con tolerancia justificada, sin prometer identidad de funciones trascendentes entre plataformas. No fallos avanzados todavía.

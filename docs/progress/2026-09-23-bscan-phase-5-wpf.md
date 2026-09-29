@@ -62,3 +62,7 @@ La Tanda 3 está [definida](../plans/2026-09-26-bscan-tanda-3-acceptance.md), pe
 propósito es aceptar el incremento existente mediante recorrido manual, estabilidad, accesibilidad,
 matriz automatizada y rendimiento diagnóstico. Duración, ciclos, umbral de tendencia de memoria,
 hardware y herramientas de medición permanecen como decisiones explícitas del usuario.
+
+Las correcciones funcionales descubiertas posteriormente durante la aceptación manual —ring live,
+redimensionado responsivo, rango residente, cursor independiente y run congelado— se consolidan en el
+[resumen de correcciones de aceptación](2026-09-29-bscan-manual-acceptance-corrections.md).

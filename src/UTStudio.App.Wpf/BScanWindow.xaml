@@ -19,10 +19,22 @@
       <Button Content="Tiempo −" Command="{Binding ZoomTimeOutCommand}" Margin="0,0,6,0" />
       <Button Content="Espacio +" Command="{Binding ZoomSpatialInCommand}" Margin="0,0,6,0" />
       <Button Content="Espacio −" Command="{Binding ZoomSpatialOutCommand}" Margin="0,0,6,0" />
+      <Button Content="Tamaño B -" Command="{Binding DecreaseLiveWindowCommand}" Margin="0,0,6,0"
+              AutomationProperties.Name="Reducir número de trazas visibles B-Scan" />
+      <TextBlock Text="{Binding LiveWindowColumns, StringFormat={}{0} trazas}" VerticalAlignment="Center"
+                 Margin="0,0,6,0" AutomationProperties.Name="Tamaño visible B-Scan" />
+      <Button Content="Tamaño B +" Command="{Binding IncreaseLiveWindowCommand}" Margin="0,0,6,0"
+              AutomationProperties.Name="Aumentar número de trazas visibles B-Scan" />
+      <Button Content="Cargar paleta" Click="OnLoadPalette" Margin="0,0,6,0"
+              AutomationProperties.Name="Cargar paleta de colores B-Scan desde archivo" />
       <Button Content="Restablecer" Command="{Binding ResetAllCommand}" Margin="0,0,12,0" />
       <TextBlock Text="{Binding State.Phase}" VerticalAlignment="Center" />
     </StackPanel>
     <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0" AutomationProperties.Name="Estado B-Scan">
+      <TextBlock x:Name="PaletteStatus" Text="Paleta: predeterminada" />
+      <TextBlock Text="{Binding State.Diagnostics.ColumnsAccepted, StringFormat=Aceptadas: {0}}" />
+      <TextBlock Text="{Binding State.Diagnostics.ColumnsRejectedPinnedSlot, StringFormat=Rechazadas por slot fijado: {0}}" />
+      <TextBlock Text="{Binding State.Diagnostics.ColumnsEvicted, StringFormat=Reemplazadas: {0}}" />
       <TextBlock Text="{Binding State.Selection.Residency, StringFormat=Selección: {0}, TargetNullValue=Selección: ninguna}" />
       <TextBlock Foreground="#FFD18A" Text="{Binding State.SelectionError}" />
       <TextBlock Foreground="#FFD18A" Text="{Binding State.BScanVisualError}" />

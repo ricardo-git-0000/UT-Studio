@@ -18,7 +18,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private BScanRasterRegion? _visibleRegion;
     private readonly SafeRelayCommand _zoomTimeIn, _zoomTimeOut, _panTimeUp, _panTimeDown, _resetTime,
         _zoomSpatialIn, _zoomSpatialOut, _panSpatialLeft, _panSpatialRight, _resetSpatial, _resetAll,
-        _refresh, _cancelSelection;
+        _decreaseLiveWindow, _increaseLiveWindow, _refresh, _cancelSelection;
     private BScanViewState _state = BScanViewState.Empty;
     private BScanVisualSnapshot? _latestMetadata;
     private CancellationTokenSource? _rasterCancellation;
@@ -26,10 +26,14 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private readonly HashSet<Task> _rasterOperations = [];
     private long _rasterGeneration;
     private int _pixelWidth = 1, _pixelHeight = 1;
+    private int _liveWindowColumns;
+    private int _maximumLiveWindowColumns = 1;
     private ulong _renderConfigurationVersion;
     private BScanRenderRequest? _lastRequested;
     private long _metadataGeneration, _appliedMetadataGeneration;
     private bool _applyingMetadata;
+    private bool _refreshAfterRaster;
+    private bool _fullRefreshAfterRaster;
     private int _closing;
     private Task? _disposal;
     private int _recoveryPosted;
@@ -65,6 +69,10 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         _panSpatialRight = Command(() => PanSpatial(.1m), CanPanSpatialRight);
         _resetSpatial = Command(ResetSpatial, () => HasSpatial() && !_state.IsSpatialAutoFit);
         _resetAll = Command(ResetAll, () => HasTime() || HasSpatial());
+        _decreaseLiveWindow = Command(() => ChangeLiveWindow(increase: false),
+            () => _liveWindowColumns > 1);
+        _increaseLiveWindow = Command(() => ChangeLiveWindow(increase: true),
+            () => _liveWindowColumns < _maximumLiveWindowColumns);
         _refresh = Command(() => RequestRefresh(force: true, full: true), HasRenderableState);
         _cancelSelection = Command(() => _selection.Cancel(_consumerId), () => _state.Selection.IsPending);
         try { _subscription = _source.Subscribe(new Observer(this)); }
@@ -87,6 +95,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     public string ConsumerId => _consumerId;
     public ScanTimeViewport? TimeViewport => _timeViewport.Viewport;
     public long ObserverErrorCount => Interlocked.Read(ref _observerErrors);
+    public int LiveWindowColumns => _liveWindowColumns;
+    public int MaximumLiveWindowColumns => _maximumLiveWindowColumns;
     public IRelayCommand ZoomTimeInCommand => _zoomTimeIn;
     public IRelayCommand ZoomTimeOutCommand => _zoomTimeOut;
     public IRelayCommand PanTimeUpCommand => _panTimeUp;
@@ -98,6 +108,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     public IRelayCommand PanSpatialRightCommand => _panSpatialRight;
     public IRelayCommand ResetSpatialCommand => _resetSpatial;
     public IRelayCommand ResetAllCommand => _resetAll;
+    public IRelayCommand DecreaseLiveWindowCommand => _decreaseLiveWindow;
+    public IRelayCommand IncreaseLiveWindowCommand => _increaseLiveWindow;
     public IRelayCommand RefreshCommand => _refresh;
     public IRelayCommand CancelSelectionCommand => _cancelSelection;
 
@@ -159,6 +171,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             selection = _selection.SelectAsync(_consumerId, identity);
         }).ConfigureAwait(false);
         await selection.ConfigureAwait(false);
+        await _lifetime.InvokeAsync(ApplySelection).ConfigureAwait(false);
     }
 
     public async Task SelectColumnAsync(ulong acquisitionIndex)
@@ -171,6 +184,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             selection = _selection.SelectAsync(_consumerId, run, acquisitionIndex);
         }).ConfigureAwait(false);
         await selection.ConfigureAwait(false);
+        await _lifetime.InvokeAsync(ApplySelection).ConfigureAwait(false);
     }
 
     public void CancelSelection() => _lifetime.Post(() => _selection.Cancel(_consumerId));
@@ -274,6 +288,25 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     }
     private void ResetAll() { ResetTime(); ResetSpatial(); }
 
+    private void ChangeLiveWindow(bool increase)
+    {
+        if (_latestMetadata is null || _state.ResidentRange is not { } resident) { return; }
+        int next = increase
+            ? (int)Math.Min((long)_maximumLiveWindowColumns, Math.Max(1L, (long)_liveWindowColumns * 2))
+            : Math.Max(1, _liveWindowColumns / 2);
+        if (next == _liveWindowColumns) { return; }
+        _liveWindowColumns = next;
+        ReplaceState(_state with
+        {
+            SpatialViewport = CreateLiveWindow(resident, next),
+            IsSpatialAutoFit = true,
+            RequiresFullRefresh = true
+        });
+        OnPropertyChanged(nameof(LiveWindowColumns));
+        RefreshCommands();
+        RequestRefresh(force: true, full: true);
+    }
+
     private void Receive(BScanVisualUpdate update)
     {
         if (update.Snapshot.ConsumerId != _consumerId) { return; }
@@ -291,9 +324,28 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         bool newRun = _latestMetadata?.RunId != snapshot.RunId;
         _latestMetadata = snapshot;
         if (newRun) { _ = _selection.SetRunAsync(snapshot.RunId); }
+        BScanVisualDiagnostics diagnostics = _source.Diagnostics;
+        int maximumLiveWindow = Math.Max(diagnostics.EffectiveCapacity, 1);
+        int liveWindow = _liveWindowColumns == 0
+            ? maximumLiveWindow
+            : Math.Clamp(_liveWindowColumns, 1, maximumLiveWindow);
+        if (_maximumLiveWindowColumns != maximumLiveWindow)
+        {
+            _maximumLiveWindowColumns = maximumLiveWindow;
+            OnPropertyChanged(nameof(MaximumLiveWindowColumns));
+        }
+        if (_liveWindowColumns != liveWindow)
+        {
+            _liveWindowColumns = liveWindow;
+            OnPropertyChanged(nameof(LiveWindowColumns));
+        }
         BScanSpatialViewport spatial = newRun || _state.SpatialViewport is null || _state.IsSpatialAutoFit
-            ? BScanSpatialViewportOperations.Reset(snapshot.ResidentRange)
+            ? CreateLiveWindow(snapshot.ResidentRange, liveWindow)
             : BScanSpatialViewportOperations.Reconcile(_state.SpatialViewport.Value, snapshot.ResidentRange);
+        // Metadata wakes the consumer; the subsequent region request carries the authoritative
+        // displayed identity. Do not discard that base merely because a queued metadata request
+        // was created before the latest region reached the UI.
+        bool metadataRequiresFull = snapshot.RequiresFullRefresh && _state.DisplayedRevision is null;
         _applyingMetadata = true;
         _timeViewport.ReconcileDomainDeferred(_consumerId, snapshot.RunId, snapshot.SnapshotVersion,
             snapshot.TemporalDomain.DomainMinimumSeconds, snapshot.TemporalDomain.DomainMaximumSeconds);
@@ -305,12 +357,12 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             RunId = snapshot.RunId,
             SnapshotVersion = snapshot.SnapshotVersion,
             StoreRevision = snapshot.StoreRevision,
-            Diagnostics = _source.Diagnostics,
+            Diagnostics = diagnostics,
             ResidentRange = snapshot.ResidentRange,
             TemporalDomain = snapshot.TemporalDomain,
             SpatialViewport = spatial,
             TimeViewportBinding = binding,
-            RequiresFullRefresh = newRun || snapshot.RequiresFullRefresh || _state.RequiresFullRefresh,
+            RequiresFullRefresh = newRun || metadataRequiresFull || _state.RequiresFullRefresh,
             Selection = newRun ? BScanSelectionState.Empty with { RunId = snapshot.RunId } : _selection.State,
             SelectionError = newRun ? null : _selection.State.SelectionError,
             IsSpatialAutoFit = newRun || _state.IsSpatialAutoFit
@@ -320,21 +372,47 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         PublishTimeBinding();
         _selection.UpdateResidency(_consumerId, snapshot.RunId, snapshot.SnapshotVersion, snapshot.ResidentRange);
         RefreshCommands();
-        RequestRefresh();
+        // The render request carries the displayed base, not the target store revision. A prior
+        // no-change request can therefore compare equal after new metadata arrives; metadata is
+        // authoritative and must bypass that request-level deduplication.
+        RequestRefresh(force: true);
+    }
+
+    private static BScanSpatialViewport CreateLiveWindow(BScanAcquisitionRange residentRange, int visibleColumns)
+    {
+        decimal residentCount = checked((decimal)(residentRange.Last - residentRange.First) + 1);
+        ulong width = (ulong)Math.Max(visibleColumns, 1);
+        ulong first = residentCount <= width
+            ? residentRange.First
+            : residentRange.Last - width + 1;
+        return new(first, 0, width);
     }
 
     private void RequestRefresh(bool force = false, bool full = false)
     {
         if (!HasRenderableState() || _latestMetadata is null || _timeViewport.Viewport is not { } time) { return; }
+        bool surfaceBootstrap;
+        lock (_gate)
+        {
+            if (!_rasterOperation.IsCompleted && !full)
+            {
+                _refreshAfterRaster = true;
+                return;
+            }
+            surfaceBootstrap = NeedsCurrentRasterUnderLock();
+        }
+        bool requestFull = full || surfaceBootstrap;
+        int rasterWidth = CurrentRasterWidth();
         var request = new BScanRenderRequest(_latestMetadata.RunId, _state.SpatialViewport!.Value, time,
-            _pixelWidth, _pixelHeight, _renderConfigurationVersion,
-            full ? null : _state.DisplayedRevision?.SnapshotVersion,
-            full ? null : _state.DisplayedRevision?.StoreRevision,
-            full ? null : _state.DisplayedRevision?.WrapGeneration, _consumerId,
-            !full && _state.Region is { } displayed ? new(displayed.Snapshot.Stream,
+            rasterWidth, _pixelHeight, _renderConfigurationVersion,
+            requestFull ? null : _state.DisplayedRevision?.SnapshotVersion,
+            requestFull ? null : _state.DisplayedRevision?.StoreRevision,
+            requestFull ? null : _state.DisplayedRevision?.WrapGeneration, _consumerId,
+            !requestFull && _state.Region is { } displayed ? new(displayed.Snapshot.Stream,
                 _state.DisplayedRevision!.Value, new(displayed.Snapshot.SpatialViewport,
                     displayed.Snapshot.TimeViewport, displayed.Snapshot.RasterWidth,
-                    displayed.Snapshot.RasterHeight, displayed.Snapshot.RenderConfigurationVersion)) : null);
+                    displayed.Snapshot.RasterHeight, displayed.Snapshot.RenderConfigurationVersion)) : null,
+            _state.IsSpatialAutoFit);
         if (!force && request == _lastRequested) { return; }
         _lastRequested = request;
         CancellationTokenSource cancellation;
@@ -382,9 +460,23 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         finally
         {
             cancellation.Dispose();
-            lock (_gate) { _rasterOperations.Remove(completion.Task); }
+            bool refreshAfterRaster;
+            bool fullRefreshAfterRaster;
+            lock (_gate)
+            {
+                _rasterOperations.Remove(completion.Task);
+                refreshAfterRaster = _refreshAfterRaster;
+                fullRefreshAfterRaster = _fullRefreshAfterRaster;
+                _refreshAfterRaster = false;
+                _fullRefreshAfterRaster = false;
+            }
             if (failure is null) { completion.TrySetResult(); }
             else { completion.TrySetException(failure); }
+            if (refreshAfterRaster && !IsClosing)
+            {
+                _lifetime.Post(() => RequestRefresh(force: true,
+                    full: fullRefreshAfterRaster || _state.Region is null));
+            }
         }
     }
 
@@ -402,10 +494,13 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         bool accepted = false;
         await _lifetime.InvokeAsync(() =>
         {
+            bool initialAutoFit;
+            lock (_gate) { initialAutoFit = NeedsCurrentRasterUnderLock() && _state.IsSpatialAutoFit; }
             if (IsClosing || generation != _rasterGeneration || managed is null ||
                 managed.Snapshot.ConsumerId != _consumerId || managed.Snapshot.RunId != _state.RunId ||
                 _latestMetadata is null || managed.Snapshot.Stream != _latestMetadata.Stream ||
-                managed.Snapshot.SpatialViewport != _state.SpatialViewport ||
+                (!initialAutoFit && !_state.IsSpatialAutoFit &&
+                    managed.Snapshot.SpatialViewport != _state.SpatialViewport) ||
                 managed.Snapshot.TimeViewport != _timeViewport.Viewport) { return; }
             if (!managed.Snapshot.RequiresFullRefresh && _state.DisplayedRevision is { } displayed &&
                 managed.Snapshot.BaseStoreRevision != displayed.StoreRevision)
@@ -427,10 +522,17 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                 {
                     Region = managed,
                     DisplayedRevision = revision,
-                    SnapshotVersion = managed.Snapshot.SnapshotVersion,
-                    StoreRevision = managed.Snapshot.StoreRevision,
-                    TimeViewportBinding = new(managed.Snapshot.RunId, managed.Snapshot.SnapshotVersion,
-                        managed.Snapshot.TimeViewport),
+                    SnapshotVersion = Math.Max(_state.SnapshotVersion.GetValueOrDefault(),
+                        managed.Snapshot.SnapshotVersion),
+                    StoreRevision = Math.Max(_state.StoreRevision.GetValueOrDefault(),
+                        managed.Snapshot.StoreRevision),
+                    SpatialViewport = _state.IsSpatialAutoFit
+                        ? managed.Snapshot.SpatialViewport
+                        : _state.SpatialViewport,
+                    TimeViewportBinding = new(managed.Snapshot.RunId,
+                        Math.Max(_state.TimeViewportBinding?.SnapshotVersion ?? 0,
+                            managed.Snapshot.SnapshotVersion),
+                        _state.TimeViewportBinding?.Viewport ?? managed.Snapshot.TimeViewport),
                     RequiresFullRefresh = false,
                     BScanVisualError = null
                 };
@@ -439,6 +541,12 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             }
             OnPropertyChanged(nameof(State));
             OnPropertyChanged(nameof(Phase));
+            _source.AcknowledgeDisplayed(_consumerId, new(managed.Snapshot.Stream,
+                new(managed.Snapshot.SnapshotVersion, managed.Snapshot.StoreRevision,
+                    managed.Snapshot.WrapGeneration),
+                new(managed.Snapshot.SpatialViewport, managed.Snapshot.TimeViewport,
+                    managed.Snapshot.RasterWidth, managed.Snapshot.RasterHeight,
+                    managed.Snapshot.RenderConfigurationVersion)));
         }).ConfigureAwait(false);
         if (!accepted) { owned?.Dispose(); }
         retired?.Dispose();
@@ -462,6 +570,22 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         lock (_gate) { if (generation == _rasterGeneration) { _rasterCancellation = null; } }
     }
 
+    private int CurrentRasterWidth()
+    {
+        if (_state.IsSpatialAutoFit && _state.ResidentRange is { } resident)
+        {
+            decimal residentCount = checked((decimal)(resident.Last - resident.First) + 1);
+            if (residentCount >= _liveWindowColumns && _liveWindowColumns <= 1024)
+            { return _liveWindowColumns; }
+        }
+        return _pixelWidth;
+    }
+
+    private bool NeedsCurrentRasterUnderLock() => _visibleRegion is null ||
+        _visibleRegion.Snapshot.RasterWidth != CurrentRasterWidth() ||
+        _visibleRegion.Snapshot.RasterHeight != _pixelHeight ||
+        _visibleRegion.Snapshot.RenderConfigurationVersion != _renderConfigurationVersion;
+
     private void OnTimeViewportChanged(object? sender, PropertyChangedEventArgs args)
     {
         if (args.PropertyName is not (nameof(SharedScanTimeViewport.Viewport) or nameof(SharedScanTimeViewport.RunId))) { return; }
@@ -483,25 +607,27 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private void OnSelectionChanged(object? sender, PropertyChangedEventArgs args)
     {
         if (args.PropertyName != nameof(BScanSelectionCoordinator.State)) { return; }
-        _lifetime.Post(() =>
+        _lifetime.Post(ApplySelection);
+    }
+
+    private void ApplySelection()
+    {
+        BScanSelectionState selection = _selection.State;
+        bool compatible = selection.RunId is null || selection.RunId == _state.RunId;
+        if (compatible && selection.Identity is { } identity && _latestMetadata?.Stream is { } stream &&
+            stream.RunId.IsValid)
         {
-            BScanSelectionState selection = _selection.State;
-            bool compatible = selection.RunId is null || selection.RunId == _state.RunId;
-            if (compatible && selection.Identity is { } identity && _latestMetadata?.Stream is { } stream &&
-                stream.RunId.IsValid)
-            {
-                compatible = identity.SourceId == stream.SourceId && identity.RunId == stream.RunId &&
-                    identity.PhysicalChannelId == stream.PhysicalChannelId;
-            }
-            if (!compatible) { return; }
-            ReplaceState(_state with
-            {
-                Selection = selection,
-                SelectedColumn = selection.Identity ?? _state.SelectedColumn,
-                SelectionError = selection.SelectionError
-            });
-            RefreshCommands();
+            compatible = identity.SourceId == stream.SourceId && identity.RunId == stream.RunId &&
+                identity.PhysicalChannelId == stream.PhysicalChannelId;
+        }
+        if (!compatible) { return; }
+        ReplaceState(_state with
+        {
+            Selection = selection,
+            SelectedColumn = selection.Identity ?? _state.SelectedColumn,
+            SelectionError = selection.SelectionError
         });
+        RefreshCommands();
     }
 
     private void ReplaceState(BScanViewState state)
@@ -518,7 +644,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     }
     private SafeRelayCommand[] Commands => [_zoomTimeIn, _zoomTimeOut, _panTimeUp, _panTimeDown, _resetTime,
         _zoomSpatialIn, _zoomSpatialOut, _panSpatialLeft, _panSpatialRight, _resetSpatial, _resetAll,
-        _refresh, _cancelSelection];
+        _decreaseLiveWindow, _increaseLiveWindow, _refresh, _cancelSelection];
 
     public ValueTask DisposeAsync()
     {
@@ -558,7 +684,11 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         Capture("selection-cancel", () => _selection.Cancel(_consumerId));
         CancellationTokenSource? rasterCancellation;
         lock (_gate) { rasterCancellation = _rasterCancellation; }
-        Capture("raster-cancel", () => rasterCancellation?.Cancel());
+        Capture("raster-cancel", () =>
+        {
+            try { rasterCancellation?.Cancel(); }
+            catch (ObjectDisposedException) { }
+        });
         Task[] rasters;
         lock (_gate) { rasters = [.. _rasterOperations]; }
         await CaptureAsync("raster-operations", () => Task.WhenAll(rasters)).ConfigureAwait(false);

@@ -26,21 +26,29 @@ public sealed class BScanRasterSizeRequestedEventArgs(int pixelWidth, int pixelH
 public sealed class BScanControl : FrameworkElement
 {
     public static readonly DependencyProperty SnapshotProperty = DependencyProperty.Register(nameof(Snapshot),
-        typeof(BScanVisualSnapshot), typeof(BScanControl), new FrameworkPropertyMetadata(null, Redraw));
+        typeof(BScanVisualSnapshot), typeof(BScanControl), new FrameworkPropertyMetadata(null,
+            FrameworkPropertyMetadataOptions.AffectsRender, Redraw));
     public static readonly DependencyProperty SpatialViewportProperty = DependencyProperty.Register(nameof(SpatialViewport),
-        typeof(BScanSpatialViewport?), typeof(BScanControl), new FrameworkPropertyMetadata(null, Redraw));
+        typeof(BScanSpatialViewport?), typeof(BScanControl), new FrameworkPropertyMetadata(null,
+            FrameworkPropertyMetadataOptions.AffectsRender, Redraw));
     public static readonly DependencyProperty TimeViewportProperty = DependencyProperty.Register(nameof(TimeViewport),
-        typeof(ScanTimeViewport), typeof(BScanControl), new FrameworkPropertyMetadata(null, Redraw));
+        typeof(ScanTimeViewport), typeof(BScanControl), new FrameworkPropertyMetadata(null,
+            FrameworkPropertyMetadataOptions.AffectsRender, Redraw));
     public static readonly DependencyProperty ResidentRangeProperty = DependencyProperty.Register(nameof(ResidentRange),
-        typeof(BScanAcquisitionRange?), typeof(BScanControl), new FrameworkPropertyMetadata(null, Redraw));
+        typeof(BScanAcquisitionRange?), typeof(BScanControl), new FrameworkPropertyMetadata(null,
+            FrameworkPropertyMetadataOptions.AffectsRender, Redraw));
     public static readonly DependencyProperty SelectedAcquisitionIndexProperty = DependencyProperty.Register(
-        nameof(SelectedAcquisitionIndex), typeof(ulong?), typeof(BScanControl), new FrameworkPropertyMetadata(null, Redraw));
+        nameof(SelectedAcquisitionIndex), typeof(ulong?), typeof(BScanControl), new FrameworkPropertyMetadata(null,
+            FrameworkPropertyMetadataOptions.AffectsRender, Redraw));
     public static readonly DependencyProperty SelectionStatusProperty = DependencyProperty.Register(nameof(SelectionStatus),
-        typeof(string), typeof(BScanControl), new FrameworkPropertyMetadata(null, Redraw));
+        typeof(string), typeof(BScanControl), new FrameworkPropertyMetadata(null,
+            FrameworkPropertyMetadataOptions.AffectsRender, Redraw));
 
     private WriteableBitmap? _bitmap;
+    private readonly DrawingVisual _selectionVisual = new();
     private BScanVisualSnapshot? _applied;
     private bool _panning;
+    private bool _selectingColumn;
     private bool _interactionEnabled = true;
     private MouseButton? _panButton;
     private Point _lastPosition;
@@ -52,6 +60,7 @@ public sealed class BScanControl : FrameworkElement
     private int _activePooledRasterBytes;
     private int _peakPooledRasterBytes;
     private int _activeCandidateBitmaps;
+    private bool _hasSelectionVisual;
     private static readonly Brush Background = Freeze(new SolidColorBrush(Color.FromRgb(11, 18, 32)));
     private static readonly Brush Text = Freeze(new SolidColorBrush(Color.FromRgb(205, 218, 232)));
     private static readonly Pen Axis = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(92, 112, 135)), 1));
@@ -65,6 +74,7 @@ public sealed class BScanControl : FrameworkElement
         _modifiers = modifiers;
         _position = position;
         _clickCount = clickCount;
+        AddVisualChild(_selectionVisual);
         RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.NearestNeighbor);
         Focusable = true;
         ClipToBounds = true;
@@ -74,8 +84,12 @@ public sealed class BScanControl : FrameworkElement
         MouseUp += OnMouseUp;
         MouseLeftButtonDown += OnMouseLeftButtonDown;
         LostMouseCapture += (_, _) => EndInteraction();
-        Loaded += (_, _) => _interactionEnabled = true;
-        Unloaded += (_, _) => { _interactionEnabled = false; EndInteraction(); };
+        Loaded += (_, _) => { _interactionEnabled = true; RequestRasterSize(); UpdateSelectionVisual(); };
+        Unloaded += (_, _) =>
+        {
+            _interactionEnabled = false;
+            EndInteraction();
+        };
         KeyDown += OnKeyDown;
     }
 
@@ -90,6 +104,7 @@ public sealed class BScanControl : FrameworkElement
     internal int ActivePooledRasterBytes => _activePooledRasterBytes;
     internal int PeakPooledRasterBytes => _peakPooledRasterBytes;
     internal int ActiveCandidateBitmaps => Volatile.Read(ref _activeCandidateBitmaps);
+    internal bool HasSelectionVisual => _hasSelectionVisual;
     internal int? FailFullCommitAtRow { get; set; }
     internal int? FailIncrementalCommitAtRow { get; set; }
 
@@ -100,6 +115,10 @@ public sealed class BScanControl : FrameworkElement
     public event EventHandler? ResetAllRequested;
     public event EventHandler? FullRefreshRequired;
     public event EventHandler<BScanRasterSizeRequestedEventArgs>? RasterSizeRequested;
+
+    protected override int VisualChildrenCount => 1;
+    protected override Visual GetVisualChild(int index) => index == 0
+        ? _selectionVisual : throw new ArgumentOutOfRangeException(nameof(index));
 
     public bool ApplyRaster(BScanVisualSnapshot descriptor, BScanRasterCopy copy,
         double dpiX = 96, double dpiY = 96)
@@ -118,13 +137,20 @@ public sealed class BScanControl : FrameworkElement
         if (descriptor.RequiresFullRefresh && descriptor.AffectedRegion !=
             new BScanRasterRectangle(0, 0, descriptor.RasterWidth, descriptor.RasterHeight))
         { throw new ArgumentException("A full refresh must cover the complete raster.", nameof(descriptor)); }
+        if (descriptor.HorizontalPixelShift < 0 || descriptor.HorizontalPixelShift >= descriptor.RasterWidth ||
+            descriptor.HorizontalPixelShift > 0 &&
+            (descriptor.RequiresFullRefresh || descriptor.AffectedRegion.X !=
+                descriptor.RasterWidth - descriptor.HorizontalPixelShift ||
+             descriptor.AffectedRegion.Width != descriptor.HorizontalPixelShift))
+        { throw new ArgumentException("Invalid B-Scan horizontal shift descriptor.", nameof(descriptor)); }
         bool recreate = _bitmap is null || _bitmap.PixelWidth != descriptor.RasterWidth ||
             _bitmap.PixelHeight != descriptor.RasterHeight || _bitmap.DpiX != dpiX || _bitmap.DpiY != dpiY;
         if (!descriptor.RequiresFullRefresh && (recreate || _applied is null ||
-            _applied.Stream != descriptor.Stream || _applied.WrapGeneration != descriptor.WrapGeneration ||
+            _applied.Stream != descriptor.Stream ||
+            (_applied.WrapGeneration != descriptor.WrapGeneration && descriptor.HorizontalPixelShift == 0) ||
             _applied.StoreRevision != descriptor.BaseStoreRevision ||
             _applied.RenderConfigurationVersion != descriptor.RenderConfigurationVersion ||
-            _applied.SpatialViewport != descriptor.SpatialViewport ||
+            (_applied.SpatialViewport != descriptor.SpatialViewport && descriptor.HorizontalPixelShift == 0) ||
             _applied.TimeViewport != descriptor.TimeViewport))
         { FullRefreshRequired?.Invoke(this, EventArgs.Empty); return false; }
         int stagedStride = checked(descriptor.AffectedRegion.Width * 4);
@@ -142,12 +168,69 @@ public sealed class BScanControl : FrameworkElement
             if (generation != Volatile.Read(ref _rasterGeneration)) { return false; }
             return descriptor.RequiresFullRefresh || recreate
                 ? CommitFull(descriptor, staging.AsSpan(0, stagedBytes), stagedStride, dpiX, dpiY, generation)
-                : CommitIncremental(descriptor, staging.AsSpan(0, stagedBytes), stagedStride, generation);
+                : descriptor.HorizontalPixelShift > 0
+                    ? CommitScrolledIncremental(descriptor, staging.AsSpan(0, stagedBytes), stagedStride, generation)
+                    : CommitIncremental(descriptor, staging.AsSpan(0, stagedBytes), stagedStride, generation);
         }
         catch
         { FullRefreshRequired?.Invoke(this, EventArgs.Empty); throw; }
         finally
         { ReturnRasterBuffer(staging); }
+    }
+
+    private bool CommitScrolledIncremental(BScanVisualSnapshot descriptor, ReadOnlySpan<byte> staging,
+        int stagedStride, long generation)
+    {
+        if (generation != Volatile.Read(ref _rasterGeneration)) { return false; }
+        WriteableBitmap bitmap = _bitmap!;
+        int fullStride = checked(descriptor.RasterWidth * 4);
+        int fullBytes = checked(fullStride * descriptor.RasterHeight);
+        byte[] backup = RentRasterBuffer(fullBytes);
+        bool locked = false;
+        try
+        {
+            bitmap.Lock();
+            locked = true;
+            var complete = new BScanRasterRectangle(0, 0, descriptor.RasterWidth, descriptor.RasterHeight);
+            CopyFromBitmap(bitmap, complete, backup.AsSpan(0, fullBytes), fullStride);
+            try
+            {
+                ScrollBitmapLeft(bitmap, descriptor.HorizontalPixelShift);
+                CopyRows(staging, stagedStride, bitmap.BackBuffer, bitmap.BackBufferStride,
+                    descriptor.AffectedRegion, FailIncrementalCommitAtRow);
+                if (generation != Volatile.Read(ref _rasterGeneration))
+                {
+                    CopyRows(backup.AsSpan(0, fullBytes), fullStride, bitmap.BackBuffer,
+                        bitmap.BackBufferStride, complete, null);
+                    return false;
+                }
+            }
+            catch
+            {
+                CopyRows(backup.AsSpan(0, fullBytes), fullStride, bitmap.BackBuffer,
+                    bitmap.BackBufferStride, complete, null);
+                throw;
+            }
+            bitmap.AddDirtyRect(new(0, 0, descriptor.RasterWidth, descriptor.RasterHeight));
+        }
+        finally
+        {
+            try { if (locked) { bitmap.Unlock(); } }
+            finally { ReturnRasterBuffer(backup); }
+        }
+        PublishCommittedRaster(bitmap, descriptor);
+        return true;
+    }
+
+    private static unsafe void ScrollBitmapLeft(WriteableBitmap bitmap, int pixels)
+    {
+        int remainingBytes = checked((bitmap.PixelWidth - pixels) * 4);
+        for (int row = 0; row < bitmap.PixelHeight; row++)
+        {
+            var scan = new Span<byte>((byte*)bitmap.BackBuffer + row * bitmap.BackBufferStride,
+                bitmap.PixelWidth * 4);
+            scan.Slice(pixels * 4, remainingBytes).CopyTo(scan);
+        }
     }
 
     private bool CommitFull(BScanVisualSnapshot descriptor, ReadOnlySpan<byte> staging, int stagedStride,
@@ -274,6 +357,7 @@ public sealed class BScanControl : FrameworkElement
     public void EndInteraction()
     {
         _panning = false;
+        _selectingColumn = false;
         _panButton = null;
         if (IsMouseCaptured) { ReleaseMouseCapture(); }
     }
@@ -282,6 +366,7 @@ public sealed class BScanControl : FrameworkElement
     {
         base.OnRenderSizeChanged(sizeInfo);
         RequestRasterSize();
+        UpdateSelectionVisual();
         InvalidateVisual();
     }
 
@@ -329,9 +414,6 @@ public sealed class BScanControl : FrameworkElement
                 drawing.DrawLine(Axis, new Point(plot.Left - 4, y), new Point(plot.Left, y));
             }
         }
-        if (SelectedAcquisitionIndex is { } selected && SpatialViewport is { } spatial &&
-            TrySpatialCoordinate(selected, spatial, plot, out double selectedX))
-        { drawing.DrawLine(Selection, new Point(selectedX, plot.Top), new Point(selectedX, plot.Bottom)); }
         if (Snapshot is { HasDiscontinuities: true })
         {
             Label(drawing, "⚠ Gap / discontinuidad", new Point(plot.Left + 4, plot.Top + 4));
@@ -375,12 +457,16 @@ public sealed class BScanControl : FrameworkElement
         Point position = _position(this);
         bool onSelection = HitSelection(position);
         bool hasColumn = TryAcquisitionIndex(position, out ulong index);
-        if (_clickCount(args) == 2 && PlotBounds().Contains(position) && !onSelection && !hasColumn)
+        if (_clickCount(args) == 2 && PlotBounds().Contains(position) && !onSelection)
         { ResetAllRequested?.Invoke(this, EventArgs.Empty); args.Handled = true; return; }
         if ((_modifiers() & ModifierKeys.Shift) != 0 && !onSelection)
         { BeginPan(position, args); return; }
         if (hasColumn)
-        { ColumnRequested?.Invoke(this, new(index)); args.Handled = true; }
+        {
+            ColumnRequested?.Invoke(this, new(index));
+            if (onSelection && CaptureMouse()) { _selectingColumn = true; _panButton = args.ChangedButton; }
+            args.Handled = true;
+        }
     }
 
     private void BeginPan(Point position, MouseButtonEventArgs args)
@@ -394,7 +480,15 @@ public sealed class BScanControl : FrameworkElement
 
     private void OnMouseMove(object sender, MouseEventArgs args)
     {
-        if (!_interactionEnabled || !_panning || TimeViewport is not { } time || SpatialViewport is not { } spatial) { return; }
+        if (!_interactionEnabled) { return; }
+        if (_selectingColumn)
+        {
+            if (TryAcquisitionIndex(_position(this), out ulong index) && index != SelectedAcquisitionIndex)
+            { ColumnRequested?.Invoke(this, new(index)); }
+            args.Handled = true;
+            return;
+        }
+        if (!_panning || TimeViewport is not { } time || SpatialViewport is not { } spatial) { return; }
         Point current = _position(this);
         Rect plot = PlotBounds();
         if (plot.Width <= 0 || plot.Height <= 0) { EndInteraction(); return; }
@@ -406,7 +500,10 @@ public sealed class BScanControl : FrameworkElement
     }
 
     private void OnMouseUp(object sender, MouseButtonEventArgs args)
-    { if (_panning && args.ChangedButton == _panButton) { EndInteraction(); args.Handled = true; } }
+    {
+        if ((_panning || _selectingColumn) && args.ChangedButton == _panButton)
+        { EndInteraction(); args.Handled = true; }
+    }
 
     private void OnKeyDown(object sender, KeyEventArgs args)
     {
@@ -419,13 +516,14 @@ public sealed class BScanControl : FrameworkElement
     {
         index = 0;
         Rect plot = PlotBounds();
-        if (!plot.Contains(point) || SpatialViewport is not { } viewport || Snapshot is not { } snapshot) { return false; }
+        if (!plot.Contains(point) || SpatialViewport is not { } viewport || ResidentRange is not { } resident)
+        { return false; }
         decimal offset = viewport.MinimumOffset + (decimal)((point.X - plot.Left) / plot.Width) * viewport.Span;
         decimal absolute = viewport.OriginAcquisitionIndex + offset;
         if (absolute < 0 || absolute > ulong.MaxValue) { return false; }
         index = (ulong)Math.Floor(absolute);
-        if (ResidentRange is { } resident) { index = Math.Clamp(index, resident.First, resident.Last); }
-        return index >= snapshot.RepresentedRange.First && index <= snapshot.RepresentedRange.Last;
+        index = Math.Clamp(index, resident.First, resident.Last);
+        return true;
     }
 
     private static bool TrySpatialCoordinate(ulong index, BScanSpatialViewport viewport, Rect plot, out double x)
@@ -465,7 +563,26 @@ public sealed class BScanControl : FrameworkElement
 
     private Rect PlotBounds() => new(64, 16, Math.Max(0, ActualWidth - 84), Math.Max(0, ActualHeight - 58));
     private static void Redraw(DependencyObject sender, DependencyPropertyChangedEventArgs args) =>
-        ((BScanControl)sender).InvalidateVisual();
+        ((BScanControl)sender).RedrawVisuals();
+
+    private void RedrawVisuals()
+    {
+        UpdateSelectionVisual();
+        InvalidateVisual();
+    }
+
+    private void UpdateSelectionVisual()
+    {
+        using DrawingContext drawing = _selectionVisual.RenderOpen();
+        Rect plot = PlotBounds();
+        if (plot.Width > 0 && plot.Height > 0 && SelectedAcquisitionIndex is { } selected &&
+            SpatialViewport is { } spatial && TrySpatialCoordinate(selected, spatial, plot, out double selectedX))
+        {
+            drawing.DrawLine(Selection, new Point(selectedX, plot.Top), new Point(selectedX, plot.Bottom));
+            _hasSelectionVisual = true;
+        }
+        else { _hasSelectionVisual = false; }
+    }
     private static T Freeze<T>(T value) where T : Freezable { value.Freeze(); return value; }
     private void Label(DrawingContext drawing, string value, Point origin) => drawing.DrawText(
         new FormattedText(value, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,

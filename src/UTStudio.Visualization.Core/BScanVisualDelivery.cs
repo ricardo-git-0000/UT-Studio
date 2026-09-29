@@ -15,6 +15,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 {
     private const int DurationWindow = 1024;
     public static readonly TimeSpan MinimumPublicationInterval = TimeSpan.FromTicks(333_334);
+    public static readonly TimeSpan WideLivePublicationInterval = TimeSpan.FromMilliseconds(100);
     private readonly object _gate = new();
     private readonly BScanIngress _ingress;
     private readonly TimeProvider _clock;
@@ -29,6 +30,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private readonly Dictionary<string, int> _consumerOwners = [];
     private readonly Dictionary<string, long> _consumerOwnerBytes = [];
     private readonly Dictionary<string, BScanVisualSnapshot> _currentByConsumer = [];
+    private readonly Dictionary<string, BScanDisplayedVisualIdentity> _displayedByConsumer = [];
     private readonly HashSet<string> _consumers = [];
     private readonly HashSet<string> _bootstrapConsumers = [];
     private readonly HashSet<string> _retiringConsumers = [];
@@ -58,12 +60,15 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private Task? _drain;
     private string? _lastError;
     internal Action? BeforeRasterCandidateValidation { get; set; }
+    internal Action<int, int>? AfterRasterColumnReleased { get; set; }
     internal Action? BeforeMetadataCandidateValidation { get; set; }
     internal int ActiveConsumerCount { get { lock (_gate) { return _consumers.Count; } } }
     internal int PendingBootstrapCount { get { lock (_gate) { return _bootstrapConsumers.Count; } } }
     internal int RetainedSnapshotCount { get { lock (_gate) { return _currentByConsumer.Count; } } }
     internal long RenderRequestCount => Interlocked.Read(ref _renderRequests);
     internal long FullIdentityRequestCount => Interlocked.Read(ref _fullIdentityRequests);
+    internal BScanDisplayedVisualIdentity? GetAcknowledgedDisplay(string consumerId)
+    { lock (_gate) { return _displayedByConsumer.GetValueOrDefault(consumerId); } }
 
     public BScanVisualDelivery(BScanIngress ingress, TimeProvider? timeProvider = null)
         : this(ingress, timeProvider, SharedByteOwnerPool.Instance) { }
@@ -144,6 +149,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             _lastRequests.Remove(consumerId);
             _pendingGenerations.Remove(consumerId);
             _currentByConsumer.Remove(consumerId);
+            _displayedByConsumer.Remove(consumerId);
             _bootstrapConsumers.Remove(consumerId);
             if (_consumerOwners.GetValueOrDefault(consumerId) == 0)
             {
@@ -157,15 +163,22 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     {
         get
         {
+            BScanDiagnostics ingress = _ingress.Diagnostics;
             lock (_gate)
             {
                 return new(_columnsIndexed, _fullRefreshes + _incrementalRefreshes, _fullRefreshes,
                     _incrementalRefreshes, _staleCandidates + _cancelledCandidates, _updatesPublished,
                     _updatesCoalesced, _observerCallbacksStarted, _observerCallbacksCompleted,
-                    _observerErrors, _activeOwners, _maximumOwners, _ingress.VisualBytesReserved,
+                    _observerErrors, _activeOwners, _maximumOwners, ingress.VisualLogicalBytes,
                     _activeOwnerBytes, _maximumOwnerBytes, BuildDurationsUnderLock(),
                     _closed ? BScanVisualCloseState.Closed : _disposed ? BScanVisualCloseState.Closing : BScanVisualCloseState.Open,
-                    _regionOperations, _lastError);
+                    _regionOperations, _lastError)
+                {
+                    EffectiveCapacity = ingress.EffectiveCapacity,
+                    ColumnsAccepted = ingress.BScanColumnsAccepted,
+                    ColumnsRejectedPinnedSlot = ingress.BScanColumnsRejectedPinnedSlot,
+                    ColumnsEvicted = ingress.BScanColumnsEvicted
+                };
             }
         }
     }
@@ -189,6 +202,37 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             _pending[request.ConsumerId] = request;
             _pendingGenerations[request.ConsumerId] = ++_requestGeneration;
             if (_wake.CurrentCount == 0) { _wake.Release(); }
+        }
+    }
+
+    public void AcknowledgeDisplayed(string consumerId, BScanDisplayedVisualIdentity displayed)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(consumerId);
+        ArgumentNullException.ThrowIfNull(displayed);
+        lock (_gate)
+        {
+            if (_disposed || !_consumers.Contains(consumerId)) { return; }
+            if (!_lastRequests.TryGetValue(consumerId, out BScanRenderRequest? current) ||
+                current.RunId != displayed.Stream.RunId) { return; }
+            BScanRenderRequest acknowledged = current with
+            {
+                SpatialViewport = displayed.Render.SpatialViewport,
+                TimeViewport = displayed.Render.TimeViewport,
+                PixelWidth = displayed.Render.PixelWidth,
+                PixelHeight = displayed.Render.PixelHeight,
+                RenderConfigurationVersion = displayed.Render.RenderConfigurationVersion,
+                DisplayedSnapshotVersion = displayed.Revision.SnapshotVersion,
+                DisplayedStoreRevision = displayed.Revision.StoreRevision,
+                DisplayedWrapGeneration = displayed.Revision.WrapGeneration,
+                Displayed = displayed
+            };
+            _lastRequests[consumerId] = acknowledged;
+            _displayedByConsumer[consumerId] = displayed;
+            if (_pending.ContainsKey(consumerId))
+            {
+                _pending[consumerId] = acknowledged;
+                _pendingGenerations[consumerId] = ++_requestGeneration;
+            }
         }
     }
 
@@ -264,9 +308,12 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null)
             { return BScanRasterResult.NotAvailable(); }
             Array.Sort(leases, 0, count, BScanLeaseComparer.Instance);
+            request = ReconcileLiveWindow(request, state.ResidentRange.Value);
             token.ThrowIfCancellationRequested();
 
-            BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state, leases, count);
+            int horizontalPixelShift = GetHorizontalPixelShift(request);
+            BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state, leases, count,
+                horizontalPixelShift);
             bool full = reason != BScanFullRefreshReason.None;
             ulong dirtyFirst = ulong.MaxValue, dirtyLast = 0;
             for (int i = 0; i < count; i++)
@@ -323,7 +370,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 DiscardOwner(request.ConsumerId, actualBytes);
                 throw;
             }
-            if (!_ingress.IsVisualStateCurrent(metadata, state.StoreRevision, state.WrapGeneration))
+            bool bootstrap = request.DisplayedSnapshotVersion is null && request.DisplayedStoreRevision is null &&
+                request.DisplayedWrapGeneration is null && request.Displayed is null;
+            if (!_ingress.IsVisualStateCurrent(metadata, state.StoreRevision, state.WrapGeneration) &&
+                !((bootstrap || request.FollowLiveWindow) && _ingress.IsBootstrapStateCompatible(
+                    metadata, state.StoreRevision, state.WrapGeneration)))
             {
                 owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes);
                 lock (_gate) { _staleCandidates++; _recoveryConsumers.Add(request.ConsumerId); }
@@ -335,7 +386,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             var dirty = new BScanDirtyRange(dirtyFirst, dirtyLast,
                 request.DisplayedStoreRevision.GetValueOrDefault(), state.StoreRevision);
             var snapshot = CreateSnapshot(metadata, request, state, version, dirty,
-                new(x, 0, width, request.PixelHeight), full, reason, leases, count);
+                new(x, 0, width, request.PixelHeight), full, reason, leases, count) with
+            { HorizontalPixelShift = horizontalPixelShift };
             bool active;
             lock (_gate)
             {
@@ -355,12 +407,54 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
     }
 
-    private static void Rasterize(BScanTraceStore.BScanTraceLease?[] leases, int count,
+    private static BScanRenderRequest ReconcileLiveWindow(BScanRenderRequest request,
+        BScanAcquisitionRange residentRange)
+    {
+        if (!request.FollowLiveWindow) { return request; }
+        decimal width = request.SpatialViewport.Span;
+        decimal residentCount = checked((decimal)(residentRange.Last - residentRange.First) + 1);
+        if (residentCount < width) { return request; }
+        ulong integralWidth = checked((ulong)decimal.Truncate(width));
+        if (integralWidth == 0 || integralWidth != width) { return request; }
+        ulong first = residentRange.Last - integralWidth + 1;
+        return request with { SpatialViewport = new(first, 0, width) };
+    }
+
+    private BScanRenderRequest WithAcknowledgedDisplay(BScanRenderRequest request)
+    {
+        BScanDisplayedVisualIdentity? displayed;
+        lock (_gate) { _displayedByConsumer.TryGetValue(request.ConsumerId, out displayed); }
+        if (displayed is null || displayed.Stream.RunId != request.RunId ||
+            request.Displayed is { } supplied &&
+            supplied.Revision.StoreRevision > displayed.Revision.StoreRevision) { return request; }
+        return request with
+        {
+            DisplayedSnapshotVersion = displayed.Revision.SnapshotVersion,
+            DisplayedStoreRevision = displayed.Revision.StoreRevision,
+            DisplayedWrapGeneration = displayed.Revision.WrapGeneration,
+            Displayed = displayed
+        };
+    }
+
+    private void Rasterize(BScanTraceStore.BScanTraceLease?[] leases, int count,
         ConventionalUtFrameMetadata metadata, int bucketSamples, BScanRenderRequest request, int rasterX, int width,
         Span<byte> pixels, CancellationToken token)
     {
         double rate = metadata.Configuration.SampleRateHz;
         double offset = metadata.Configuration.FirstSampleOffsetSeconds;
+        Span<int> sampleFirstByRow = stackalloc int[request.PixelHeight];
+        Span<int> sampleLastByRow = stackalloc int[request.PixelHeight];
+        for (int y = 0; y < request.PixelHeight; y++)
+        {
+            double t0 = request.TimeViewport.VisibleMinimumSeconds +
+                request.TimeViewport.VisibleSpanSeconds * y / request.PixelHeight;
+            double t1 = request.TimeViewport.VisibleMinimumSeconds +
+                request.TimeViewport.VisibleSpanSeconds * (y + 1) / request.PixelHeight;
+            sampleFirstByRow[y] = Math.Clamp((int)Math.Floor((t0 - offset) * rate),
+                0, metadata.Configuration.SampleCount);
+            sampleLastByRow[y] = Math.Clamp((int)Math.Ceiling((t1 - offset) * rate),
+                0, metadata.Configuration.SampleCount);
+        }
         int columnStart = 0;
         for (int localX = 0; localX < width; localX++)
         {
@@ -372,8 +466,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 request.SpatialViewport.Span * (pixelX + 1) / request.PixelWidth;
             while (columnStart < count && BScanSpatialViewportOperations.RelativeOffset(
                 leases[columnStart]!.Descriptor.AcquisitionIndex,
-                request.SpatialViewport.OriginAcquisitionIndex) < left)
-            { columnStart++; }
+                request.SpatialViewport.OriginAcquisitionIndex) + 1 <= left)
+            {
+                leases[columnStart]!.Dispose();
+                columnStart++;
+            }
             int columnEnd = columnStart;
             while (columnEnd < count && BScanSpatialViewportOperations.RelativeOffset(
                 leases[columnEnd]!.Descriptor.AcquisitionIndex,
@@ -381,12 +478,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             { columnEnd++; }
             for (int y = 0; y < request.PixelHeight; y++)
             {
-                double t0 = request.TimeViewport.VisibleMinimumSeconds +
-                    request.TimeViewport.VisibleSpanSeconds * y / request.PixelHeight;
-                double t1 = request.TimeViewport.VisibleMinimumSeconds +
-                    request.TimeViewport.VisibleSpanSeconds * (y + 1) / request.PixelHeight;
-                int sampleFirst = Math.Clamp((int)Math.Floor((t0 - offset) * rate), 0, metadata.Configuration.SampleCount);
-                int sampleLastExclusive = Math.Clamp((int)Math.Ceiling((t1 - offset) * rate), 0, metadata.Configuration.SampleCount);
+                int sampleFirst = sampleFirstByRow[y];
+                int sampleLastExclusive = sampleLastByRow[y];
                 bool found = false;
                 short selected = 0;
                 int selectedMagnitude = -1;
@@ -398,6 +491,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 }
                 if (found) { pixels[y * width + localX] = BScanBipolarIntensity8.Map(selected); }
             }
+            AfterRasterColumnReleased?.Invoke(pixelX, count - columnStart);
         }
     }
 
@@ -454,7 +548,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private BScanFullRefreshReason GetFullRefreshReason(BScanRenderRequest request,
         ConventionalUtFrameMetadata metadata, BScanStoreVisualState state,
-        BScanTraceStore.BScanTraceLease?[] leases, int count)
+        BScanTraceStore.BScanTraceLease?[] leases, int count, int horizontalPixelShift = 0)
     {
         bool coalesced;
         bool recovery;
@@ -478,15 +572,17 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             if (request.DisplayedStoreRevision != prior.StoreRevision) { reason |= BScanFullRefreshReason.BaseRevisionMismatch; }
             if (prior.RasterWidth != request.PixelWidth || prior.RasterHeight != request.PixelHeight)
             { reason |= BScanFullRefreshReason.ResolutionChanged; }
-            if (prior.SpatialViewport != request.SpatialViewport || prior.TimeViewport != request.TimeViewport)
+            if ((prior.SpatialViewport != request.SpatialViewport && horizontalPixelShift == 0) ||
+                prior.TimeViewport != request.TimeViewport)
             { reason |= BScanFullRefreshReason.ViewportChanged; }
             if (prior.RenderConfigurationVersion != request.RenderConfigurationVersion)
             { reason |= BScanFullRefreshReason.RenderConfigurationChanged; }
-            if (state.ResidentRange is { } resident &&
+            if (horizontalPixelShift == 0 && state.ResidentRange is { } resident &&
                 (prior.ResidentRange.First < resident.First || prior.ResidentRange.Last > resident.Last))
             { reason |= BScanFullRefreshReason.DirtyRangeEvicted; }
         }
-        if (request.DisplayedWrapGeneration != state.WrapGeneration) { reason |= BScanFullRefreshReason.WrapChanged; }
+        if (request.DisplayedWrapGeneration != state.WrapGeneration && horizontalPixelShift == 0)
+        { reason |= BScanFullRefreshReason.WrapChanged; }
         if (request.Displayed is { } displayed)
         {
             var targetStream = new BScanStreamIdentity(metadata.SourceId, metadata.RunId,
@@ -494,7 +590,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             if (displayed.Stream != targetStream) { reason |= BScanFullRefreshReason.RunChanged; }
             if (displayed.Render.PixelWidth != request.PixelWidth || displayed.Render.PixelHeight != request.PixelHeight)
             { reason |= BScanFullRefreshReason.ResolutionChanged; }
-            if (displayed.Render.SpatialViewport != request.SpatialViewport || displayed.Render.TimeViewport != request.TimeViewport)
+            if ((displayed.Render.SpatialViewport != request.SpatialViewport && horizontalPixelShift == 0) ||
+                displayed.Render.TimeViewport != request.TimeViewport)
             { reason |= BScanFullRefreshReason.ViewportChanged; }
             if (displayed.Render.RenderConfigurationVersion != request.RenderConfigurationVersion)
             { reason |= BScanFullRefreshReason.RenderConfigurationChanged; }
@@ -517,6 +614,26 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         return reason;
     }
 
+    private static int GetHorizontalPixelShift(BScanRenderRequest request)
+    {
+        if (!request.FollowLiveWindow || request.Displayed is not { } displayed ||
+            displayed.Render.PixelWidth != request.PixelWidth ||
+            displayed.Render.PixelHeight != request.PixelHeight ||
+            displayed.Render.TimeViewport != request.TimeViewport ||
+            displayed.Render.RenderConfigurationVersion != request.RenderConfigurationVersion ||
+            displayed.Render.SpatialViewport.Span != request.SpatialViewport.Span)
+        { return 0; }
+        BScanSpatialViewport previous = displayed.Render.SpatialViewport;
+        decimal previousMinimum = previous.OriginAcquisitionIndex + previous.MinimumOffset;
+        decimal currentMinimum = request.SpatialViewport.OriginAcquisitionIndex +
+            request.SpatialViewport.MinimumOffset;
+        decimal traceShift = currentMinimum - previousMinimum;
+        if (traceShift <= 0 || traceShift >= request.SpatialViewport.Span) { return 0; }
+        decimal pixelShift = traceShift * request.PixelWidth / request.SpatialViewport.Span;
+        if (pixelShift != decimal.Truncate(pixelShift)) { return 0; }
+        return checked((int)pixelShift);
+    }
+
     private async Task PublishLoopAsync()
     {
         try
@@ -527,8 +644,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 TimeSpan remaining;
                 lock (_gate)
                 {
+                    TimeSpan interval = _pending.Count == 0
+                        ? MinimumPublicationInterval
+                        : _pending.Values.Max(PublicationInterval);
                     remaining = _lastPublication is { } last
-                        ? MinimumPublicationInterval - _clock.GetElapsedTime(last, _clock.GetTimestamp()) : TimeSpan.Zero;
+                        ? interval - _clock.GetElapsedTime(last, _clock.GetTimestamp()) : TimeSpan.Zero;
                 }
                 if (remaining > TimeSpan.Zero) { await DelayAsync(remaining, _shutdown.Token).ConfigureAwait(false); }
                 (string ConsumerId, BScanRenderRequest Request, long Generation)[] batch;
@@ -549,6 +669,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         catch (Exception error) { lock (_gate) { _lastError = Message(error); } }
     }
 
+    internal static TimeSpan PublicationInterval(BScanRenderRequest request) =>
+        request.FollowLiveWindow && request.SpatialViewport.Span > 512
+            ? WideLivePublicationInterval
+            : MinimumPublicationInterval;
+
     private void PublishMetadata(BScanRenderRequest request, long requestGeneration)
     {
         BScanTraceStore.BScanTraceLease?[] leases = ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Rent(_ingress.VisualCapacity);
@@ -558,7 +683,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         {
             if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null) { return; }
             Array.Sort(leases, 0, count, BScanLeaseComparer.Instance);
-            BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state, leases, count);
+            request = WithAcknowledgedDisplay(request);
+            request = ReconcileLiveWindow(request, state.ResidentRange.Value);
+            int horizontalPixelShift = GetHorizontalPixelShift(request);
+            BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state, leases, count,
+                horizontalPixelShift);
             bool full = reason != BScanFullRefreshReason.None;
             ulong first = ulong.MaxValue, last = 0;
             for (int i = 0; i < count; i++)
@@ -572,7 +701,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             lock (_gate) { version = ++_snapshotVersion; }
             var dirty = new BScanDirtyRange(first, last, request.DisplayedStoreRevision.GetValueOrDefault(), state.StoreRevision);
             var snapshot = CreateSnapshot(metadata, request, state, version, dirty,
-                new(0, 0, request.PixelWidth, request.PixelHeight), full, reason, leases, count);
+                new(0, 0, request.PixelWidth, request.PixelHeight), full, reason, leases, count) with
+            { HorizontalPixelShift = horizontalPixelShift };
             BeforeMetadataCandidateValidation?.Invoke();
             if (!_ingress.IsVisualStateCurrent(metadata, state.StoreRevision, state.WrapGeneration))
             { lock (_gate) { _staleCandidates++; _recoveryConsumers.Add(request.ConsumerId); } return; }

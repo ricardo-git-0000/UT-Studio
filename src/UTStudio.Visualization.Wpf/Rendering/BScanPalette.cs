@@ -18,7 +18,13 @@ public static class BScanPalette
 
     public static void CopyToBgra32(ReadOnlySpan<byte> source, int sourceStride,
         Span<byte> destination, int destinationStride, BScanRasterRectangle affected)
+        => CopyToBgra32(source, sourceStride, destination, destinationStride, affected, Values);
+
+    public static void CopyToBgra32(ReadOnlySpan<byte> source, int sourceStride,
+        Span<byte> destination, int destinationStride, BScanRasterRectangle affected,
+        ReadOnlySpan<uint> palette)
     {
+        if (palette.Length != 256) { throw new ArgumentException("A B-Scan palette must contain 256 colors.", nameof(palette)); }
         if (sourceStride < affected.Width) { throw new ArgumentException("Source stride is too small.", nameof(sourceStride)); }
         if (source.Length < checked((affected.Height - 1) * sourceStride + affected.Width))
         { throw new ArgumentException("Source is too small.", nameof(source)); }
@@ -34,7 +40,7 @@ public static class BScanPalette
                 affected.X * 4), checked(affected.Width * 4));
             for (int column = 0; column < affected.Width; column++)
             {
-                uint color = Values[input[column]];
+                uint color = palette[input[column]];
                 int offset = column * 4;
                 output[offset] = (byte)color;
                 output[offset + 1] = (byte)(color >> 8);

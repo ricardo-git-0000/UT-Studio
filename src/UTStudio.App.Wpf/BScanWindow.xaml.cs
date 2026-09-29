@@ -1,7 +1,11 @@
 using System.ComponentModel;
+using System.IO;
 using System.Windows;
+using System.Xml;
+using Microsoft.Win32;
 using UTStudio.App.Wpf.Adapters;
 using UTStudio.Presentation;
+using UTStudio.Visualization.Wpf.Rendering;
 
 namespace UTStudio.App.Wpf;
 
@@ -9,6 +13,7 @@ public partial class BScanWindow : Window
 {
     private readonly object _closeGate = new();
     private readonly BScanViewModel _viewModel;
+    private readonly BScanControlAdapter? _adapter;
     private readonly Action _disposeAdapter;
     private readonly Func<Task> _disposeViewModel;
     private readonly Action? _beforeWindowClose;
@@ -22,7 +27,7 @@ public partial class BScanWindow : Window
     {
         InitializeComponent();
         DataContext = _viewModel = viewModel;
-        var adapter = new BScanControlAdapter(viewModel, Scan);
+        var adapter = _adapter = new BScanControlAdapter(viewModel, Scan);
         _disposeAdapter = adapter.Dispose;
         _disposeViewModel = () => viewModel.DisposeAsync().AsTask();
         _beforeWindowClose = null;
@@ -34,6 +39,7 @@ public partial class BScanWindow : Window
     {
         InitializeComponent();
         DataContext = _viewModel = viewModel;
+        _adapter = null;
         _disposeAdapter = disposeAdapter;
         _disposeViewModel = disposeViewModel;
         _beforeWindowClose = beforeWindowClose;
@@ -41,6 +47,33 @@ public partial class BScanWindow : Window
     }
 
     internal string ConsumerId => _viewModel.ConsumerId;
+
+    private void OnLoadPalette(object sender, RoutedEventArgs e)
+    {
+        if (_adapter is null)
+        {
+            PaletteStatus.Text = "Paleta: carga no disponible en esta composición.";
+            return;
+        }
+        var dialog = new OpenFileDialog
+        {
+            Title = "Cargar paleta B-Scan",
+            Filter = "Paleta XML (*.xml)|*.xml|Todos los archivos (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+        if (dialog.ShowDialog(this) != true) { return; }
+        try
+        {
+            BScanColorPalette palette = BScanPaletteFile.Load(dialog.FileName);
+            _adapter.SetPalette(palette);
+            PaletteStatus.Text = $"Paleta: {palette.Name}";
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or XmlException or InvalidDataException)
+        {
+            PaletteStatus.Text = $"Paleta no cargada: {error.Message}";
+        }
+    }
 
     internal Task CloseOwnedAsync()
     {

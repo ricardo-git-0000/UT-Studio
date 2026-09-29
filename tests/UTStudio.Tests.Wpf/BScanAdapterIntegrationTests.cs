@@ -84,6 +84,32 @@ public sealed class BScanAdapterIntegrationTests
         }
     });
 
+    [TestMethod]
+    public Task Requested_column_is_visible_while_exact_trace_resolution_is_pending() => StaTest.Run(async () =>
+    {
+        var source = new Source();
+        var dispatcher = new WpfUiDispatcher(Dispatcher.CurrentDispatcher);
+        var provider = new PendingTraceProvider();
+        await using var viewport = new SharedScanTimeViewport(dispatcher);
+        await using var selection = new BScanSelectionCoordinator(dispatcher, provider, new AScanProjector());
+        await using var viewModel = new BScanViewModel(source, viewport, selection, dispatcher);
+        var control = new BScanControl();
+        using var window = new Host(control);
+        using var adapter = new BScanControlAdapter(viewModel, control);
+        BScanVisualSnapshot snapshot = Snapshot(source.ConsumerId!);
+        source.RegionFactory = _ => Region(snapshot, 1);
+        await EmitAndWaitAsync(source, viewModel, snapshot);
+
+        Task request = adapter.SelectColumnAsync(2);
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+
+        Assert.AreEqual(2UL, control.SelectedAcquisitionIndex);
+        Assert.IsFalse(request.IsCompleted);
+        provider.Complete(BScanTraceResult.NotAvailable());
+        await request;
+        Assert.IsNull(control.SelectedAcquisitionIndex);
+    });
+
     private static async Task EmitAndWaitAsync(Source source, BScanViewModel viewModel, BScanVisualSnapshot snapshot)
     {
         var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -121,6 +147,20 @@ public sealed class BScanAdapterIntegrationTests
     { public Memory<byte> Memory { get; private set; } = data; public void Dispose() => Memory = Memory<byte>.Empty; }
     private sealed class NoTraceProvider : IBScanTraceProvider
     { public ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity, CancellationToken cancellationToken = default) => throw new NotSupportedException(); }
+    private sealed class PendingTraceProvider : IBScanTraceProvider
+    {
+        private readonly TaskCompletionSource<BScanTraceResult> _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex,
+            out BScanTraceIdentity identity)
+        {
+            identity = new(new UtSourceId("adapter"), runId, new PhysicalChannelId(0), acquisitionIndex);
+            return true;
+        }
+        public ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity,
+            CancellationToken cancellationToken = default) => new(_completion.Task.WaitAsync(cancellationToken));
+        internal void Complete(BScanTraceResult result) => _completion.TrySetResult(result);
+    }
     private sealed class Source : IBScanVisualSource
     {
         private IObserver<BScanVisualUpdate>? _observer;

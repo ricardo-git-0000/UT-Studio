@@ -24,6 +24,9 @@ Devolver hallazgos con gravedad, evidencia, recomendación y pendientes; disting
 - Hardware sin Dispatcher ni controles. Operaciones largas cancelables y cierre ordenado.
 - Caudal validado por configuración; no combinar máximos individuales como garantía. Identificar por separado canal físico, elemento, beam y ley focal.
 - Memoria y colas acotadas; buffers reutilizables con propietario y liberación definidos. Visualización puede descartar antiguos; almacenamiento nunca pierde silenciosamente.
+- En visualización incremental, distinguir siempre el rango residente autoritativo del rango parcial representado en una actualización. Hit testing, selección e identidad se resuelven contra el rango residente; la región dirty solo delimita trabajo de raster.
+- Los parámetros acoplados de una petición visual (capacidad visible, viewport, resolución y revisión) se publican de forma coherente antes de notificar bindings. Suponer que `PropertyChanged`, measure/arrange y callbacks WPF pueden reentrar inmediatamente.
+- Una acción explícita que invalida la geometría visual cancela o sustituye el raster obsoleto y produce una única resincronización full; las actualizaciones live ordinarias se coalescen. El trabajo de render no puede privar de atención a Stop, cierre ni comandos UI, y esa capacidad de respuesta debe cubrirse con regresiones productivas.
 - Inspecciones por bloques/regiones, sin cargarlas completas. SDK externos detrás de contratos propios.
 
 ## Repositorio

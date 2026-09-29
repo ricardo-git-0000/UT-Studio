@@ -55,6 +55,8 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     public void OpenRun(ConventionalUtFrameMetadata metadata)
     {
         ArgumentNullException.ThrowIfNull(metadata);
+        BScanTraceStore? previousStore;
+        Task? previousClose;
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -62,7 +64,14 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
             {
                 throw new InvalidOperationException("The previous B-Scan run is still active or closing.");
             }
-            _closeTask?.GetAwaiter().GetResult();
+            previousStore = _store;
+            previousClose = _closeTask;
+        }
+        previousClose?.GetAwaiter().GetResult();
+        previousStore?.CloseAsync().GetAwaiter().GetResult();
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var store = new BScanTraceStore(metadata.Configuration.SampleCount, _options, _arrayPool);
             var wake = new SemaphoreSlim(0, 1);
             var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
@@ -160,9 +169,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
             if (!_open || _metadata?.RunId != runId) { return; }
             _open = false;
             _store!.StopAccepting();
-            _runCancellation!.Cancel();
-            try { _wake!.Release(); } catch (SemaphoreFullException) { }
-            _closeTask ??= CloseCoreAsync(_store, _worker!, _wake!, _runCancellation);
+            _closeTask ??= FreezeCoreAsync(_store, _worker!, _wake!, _runCancellation!);
         }
     }
 
@@ -183,9 +190,9 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         BScanTraceStore? store;
         lock (_gate)
         {
-            if (_disposed || !_open || _store is null) { return BScanTraceResult.NotAvailable(); }
+            if (_disposed || _store is null) { return BScanTraceResult.NotAvailable(); }
             _providerOperations++;
-            lifetime = _runCancellation!.Token;
+            lifetime = _open ? _runCancellation!.Token : _lifetimeCancellation.Token;
             store = _store;
         }
 
@@ -251,7 +258,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     {
         lock (_gate)
         {
-            if (_disposed || !_open || _metadata?.RunId != runId || _store is null)
+            if (_disposed || _metadata?.RunId != runId || _store is null)
             { identity = default; return false; }
             return _store.TryResolveIdentity(acquisitionIndex, out identity);
         }
@@ -290,8 +297,9 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
             _disposed = true;
             _lifetimeCancellation.Cancel();
             if (_open) { CloseRun(_metadata!.RunId); }
+            Task closeAndReturn = CloseAndReturnStoreAsync(_closeTask ?? Task.CompletedTask, _store);
             _drainTask ??= DrainCoreAsync(
-                _closeTask ?? Task.CompletedTask,
+                closeAndReturn,
                 _providerOperations == 0 ? Task.CompletedTask :
                     (_providerDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task);
         }
@@ -322,38 +330,58 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         if (failures.Count != 0) { throw new AggregateException("B-Scan ingress drain failed.", failures); }
     }
 
-    private async Task CloseCoreAsync(BScanTraceStore store, Task worker, SemaphoreSlim wake,
+    private async Task FreezeCoreAsync(BScanTraceStore store, Task worker, SemaphoreSlim wake,
         CancellationTokenSource cancellation)
     {
         List<Exception> failures = [];
+        try
+        {
+            await store.WaitForWritersAsync().ConfigureAwait(false);
+            try { wake.Release(); } catch (SemaphoreFullException) { }
+        }
+        catch (Exception error) { failures.Add(error); }
         try { await worker.ConfigureAwait(false); }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested ||
+            _lifetimeCancellation.IsCancellationRequested)
+        { }
         catch (Exception error)
         {
             lock (_gate) { _workerError ??= Message(error); }
             failures.Add(error);
         }
-        try { await store.CloseAsync().ConfigureAwait(false); }
-        catch (Exception error)
-        {
-            AddFailures(failures, error);
-            lock (_gate)
-            {
-                IEnumerable<Exception> errors = error is AggregateException aggregate
-                    ? aggregate.Flatten().InnerExceptions : [error];
-                foreach (Exception cleanupError in errors)
-                {
-                    if (_cleanupErrors.Count == 8) { break; }
-                    _cleanupErrors.Add(Message(cleanupError));
-                }
-            }
-        }
-        finally
+        try
         {
             wake.Dispose();
             cancellation.Dispose();
         }
+        catch (Exception error) { failures.Add(error); }
         if (failures.Count != 0) { throw new AggregateException("B-Scan run cleanup failed.", failures); }
+    }
+
+    private async Task CloseAndReturnStoreAsync(Task frozen, BScanTraceStore? store)
+    {
+        List<Exception> failures = [];
+        try { await frozen.ConfigureAwait(false); }
+        catch (Exception error) { AddFailures(failures, error); }
+        if (store is not null)
+        {
+            try { await store.CloseAsync().ConfigureAwait(false); }
+            catch (Exception error)
+            {
+                AddFailures(failures, error);
+                lock (_gate)
+                {
+                    IEnumerable<Exception> errors = error is AggregateException aggregate
+                        ? aggregate.Flatten().InnerExceptions : [error];
+                    foreach (Exception cleanupError in errors)
+                    {
+                        if (_cleanupErrors.Count == 8) { break; }
+                        _cleanupErrors.Add(Message(cleanupError));
+                    }
+                }
+            }
+        }
+        if (failures.Count != 0) { throw new AggregateException("B-Scan store cleanup failed.", failures); }
     }
 
     private static void AddFailures(List<Exception> failures, Exception error)
@@ -390,6 +418,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
                     NotifyVisualStateChanged();
                 }
             }
+            if (!store.IsAccepting) { return; }
         }
     }
 
@@ -459,14 +488,14 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     internal int VisualCapacity { get { lock (_gate) { return _store?.Capacity ?? 0; } } }
     internal long VisualBytesReserved { get { lock (_gate) { return _store?.VisualLogicalBytes ?? 0; } } }
     internal BScanOptions Options => _options;
-    internal ConventionalUtFrameMetadata? CurrentMetadata { get { lock (_gate) { return _open ? _metadata : null; } } }
+    internal ConventionalUtFrameMetadata? CurrentMetadata { get { lock (_gate) { return _disposed ? null : _metadata; } } }
     internal int CaptureVisualLeases(Span<BScanTraceStore.BScanTraceLease?> destination,
         out ConventionalUtFrameMetadata? metadata, out BScanStoreVisualState state)
     {
         BScanTraceStore? store;
         lock (_gate)
         {
-            store = _open ? _store : null;
+            store = _disposed ? null : _store;
             metadata = store is null ? null : _metadata;
         }
         if (store is null) { state = default; return 0; }
@@ -478,10 +507,22 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         BScanTraceStore? store;
         lock (_gate)
         {
-            if (!_open || _metadata != metadata) { return false; }
+            if (_disposed || _metadata != metadata) { return false; }
             store = _store;
         }
         return store is not null && store.IsVisualStateCurrent(revision, wrapGeneration);
+    }
+
+    internal bool IsBootstrapStateCompatible(ConventionalUtFrameMetadata metadata, ulong revision,
+        ulong wrapGeneration)
+    {
+        BScanTraceStore? store;
+        lock (_gate)
+        {
+            if (_disposed || _metadata != metadata) { return false; }
+            store = _store;
+        }
+        return store is not null && store.IsBootstrapStateCompatible(revision, wrapGeneration);
     }
 
     private static bool IsCompatible(ConventionalUtFrameMetadata expected, ConventionalUtFrameMetadata actual) =>

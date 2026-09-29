@@ -402,7 +402,7 @@ public sealed class AScanViewModelTests
     ];
 
     [TestMethod]
-    public async Task InactiveViewModelRemovesItsDomainFromSharedViewport()
+    public async Task StoppedViewModelKeepsFrozenSignalAndItsSharedViewportDomain()
     {
         var ui = new ManualUiDispatcher();
         var session = new ManualApplicationSession();
@@ -418,9 +418,10 @@ public sealed class AScanViewModelTests
         Assert.AreEqual(vm.AScan!.MinimumTimeSeconds, shared.Viewport!.DomainMinimumSeconds, 1e-15);
 
         session.Set(ManualApplicationSession.Create(2, SessionPhase.Idle, run, canStart: true));
-        await ui.DriveUntilAsync(() => vm.AScan is null);
-        Assert.AreEqual(-1, shared.Viewport!.DomainMinimumSeconds);
-        Assert.AreEqual(1, shared.Viewport.DomainMaximumSeconds);
+        await ui.DriveUntilAsync(() => vm.Session.Phase == SessionPhase.Idle);
+        Assert.IsNotNull(vm.AScan);
+        Assert.AreEqual(vm.AScan.MinimumTimeSeconds, shared.Viewport!.DomainMinimumSeconds, 1e-15);
+        Assert.AreEqual(vm.AScan.MaximumTimeSeconds, shared.Viewport.DomainMaximumSeconds, 1e-15);
         await ui.DriveAsync(vm.DisposeAsync().AsTask());
         await ui.DriveAsync(shared.DisposeAsync().AsTask());
     }
@@ -641,7 +642,7 @@ public sealed class AScanViewModelTests
             Assert.AreSame(latest, vm.AScan);
             session.Set(ManualApplicationSession.Create(6, SessionPhase.Stopping, run2));
             await ui.DriveUntilAsync(() => vm.Session.Phase == SessionPhase.Stopping);
-            Assert.IsNull(vm.AScan);
+            Assert.AreSame(latest, vm.AScan);
         }
         finally { await ui.DriveAsync(vm.DisposeAsync().AsTask()); }
     }

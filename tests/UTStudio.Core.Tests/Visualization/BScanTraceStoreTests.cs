@@ -176,6 +176,59 @@ public sealed class BScanTraceStoreTests
         Assert.AreEqual(pool.RentCount, pool.ReturnCount);
     }
 
+    [TestMethod]
+    public async Task Visual_state_is_not_current_while_slot_is_writing_or_waiting_for_index()
+    {
+        var pool = new DeterministicShortPool();
+        var store = new BScanTraceStore(2,
+            new BScanOptions(traceMemoryBudgetBytes: 128, maximumColumns: 1, minimumColumns: 1), pool);
+        BScanTraceIdentity first = Identity(0);
+        Commit(store, first, [7, 8]);
+        Assert.IsTrue(store.CommitIndex(first, 1, [new(7, 0, 8, 1)]));
+        Assert.IsTrue(store.IsVisualStateCurrent(1, 0));
+
+        BScanTraceStore.StoreWriteReservation writer = store.BeginWrite(2);
+        Assert.AreEqual(StoreWriteKind.Accepted, writer.Kind);
+        Assert.IsFalse(store.IsVisualStateCurrent(1, 0));
+        writer.Abort();
+        Assert.IsTrue(store.IsVisualStateCurrent(1, 0));
+
+        BScanTraceIdentity second = Identity(1);
+        Commit(store, second, [9, 10]);
+        Assert.IsFalse(store.IsVisualStateCurrent(1, 0));
+        Assert.IsTrue(store.CommitIndex(second, 2, [new(9, 0, 10, 1)]));
+        Assert.IsTrue(store.IsVisualStateCurrent(2, 1));
+
+        await store.CloseAsync();
+        Assert.AreEqual(pool.RentCount, pool.ReturnCount);
+    }
+
+    [TestMethod]
+    public async Task Visual_capture_keeps_next_wrap_slots_writable()
+    {
+        var pool = new DeterministicShortPool();
+        var store = new BScanTraceStore(2,
+            new BScanOptions(traceMemoryBudgetBytes: 256, maximumColumns: 4, minimumColumns: 4), pool);
+        for (ulong sequence = 0; sequence < 4; sequence++)
+        {
+            BScanTraceIdentity identity = Identity(sequence);
+            Commit(store, identity, [checked((short)(sequence + 1)), checked((short)(sequence + 2))]);
+            Assert.IsTrue(store.CommitIndex(identity, 1,
+                [new(checked((short)(sequence + 1)), 0, checked((short)(sequence + 2)), 1)]));
+        }
+        var leases = new BScanTraceStore.BScanTraceLease?[4];
+        Assert.AreEqual(4, store.CaptureVisualLeases(leases, out _));
+        Assert.AreEqual(0, store.Statistics.ActiveLeases);
+
+        BScanTraceStore.StoreWriteReservation writer = store.BeginWrite(2);
+        Assert.AreEqual(StoreWriteKind.Accepted, writer.Kind);
+        writer.Abort();
+
+        foreach (BScanTraceStore.BScanTraceLease? lease in leases) { lease?.Dispose(); }
+        await store.CloseAsync();
+        Assert.AreEqual(pool.RentCount, pool.ReturnCount);
+    }
+
     private static void Commit(BScanTraceStore store, BScanTraceIdentity identity, short[] samples)
     {
         var reservation = store.BeginWrite(samples.Length);

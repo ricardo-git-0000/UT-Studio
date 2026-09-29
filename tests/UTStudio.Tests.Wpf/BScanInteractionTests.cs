@@ -35,16 +35,33 @@ public sealed class BScanInteractionTests
         Assert.AreEqual(1, selected);
         point = new(70, 120); clicks = 1;
         control.RaiseEvent(Button(MouseButton.Left, UIElement.MouseLeftButtonDownEvent));
-        Assert.AreEqual(1, selected);
+        Assert.AreEqual(2, selected);
         clicks = 2;
         control.RaiseEvent(Button(MouseButton.Left, UIElement.MouseLeftButtonDownEvent));
-        Assert.AreEqual(1, resets); Assert.AreEqual(1, selected);
+        Assert.AreEqual(1, resets); Assert.AreEqual(2, selected);
         control.RaiseEvent(KeyEvent(control, Key.Home));
         Assert.AreEqual(2, resets);
         point = new(2, 2); clicks = 1;
         control.RaiseEvent(Wheel(120));
         control.RaiseEvent(Button(MouseButton.Left, UIElement.MouseLeftButtonDownEvent));
-        Assert.AreEqual(1, timeZoom); Assert.AreEqual(1, selected);
+        Assert.AreEqual(1, timeZoom); Assert.AreEqual(2, selected);
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task Incremental_snapshot_allows_selection_from_the_complete_resident_range() => StaTest.Run(() =>
+    {
+        Point point = default;
+        var control = Control(() => ModifierKeys.None, _ => point, _ => 1);
+        using var host = new TestWindow(control);
+        point = new(64 + (control.ActualWidth - 84) * (1.5d / 11d), 100);
+        ulong? selected = null;
+        control.ColumnRequested += (_, args) => selected = args.AcquisitionIndex;
+
+        control.RaiseEvent(Button(MouseButton.Left, UIElement.MouseLeftButtonDownEvent));
+
+        Assert.AreEqual(1UL, selected);
+        Assert.IsLessThan(control.Snapshot!.RepresentedRange.First, selected.GetValueOrDefault());
         return Task.CompletedTask;
     });
 
@@ -77,7 +94,12 @@ public sealed class BScanInteractionTests
         point = new(marker, 100);
         Assert.IsTrue(control.HitSelection(point));
         control.RaiseEvent(Button(MouseButton.Left, UIElement.MouseLeftButtonDownEvent));
-        Assert.AreEqual(1, selections); Assert.IsFalse(control.IsMouseCaptured);
+        Assert.AreEqual(1, selections); Assert.IsTrue(control.IsMouseCaptured);
+        point = new(64 + (control.ActualWidth - 84) * (7d / 11d), 100);
+        control.RaiseEvent(Move());
+        Assert.AreEqual(2, selections);
+        control.RaiseEvent(Button(MouseButton.Left, Mouse.MouseUpEvent));
+        Assert.IsFalse(control.IsMouseCaptured);
         return Task.CompletedTask;
     });
 

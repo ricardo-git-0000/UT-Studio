@@ -1,5 +1,8 @@
+using System.IO;
 using System.Windows.Media.Imaging;
 using System.Windows;
+using System.Text;
+using System.Xml;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Controls;
@@ -11,6 +14,35 @@ namespace UTStudio.Tests.Wpf;
 public sealed class BScanControlTests
 {
     [TestMethod]
+    public Task Selection_overlay_is_an_independent_visual_and_does_not_replace_the_raster() => StaTest.Run(() =>
+    {
+        var control = new BScanControl();
+        var window = new Window
+        {
+            Content = control,
+            Width = 320,
+            Height = 180,
+            ShowInTaskbar = false,
+            WindowStyle = WindowStyle.None
+        };
+        window.Show();
+        window.UpdateLayout();
+        BScanVisualSnapshot full = Snapshot(1, 0, 1, true, new(0, 0, 4, 2));
+        Assert.IsTrue(control.ApplyRaster(full, (address, length, stride) =>
+        { Fill(Surface(address, length), stride, 4, 2, _ => 1); return true; }));
+        control.SpatialViewport = full.SpatialViewport;
+        var raster = control.RasterSource;
+
+        control.SelectedAcquisitionIndex = 2;
+
+        Assert.IsTrue(control.HasSelectionVisual);
+        Assert.AreEqual(1, System.Windows.Media.VisualTreeHelper.GetChildrenCount(control));
+        Assert.AreSame(raster, control.RasterSource);
+        window.Close();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
     public void Palette_is_deterministic_and_distinguishes_reserved_and_rf_anchors()
     {
         var colors = Enumerable.Range(0, 256).Select(i => BScanPalette.GetColor((byte)i)).ToArray();
@@ -19,6 +51,55 @@ public sealed class BScanControlTests
         Assert.IsGreaterThan(colors[1].R, colors[1].B);
         Assert.IsGreaterThan(colors[255].B, colors[255].R);
         Assert.AreEqual(colors[128].R, colors[128].G, 10);
+    }
+
+    [TestMethod]
+    public void Xml_palette_is_validated_and_interpolated_to_the_complete_intensity_domain()
+    {
+        const string xml = """
+            <palette type="normal">
+              <allColors>
+                <color red="10" green="20" blue="30" />
+                <color red="110" green="120" blue="130" />
+              </allColors>
+              <allMinColors><color red="1" green="2" blue="3" /></allMinColors>
+              <allMaxColors><color red="250" green="251" blue="252" /></allMaxColors>
+            </palette>
+            """;
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(xml));
+
+        BScanColorPalette palette = BScanPaletteFile.Load(stream, "fixture.xml");
+
+        Assert.AreEqual("fixture.xml", palette.Name);
+        Assert.AreEqual(256, palette.Bgra32.Length);
+        Assert.AreEqual(0xFF010203u, palette.Bgra32.Span[0]);
+        Assert.AreEqual(0xFF0A141Eu, palette.Bgra32.Span[1]);
+        Assert.AreEqual(0xFFFAFBFCu, palette.Bgra32.Span[255]);
+        Assert.AreNotEqual(palette.Bgra32.Span[1], palette.Bgra32.Span[128]);
+
+        byte[] source = [0, 1, 255];
+        byte[] destination = new byte[source.Length * 4];
+        BScanPalette.CopyToBgra32(source, source.Length, destination, destination.Length,
+            new(0, 0, source.Length, 1), palette.Bgra32.Span);
+
+        CollectionAssert.AreEqual(new byte[]
+        {
+            3, 2, 1, 255,
+            30, 20, 10, 255,
+            252, 251, 250, 255
+        }, destination);
+    }
+
+    [TestMethod]
+    public void Xml_palette_rejects_dtd_and_invalid_channels()
+    {
+        using var dtd = new MemoryStream(Encoding.UTF8.GetBytes(
+            "<!DOCTYPE palette [<!ENTITY x '1'>]><palette><allColors><color red='0' green='0' blue='0'/><color red='1' green='1' blue='1'/></allColors></palette>"));
+        Assert.ThrowsExactly<XmlException>(() => BScanPaletteFile.Load(dtd));
+
+        using var invalid = new MemoryStream(Encoding.UTF8.GetBytes(
+            "<palette><allColors><color red='999' green='0' blue='0'/><color red='1' green='1' blue='1'/></allColors></palette>"));
+        Assert.ThrowsExactly<InvalidDataException>(() => BScanPaletteFile.Load(invalid));
     }
 
     [TestMethod]
@@ -35,6 +116,72 @@ public sealed class BScanControlTests
         byte[] after = Pixels(bitmap);
         Assert.AreEqual(before[0], after[0]);
         Assert.AreNotEqual(before[4], after[4]);
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task Live_scroll_moves_existing_pixels_and_applies_only_new_right_columns() => StaTest.Run(() =>
+    {
+        var control = new BScanControl();
+        BScanVisualSnapshot full = Snapshot(1, 0, 1, true, new(0, 0, 4, 2));
+        Assert.IsTrue(control.ApplyRaster(full, (address, length, stride) =>
+        {
+            Span<byte> target = Surface(address, length);
+            for (int y = 0; y < 2; y++)
+                for (int x = 0; x < 4; x++) { Set(target, stride, x, y, (byte)(10 + x)); }
+            return true;
+        }));
+        var bitmap = (WriteableBitmap)control.RasterSource!;
+        byte[] before = Pixels(bitmap);
+        BScanVisualSnapshot shifted = full with
+        {
+            SnapshotVersion = 2,
+            BaseStoreRevision = 1,
+            StoreRevision = 2,
+            WrapGeneration = 1,
+            SpatialViewport = new(1, 0, 4),
+            DirtyRange = new(4, 4, 1, 2),
+            AffectedRegion = new(3, 0, 1, 2),
+            RequiresFullRefresh = false,
+            FullRefreshReason = BScanFullRefreshReason.None,
+            HorizontalPixelShift = 1
+        };
+
+        Assert.IsTrue(control.ApplyRaster(shifted, (address, length, stride) =>
+        {
+            Span<byte> target = Surface(address, length);
+            Set(target, stride, 0, 0, 20);
+            Set(target, stride, 0, 1, 20);
+            return true;
+        }));
+
+        byte[] after = Pixels(bitmap);
+        for (int y = 0; y < 2; y++)
+        {
+            int row = y * bitmap.BackBufferStride;
+            CollectionAssert.AreEqual(before[(row + 4)..(row + 16)], after[row..(row + 12)]);
+        }
+        control.FailIncrementalCommitAtRow = 0;
+        BScanVisualSnapshot failing = shifted with
+        {
+            SnapshotVersion = 3,
+            BaseStoreRevision = 2,
+            StoreRevision = 3,
+            SpatialViewport = new(2, 0, 4),
+            DirtyRange = new(5, 5, 2, 3)
+        };
+        Assert.ThrowsExactly<InvalidOperationException>(() => control.ApplyRaster(failing,
+            (address, length, stride) =>
+            {
+                Span<byte> target = Surface(address, length);
+                Set(target, stride, 0, 0, 30);
+                Set(target, stride, 0, 1, 30);
+                return true;
+            }));
+        CollectionAssert.AreEqual(after, Pixels(bitmap));
+        control.FailIncrementalCommitAtRow = null;
+        Assert.AreSame(bitmap, control.RasterSource);
+        Assert.AreEqual(0, control.ActivePooledRasterBytes);
         return Task.CompletedTask;
     });
 
@@ -62,7 +209,7 @@ public sealed class BScanControlTests
             var target = new RenderTargetBitmap((int)(72 * dpi / 96), (int)(48 * dpi / 96), dpi, dpi,
                 System.Windows.Media.PixelFormats.Pbgra32);
             target.Render(control);
-            Assert.AreEqual(0, System.Windows.Media.VisualTreeHelper.GetChildrenCount(control));
+            Assert.AreEqual(1, System.Windows.Media.VisualTreeHelper.GetChildrenCount(control));
         }
         return Task.CompletedTask;
     });

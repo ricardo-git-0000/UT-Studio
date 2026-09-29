@@ -24,4 +24,11 @@ public sealed record BScanVisualDiagnostics(
     BScanVisualBuildDurationStatistics BuildDuration,
     BScanVisualCloseState CloseState,
     int ActiveBuilds,
-    string? LastVisualError);
+    string? LastVisualError)
+{
+    /// <summary>Number of trace columns retained by the bounded live ring.</summary>
+    public int EffectiveCapacity { get; init; }
+    public ulong ColumnsAccepted { get; init; }
+    public ulong ColumnsRejectedPinnedSlot { get; init; }
+    public ulong ColumnsEvicted { get; init; }
+}

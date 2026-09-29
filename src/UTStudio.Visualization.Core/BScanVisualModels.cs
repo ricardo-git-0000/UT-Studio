@@ -139,7 +139,8 @@ public sealed record BScanRenderRequest(
     ulong? DisplayedStoreRevision = null,
     ulong? DisplayedWrapGeneration = null,
     string ConsumerId = "default",
-    BScanDisplayedVisualIdentity? Displayed = null)
+    BScanDisplayedVisualIdentity? Displayed = null,
+    bool FollowLiveWindow = false)
 {
     public BScanRenderRequest Validate()
     {
@@ -188,6 +189,7 @@ public sealed record BScanVisualSnapshot(
 {
     public string ConsumerId { get; init; } = "default";
     public BScanStreamIdentity Stream { get; init; }
+    public int HorizontalPixelShift { get; init; }
 }
 
 public sealed record BScanVisualUpdate(BScanVisualSnapshot Snapshot);
@@ -208,6 +210,7 @@ public interface IBScanVisualSource : IObservable<BScanVisualUpdate>, IBScanRast
     void RequestBootstrap(string consumerId) { }
     void UnregisterConsumer(string consumerId) { }
     void RequestRender(BScanRenderRequest request);
+    void AcknowledgeDisplayed(string consumerId, BScanDisplayedVisualIdentity displayed) { }
 }
 
 public sealed class BScanRasterResult

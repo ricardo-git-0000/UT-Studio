@@ -62,9 +62,15 @@ Recorrido por cada DPI:
    overlays, ticks, labels y hit testing sin excepciones ni contenido esencial inaccesible.
 6. Cerrar B durante live; confirmar que A y la sesión continúan. Reabrir B y confirmar bootstrap desde
    el store activo, consumidor nuevo y datos recientes.
-7. Ejecutar cierre normal desde `MainWindow`: primero se bloquea interacción, después se completa el
+7. Con 1.024 trazas y el ring lleno, reducir y aumentar repetidamente el tamaño B durante live. Confirmar
+   que Stop, cierre, botones y ratón responden, que cada cambio admite una sola resincronización full y
+   que después reaparece el desplazamiento incremental sin huecos negros.
+8. Detener adquisición sin hacer zoom ni resize. Seleccionar inmediatamente una columna de cualquier
+   parte del rango residente: el cursor y el A-Scan exacto deben aparecer en la misma interacción.
+   Verificar después zoom, pan y resize sobre la imagen congelada y `ReturnToLive` sobre la última señal.
+9. Ejecutar cierre normal desde `MainWindow`: primero se bloquea interacción, después se completa el
    orden contractual y ambas ventanas terminan cerradas.
-8. El cleanup no confirmado no dispone hoy de una entrada diagnóstica en la aplicación —añadirla sería
+10. El cleanup no confirmado no dispone hoy de una entrada diagnóstica en la aplicación —añadirla sería
    funcionalidad productiva fuera de alcance—. Su aceptación se obtiene con las pruebas WPF existentes
    `Productive_shutdown_waits_for_raster_owner_before_disposal_and_host` y
    `Failed_block_return_keeps_productive_cleanup_unconfirmed_and_shell_visible`, que controlan owner,
@@ -139,6 +145,8 @@ baseline contractual.
 | Zoom/pan/reset/cursor B | `BScanInteractionTests`, `BScanControlTests` | Gestos, prioridad y cancelación | No |
 | Full/incremental, stale, wrap, recovery | `BScanVisualProtocolTests`, `BScanProductiveIntegrationTests` | Interacción durante wrap | No repetir matriz Core en E2E |
 | Raster WPF transaccional | `BScanControlTests`, `BScanAdapterIntegrationTests` | Ausencia de corrupción visible | No |
+| Ring lleno y cambio de tamaño live | `Reducing_full_live_ring_keeps_incremental_scroll_and_ui_work_bounded` y pruebas de protocolo/raster | 1.024↔tamaños menores, Stop/cierre y ratón responsivos | No; la regresión productiva reproduce el defecto |
+| Selección congelada inmediata | `Incremental_snapshot_allows_selection_from_the_complete_resident_range`, `Frozen_productive_selection_updates_ascan_and_cursor_without_raster_refresh` | Stop, clic sin zoom/resize, cursor y A exacto | No |
 | Resize, DPI y controles estrechos | `BScanControlTests` off-screen 96/144 DPI | 100/125/150/200 % real | Ninguna preventiva; una regresión real exige test dirigido |
 | Cerrar/reabrir B con store activo | `BScanProductiveIntegrationTests`, `CompositionTests` | 50 ciclos propuestos | No; campaña manual/diagnóstica |
 | Shutdown normal y no confirmado | `ShutdownTests`, `ShutdownRobustnessTests`, `CompositionTests` | Cierre real y ruta diagnóstica | No |

@@ -9,6 +9,22 @@ namespace UTStudio.Core.Tests.Visualization;
 public sealed class BScanVisualPublicationTests
 {
     [TestMethod]
+    public void Wide_live_windows_use_responsive_coalesced_publication_rate()
+    {
+        var narrow = new BScanRenderRequest(new(Guid.NewGuid()), new(0, 0, 512),
+            ScanTimeViewportOperations.Create(0, 1), 512, 512, 1, FollowLiveWindow: true);
+        BScanRenderRequest wide = narrow with { SpatialViewport = new(0, 0, 1024) };
+        BScanRenderRequest manual = wide with { FollowLiveWindow = false };
+
+        Assert.AreEqual(BScanVisualDelivery.MinimumPublicationInterval,
+            BScanVisualDelivery.PublicationInterval(narrow));
+        Assert.AreEqual(BScanVisualDelivery.WideLivePublicationInterval,
+            BScanVisualDelivery.PublicationInterval(wide));
+        Assert.AreEqual(BScanVisualDelivery.MinimumPublicationInterval,
+            BScanVisualDelivery.PublicationInterval(manual));
+    }
+
+    [TestMethod]
     public async Task FirstPublicationIsImmediateWithManualClock()
     {
         await using PublicationHarness harness = await PublicationHarness.CreateAsync();
