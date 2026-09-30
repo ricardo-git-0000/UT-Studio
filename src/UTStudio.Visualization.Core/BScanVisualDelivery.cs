@@ -341,7 +341,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             long budget = checked(_ingress.Options.VisualMemoryBudgetBytes - _ingress.VisualBytesReserved);
             lock (_gate)
             {
-                long consumerCeiling = budget / _ingress.Options.MaximumRasterConsumers;
+                long consumerCeiling = _ingress.Options.VisualMemoryBudgetBytes /
+                    _ingress.Options.MaximumRasterConsumers;
                 long consumerBytes = _consumerOwnerBytes.GetValueOrDefault(request.ConsumerId);
                 if (!_consumers.Contains(request.ConsumerId) ||
                     _consumerOwners.GetValueOrDefault(request.ConsumerId) >=
@@ -366,9 +367,9 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             Span<byte> provenance = storage.Span.Slice(checked(cells * 2), cells);
             try
             {
-                if (request.EffectiveResampling.Mode == Scan2DInterpolationMode.NearestNeighbor)
+                if (request.EffectiveResampling.Mode != Scan2DInterpolationMode.None)
                 {
-                    RasterizeNearest(leases, count, metadata, state.IndexBucketSamples, request,
+                    RasterizeResampled(leases, count, metadata, state.IndexBucketSamples, request,
                         storage, token);
                 }
                 else
@@ -539,13 +540,18 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
     }
 
-    private void RasterizeNearest(BScanTraceStore.BScanTraceLease?[] leases, int count,
+    private void RasterizeResampled(BScanTraceStore.BScanTraceLease?[] leases, int count,
         ConventionalUtFrameMetadata metadata, int bucketSamples, BScanRenderRequest request,
         Memory<byte> destinationStorage, CancellationToken token)
     {
         const int BlockRows = 64;
-        int sourceCells = GetNearestSourceCells(request);
-        int sourceWidth = sourceCells / request.PixelHeight;
+        int sourceWidth = GetResamplingSourceWidth(request);
+        int verticalHalo = request.EffectiveResampling.Mode switch
+        {
+            Scan2DInterpolationMode.Bilinear => 1,
+            Scan2DInterpolationMode.Bicubic => 2,
+            _ => 0
+        };
         int firstOffset = checked((int)decimal.Floor(request.SpatialViewport.MinimumOffset));
         double rate = metadata.Configuration.SampleRateHz;
         double offset = metadata.Configuration.FirstSampleOffsetSeconds;
@@ -564,7 +570,10 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         for (int blockY = 0; blockY < request.PixelHeight; blockY += BlockRows)
         {
             int blockHeight = Math.Min(BlockRows, request.PixelHeight - blockY);
-            int blockSourceCells = checked(sourceWidth * blockHeight);
+            int sourceStartY = Math.Max(0, blockY - verticalHalo);
+            int sourceEndY = Math.Min(request.PixelHeight, checked(blockY + blockHeight + verticalHalo));
+            int blockSourceHeight = sourceEndY - sourceStartY;
+            int blockSourceCells = checked(sourceWidth * blockSourceHeight);
             int blockDestinationCells = checked(request.PixelWidth * blockHeight);
             int scratchLength = checked(checked(blockDestinationCells * 3) + checked(blockSourceCells * 4));
             IMemoryOwner<byte> scratch = _pool.Rent(scratchLength);
@@ -588,9 +597,9 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     int leaseIndex = acquisitionIndex is { } index ? FindAcquisitionIndex(leases, count, index) : -1;
                     if (leaseIndex < 0) { gap = true; continue; }
                     if (gap) { segment = segment == byte.MaxValue ? (byte)1 : checked((byte)(segment + 1)); gap = false; }
-                    for (int localY = 0; localY < blockHeight; localY++)
+                    for (int localY = 0; localY < blockSourceHeight; localY++)
                     {
-                        int y = blockY + localY;
+                        int y = sourceStartY + localY;
                         bool found = false; short selected = 0; int magnitude = -1;
                         SelectRange(leases[leaseIndex]!, bucketSamples, sampleFirstByRow[y], sampleLastByRow[y],
                             ref selected, ref magnitude, ref found);
@@ -602,14 +611,14 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     }
                 }
 
-                var sourceGeometry = new Scan2DGridGeometry(firstOffset + .5, .5, 1, 1);
+                var sourceGeometry = new Scan2DGridGeometry(firstOffset + .5, sourceStartY + .5, 1, 1);
                 var destinationGeometry = new Scan2DGridGeometry(
                     (double)(request.SpatialViewport.MinimumOffset + request.SpatialViewport.Span /
-                        (2m * request.PixelWidth)), .5,
+                        (2m * request.PixelWidth)), blockY + .5,
                     (double)(request.SpatialViewport.Span / request.PixelWidth), 1);
-                var source = new Scan2DSourceGrid(sourceWidth, blockHeight, sourceWidth, sourceGeometry,
+                var source = new Scan2DSourceGrid(sourceWidth, blockSourceHeight, sourceWidth, sourceGeometry,
                     sourceIntensity, sourceMask, sourceSegments, sourceProvenance);
-                var renderRequest = new Scan2DRenderRequest(sourceGeometry, sourceWidth, blockHeight,
+                var renderRequest = new Scan2DRenderRequest(sourceGeometry, sourceWidth, blockSourceHeight,
                     destinationGeometry, request.PixelWidth, blockHeight,
                     new(0, 0, request.PixelWidth, blockHeight), request.EffectiveResampling);
                 using Scan2DRenderResult result = _resampler.Render(source, renderRequest,
@@ -651,13 +660,13 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         source.CopyTo(destination.Slice(destinationOffset, source.Length));
     }
 
-    private static int GetNearestSourceCells(BScanRenderRequest request)
+    private static int GetResamplingSourceWidth(BScanRenderRequest request)
     {
         decimal first = decimal.Floor(request.SpatialViewport.MinimumOffset);
         decimal lastExclusive = decimal.Ceiling(request.SpatialViewport.MaximumOffset);
         int width = checked((int)(lastExclusive - first));
         ArgumentOutOfRangeException.ThrowIfLessThan(width, 1);
-        return checked(width * request.PixelHeight);
+        return width;
     }
 
     private static ulong? TryAddOffset(ulong origin, decimal offset)
@@ -763,7 +772,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             return initial;
         }
         BScanFullRefreshReason reason = BScanFullRefreshReason.None;
-        if (request.EffectiveResampling.Mode == Scan2DInterpolationMode.NearestNeighbor)
+        if (request.EffectiveResampling.Mode != Scan2DInterpolationMode.None)
         { reason |= BScanFullRefreshReason.RenderConfigurationChanged; }
         if (request.Displayed is null && prior is not null)
         {
@@ -819,7 +828,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private static int GetHorizontalPixelShift(BScanRenderRequest request)
     {
-        if (!request.FollowLiveWindow || request.Displayed is not { } displayed ||
+        if (request.EffectiveResampling.Mode != Scan2DInterpolationMode.None ||
+            !request.FollowLiveWindow || request.Displayed is not { } displayed ||
             displayed.Render.PixelWidth != request.PixelWidth ||
             displayed.Render.PixelHeight != request.PixelHeight ||
             displayed.Render.TimeViewport != request.TimeViewport ||

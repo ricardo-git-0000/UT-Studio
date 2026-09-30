@@ -1,6 +1,6 @@
 # ADR 0014 — Remuestreo B-Scan seleccionable y reconstrucción separada
 
-Fecha: 2026-09-29. Estado: Propuesto; pendiente de aprobación antes de implementar.
+Fecha: 2026-09-29. Estado: Aceptado; Fases 1–2 implementadas.
 Trazabilidad: R01, R06, R08, R09, R13 y R14. Complementa, no sustituye,
 [ADR 0013](0013-bscan-bounded-live-visualization.md).
 
@@ -102,13 +102,25 @@ peso uno. La acumulación usa orden fijo, precisión definida por implementació
 | None | Camino actual; sin rejilla intermedia obligatoria | Conserva exactamente el sentinel y discontinuidades actuales | O(1) más formación | Es la referencia de compatibilidad |
 | Nearest | Centro más próximo; empate hacia el índice menor | Válido solo si la celda elegida es válida y del segmento | 1 tap | Bloques/aliasing; no inventa valores |
 | Bilinear | Separable 2×2, radio 1 | Los cuatro taps requeridos deben ser válidos y del mismo segmento; si no, `NoData` | 4 taps | Suavizado, sin overshoot |
-| Bicubic | Keys separable 4×4, radio 2 | Política conservadora idéntica; bordes repiten solo dentro del segmento | 16 taps | Overshoot; clamp final a intensidad [1,255] |
+| Bicubic | Keys separable 4×4, radio 2 | Los 16 taps deben ser válidos y del mismo segmento; bordes repiten solo dentro del segmento | 16 taps | Overshoot; clamp final a intensidad [0,255] |
 | Lanczos | `sinc(x)sinc(x/a)`, separable 6×6 con `a=3` propuesto | Todos los taps reales requeridos válidos; normalización determinista; no cruza gaps | 36 taps | Ringing y overshoot; clamp final [1,255] |
 | GP/Kriging | Vecindario espacial y sistema de covarianza | Puede estimar huecos, por lo que no es modo visual | al menos O(P·k²), O(P·k³) sin factorización reutilizable | Coste, modelo y falsa certeza NDT |
 
 No se renormalizan subconjuntos arbitrarios de taps junto a `NoData`: hacerlo extendería datos dentro de
 huecos. En bordes geométricos sí se combinan taps repetidos del mismo segmento y se normalizan los pesos.
-Bicubic propone Keys/Catmull–Rom `a=-0.5`; Lanczos propone `a=3`. Ambos parámetros requieren aprobación.
+Bicubic fija Keys/Catmull–Rom `a=-0.5`; Lanczos propone `a=3` y continúa pendiente de aprobación.
+
+La Fase 2 acumula Bilinear y Bicubic en `double`, en orden estable de filas y taps de izquierda a
+derecha, y redondea el valor final con `MidpointRounding.AwayFromZero`. El clamp geométrico se aplica a
+cada índice antes de validar máscara y segmento; el clamp de amplitud bicúbico se aplica después de la
+suma completa. El rango es `[0,255]` porque intensidad cero válida se distingue de NoData mediante la
+máscara. Los 4/16 taps se validan incluso si su peso matemático es cero. Ambos modos son full-only en
+esta fase; los bloques B incorporan halo vertical 1/2 y no convierten sus fronteras internas en bordes.
+En 1024×1024, resultado vigente y candidato consumen 6 MiB lógicos; el bloque máximo añade
+aproximadamente 193 KiB lógicos. Con los buckets observados de `MemoryPool`, la coexistencia máxima
+rentada es 8.650.752 bytes. El techo por consumidor contempla sus dos owners permitidos y el presupuesto
+global de 16 MiB continúa siendo la autoridad; el scratch temporal se carga al global y se libera antes
+de transferir el candidato.
 
 ## Gaussian Process / Kriging
 
@@ -244,7 +256,8 @@ contra datos adquiridos.
 
 ## Parámetros y decisiones aplazadas
 
-Requieren aprobación: significado visible de None frente a Nearest; Keys `a=-0.5`; Lanczos `a=3`;
-política conservadora de todos los taps válidos; ubicación inicial en Visualization.Core sin proyecto
-nuevo; persistencia de preferencia; objetivos de memoria/tiempo y hardware; y exclusión de Kriging del
-incremento. Variograma, parámetros, unidades y UX de incertidumbre de Kriging quedan para su ADR.
+Quedan confirmados: semántica compatible de None, Nearest explícito, Keys `a=-0.5`, política
+conservadora de todos los taps válidos, composición en Visualization.Core sin proyecto nuevo y
+exclusión de Kriging del selector visual. Continúan pendientes Lanczos `a=3`, persistencia de
+preferencia y conversión de objetivos diagnósticos de memoria/tiempo en gates sobre hardware acordado.
+Variograma, parámetros, unidades y UX de incertidumbre de Kriging quedan para su propio ADR.

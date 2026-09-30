@@ -183,6 +183,158 @@ public sealed class BScanVisualDeliveryTests
     }
 
     [TestMethod]
+    public async Task CandidateIsStaleWhenAlgorithmVersionChangesBeforeTransactionalCommit()
+    {
+        var ingress = new BScanIngress(Options(2, 2));
+        ConventionalUtFrameMetadata metadata = Metadata(2);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+        ingress.OpenRun(metadata);
+        await using var delivery = new BScanVisualDelivery(ingress);
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[] { 1, 2 });
+        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        BScanRenderRequest request = Request(metadata.RunId, new(0, 1), 2, 2) with
+        { Resampling = new(Scan2DInterpolationMode.Bicubic, algorithmVersion: 2) };
+        var entered = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        delivery.BeforeRasterCandidateValidation = () => { entered.Set(); release.Wait(); };
+
+        Task<BScanRasterResult> pending = Task.Run(async () => await delivery.GetRegionAsync(request));
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+        delivery.RequestRender(request with
+        { Resampling = new(Scan2DInterpolationMode.Bicubic, algorithmVersion: 3) });
+        release.Set();
+
+        Assert.AreEqual(BScanRasterResultKind.Stale,
+            (await pending.WaitAsync(TimeSpan.FromSeconds(10))).Kind);
+        Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
+    [DataRow(Scan2DInterpolationMode.Bilinear)]
+    [DataRow(Scan2DInterpolationMode.Bicubic)]
+    public async Task InterpolatingModesAreFullOnlyAndKeepScratchAndOwnersBalanced(
+        Scan2DInterpolationMode mode)
+    {
+        var ingress = new BScanIngress(Options(4, 2));
+        ConventionalUtFrameMetadata metadata = Metadata(4);
+        var indexed = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int committed = 0;
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult(Interlocked.Increment(ref committed));
+        ingress.OpenRun(metadata);
+        await using var delivery = new BScanVisualDelivery(ingress);
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[] { 0, 10, 20, 30 });
+        await WaitForCount(indexed, 1);
+        indexed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult(Interlocked.Increment(ref committed));
+        ingress.Accept(metadata, 1, 1, TimeSpan.Zero, null, new short[] { 30, 20, 10, 0 });
+        await WaitForCount(indexed, 2);
+
+        BScanRenderRequest request = Request(metadata.RunId, new(0, 3), 8, 70) with
+        { Resampling = new(mode) };
+        BScanRasterResult firstResult = await delivery.GetRegionAsync(request);
+        Assert.AreEqual(BScanRasterResultKind.Available, firstResult.Kind, firstResult.Error);
+        using BScanRasterRegion first = firstResult.Region!;
+        Assert.IsTrue(first.Snapshot.RequiresFullRefresh);
+        Assert.AreEqual(8, first.Width);
+        Assert.AreEqual((byte)1, first.ValidityMask.Span[63 * first.Width]);
+        Assert.AreEqual((byte)1, first.ValidityMask.Span[64 * first.Width]);
+        Assert.IsGreaterThan(0L, delivery.Diagnostics.MaximumVisualBytesRented);
+        Assert.AreEqual(1, delivery.Diagnostics.ActiveRasterOwners);
+
+        BScanRenderRequest based = request with
+        {
+            DisplayedSnapshotVersion = first.Snapshot.SnapshotVersion,
+            DisplayedStoreRevision = first.Snapshot.StoreRevision,
+            DisplayedWrapGeneration = first.Snapshot.WrapGeneration,
+            Displayed = new(first.Snapshot.Stream,
+                new(first.Snapshot.SnapshotVersion, first.Snapshot.StoreRevision, first.Snapshot.WrapGeneration),
+                new(first.Snapshot.SpatialViewport, first.Snapshot.TimeViewport, first.Snapshot.RasterWidth,
+                    first.Snapshot.RasterHeight, first.Snapshot.RenderConfigurationVersion, first.Snapshot.Resampling))
+        };
+        first.Dispose();
+        BScanRasterResult secondResult = await delivery.GetRegionAsync(based);
+        Assert.AreEqual(BScanRasterResultKind.Available, secondResult.Kind, secondResult.Error);
+        using BScanRasterRegion second = secondResult.Region!;
+        Assert.IsTrue(second.Snapshot.RequiresFullRefresh);
+        Assert.IsTrue(second.Snapshot.FullRefreshReason.HasFlag(BScanFullRefreshReason.RenderConfigurationChanged));
+        second.Dispose();
+        Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
+        Assert.AreEqual(0L, delivery.Diagnostics.VisualBytesRented);
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
+    [DataRow(Scan2DInterpolationMode.Bilinear)]
+    [DataRow(Scan2DInterpolationMode.Bicubic)]
+    public async Task InterpolatingModesAtMaximumRasterStayWithinNeutralBudget(
+        Scan2DInterpolationMode mode)
+    {
+        var ingress = new BScanIngress(Options(4, 2));
+        ConventionalUtFrameMetadata metadata = Metadata(4);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+        ingress.OpenRun(metadata);
+        await using var delivery = new BScanVisualDelivery(ingress);
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[] { short.MinValue, 0, short.MaxValue, 1 });
+        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        BScanRenderRequest none = Request(metadata.RunId, new(0, 3), 1024, 1024);
+        BScanRasterResult baselineResult = await delivery.GetRegionAsync(none);
+        Assert.AreEqual(BScanRasterResultKind.Available, baselineResult.Kind, baselineResult.Error);
+        using BScanRasterRegion baseline = baselineResult.Region!;
+        BScanRenderRequest request = none with
+        { Resampling = new(mode) };
+        BScanRasterResult result = await delivery.GetRegionAsync(request);
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind, result.Error);
+        using BScanRasterRegion region = result.Region!;
+        Assert.AreEqual(checked(1024 * 1024), region.Pixels.Length);
+        Assert.AreEqual(8_650_752L, delivery.Diagnostics.MaximumVisualBytesRented);
+        Assert.IsLessThanOrEqualTo(16L * 1024 * 1024, delivery.Diagnostics.MaximumVisualBytesRented);
+        region.Dispose(); baseline.Dispose();
+        Assert.AreEqual(0L, delivery.Diagnostics.VisualBytesRented);
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task ConsumerByteCeilingPreservesTheOtherConsumersProportionalShare()
+    {
+        var options = new BScanOptions(traceMemoryBudgetBytes: 1_000_000,
+            visualMemoryBudgetBytes: 16 * 1024 * 1024, maximumColumns: 4, minimumColumns: 2,
+            indexBucketSamples: 2, maximumRasterConsumers: 2, maximumRasterOwnersPerConsumer: 3);
+        var ingress = new BScanIngress(options);
+        ConventionalUtFrameMetadata metadata = Metadata(4);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+        ingress.OpenRun(metadata);
+        await using var delivery = new BScanVisualDelivery(ingress);
+        Assert.IsTrue(delivery.RegisterConsumer("first"));
+        Assert.IsTrue(delivery.RegisterConsumer("second"));
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[] { 1, 2, 3, 4 });
+        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        BScanRenderRequest request = Request(metadata.RunId, new(0, 3), 1024, 1024) with
+        {
+            ConsumerId = "first",
+            Resampling = new(Scan2DInterpolationMode.Bilinear)
+        };
+        using BScanRasterRegion first = (await delivery.GetRegionAsync(request)).Region!;
+        using BScanRasterRegion second = (await delivery.GetRegionAsync(request)).Region!;
+        using BScanRasterRegion otherConsumer = (await delivery.GetRegionAsync(request with
+        { ConsumerId = "second" })).Region!;
+        BScanRasterResult rejected = await delivery.GetRegionAsync(request);
+
+        Assert.AreEqual(BScanRasterResultKind.ResourceLimit, rejected.Kind);
+        Assert.AreEqual(3, delivery.Diagnostics.ActiveRasterOwners);
+        first.Dispose();
+        second.Dispose();
+        otherConsumer.Dispose();
+        Assert.AreEqual(0L, delivery.Diagnostics.VisualBytesRented);
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task OwnerQuotaIsBoundedAndDisposeIsIdempotent()
     {
         var ingress = new BScanIngress(Options(2, 2));

@@ -10,7 +10,8 @@ namespace UTStudio.Benchmarks;
 public class BScanFullRasterBenchmarks
 {
     [Params(256, 1024)] public int RasterSize { get; set; }
-    [Params(Scan2DInterpolationMode.None, Scan2DInterpolationMode.NearestNeighbor)]
+    [Params(Scan2DInterpolationMode.None, Scan2DInterpolationMode.NearestNeighbor,
+        Scan2DInterpolationMode.Bilinear, Scan2DInterpolationMode.Bicubic)]
     public Scan2DInterpolationMode Mode { get; set; }
     private BScanVisualBenchmarkFixture _fixture = null!;
 

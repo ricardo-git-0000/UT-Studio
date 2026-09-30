@@ -1,6 +1,6 @@
 # Plan de implementación de modos de remuestreo B-Scan
 
-Estado: Fase 1 implementada; fases 2–4 no autorizadas. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
+Estado: Fases 1–2 implementadas; fases 3–4 no autorizadas. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
 
 ## Alcance, propiedad y reglas
 
@@ -39,11 +39,12 @@ consume intensidad y máscara y no infiere validez del byte cero.
 
 ## Fase 2 — Bilinear y Bicubic
 
-Implementar full con máscara conservadora y después incremental con halos 1/2. Bicubic usa el parámetro
-aprobado, acumulación determinista, normalización y clamp final.
+Implementar full con máscara conservadora. Bilinear y Bicubic permanecen full-only en esta fase;
+incremental con halos queda aplazado. Bicubic usa Keys/Catmull–Rom `a=-0.5`, acumulación determinista,
+sin renormalizar taps inválidos y clamp final `[0,255]`.
 
 Aceptación: vectores exactos de constantes, rampas, impulsos y bordes; ausencia de overshoot en bilinear;
-overshoot bicubic controlado; full = composición de incrementales; gaps no cerrados; dirty expandido;
+overshoot bicubic controlado; gaps no cerrados; una base incremental recupera mediante una única full;
 cambio rápido de modo/zoom/resize produce una sola full vigente; sin starvation de Stop/cierre.
 
 ## Fase 3 — Lanczos
@@ -119,12 +120,9 @@ universal o superficie pública hasta que C-Scan aporte requisitos y un segundo 
 - documentación sincronizada y sin fixtures reales/secretos;
 - no commit, stage o integración sin autorización expresa.
 
-## Decisiones requeridas antes de Fase 1
+## Estado de decisiones
 
-1. Aprobar que Kriging/GP queda separado como reconstrucción.
-2. Aprobar política conservadora: todos los taps requeridos válidos y ningún cruce de segmento.
-3. Aprobar Keys `a=-0.5` y Lanczos `a=3`, o sustituirlos.
-4. Aprobar semántica de `None` compatible y `Nearest` como remuestreo explícito desde rejilla neutral.
-5. Aprobar composición en Visualization.Core sin proyecto `Scan2D.Core` todavía.
-6. Decidir persistencia en Fase 4; propuesta: preferencia UI versionada, nunca metadata de adquisición.
-7. Aprobar hardware, metodología y objetivos de tiempo/memoria antes de convertirlos en gates.
+Confirmadas para Fases 1–2: Kriging/GP separado, política conservadora de taps/segmentos,
+Keys `a=-0.5`, None compatible, Nearest explícito y composición en Visualization.Core sin proyecto
+`Scan2D.Core`. Continúan pendientes Lanczos `a=3`, persistencia de Fase 4 y aprobación de hardware,
+metodología y objetivos antes de convertir los diagnósticos de rendimiento en gates.
