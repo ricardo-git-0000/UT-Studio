@@ -1,6 +1,6 @@
 # Plan de implementación de modos de remuestreo B-Scan
 
-Estado: Fases 1–2 implementadas; fases 3–4 no autorizadas. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
+Estado: Fases 1–3 implementadas; fase 4 no autorizada. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
 
 ## Alcance, propiedad y reglas
 
@@ -49,12 +49,19 @@ cambio rápido de modo/zoom/resize produce una sola full vigente; sin starvation
 
 ## Fase 3 — Lanczos
 
-Implementar Lanczos separable con radio aprobado (propuesta `a=3`), tabla/pesos acotados y halo. Primero
-full; incremental solo después de probar equivalencia y disponibilidad del vecindario.
+Implementado Lanczos separable con radio fijo aprobado `a=3`, soporte 6×6, pesos calculados sin
+asignación por píxel, halo vertical 3 y halo horizontal 3 limitado al rango residente. Permanece
+full-only; una petición incremental solicita una única
+recuperación full y el incremental con halo queda aplazado.
 
-Aceptación: `sinc(0)=1`, constantes conservadas, impulso/ringing documentado, normalización y clamp
-deterministas; full/incremental equivalentes; 1/8/33/100 columnas medidos; degradación solo por cadencia
-latest-only, nunca por cambio silencioso de kernel.
+Aceptación: `sinc(0)=1`, constantes conservadas, impulso/ringing documentado, normalización completa y
+clamp `[0,255]` deterministas; 36 taps conservadores del mismo segmento; recuperación full única;
+256×256 y 1024×1024 medidos como diagnóstico; degradación solo por cadencia latest-only, nunca por
+cambio silencioso de kernel.
+
+Resultado diagnóstico Dry en la VM VMware: Lanczos completó aislado en 256×256 y 1024×1024 y dentro
+de la matriz completa de diez casos, con código cero y balances finales cero. Los intervalos observados
+fueron 109,44–116,92 ms y 825,71–934,11 ms respectivamente; no son baseline y no modifican objetivos.
 
 ## Fase 4 — UI, preferencia y aceptación
 
@@ -122,7 +129,7 @@ universal o superficie pública hasta que C-Scan aporte requisitos y un segundo 
 
 ## Estado de decisiones
 
-Confirmadas para Fases 1–2: Kriging/GP separado, política conservadora de taps/segmentos,
-Keys `a=-0.5`, None compatible, Nearest explícito y composición en Visualization.Core sin proyecto
-`Scan2D.Core`. Continúan pendientes Lanczos `a=3`, persistencia de Fase 4 y aprobación de hardware,
+Confirmadas para Fases 1–3: Kriging/GP separado, política conservadora de taps/segmentos,
+Keys `a=-0.5`, Lanczos-3 `a=3`, None compatible, Nearest explícito y composición en Visualization.Core sin proyecto
+`Scan2D.Core`. Continúan pendientes la persistencia de Fase 4 y aprobación de hardware,
 metodología y objetivos antes de convertir los diagnósticos de rendimiento en gates.

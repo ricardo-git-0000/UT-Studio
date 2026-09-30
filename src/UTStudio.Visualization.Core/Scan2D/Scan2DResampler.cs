@@ -39,10 +39,9 @@ public sealed class Scan2DResampler : IScan2DResampler
                     RenderNearest(source, request, result, cancellationToken);
                     break;
                 case Scan2DInterpolationMode.Bilinear:
-                    RenderKernel(source, request, result, bicubic: false, cancellationToken);
-                    break;
                 case Scan2DInterpolationMode.Bicubic:
-                    RenderKernel(source, request, result, bicubic: true, cancellationToken);
+                case Scan2DInterpolationMode.Lanczos:
+                    RenderKernel(source, request, result, cancellationToken);
                     break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(request), "Unsupported interpolation mode.");
@@ -103,11 +102,24 @@ public sealed class Scan2DResampler : IScan2DResampler
     }
 
     private void RenderKernel(Scan2DSourceGrid source, Scan2DRenderRequest request,
-        Scan2DRenderResult result, bool bicubic, CancellationToken token)
+        Scan2DRenderResult result, CancellationToken token)
     {
         Scan2DRectangle region = request.Viewport;
-        int tapCount = bicubic ? 4 : 2;
-        int firstTapOffset = bicubic ? -1 : 0;
+        Scan2DInterpolationMode mode = request.Options.Mode;
+        int tapCount = mode switch
+        {
+            Scan2DInterpolationMode.Bilinear => 2,
+            Scan2DInterpolationMode.Bicubic => 4,
+            Scan2DInterpolationMode.Lanczos => 6,
+            _ => throw new ArgumentOutOfRangeException(nameof(request), "Unsupported kernel mode.")
+        };
+        int firstTapOffset = mode switch
+        {
+            Scan2DInterpolationMode.Bilinear => 0,
+            Scan2DInterpolationMode.Bicubic => -1,
+            Scan2DInterpolationMode.Lanczos => -2,
+            _ => throw new ArgumentOutOfRangeException(nameof(request), "Unsupported kernel mode.")
+        };
         for (int y = region.Y; y < checked(region.Y + region.Height); y++)
         {
             token.ThrowIfCancellationRequested();
@@ -124,14 +136,14 @@ public sealed class Scan2DResampler : IScan2DResampler
                 int baseX = checked((int)Math.Floor(sourceX));
                 double fractionX = sourceX - baseX;
                 double accumulated = 0;
+                double combinedWeight = 0;
                 byte segment = 0;
                 bool valid = true;
                 for (int tapY = 0; tapY < tapCount && valid; tapY++)
                 {
                     int unclampedY = checked(baseY + firstTapOffset + tapY);
                     int sampleY = Math.Clamp(unclampedY, 0, source.Height - 1);
-                    double weightY = bicubic ? KeysWeight(fractionY - (firstTapOffset + tapY),
-                        request.Options.CubicA) : LinearWeight(fractionY - tapY);
+                    double weightY = KernelWeight(mode, fractionY - (firstTapOffset + tapY), request.Options);
                     for (int tapX = 0; tapX < tapCount; tapX++)
                     {
                         int unclampedX = checked(baseX + firstTapOffset + tapX);
@@ -142,12 +154,20 @@ public sealed class Scan2DResampler : IScan2DResampler
                         byte tapSegment = source.SegmentIds.Span[sourceIndex];
                         if (segment == 0) { segment = tapSegment; }
                         else if (tapSegment != segment) { valid = false; break; }
-                        double weightX = bicubic ? KeysWeight(fractionX - (firstTapOffset + tapX),
-                            request.Options.CubicA) : LinearWeight(fractionX - tapX);
-                        accumulated += source.Intensities.Span[sourceIndex] * weightY * weightX;
+                        double weightX = KernelWeight(mode, fractionX - (firstTapOffset + tapX), request.Options);
+                        double weight = weightY * weightX;
+                        accumulated += source.Intensities.Span[sourceIndex] * weight;
+                        combinedWeight += weight;
                     }
                 }
                 if (!valid) { continue; }
+                if (mode == Scan2DInterpolationMode.Lanczos)
+                {
+                    if (!double.IsFinite(combinedWeight) ||
+                        Math.Abs(combinedWeight) < LanczosCoincidenceTolerance)
+                    { throw new InvalidOperationException("Lanczos normalization weight is zero."); }
+                    accumulated /= combinedWeight;
+                }
                 int destinationIndex = checked(y * result.Stride + x);
                 result.Intensities.Span[destinationIndex] = RoundIntensity(accumulated);
                 result.ValidityMask.Span[destinationIndex] = 1;
@@ -183,12 +203,44 @@ public sealed class Scan2DResampler : IScan2DResampler
         return 0;
     }
 
+    private static double KernelWeight(Scan2DInterpolationMode mode, double distance,
+        Scan2DResamplingOptions options) => mode switch
+        {
+            Scan2DInterpolationMode.Bilinear => LinearWeight(distance),
+            Scan2DInterpolationMode.Bicubic => KeysWeight(distance, options.CubicA),
+            Scan2DInterpolationMode.Lanczos => LanczosWeight(distance),
+            _ => throw new ArgumentOutOfRangeException(nameof(mode))
+        };
+
+    // The tolerance makes mathematically coincident centers and integer sinc zeros stable against
+    // binary coordinate error; it is far below an intensity rounding boundary.
+    internal const double LanczosCoincidenceTolerance = 1e-12;
+
+    internal static double NormalizedSinc(double value)
+    {
+        if (Math.Abs(value) <= LanczosCoincidenceTolerance) { return 1; }
+        double nearestInteger = Math.Round(value);
+        if (nearestInteger != 0 && Math.Abs(value - nearestInteger) <= LanczosCoincidenceTolerance)
+        { return 0; }
+        double piValue = Math.PI * value;
+        return Math.Sin(piValue) / piValue;
+    }
+
+    internal static double LanczosWeight(double distance)
+    {
+        double absolute = Math.Abs(distance);
+        return absolute < Scan2DResamplingOptions.LanczosRadius
+            ? NormalizedSinc(distance) * NormalizedSinc(distance / Scan2DResamplingOptions.LanczosRadius)
+            : 0;
+    }
+
     private static byte RoundIntensity(double value)
     {
         double clamped = Math.Clamp(value, byte.MinValue, byte.MaxValue);
         return checked((byte)Math.Round(clamped, MidpointRounding.AwayFromZero));
     }
 
+    // Provenance uses zero tolerance: a merely near-integer coordinate remains derived.
     private static bool IsExactSourceCenter(double coordinate, int length) =>
         coordinate == Math.Truncate(coordinate) && coordinate >= 0 && coordinate < length;
 

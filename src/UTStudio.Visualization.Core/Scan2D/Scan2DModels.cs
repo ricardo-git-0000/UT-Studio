@@ -2,7 +2,7 @@ using System.Buffers;
 
 namespace UTStudio.Visualization.Core.Scan2D;
 
-public enum Scan2DInterpolationMode { None = 0, NearestNeighbor = 1, Bilinear = 2, Bicubic = 3 }
+public enum Scan2DInterpolationMode { None = 0, NearestNeighbor = 1, Bilinear = 2, Bicubic = 3, Lanczos = 4 }
 
 public enum Scan2DMaskPolicy { AllRequiredSupportValidAndSameSegment = 0 }
 
@@ -92,25 +92,31 @@ public readonly struct Scan2DSourceGrid
 
 public readonly record struct Scan2DResamplingOptions
 {
-    public const uint CurrentAlgorithmVersion = 2;
+    public const uint CurrentAlgorithmVersion = 3;
     public const double CatmullRomA = -0.5;
+    public const int LanczosRadius = 3;
 
     public Scan2DResamplingOptions(Scan2DInterpolationMode mode,
         Scan2DMaskPolicy maskPolicy = Scan2DMaskPolicy.AllRequiredSupportValidAndSameSegment,
-        uint algorithmVersion = CurrentAlgorithmVersion, double cubicA = CatmullRomA)
+        uint algorithmVersion = CurrentAlgorithmVersion, double cubicA = CatmullRomA,
+        int lanczosRadius = LanczosRadius)
     {
         Mode = Enum.IsDefined(mode) ? mode : Scan2DInterpolationMode.None;
         if (!Enum.IsDefined(maskPolicy)) { throw new ArgumentOutOfRangeException(nameof(maskPolicy)); }
         if (algorithmVersion == 0) { throw new ArgumentOutOfRangeException(nameof(algorithmVersion)); }
         if (!double.IsFinite(cubicA) || cubicA != CatmullRomA)
         { throw new ArgumentOutOfRangeException(nameof(cubicA), "Phase 2 supports only Keys/Catmull-Rom a=-0.5."); }
+        if (lanczosRadius != LanczosRadius)
+        { throw new ArgumentOutOfRangeException(nameof(lanczosRadius), "Lanczos supports only the fixed radius a=3."); }
         MaskPolicy = maskPolicy; AlgorithmVersion = algorithmVersion; CubicA = cubicA;
+        LanczosA = lanczosRadius;
     }
 
     public Scan2DInterpolationMode Mode { get; }
     public Scan2DMaskPolicy MaskPolicy { get; }
     public uint AlgorithmVersion { get; }
     public double CubicA { get; }
+    public int LanczosA { get; }
     public static Scan2DResamplingOptions Default => new(Scan2DInterpolationMode.None);
 }
 

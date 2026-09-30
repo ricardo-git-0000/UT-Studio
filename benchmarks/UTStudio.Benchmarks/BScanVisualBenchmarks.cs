@@ -17,7 +17,8 @@ public class BScanFullRasterBenchmarks
     public IEnumerable<int> RasterSizes => DiagnosticParameter("UTSTUDIO_SCAN2D_SIZE", [256, 1024], int.Parse);
     public IEnumerable<Scan2DInterpolationMode> Modes => DiagnosticParameter("UTSTUDIO_SCAN2D_MODE",
         [Scan2DInterpolationMode.None, Scan2DInterpolationMode.NearestNeighbor,
-            Scan2DInterpolationMode.Bilinear, Scan2DInterpolationMode.Bicubic],
+            Scan2DInterpolationMode.Bilinear, Scan2DInterpolationMode.Bicubic,
+            Scan2DInterpolationMode.Lanczos],
         value => Enum.Parse<Scan2DInterpolationMode>(value, ignoreCase: true));
 
     [GlobalSetup]

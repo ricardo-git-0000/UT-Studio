@@ -9,6 +9,7 @@ public sealed class Scan2DAdvancedResamplerTests
     [TestMethod]
     [DataRow(Scan2DInterpolationMode.Bilinear)]
     [DataRow(Scan2DInterpolationMode.Bicubic)]
+    [DataRow(Scan2DInterpolationMode.Lanczos)]
     public void ConstantsIdentityAndSingletonsAreExact(Scan2DInterpolationMode mode)
     {
         AssertRender([0], 1, 1, new(0, 0, 1, 1), 1, 1, mode, [0], [1]);
@@ -97,7 +98,13 @@ public sealed class Scan2DAdvancedResamplerTests
     [DataRow(Scan2DInterpolationMode.Bicubic)]
     public void AnyInvalidOrDifferentSegmentTapProducesNoData(Scan2DInterpolationMode mode)
     {
-        int width = mode == Scan2DInterpolationMode.Bilinear ? 2 : 4;
+        int width = mode switch
+        {
+            Scan2DInterpolationMode.Bilinear => 2,
+            Scan2DInterpolationMode.Bicubic => 4,
+            Scan2DInterpolationMode.Lanczos => 6,
+            _ => throw new AssertFailedException("Unexpected interpolation mode.")
+        };
         byte[] values = Enumerable.Repeat((byte)100, width).ToArray();
         byte[] mask = Enumerable.Repeat((byte)1, width).ToArray();
         byte[] segments = Enumerable.Repeat((byte)1, width).ToArray();
@@ -148,12 +155,13 @@ public sealed class Scan2DAdvancedResamplerTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new Scan2DResamplingOptions(
             Scan2DInterpolationMode.Bicubic, algorithmVersion: 2, cubicA: double.NaN));
         Assert.AreNotEqual(bicubic, new Scan2DResamplingOptions(Scan2DInterpolationMode.Bicubic,
-            algorithmVersion: 3));
+            algorithmVersion: 4));
     }
 
     [TestMethod]
     [DataRow(Scan2DInterpolationMode.Bilinear)]
     [DataRow(Scan2DInterpolationMode.Bicubic)]
+    [DataRow(Scan2DInterpolationMode.Lanczos)]
     public void CancellationDisposesOwnerWithoutPublishingPartialResult(Scan2DInterpolationMode mode)
     {
         const int size = 128;

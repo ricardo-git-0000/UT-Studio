@@ -1,6 +1,6 @@
 # ADR 0014 — Remuestreo B-Scan seleccionable y reconstrucción separada
 
-Fecha: 2026-09-29. Estado: Aceptado; Fases 1–2 implementadas.
+Fecha: 2026-09-29. Estado: Aceptado; Fases 1–3 implementadas.
 Trazabilidad: R01, R06, R08, R09, R13 y R14. Complementa, no sustituye,
 [ADR 0013](0013-bscan-bounded-live-visualization.md).
 
@@ -103,12 +103,12 @@ peso uno. La acumulación usa orden fijo, precisión definida por implementació
 | Nearest | Centro más próximo; empate hacia el índice menor | Válido solo si la celda elegida es válida y del segmento | 1 tap | Bloques/aliasing; no inventa valores |
 | Bilinear | Separable 2×2, radio 1 | Los cuatro taps requeridos deben ser válidos y del mismo segmento; si no, `NoData` | 4 taps | Suavizado, sin overshoot |
 | Bicubic | Keys separable 4×4, radio 2 | Los 16 taps deben ser válidos y del mismo segmento; bordes repiten solo dentro del segmento | 16 taps | Overshoot; clamp final a intensidad [0,255] |
-| Lanczos | `sinc(x)sinc(x/a)`, separable 6×6 con `a=3` propuesto | Todos los taps reales requeridos válidos; normalización determinista; no cruza gaps | 36 taps | Ringing y overshoot; clamp final [1,255] |
+| Lanczos | `sinc(x)sinc(x/3)`, separable 6×6 con `a=3` fijo | Los 36 taps requeridos son válidos y del mismo segmento; normalización completa determinista; no cruza gaps | 36 taps | Ringing y overshoot; clamp final [0,255] |
 | GP/Kriging | Vecindario espacial y sistema de covarianza | Puede estimar huecos, por lo que no es modo visual | al menos O(P·k²), O(P·k³) sin factorización reutilizable | Coste, modelo y falsa certeza NDT |
 
 No se renormalizan subconjuntos arbitrarios de taps junto a `NoData`: hacerlo extendería datos dentro de
 huecos. En bordes geométricos sí se combinan taps repetidos del mismo segmento y se normalizan los pesos.
-Bicubic fija Keys/Catmull–Rom `a=-0.5`; Lanczos propone `a=3` y continúa pendiente de aprobación.
+Bicubic fija Keys/Catmull–Rom `a=-0.5`; Lanczos fija el radio aprobado `a=3`.
 
 La Fase 2 acumula Bilinear y Bicubic en `double`, en orden estable de filas y taps de izquierda a
 derecha, y redondea el valor final con `MidpointRounding.AwayFromZero`. El clamp geométrico se aplica a
@@ -121,6 +121,28 @@ aproximadamente 193 KiB lógicos. Con los buckets observados de `MemoryPool`, la
 rentada es 8.650.752 bytes. El techo por consumidor contempla sus dos owners permitidos y el presupuesto
 global de 16 MiB continúa siendo la autoridad; el scratch temporal se carga al global y se libera antes
 de transferir el candidato.
+
+La Fase 3 implementa Lanczos-3 full-only con offsets `-2..+3`, halo vertical 3 en los bloques B y halo
+horizontal 3 limitado al rango residente autoritativo. Así el clamp geométrico replica únicamente un
+borde residente real; un gap o cambio de segmento fuera del viewport pero dentro del soporte sigue
+invalidando el destino. La
+acumulación `double` determinista en orden Y→X. `sinc(0)=1` y los enteros no nulos se resuelven con una
+tolerancia absoluta `1e-12` antes de evaluar `sin(πx)/(πx)`, evitando residuos dependientes de la
+plataforma; la procedencia conserva tolerancia cero y solo copia la procedencia fuente en una
+coincidencia integral exacta dentro del dominio. Primero se limita geométricamente cada índice, después
+se validan siempre los 36 taps y su segmento, se normaliza el kernel completo, se acumula el resultado,
+se limita la amplitud a `[0,255]` y se redondea con `MidpointRounding.AwayFromZero`. No se renormaliza
+ningún subconjunto válido: un solo `NoData` o cambio de segmento invalida el destino y puede ensanchar
+visualmente un gap. La versión estructural del algoritmo es 3.
+
+Lanczos permanece full-only: una petición con base incremental fuerza una única recuperación full por
+la infraestructura latest-only existente. No existe fallback a otro kernel. En la comprobación
+1024×1024, resultado vigente, candidato y scratch conservaron el pico rentado observado de
+8.650.752 bytes, por debajo de los 16 MiB neutrales; owners, bytes, builds, leases y bloques terminaron
+en cero. En la VM VMware de diagnóstico, Dry observó 109,44–116,92 ms para 256×256 y
+825,71–934,11 ms para 1024×1024 en ejecuciones aisladas/matriz. Estos tiempos incluyen render y
+liberación del owner, exceden las hipótesis iniciales y no son baseline ni autorizan cambiar
+presupuestos; requieren una campaña normal con warmup, iteraciones y hardware aprobados.
 
 ## Gaussian Process / Kriging
 
@@ -256,8 +278,8 @@ contra datos adquiridos.
 
 ## Parámetros y decisiones aplazadas
 
-Quedan confirmados: semántica compatible de None, Nearest explícito, Keys `a=-0.5`, política
+Quedan confirmados: semántica compatible de None, Nearest explícito, Keys `a=-0.5`, Lanczos-3 `a=3`, política
 conservadora de todos los taps válidos, composición en Visualization.Core sin proyecto nuevo y
-exclusión de Kriging del selector visual. Continúan pendientes Lanczos `a=3`, persistencia de
+exclusión de Kriging del selector visual. Continúan pendientes la persistencia de
 preferencia y conversión de objetivos diagnósticos de memoria/tiempo en gates sobre hardware acordado.
 Variograma, parámetros, unidades y UX de incertidumbre de Kriging quedan para su propio ADR.

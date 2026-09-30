@@ -156,6 +156,34 @@ public sealed class BScanVisualDeliveryTests
     }
 
     [TestMethod]
+    public async Task LanczosInteriorViewportUsesHorizontalHaloAndSeesGapOutsideVisibleRange()
+    {
+        var ingress = new BScanIngress(Options(8, 2));
+        ConventionalUtFrameMetadata metadata = Metadata(4);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int remaining = 7;
+        ingress.AfterIndexCommit = _ => { if (Interlocked.Decrement(ref remaining) == 0) indexed.TrySetResult(); };
+        ingress.OpenRun(metadata);
+        await using var delivery = new BScanVisualDelivery(ingress);
+        ulong[] acquisitionIndices = [0, 1, 2, 4, 5, 6, 7];
+        for (int index = 0; index < acquisitionIndices.Length; index++)
+            ingress.Accept(metadata, (ulong)index, acquisitionIndices[index], TimeSpan.Zero, null,
+                new short[] { 100, 100, 100, 100 });
+        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var request = new BScanRenderRequest(metadata.RunId, new(0, 4, 6),
+            ScanTimeViewportOperations.Create(0, .000004), 2, 1, 1,
+            Resampling: new(Scan2DInterpolationMode.Lanczos));
+        using BScanRasterRegion region = (await delivery.GetRegionAsync(request)).Region!;
+
+        CollectionAssert.AreEqual(new byte[] { 0, 0 }, region.ValidityMask.ToArray());
+        CollectionAssert.AreEqual(new byte[] { 0, 0 }, region.Pixels.ToArray());
+        region.Dispose();
+        Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task CandidateIsStaleWhenModeChangesBeforeTransactionalCommit()
     {
         var ingress = new BScanIngress(Options(2, 2));
@@ -173,7 +201,7 @@ public sealed class BScanVisualDeliveryTests
 
         Task<BScanRasterResult> pending = Task.Run(async () => await delivery.GetRegionAsync(none));
         Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
-        delivery.RequestRender(none with { Resampling = new(Scan2DInterpolationMode.NearestNeighbor) });
+        delivery.RequestRender(none with { Resampling = new(Scan2DInterpolationMode.Lanczos) });
         release.Set();
 
         Assert.AreEqual(BScanRasterResultKind.Stale,
@@ -194,7 +222,7 @@ public sealed class BScanVisualDeliveryTests
         ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[] { 1, 2 });
         await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
         BScanRenderRequest request = Request(metadata.RunId, new(0, 1), 2, 2) with
-        { Resampling = new(Scan2DInterpolationMode.Bicubic, algorithmVersion: 2) };
+        { Resampling = new(Scan2DInterpolationMode.Lanczos, algorithmVersion: 2) };
         var entered = new ManualResetEventSlim();
         var release = new ManualResetEventSlim();
         delivery.BeforeRasterCandidateValidation = () => { entered.Set(); release.Wait(); };
@@ -202,7 +230,7 @@ public sealed class BScanVisualDeliveryTests
         Task<BScanRasterResult> pending = Task.Run(async () => await delivery.GetRegionAsync(request));
         Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
         delivery.RequestRender(request with
-        { Resampling = new(Scan2DInterpolationMode.Bicubic, algorithmVersion: 3) });
+        { Resampling = new(Scan2DInterpolationMode.Lanczos, algorithmVersion: 3) });
         release.Set();
 
         Assert.AreEqual(BScanRasterResultKind.Stale,
@@ -214,6 +242,7 @@ public sealed class BScanVisualDeliveryTests
     [TestMethod]
     [DataRow(Scan2DInterpolationMode.Bilinear)]
     [DataRow(Scan2DInterpolationMode.Bicubic)]
+    [DataRow(Scan2DInterpolationMode.Lanczos)]
     public async Task InterpolatingModesAreFullOnlyAndKeepScratchAndOwnersBalanced(
         Scan2DInterpolationMode mode)
     {
@@ -268,6 +297,7 @@ public sealed class BScanVisualDeliveryTests
     [TestMethod]
     [DataRow(Scan2DInterpolationMode.Bilinear)]
     [DataRow(Scan2DInterpolationMode.Bicubic)]
+    [DataRow(Scan2DInterpolationMode.Lanczos)]
     public async Task InterpolatingModesAtMaximumRasterStayWithinNeutralBudget(
         Scan2DInterpolationMode mode)
     {

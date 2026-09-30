@@ -545,14 +545,25 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         Memory<byte> destinationStorage, CancellationToken token)
     {
         const int BlockRows = 64;
-        int sourceWidth = GetResamplingSourceWidth(request);
+        bool lanczos = request.EffectiveResampling.Mode == Scan2DInterpolationMode.Lanczos;
+        decimal requestedFirst = decimal.Floor(request.SpatialViewport.MinimumOffset);
+        decimal requestedLastExclusive = decimal.Ceiling(request.SpatialViewport.MaximumOffset);
+        decimal residentFirstOffset = lanczos ? RelativeOffset(request.SpatialViewport.OriginAcquisitionIndex,
+            leases[0]!.Descriptor.AcquisitionIndex) : requestedFirst;
+        decimal residentLastExclusive = lanczos ? checked(RelativeOffset(
+            request.SpatialViewport.OriginAcquisitionIndex, leases[count - 1]!.Descriptor.AcquisitionIndex) + 1)
+            : requestedLastExclusive;
+        int firstOffset = checked((int)Math.Max(requestedFirst - (lanczos ? 3 : 0), residentFirstOffset));
+        decimal lastExclusive = Math.Min(requestedLastExclusive + (lanczos ? 3 : 0), residentLastExclusive);
+        int sourceWidth = checked((int)(lastExclusive - firstOffset));
+        ArgumentOutOfRangeException.ThrowIfLessThan(sourceWidth, 1);
         int verticalHalo = request.EffectiveResampling.Mode switch
         {
             Scan2DInterpolationMode.Bilinear => 1,
             Scan2DInterpolationMode.Bicubic => 2,
+            Scan2DInterpolationMode.Lanczos => 3,
             _ => 0
         };
-        int firstOffset = checked((int)decimal.Floor(request.SpatialViewport.MinimumOffset));
         double rate = metadata.Configuration.SampleRateHz;
         double offset = metadata.Configuration.FirstSampleOffsetSeconds;
         Span<int> sampleFirstByRow = stackalloc int[request.PixelHeight];
@@ -660,14 +671,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         source.CopyTo(destination.Slice(destinationOffset, source.Length));
     }
 
-    private static int GetResamplingSourceWidth(BScanRenderRequest request)
-    {
-        decimal first = decimal.Floor(request.SpatialViewport.MinimumOffset);
-        decimal lastExclusive = decimal.Ceiling(request.SpatialViewport.MaximumOffset);
-        int width = checked((int)(lastExclusive - first));
-        ArgumentOutOfRangeException.ThrowIfLessThan(width, 1);
-        return width;
-    }
+    private static decimal RelativeOffset(ulong origin, ulong acquisitionIndex) =>
+        acquisitionIndex >= origin ? acquisitionIndex - origin : -(decimal)(origin - acquisitionIndex);
 
     private static ulong? TryAddOffset(ulong origin, decimal offset)
     {
