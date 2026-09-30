@@ -1,5 +1,6 @@
 using System.Buffers;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Visualization.Core;
 
@@ -140,8 +141,12 @@ public sealed record BScanRenderRequest(
     ulong? DisplayedWrapGeneration = null,
     string ConsumerId = "default",
     BScanDisplayedVisualIdentity? Displayed = null,
-    bool FollowLiveWindow = false)
+    bool FollowLiveWindow = false,
+    Scan2DResamplingOptions Resampling = default)
 {
+    public Scan2DResamplingOptions EffectiveResampling =>
+        Resampling == default ? Scan2DResamplingOptions.Default : Resampling;
+
     public BScanRenderRequest Validate()
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ConsumerId);
@@ -162,7 +167,8 @@ public sealed record BScanRenderRequest(
 }
 
 public readonly record struct BScanRenderSignature(BScanSpatialViewport SpatialViewport,
-    ScanTimeViewport TimeViewport, int PixelWidth, int PixelHeight, ulong RenderConfigurationVersion);
+    ScanTimeViewport TimeViewport, int PixelWidth, int PixelHeight, ulong RenderConfigurationVersion,
+    Scan2DResamplingOptions Resampling = default);
 
 public sealed record BScanDisplayedVisualIdentity(BScanStreamIdentity Stream, BScanVisualRevision Revision,
     BScanRenderSignature Render);
@@ -190,6 +196,7 @@ public sealed record BScanVisualSnapshot(
     public string ConsumerId { get; init; } = "default";
     public BScanStreamIdentity Stream { get; init; }
     public int HorizontalPixelShift { get; init; }
+    public Scan2DResamplingOptions Resampling { get; init; }
 }
 
 public sealed record BScanVisualUpdate(BScanVisualSnapshot Snapshot);
@@ -239,13 +246,16 @@ public sealed class BScanRasterRegion : IDisposable
         Snapshot = snapshot;
         X = x; Y = y; Width = width; Height = height; Stride = width;
         Format = BScanRasterFormat.BipolarIntensity8;
-        if (owner.Memory.Length < checked(width * height))
+        int cells = checked(width * height);
+        if (owner.Memory.Length < checked(cells * 3))
         {
             owner.Dispose();
             release();
             throw new ArgumentException("The raster owner is too small.", nameof(owner));
         }
-        _ownership = new(owner, owner.Memory[..checked(width * height)], release);
+        ReadOnlyMemory<byte> validity = owner.Memory.Slice(cells, cells);
+        ReadOnlyMemory<byte> provenance = owner.Memory.Slice(checked(cells * 2), cells);
+        _ownership = new(owner, owner.Memory[..cells], validity, provenance, release);
     }
 
     public BScanVisualSnapshot Snapshot { get; }
@@ -257,6 +267,10 @@ public sealed class BScanRasterRegion : IDisposable
     public BScanRasterFormat Format { get; }
     public ReadOnlyMemory<byte> Pixels => Volatile.Read(ref _ownership)?.Pixels
         ?? throw new ObjectDisposedException(nameof(BScanRasterRegion));
+    public ReadOnlyMemory<byte> ValidityMask => Volatile.Read(ref _ownership)?.ValidityMask
+        ?? throw new ObjectDisposedException(nameof(BScanRasterRegion));
+    public ReadOnlyMemory<byte> Provenance => Volatile.Read(ref _ownership)?.Provenance
+        ?? throw new ObjectDisposedException(nameof(BScanRasterRegion));
 
     public void Dispose()
     {
@@ -266,5 +280,6 @@ public sealed class BScanRasterRegion : IDisposable
         finally { ownership.Release(); }
     }
 
-    private sealed record Ownership(IMemoryOwner<byte> Owner, ReadOnlyMemory<byte> Pixels, Action Release);
+    private sealed record Ownership(IMemoryOwner<byte> Owner, ReadOnlyMemory<byte> Pixels,
+        ReadOnlyMemory<byte> ValidityMask, ReadOnlyMemory<byte> Provenance, Action Release);
 }

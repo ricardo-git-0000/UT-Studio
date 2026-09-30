@@ -1,6 +1,7 @@
 using BenchmarkDotNet.Attributes;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Benchmarks;
 
@@ -9,10 +10,12 @@ namespace UTStudio.Benchmarks;
 public class BScanFullRasterBenchmarks
 {
     [Params(256, 1024)] public int RasterSize { get; set; }
+    [Params(Scan2DInterpolationMode.None, Scan2DInterpolationMode.NearestNeighbor)]
+    public Scan2DInterpolationMode Mode { get; set; }
     private BScanVisualBenchmarkFixture _fixture = null!;
 
     [GlobalSetup]
-    public void Setup() => _fixture = BScanVisualBenchmarkFixture.Create(128, 2048, RasterSize);
+    public void Setup() => _fixture = BScanVisualBenchmarkFixture.Create(128, 2048, RasterSize, mode: Mode);
 
     [GlobalCleanup]
     public void Cleanup() => _fixture.Dispose();
@@ -109,7 +112,8 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
     { _ingress = ingress; _delivery = delivery; _request = request; _preparedRequest = request; }
 
     internal static BScanVisualBenchmarkFixture Create(int columns, int samples, int rasterSize,
-        bool subscribe = false, int? initialColumns = null)
+        bool subscribe = false, int? initialColumns = null,
+        Scan2DInterpolationMode mode = Scan2DInterpolationMode.None)
     {
         int initial = initialColumns ?? columns;
         var options = new BScanOptions(32L * 1024 * 1024, 16L * 1024 * 1024,
@@ -131,7 +135,7 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
         var time = ScanTimeViewportOperations.Create(metadata.Configuration.FirstSampleOffsetSeconds,
             metadata.Configuration.FirstSampleOffsetSeconds + samples / metadata.Configuration.SampleRateHz);
         var request = new BScanRenderRequest(metadata.RunId, BScanSpatialViewportOperations.Reset(range),
-            time, rasterSize, rasterSize, 1);
+            time, rasterSize, rasterSize, 1, Resampling: new(mode));
         var fixture = new BScanVisualBenchmarkFixture(ingress, delivery, request) { _sequence = (ulong)initial };
         if (subscribe) { fixture._subscription = delivery.Subscribe(new Observer()); }
         return fixture;

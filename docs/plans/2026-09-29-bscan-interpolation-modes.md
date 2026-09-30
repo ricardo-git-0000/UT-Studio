@@ -1,6 +1,6 @@
 # Plan de implementación de modos de remuestreo B-Scan
 
-Estado: propuesto; implementación no autorizada. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
+Estado: Fase 1 implementada; fases 2–4 no autorizadas. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
 
 ## Alcance, propiedad y reglas
 
@@ -30,6 +30,12 @@ Aceptación:
 - gaps/NoData nunca participan como cero ni se cruzan;
 - firma antigua, token cancelado, run/revisión/viewport/tamaño obsoleto no confirman;
 - memoria y owners permanecen dentro de cuota y llegan a cero al cierre.
+
+Precisión de implementación: `None` conserva full e incremental directos. `NearestNeighbor` se publica
+solo como full en esta fase; cualquier base incremental se recupera mediante una full única porque el
+protocolo dirty vigente no representa todavía el soporte inverso de la transformación centro-a-centro.
+Intensidad, máscara y procedencia del resultado comparten un owner acotado con slices separados; la LUT
+consume intensidad y máscara y no infiere validez del byte cero.
 
 ## Fase 2 — Bilinear y Bicubic
 

@@ -239,7 +239,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                 descriptor.Token != token || descriptor.PresentationGeneration != _rasterGeneration ||
                 descriptor.Snapshot != _visibleRegion.Snapshot)
             { return false; }
-            visitor(_visibleRegion.Pixels.Span, descriptor.Stride);
+            visitor(_visibleRegion.Pixels.Span, _visibleRegion.ValidityMask.Span, descriptor.Stride);
             return true;
         }
     }
@@ -411,7 +411,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             !requestFull && _state.Region is { } displayed ? new(displayed.Snapshot.Stream,
                 _state.DisplayedRevision!.Value, new(displayed.Snapshot.SpatialViewport,
                     displayed.Snapshot.TimeViewport, displayed.Snapshot.RasterWidth,
-                    displayed.Snapshot.RasterHeight, displayed.Snapshot.RenderConfigurationVersion)) : null,
+                    displayed.Snapshot.RasterHeight, displayed.Snapshot.RenderConfigurationVersion,
+                    displayed.Snapshot.Resampling)) : null,
             _state.IsSpatialAutoFit);
         if (!force && request == _lastRequested) { return; }
         _lastRequested = request;
@@ -546,7 +547,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                     managed.Snapshot.WrapGeneration),
                 new(managed.Snapshot.SpatialViewport, managed.Snapshot.TimeViewport,
                     managed.Snapshot.RasterWidth, managed.Snapshot.RasterHeight,
-                    managed.Snapshot.RenderConfigurationVersion)));
+                    managed.Snapshot.RenderConfigurationVersion, managed.Snapshot.Resampling)));
         }).ConfigureAwait(false);
         if (!accepted) { owned?.Dispose(); }
         retired?.Dispose();

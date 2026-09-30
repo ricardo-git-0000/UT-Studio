@@ -663,9 +663,17 @@ public sealed class BScanPresentationTests
         public void Dispose() => Memory = Memory<short>.Empty;
     }
 
-    private sealed class ByteOwner(byte[] bytes) : IMemoryOwner<byte>
+    private sealed class ByteOwner : IMemoryOwner<byte>
     {
-        public Memory<byte> Memory { get; private set; } = bytes;
+        internal ByteOwner(byte[] pixels)
+        {
+            byte[] storage = new byte[checked(pixels.Length * 3)];
+            pixels.CopyTo(storage, 0);
+            storage.AsSpan(pixels.Length, pixels.Length).Fill(1);
+            storage.AsSpan(checked(pixels.Length * 2), pixels.Length).Fill(1);
+            Memory = storage;
+        }
+        public Memory<byte> Memory { get; private set; }
         public void Dispose() => Memory = Memory<byte>.Empty;
     }
 

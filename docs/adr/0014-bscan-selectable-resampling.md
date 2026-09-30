@@ -213,6 +213,16 @@ equivalencia; Nearest entra full-first; Bilinear/Bicubic y Lanczos incorporan fu
 por último UI y persistencia. Pruebas de arquitectura prohibirán WPF en Core/Presentation, referencias
 de interpoladores a tipos `BScan*`, y dependencia de Visualization.Wpf distinta de Visualization.Core.
 
+En la Fase 1 implementada, `Scan2DSourceGrid` es una vista no propietaria con centros expresados como
+`FirstCenter + index * CenterStep`, stride independiente y buffers separados de intensidad, máscara,
+segmento y procedencia. El resultado usa un único owner acotado con tres slices contiguos byte por celda
+(intensidad, máscara y procedencia). Nearest forma y remuestrea bloques de hasta 64 filas con un owner
+scratch separado de intensidad, máscara, segmento compacto y procedencia; se contabiliza contra el
+presupuesto global y se libera antes de transferir el resultado. La máscara se transporta
+hasta la LUT WPF y es la única autoridad de NoData. `NearestNeighbor` es full-only en esta fase: una
+petición con base previa fuerza una full por cambio de configuración, porque el dirty B actual describe
+la huella de `None` y todavía no prueba el soporte inverso de Nearest.
+
 ## Alternativas descartadas
 
 - interpolar BGRA o usar el escalado WPF como implementación: mezcla la LUT y `NoData`;

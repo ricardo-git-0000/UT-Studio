@@ -55,11 +55,12 @@ internal sealed class BScanControlAdapter : IDisposable
         {
             if (_control.ApplyRaster(region.Snapshot,
                 (destination, length, stride) => _viewModel.TryVisitPresentedRegion(region.Token,
-                    (source, sourceStride) =>
+                    (source, validityMask, sourceStride) =>
                     {
                         ReadOnlySpan<uint> palette = _palette is null
                             ? BScanPalette.Bgra32 : _palette.Bgra32.Span;
-                        BScanPalette.CopyToBgra32(source, sourceStride, Surface(destination, length), stride,
+                        BScanPalette.CopyToBgra32(source, validityMask, sourceStride,
+                            Surface(destination, length), stride,
                             new(0, 0, region.Snapshot.AffectedRegion.Width,
                                 region.Snapshot.AffectedRegion.Height), palette);
                     }),

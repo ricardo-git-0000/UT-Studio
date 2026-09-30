@@ -150,6 +150,7 @@ public sealed class BScanControl : FrameworkElement
             (_applied.WrapGeneration != descriptor.WrapGeneration && descriptor.HorizontalPixelShift == 0) ||
             _applied.StoreRevision != descriptor.BaseStoreRevision ||
             _applied.RenderConfigurationVersion != descriptor.RenderConfigurationVersion ||
+            _applied.Resampling != descriptor.Resampling ||
             (_applied.SpatialViewport != descriptor.SpatialViewport && descriptor.HorizontalPixelShift == 0) ||
             _applied.TimeViewport != descriptor.TimeViewport))
         { FullRefreshRequired?.Invoke(this, EventArgs.Empty); return false; }

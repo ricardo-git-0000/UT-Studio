@@ -20,7 +20,25 @@ public static class BScanPalette
         Span<byte> destination, int destinationStride, BScanRasterRectangle affected)
         => CopyToBgra32(source, sourceStride, destination, destinationStride, affected, Values);
 
+    public static void CopyToBgra32(ReadOnlySpan<byte> source, ReadOnlySpan<byte> validityMask,
+        int sourceStride, Span<byte> destination, int destinationStride, BScanRasterRectangle affected,
+        ReadOnlySpan<uint> palette)
+    {
+        Validate(source, sourceStride, destination, destinationStride, affected, palette);
+        if (validityMask.Length < checked((affected.Height - 1) * sourceStride + affected.Width))
+        { throw new ArgumentException("Validity mask is too small.", nameof(validityMask)); }
+        Copy(source, validityMask, sourceStride, destination, destinationStride, affected, palette);
+    }
+
     public static void CopyToBgra32(ReadOnlySpan<byte> source, int sourceStride,
+        Span<byte> destination, int destinationStride, BScanRasterRectangle affected,
+        ReadOnlySpan<uint> palette)
+    {
+        Validate(source, sourceStride, destination, destinationStride, affected, palette);
+        Copy(source, default, sourceStride, destination, destinationStride, affected, palette);
+    }
+
+    private static void Validate(ReadOnlySpan<byte> source, int sourceStride,
         Span<byte> destination, int destinationStride, BScanRasterRectangle affected,
         ReadOnlySpan<uint> palette)
     {
@@ -33,14 +51,23 @@ public static class BScanPalette
         if (destination.Length < checked((affected.Y + affected.Height - 1) * destinationStride +
             (affected.X + affected.Width) * 4))
         { throw new ArgumentException("Destination is too small.", nameof(destination)); }
+    }
+
+    private static void Copy(ReadOnlySpan<byte> source, ReadOnlySpan<byte> validityMask, int sourceStride,
+        Span<byte> destination, int destinationStride, BScanRasterRectangle affected,
+        ReadOnlySpan<uint> palette)
+    {
+        bool hasMask = !validityMask.IsEmpty;
         for (int row = 0; row < affected.Height; row++)
         {
             ReadOnlySpan<byte> input = source.Slice(checked(row * sourceStride), affected.Width);
+            ReadOnlySpan<byte> mask = hasMask
+                ? validityMask.Slice(checked(row * sourceStride), affected.Width) : default;
             Span<byte> output = destination.Slice(checked((affected.Y + row) * destinationStride +
                 affected.X * 4), checked(affected.Width * 4));
             for (int column = 0; column < affected.Width; column++)
             {
-                uint color = palette[input[column]];
+                uint color = palette[hasMask && mask[column] == 0 ? BScanBipolarIntensity8.NoData : input[column]];
                 int offset = column * 4;
                 output[offset] = (byte)color;
                 output[offset + 1] = (byte)(color >> 8);

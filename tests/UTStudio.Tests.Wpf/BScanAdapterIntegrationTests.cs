@@ -123,7 +123,12 @@ public sealed class BScanAdapterIntegrationTests
     private static BScanRasterRegion Region(BScanVisualSnapshot snapshot, byte value)
     {
         BScanRasterRectangle affected = snapshot.AffectedRegion;
-        var owner = new Owner(Enumerable.Repeat(value, affected.Width * affected.Height).ToArray());
+        int cells = checked(affected.Width * affected.Height);
+        byte[] storage = new byte[checked(cells * 3)];
+        storage.AsSpan(0, cells).Fill(value);
+        storage.AsSpan(cells, cells).Fill(1);
+        storage.AsSpan(checked(cells * 2), cells).Fill(1);
+        var owner = new Owner(storage);
         return new(snapshot, affected.X, affected.Y, affected.Width, affected.Height, owner, () => { });
     }
     private static BScanVisualSnapshot Snapshot(string consumer)
