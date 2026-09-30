@@ -9,20 +9,43 @@ namespace UTStudio.Benchmarks;
 [MemoryDiagnoser]
 public class BScanFullRasterBenchmarks
 {
-    [Params(256, 1024)] public int RasterSize { get; set; }
-    [Params(Scan2DInterpolationMode.None, Scan2DInterpolationMode.NearestNeighbor,
-        Scan2DInterpolationMode.Bilinear, Scan2DInterpolationMode.Bicubic)]
+    [ParamsSource(nameof(RasterSizes))] public int RasterSize { get; set; }
+    [ParamsSource(nameof(Modes))]
     public Scan2DInterpolationMode Mode { get; set; }
     private BScanVisualBenchmarkFixture _fixture = null!;
 
+    public IEnumerable<int> RasterSizes => DiagnosticParameter("UTSTUDIO_SCAN2D_SIZE", [256, 1024], int.Parse);
+    public IEnumerable<Scan2DInterpolationMode> Modes => DiagnosticParameter("UTSTUDIO_SCAN2D_MODE",
+        [Scan2DInterpolationMode.None, Scan2DInterpolationMode.NearestNeighbor,
+            Scan2DInterpolationMode.Bilinear, Scan2DInterpolationMode.Bicubic],
+        value => Enum.Parse<Scan2DInterpolationMode>(value, ignoreCase: true));
+
     [GlobalSetup]
-    public void Setup() => _fixture = BScanVisualBenchmarkFixture.Create(128, 2048, RasterSize, mode: Mode);
+    public void Setup()
+    {
+        Console.WriteLine($"SCAN2D_SETUP_START {DateTimeOffset.UtcNow:O} mode={Mode} size={RasterSize}");
+        _fixture = BScanVisualBenchmarkFixture.Create(128, 2048, RasterSize, mode: Mode);
+        Console.WriteLine($"SCAN2D_SETUP_END {DateTimeOffset.UtcNow:O} {_fixture.DiagnosticState}");
+    }
 
     [GlobalCleanup]
-    public void Cleanup() => _fixture.Dispose();
+    public void Cleanup()
+    {
+        Console.WriteLine($"SCAN2D_CLEANUP_START {DateTimeOffset.UtcNow:O} {_fixture.DiagnosticState}");
+        _fixture.Dispose();
+        Console.WriteLine($"SCAN2D_CLEANUP_END {DateTimeOffset.UtcNow:O} {_fixture.DiagnosticState}");
+    }
 
-    [Benchmark(Description = "B-Scan full neutral raster with temporal/spatial reduction")]
+    [Benchmark(Description = "B-Scan full neutral raster render and owner release")]
     public int FullRaster() => _fixture.RenderFull();
+
+    private static IEnumerable<T> DiagnosticParameter<T>(string name, T[] defaults, Func<string, T> parse)
+    {
+        string? value = Environment.GetEnvironmentVariable(name);
+        return string.IsNullOrWhiteSpace(value)
+            ? defaults
+            : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(parse);
+    }
 }
 
 [MemoryDiagnoser]
@@ -104,9 +127,20 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
     private readonly BScanVisualDelivery _delivery;
     private readonly BScanRenderRequest _request;
     private BScanRenderRequest _preparedRequest;
-    private BScanRasterRegion? _measuredRegion;
     private IDisposable? _subscription;
     private ulong _sequence;
+
+    internal string DiagnosticState
+    {
+        get
+        {
+            BScanVisualDiagnostics visual = _delivery.Diagnostics;
+            BScanDiagnostics ingress = _ingress.Diagnostics;
+            return $"owners={visual.ActiveRasterOwners} ownerBytes={visual.VisualBytesRented} " +
+                $"activeBuilds={visual.ActiveBuilds} leases={ingress.ActiveReadLeases} " +
+                $"blocks={ingress.BlocksRented - ingress.BlocksReturned}";
+        }
+    }
 
     private BScanVisualBenchmarkFixture(BScanIngress ingress, BScanVisualDelivery delivery,
         BScanRenderRequest request)
@@ -162,14 +196,14 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
 
     internal int RenderFull()
     {
-        _measuredRegion = GetRegion(_request);
-        return _measuredRegion.Pixels.Length;
+        using BScanRasterRegion measuredRegion = GetRegion(_request);
+        return measuredRegion.Pixels.Length;
     }
 
     internal int RenderPrepared()
     {
-        _measuredRegion = GetRegion(_preparedRequest);
-        return _measuredRegion.Pixels.Length;
+        using BScanRasterRegion measuredRegion = GetRegion(_preparedRequest);
+        return measuredRegion.Pixels.Length;
     }
 
     internal void RequestBurst()
@@ -208,10 +242,14 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
 
     public void Dispose()
     {
-        _measuredRegion?.Dispose();
-        _subscription?.Dispose();
-        _delivery.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        _ingress.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        List<Exception> failures = [];
+        try { _subscription?.Dispose(); }
+        catch (Exception error) { failures.Add(error); }
+        try { _delivery.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult(); }
+        catch (Exception error) { failures.Add(error); }
+        try { _ingress.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult(); }
+        catch (Exception error) { failures.Add(error); }
+        if (failures.Count != 0) { throw new AggregateException("B-Scan benchmark fixture cleanup failed.", failures); }
     }
 
     private sealed class Observer : IObserver<BScanVisualUpdate>
