@@ -1,4 +1,5 @@
 using BenchmarkDotNet.Attributes;
+using System.Buffers;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
@@ -46,6 +47,99 @@ public class BScanFullRasterBenchmarks
         return string.IsNullOrWhiteSpace(value)
             ? defaults
             : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(parse);
+    }
+}
+
+[MemoryDiagnoser]
+public class Scan2DLanczosStageBenchmarks
+{
+    [ParamsSource(nameof(RasterSizes))] public int RasterSize { get; set; }
+    private Scan2DResampler _resampler = null!;
+    private Scan2DSourceGrid _source;
+    private Scan2DRenderRequest _request;
+    private Scan2DResampler.LanczosTables _tables = null!;
+    private Scan2DRenderResult _preparedResult = null!;
+
+    public IEnumerable<int> RasterSizes
+    {
+        get
+        {
+            string? value = Environment.GetEnvironmentVariable("UTSTUDIO_SCAN2D_SIZE");
+            return string.IsNullOrWhiteSpace(value) ? [256, 1024] :
+                value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(int.Parse);
+        }
+    }
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        const int sourceWidth = 128;
+        const int sourceHeight = 2048;
+        int sourceCells = sourceWidth * sourceHeight;
+        int destinationCells = checked(RasterSize * RasterSize);
+        byte[] intensities = new byte[sourceCells];
+        byte[] validity = new byte[sourceCells];
+        byte[] segments = new byte[sourceCells];
+        byte[] provenance = new byte[sourceCells];
+        for (int index = 0; index < sourceCells; index++)
+        {
+            intensities[index] = checked((byte)(index % 251));
+            validity[index] = 1;
+            segments[index] = 1;
+            provenance[index] = (byte)Scan2DSampleProvenance.AcquiredSupport;
+        }
+        var sourceGeometry = new Scan2DGridGeometry(0, 0, 1, 1);
+        var destinationGeometry = new Scan2DGridGeometry(
+            (double)sourceWidth / (2 * RasterSize) - .5,
+            (double)sourceHeight / (2 * RasterSize) - .5,
+            (double)sourceWidth / RasterSize, (double)sourceHeight / RasterSize);
+        _source = new Scan2DSourceGrid(sourceWidth, sourceHeight, sourceWidth, sourceGeometry,
+            intensities, validity, segments, provenance);
+        _request = new Scan2DRenderRequest(sourceGeometry, sourceWidth, sourceHeight, destinationGeometry,
+            RasterSize, RasterSize, new(0, 0, RasterSize, RasterSize),
+            new(Scan2DInterpolationMode.Lanczos));
+        _resampler = new Scan2DResampler();
+        _tables = _resampler.PrepareLanczosTables(_source, _request);
+        _preparedResult = new Scan2DRenderResult(new RetainedByteOwner(destinationCells * 3), RasterSize,
+            RasterSize, RasterSize, _request.Viewport, true, Scan2DRenderDiagnostic.Completed);
+        Console.WriteLine($"LANCZOS_TABLES logical={_resampler.LastLanczosTableMemory.LogicalBytes} " +
+            $"rented={_resampler.LastLanczosTableMemory.RentedBytes}");
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _preparedResult.Dispose();
+        _tables.Dispose();
+    }
+
+    [Benchmark(Description = "Lanczos prepare X/Y tables and return scratch")]
+    public long PrepareTables()
+    {
+        using Scan2DResampler.LanczosTables tables = _resampler.PrepareLanczosTables(_source, _request);
+        return tables.Memory.RentedBytes;
+    }
+
+    [Benchmark(Description = "Lanczos kernel over prepared source and tables")]
+    public byte PreparedKernel()
+    {
+        _resampler.RenderLanczosPrepared(_source, _request, _preparedResult, _tables);
+        return _preparedResult.Intensities.Span[^1];
+    }
+
+    [Benchmark(Description = "Lanczos complete render with owner rent/release")]
+    public byte CompleteRender()
+    {
+        using Scan2DRenderResult result = _resampler.Render(_source, _request,
+            MemoryPool<byte>.Shared.Rent(checked(RasterSize * RasterSize * 3)));
+        return result.Intensities.Span[^1];
+    }
+
+    private sealed class RetainedByteOwner(int length) : IMemoryOwner<byte>
+    {
+        private byte[]? _bytes = new byte[length];
+        public Memory<byte> Memory => _bytes ?? throw new ObjectDisposedException(nameof(RetainedByteOwner));
+        public void Dispose() => _bytes = null;
     }
 }
 

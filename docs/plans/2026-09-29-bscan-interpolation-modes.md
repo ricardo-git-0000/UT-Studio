@@ -63,6 +63,30 @@ Resultado diagnóstico Dry en la VM VMware: Lanczos completó aislado en 256×25
 de la matriz completa de diez casos, con código cero y balances finales cero. Los intervalos observados
 fueron 109,44–116,92 ms y 825,71–934,11 ms respectivamente; no son baseline y no modifican objetivos.
 
+Caracterización diagnóstica no-Dry posterior (`3` procesos, `3` warmups y `3` iteraciones): la
+precomputación acotada de índices/pesos redujo el pipeline B full de 44,42 a 11,11 ms en 256² y de
+708,61 a 180,80 ms en 1024², sin diferencias byte a byte. Preparar y devolver tablas cuesta 42,80 µs
+y 162,70 µs; el kernel de 36 taps ya preparado domina con 10,89 ms y 161,15 ms. Las tablas consumen
+40.960/163.840 bytes lógicos y 49.152/196.608 bytes rentados; por bloque B 1024×64 consumen
+87.040/104.448 bytes. El pico total observado es 8.755.200 bytes. Estos datos tampoco son baseline.
+Con aproximadamente 5,5 Hz en 1024², la política confirmada para Fase 4 es alta calidad live con cadencia
+reducida, también disponible con adquisición detenida; no implica 30 Hz ni degradación silenciosa.
+`None` sigue predeterminado y Bilinear/Bicubic son los candidatos interactivos. Latest-only conserva el
+último raster confirmado, sustituye generaciones pendientes y evita acumular trabajo. Las regresiones
+productivas detienen el kernel Lanczos real tras una fila y acreditan que Stop/cierre cancelan y drenan,
+que supersession nunca transfiere el candidato antiguo y que Lanczos→Bicubic/None publica directamente
+la firma nueva. El seam diagnóstico es `internal`, síncrono, acotado a tests y no asigna cuando está vacío.
+Comandos reproducibles desde la raíz, con `UTSTUDIO_SCAN2D_SIZE=256,1024` y, para el pipeline,
+`UTSTUDIO_SCAN2D_MODE=Lanczos`: `dotnet run -c Release -f net10.0 --project
+benchmarks/UTStudio.Benchmarks -- --filter '*BScanFullRasterBenchmarks*' --job short --launchCount 3
+--warmupCount 3 --iterationCount 3` y el mismo comando con filtro
+`'*Scan2DLanczosStageBenchmarks*'`. El primer comando se ejecutó también sobre una copia temporal exacta
+de `HEAD` anterior a la optimización. El benchmark por etapas separa tablas, kernel preparado y render
+directo con owner; formación B y copias de delivery se estiman por diferencia con el pipeline completo,
+no son una medición aislada. Tampoco separa dentro del hot path validación de máscara/segmentos y
+acumulación, porque hacerlo requeriría un kernel diagnóstico distinto del productivo. Esa separación es
+P3 de profiling futuro, no defecto funcional ni bloqueo del commit.
+
 ## Fase 4 — UI, preferencia y aceptación
 
 Añadir selector, parámetros aprobados, estado visible, teclado/UIA, validación y errores. La transición

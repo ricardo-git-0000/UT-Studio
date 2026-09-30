@@ -21,7 +21,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private readonly BScanIngress _ingress;
     private readonly TimeProvider _clock;
     private readonly IByteOwnerPool _pool;
-    private readonly IScan2DResampler _resampler = new Scan2DResampler();
+    private readonly Scan2DResampler _resampler;
     private readonly SemaphoreSlim _wake = new(0, 1);
     private readonly CancellationTokenSource _shutdown = new();
     private readonly List<Subscription> _subscriptions = [];
@@ -62,6 +62,12 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private Task? _drain;
     private string? _lastError;
     internal Action? BeforeRasterCandidateValidation { get; set; }
+    /// <summary>Diagnostic seam invoked after a real Lanczos row and before the next cancellation checkpoint.</summary>
+    internal Action<int>? AfterLanczosKernelRowProcessed
+    {
+        get => _resampler.AfterKernelRowProcessed;
+        set => _resampler.AfterKernelRowProcessed = value;
+    }
     internal Action<int, int>? AfterRasterColumnReleased { get; set; }
     internal Action? BeforeMetadataCandidateValidation { get; set; }
     internal int ActiveConsumerCount { get { lock (_gate) { return _consumers.Count; } } }
@@ -80,6 +86,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         _ingress = ingress ?? throw new ArgumentNullException(nameof(ingress));
         _clock = timeProvider ?? TimeProvider.System;
         _pool = pool ?? throw new ArgumentNullException(nameof(pool));
+        _resampler = new Scan2DResampler(SharedLanczosTablePool.Instance, ChangeTableBytes);
         _ingress.VisualStateChanged += OnVisualStateChanged;
         _worker = Task.Run(PublishLoopAsync);
     }
@@ -661,6 +668,22 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         lock (_gate)
         {
             _activeOwnerBytes -= bytes;
+        }
+    }
+
+    private void ChangeTableBytes(long delta)
+    {
+        lock (_gate)
+        {
+            if (delta > 0)
+            {
+                long budget = checked(_ingress.Options.VisualMemoryBudgetBytes - _ingress.VisualBytesReserved);
+                if (checked(_activeOwnerBytes + delta) > budget)
+                { throw new InvalidOperationException("The B-Scan visual table quota is exhausted."); }
+                _activeOwnerBytes += delta;
+                _maximumOwnerBytes = Math.Max(_maximumOwnerBytes, _activeOwnerBytes);
+            }
+            else { _activeOwnerBytes += delta; }
         }
     }
 

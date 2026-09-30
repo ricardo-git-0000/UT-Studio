@@ -144,6 +144,27 @@ en cero. En la VM VMware de diagnóstico, Dry observó 109,44–116,92 ms para 2
 liberación del owner, exceden las hipótesis iniciales y no son baseline ni autorizan cambiar
 presupuestos; requieren una campaña normal con warmup, iteraciones y hardware aprobados.
 
+La caracterización posterior conserva exactamente ese orden y semántica, pero prepara por coordenada
+los seis índices clampados y seis pesos de cada eje; la coordenada original se conserva aparte para la
+procedencia exacta. Las cuatro tablas tipadas se rentan de pools acotados, se contabilizan y se devuelven
+en éxito, cancelación, excepción y fallo parcial de renta. Su coste lógico es `80 × (ancho + alto)`:
+40.960 bytes en 256², 163.840 bytes en 1024² y 87.040 bytes por bloque B de 1024×64. Los buckets medidos
+son 49.152, 196.608 y 104.448 bytes respectivamente. El pico B-Scan 1024² medido pasa a 8.755.200 bytes,
+todavía bajo el límite neutral de 16 MiB.
+
+En la misma VM VMware, BenchmarkDotNet con tres procesos, tres warmups y tres iteraciones midió el
+pipeline B completo antes/después en 44,42/11,11 ms para 256² y 708,61/180,80 ms para 1024². La mejora
+es aproximadamente 4×, pero 1024² equivale a unos 5,5 Hz y continúa lejos de 30 Hz. Son resultados
+diagnósticos, no baseline. Lanczos-3 se ofrece en live como modo de alta calidad con cadencia reducida,
+sin garantía de 30 Hz; también puede utilizarse con la adquisición detenida. `None` continúa siendo el
+modo predeterminado y Bilinear/Bicubic son los candidatos interactivos. Latest-only evita acumular
+trabajo, conserva visible el último raster confirmado mientras se calcula y descarta cualquier candidato
+obsoleto antes de publicarlo. Stop y cierre cancelan en el siguiente checkpoint por fila y esperan las
+barreras de región, owners, callbacks y worker. No existe fallback silencioso ni cambio de kernel.
+Una convolución separable se descarta por ahora porque cambiaría el orden de acumulación. Separar en
+microbenchmarks la validación y la acumulación combinadas queda como P3 de profiling futuro, no como
+defecto funcional ni bloqueo de entrega.
+
 ## Gaussian Process / Kriging
 
 Kriging solo será evaluable cuando haya coordenadas físicas calibradas, unidades y semántica espacial

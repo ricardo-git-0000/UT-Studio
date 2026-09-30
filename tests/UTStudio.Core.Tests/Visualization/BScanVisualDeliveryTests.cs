@@ -320,7 +320,8 @@ public sealed class BScanVisualDeliveryTests
         Assert.AreEqual(BScanRasterResultKind.Available, result.Kind, result.Error);
         using BScanRasterRegion region = result.Region!;
         Assert.AreEqual(checked(1024 * 1024), region.Pixels.Length);
-        Assert.AreEqual(8_650_752L, delivery.Diagnostics.MaximumVisualBytesRented);
+        long expectedMaximum = mode == Scan2DInterpolationMode.Lanczos ? 8_755_200L : 8_650_752L;
+        Assert.AreEqual(expectedMaximum, delivery.Diagnostics.MaximumVisualBytesRented);
         Assert.IsLessThanOrEqualTo(16L * 1024 * 1024, delivery.Diagnostics.MaximumVisualBytesRented);
         region.Dispose(); baseline.Dispose();
         Assert.AreEqual(0L, delivery.Diagnostics.VisualBytesRented);

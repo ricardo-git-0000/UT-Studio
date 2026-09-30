@@ -160,6 +160,206 @@ public sealed class Scan2DLanczosResamplerTests
             algorithmVersion: 4));
     }
 
+    [TestMethod]
+    public void PreparationAndRasterCancellationReturnEveryTableAndDestinationOwner()
+    {
+        var pool = new DeterministicLanczosPool();
+        var resampler = new Scan2DResampler(pool);
+        using var preparationCancellation = new CancellationTokenSource();
+        resampler.AfterLanczosCoordinatePrepared = (coordinate, yAxis) =>
+        { if (!yAxis && coordinate == 3) { preparationCancellation.Cancel(); } };
+        CountingOwner preparationOwner = RenderOwner(32);
+        Assert.ThrowsExactly<OperationCanceledException>(() => RenderSquare(resampler, preparationOwner,
+            32, preparationCancellation.Token));
+        Assert.AreEqual(1, preparationOwner.DisposeCount);
+        Assert.AreEqual(0, pool.ActiveArrays);
+
+        using var rasterCancellation = new CancellationTokenSource();
+        resampler.AfterLanczosCoordinatePrepared = null;
+        resampler.AfterKernelRowProcessed = row => { if (row == 0) { rasterCancellation.Cancel(); } };
+        CountingOwner rasterOwner = RenderOwner(32);
+        Assert.ThrowsExactly<OperationCanceledException>(() => RenderSquare(resampler, rasterOwner,
+            32, rasterCancellation.Token));
+        Assert.AreEqual(1, rasterOwner.DisposeCount);
+        Assert.AreEqual(0, pool.ActiveArrays);
+    }
+
+    [TestMethod]
+    public void EveryTableAcquisitionFailureReturnsAllEarlierRents()
+    {
+        for (int failure = 1; failure <= 4; failure++)
+        {
+            var pool = new DeterministicLanczosPool(failure);
+            long bytes = 0;
+            var resampler = new Scan2DResampler(pool, delta => bytes += delta);
+            CountingOwner owner = RenderOwner(8);
+            Assert.ThrowsExactly<InvalidOperationException>(() => RenderSquare(resampler, owner, 8));
+            Assert.AreEqual(1, owner.DisposeCount, $"failure {failure}");
+            Assert.AreEqual(0, pool.ActiveArrays, $"failure {failure}");
+            Assert.AreEqual(0L, bytes, $"failure {failure}");
+        }
+    }
+
+    [TestMethod]
+    public void FailedTableByteAdmissionReturnsTheJustRentedArrayAndEarlierTables()
+    {
+        for (int admission = 1; admission <= 4; admission++)
+        {
+            var pool = new DeterministicLanczosPool();
+            int callbacks = 0;
+            long bytes = 0;
+            var resampler = new Scan2DResampler(pool, delta =>
+            {
+                if (delta > 0 && ++callbacks == admission) throw new InvalidOperationException("quota");
+                bytes += delta;
+            });
+            CountingOwner owner = RenderOwner(8);
+            Assert.ThrowsExactly<InvalidOperationException>(() => RenderSquare(resampler, owner, 8));
+            Assert.AreEqual(1, owner.DisposeCount);
+            Assert.AreEqual(0, pool.ActiveArrays);
+            Assert.AreEqual(0L, bytes);
+        }
+    }
+
+    [TestMethod]
+    public void IndependentConcurrentCallsReturnTheirTables()
+    {
+        var pool = new DeterministicLanczosPool();
+        Parallel.For(0, 8, _ =>
+        {
+            var resampler = new Scan2DResampler(pool);
+            using Scan2DRenderResult result = RenderSquare(resampler, RenderOwner(64), 64);
+            Assert.AreEqual((byte)73, result.Intensities.Span[0]);
+        });
+        Assert.AreEqual(0, pool.ActiveArrays);
+    }
+
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(5)]
+    [DataRow(256)]
+    [DataRow(1024)]
+    public void TablesAreBoundedAndReturnedForRequiredDimensions(int size)
+    {
+        var pool = new DeterministicLanczosPool();
+        var resampler = new Scan2DResampler(pool);
+        using Scan2DRenderResult result = RenderSquare(resampler, RenderOwner(size), size);
+        Assert.AreEqual(checked(160L * size), resampler.LastLanczosTableMemory.LogicalBytes);
+        Assert.IsGreaterThanOrEqualTo(resampler.LastLanczosTableMemory.RentedBytes,
+            resampler.LastLanczosTableMemory.LogicalBytes);
+        Assert.AreEqual(0, pool.ActiveArrays);
+    }
+
+    [TestMethod]
+    public void PrecomputedPathIsByteIdenticalToThePreviousScalarLoop()
+    {
+        const int width = 9, height = 7, destinationWidth = 13, destinationHeight = 11;
+        byte[] values = Enumerable.Range(0, width * height).Select(x => checked((byte)((x * 37) % 256))).ToArray();
+        byte[] mask = Enumerable.Repeat((byte)1, values.Length).ToArray();
+        byte[] segments = Enumerable.Repeat((byte)1, values.Length).ToArray();
+        byte[] provenance = Enumerable.Repeat((byte)Scan2DSampleProvenance.AcquiredSupport, values.Length).ToArray();
+        mask[3 * width + 4] = 0; segments[3 * width + 4] = 0; provenance[3 * width + 4] = 0;
+        for (int y = 0; y < height; y++) segments[y * width + 7] = 2;
+        var sourceGeometry = new Scan2DGridGeometry(0, 0, 1, 1);
+        var destinationGeometry = new Scan2DGridGeometry(-.25, .125, .7, .625);
+        var source = new Scan2DSourceGrid(width, height, width, sourceGeometry,
+            values, mask, segments, provenance);
+        var request = new Scan2DRenderRequest(sourceGeometry, width, height, destinationGeometry,
+            destinationWidth, destinationHeight, new(0, 0, destinationWidth, destinationHeight),
+            new(Scan2DInterpolationMode.Lanczos));
+        using Scan2DRenderResult actual = new Scan2DResampler().Render(source, request,
+            new Owner(destinationWidth * destinationHeight * 3));
+        (byte[] intensities, byte[] validity, byte[] expectedProvenance) = ScalarReference(source, request);
+        CollectionAssert.AreEqual(intensities, actual.Intensities.ToArray());
+        CollectionAssert.AreEqual(validity, actual.ValidityMask.ToArray());
+        CollectionAssert.AreEqual(expectedProvenance, actual.Provenance.ToArray());
+    }
+
+    private static (byte[] Intensities, byte[] Validity, byte[] Provenance) ScalarReference(
+        Scan2DSourceGrid source, Scan2DRenderRequest request)
+    {
+        int cells = request.DestinationWidth * request.DestinationHeight;
+        byte[] intensities = new byte[cells], validity = new byte[cells], provenance = new byte[cells];
+        for (int y = 0; y < request.DestinationHeight; y++)
+        {
+            double sourceY = (request.DestinationGeometry.FirstCenterY + y * request.DestinationGeometry.CenterStepY -
+                source.Geometry.FirstCenterY) / source.Geometry.CenterStepY;
+            int baseY = (int)Math.Floor(sourceY);
+            double fractionY = sourceY - baseY;
+            for (int x = 0; x < request.DestinationWidth; x++)
+            {
+                double sourceX = (request.DestinationGeometry.FirstCenterX + x * request.DestinationGeometry.CenterStepX -
+                    source.Geometry.FirstCenterX) / source.Geometry.CenterStepX;
+                int baseX = (int)Math.Floor(sourceX);
+                double fractionX = sourceX - baseX;
+                double accumulated = 0, combinedWeight = 0;
+                byte segment = 0;
+                bool valid = true;
+                for (int tapY = 0; tapY < 6 && valid; tapY++)
+                {
+                    int offsetY = -2 + tapY;
+                    int sampleY = Math.Clamp(baseY + offsetY, 0, source.Height - 1);
+                    double weightY = ReferenceLanczos(fractionY - offsetY);
+                    for (int tapX = 0; tapX < 6; tapX++)
+                    {
+                        int offsetX = -2 + tapX;
+                        int sampleX = Math.Clamp(baseX + offsetX, 0, source.Width - 1);
+                        int sourceIndex = sampleY * source.Stride + sampleX;
+                        if (source.ValidityMask.Span[sourceIndex] == 0) { valid = false; break; }
+                        byte tapSegment = source.SegmentIds.Span[sourceIndex];
+                        if (segment == 0) segment = tapSegment;
+                        else if (segment != tapSegment) { valid = false; break; }
+                        double weight = weightY * ReferenceLanczos(fractionX - offsetX);
+                        accumulated += source.Intensities.Span[sourceIndex] * weight;
+                        combinedWeight += weight;
+                    }
+                }
+                if (!valid) continue;
+                int destination = y * request.DestinationWidth + x;
+                intensities[destination] = checked((byte)Math.Round(Math.Clamp(accumulated / combinedWeight, 0, 255),
+                    MidpointRounding.AwayFromZero));
+                validity[destination] = 1;
+                bool exact = sourceX == Math.Truncate(sourceX) && sourceX >= 0 && sourceX < source.Width &&
+                    sourceY == Math.Truncate(sourceY) && sourceY >= 0 && sourceY < source.Height;
+                provenance[destination] = exact
+                    ? source.Provenance.Span[(int)sourceY * source.Stride + (int)sourceX]
+                    : (byte)Scan2DSampleProvenance.VisualDerived;
+            }
+        }
+        return (intensities, validity, provenance);
+    }
+
+    private static double ReferenceLanczos(double value)
+    {
+        double absolute = Math.Abs(value);
+        if (absolute >= 3) return 0;
+        return ReferenceSinc(value) * ReferenceSinc(value / 3);
+    }
+
+    private static double ReferenceSinc(double value)
+    {
+        if (Math.Abs(value) <= 1e-12) return 1;
+        double nearest = Math.Round(value);
+        if (nearest != 0 && Math.Abs(value - nearest) <= 1e-12) return 0;
+        double piValue = Math.PI * value;
+        return Math.Sin(piValue) / piValue;
+    }
+
+    private static CountingOwner RenderOwner(int size) => new(checked(size * size * 3));
+
+    private static Scan2DRenderResult RenderSquare(Scan2DResampler resampler, CountingOwner owner,
+        int size, CancellationToken token = default)
+    {
+        byte[] values = Enumerable.Repeat((byte)73, checked(size * size)).ToArray();
+        byte[] valid = Enumerable.Repeat((byte)1, values.Length).ToArray();
+        var geometry = new Scan2DGridGeometry(0, 0, 1, 1);
+        var source = new Scan2DSourceGrid(size, size, size, geometry, values, valid, valid,
+            Enumerable.Repeat((byte)Scan2DSampleProvenance.AcquiredSupport, values.Length).ToArray());
+        var request = new Scan2DRenderRequest(geometry, size, size, geometry, size, size,
+            new(0, 0, size, size), new(Scan2DInterpolationMode.Lanczos));
+        return resampler.Render(source, request, owner, token);
+    }
+
     private static void AssertRender1D(byte[] source, double[] centers, byte[] expected)
     {
         var destination = new Scan2DGridGeometry(centers[0], 0,
@@ -202,5 +402,33 @@ public sealed class Scan2DLanczosResamplerTests
         private byte[]? _bytes = new byte[length];
         public Memory<byte> Memory => _bytes ?? throw new ObjectDisposedException(nameof(Owner));
         public void Dispose() => _bytes = null;
+    }
+
+    private sealed class CountingOwner(int length) : IMemoryOwner<byte>
+    {
+        private byte[]? _bytes = new byte[length];
+        public int DisposeCount { get; private set; }
+        public Memory<byte> Memory => _bytes ?? throw new ObjectDisposedException(nameof(CountingOwner));
+        public void Dispose() { if (_bytes is not null) { _bytes = null; DisposeCount++; } }
+    }
+
+    private sealed class DeterministicLanczosPool(int? failOnRent = null) : ILanczosTablePool
+    {
+        private int _rentCount;
+        private int _activeArrays;
+        public int ActiveArrays => Volatile.Read(ref _activeArrays);
+
+        public int[] RentIndices(int minimumLength) => Rent(new int[minimumLength]);
+        public double[] RentWeights(int minimumLength) => Rent(new double[minimumLength]);
+        public void Return(int[] array) => Interlocked.Decrement(ref _activeArrays);
+        public void Return(double[] array) => Interlocked.Decrement(ref _activeArrays);
+
+        private T[] Rent<T>(T[] array)
+        {
+            int rent = Interlocked.Increment(ref _rentCount);
+            if (rent == failOnRent) { throw new InvalidOperationException("Injected table rent failure."); }
+            Interlocked.Increment(ref _activeArrays);
+            return array;
+        }
     }
 }
