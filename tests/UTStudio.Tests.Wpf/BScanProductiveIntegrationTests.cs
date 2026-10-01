@@ -5,6 +5,7 @@ using UTStudio.App.Wpf.Services;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Tests.Wpf;
 
@@ -286,6 +287,97 @@ public sealed class BScanProductiveIntegrationTests
             { cursorPixels++; }
         }
         Assert.IsGreaterThan(10, cursorPixels);
+    });
+
+    [TestMethod]
+    public Task Frozen_productive_run_can_rebuild_with_a_new_resampling_mode() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(128);
+        await fixture.WaitForRevisionAsync(128);
+        fixture.Ingress.CloseRun(fixture.Metadata.RunId);
+        await fixture.Ingress.WaitForCloseAsync(fixture.Metadata.RunId);
+        BScanPresentedRegionToken previous = fixture.ViewModel.State.Region!.Token;
+
+        fixture.ViewModel.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Bicubic);
+        await fixture.WaitForTokenChangeAsync(previous);
+
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.ViewModel.State.RequestedResamplingMode);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.ViewModel.State.PresentedResamplingMode);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic,
+            fixture.Control.AppliedSnapshot!.Resampling.Mode);
+        Assert.IsFalse(fixture.ViewModel.State.IsRenderPending);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
+    public Task Reduced_live_window_can_rebuild_with_a_new_resampling_mode() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512);
+        await fixture.WaitForRevisionAsync(512);
+        BScanPresentedRegionToken fullWindow = fixture.ViewModel.State.Region!.Token;
+
+        fixture.ViewModel.DecreaseLiveWindowCommand.Execute(null);
+        await fixture.WaitForTokenChangeAsync(fullWindow);
+        Assert.AreEqual(256, fixture.ViewModel.LiveWindowColumns);
+        BScanPresentedRegionToken reducedWindow = fixture.ViewModel.State.Region!.Token;
+
+        fixture.ViewModel.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Bicubic);
+        await fixture.WaitForTokenChangeAsync(reducedWindow);
+
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.ViewModel.State.RequestedResamplingMode);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.ViewModel.State.PresentedResamplingMode);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.Control.AppliedSnapshot!.Resampling.Mode);
+        Assert.AreEqual(256m, fixture.ViewModel.State.Region.Snapshot.SpatialViewport.Span);
+        Assert.IsFalse(fixture.ViewModel.State.IsRenderPending);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
+    public Task Reducing_live_window_preserves_the_selected_resampling_mode() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512);
+        await fixture.WaitForRevisionAsync(512);
+        BScanPresentedRegionToken none = fixture.ViewModel.State.Region!.Token;
+        fixture.ViewModel.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Bicubic);
+        await fixture.WaitForTokenChangeAsync(none);
+        BScanPresentedRegionToken interpolated = fixture.ViewModel.State.Region!.Token;
+
+        fixture.ViewModel.DecreaseLiveWindowCommand.Execute(null);
+        await fixture.WaitForTokenChangeAsync(interpolated);
+
+        Assert.AreEqual(256, fixture.ViewModel.LiveWindowColumns);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.ViewModel.State.RequestedResamplingMode);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.ViewModel.State.PresentedResamplingMode);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, fixture.Control.AppliedSnapshot!.Resampling.Mode);
+        Assert.AreEqual(256m, fixture.Control.AppliedSnapshot.SpatialViewport.Span);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
+    public Task Rapid_reduce_and_mode_change_publish_only_the_latest_signature() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512);
+        await fixture.WaitForRevisionAsync(512);
+        BScanPresentedRegionToken previous = fixture.ViewModel.State.Region!.Token;
+
+        fixture.ViewModel.DecreaseLiveWindowCommand.Execute(null);
+        fixture.ViewModel.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Bicubic);
+        await DiagnosticWait.Until(() => fixture.ViewModel.State is
+        {
+            RequestedResamplingMode: Scan2DInterpolationMode.Bicubic,
+            PresentedResamplingMode: Scan2DInterpolationMode.Bicubic,
+            IsRenderPending: false,
+            Region.Token: var token
+        } && token != previous && fixture.Control.AppliedSnapshot is
+        {
+            RasterWidth: 128,
+            Resampling.Mode: Scan2DInterpolationMode.Bicubic
+        }, "latest reduced Bicubic signature");
+
+        Assert.AreEqual(128, fixture.ViewModel.State.ConfirmedRenderSignature!.Value.PixelWidth);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic,
+            fixture.ViewModel.State.ConfirmedRenderSignature.Value.Resampling.Mode);
+        fixture.AssertOpenBalances();
     });
 
     [TestMethod]

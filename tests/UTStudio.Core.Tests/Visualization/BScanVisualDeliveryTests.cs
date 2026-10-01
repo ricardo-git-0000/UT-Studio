@@ -42,6 +42,34 @@ public sealed class BScanVisualDeliveryTests
     }
 
     [TestMethod]
+    public async Task Bilinear_upsamples_visible_rf_samples_along_time_axis_instead_of_repeating_rows()
+    {
+        var ingress = new BScanIngress(Options(1, 1));
+        ConventionalUtFrameMetadata metadata = Metadata(8);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+        ingress.OpenRun(metadata);
+        await using var delivery = new BScanVisualDelivery(ingress);
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null,
+            new short[] { -1, -1, short.MinValue, 0, short.MaxValue, 0, -1, -1 });
+        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var request = new BScanRenderRequest(metadata.RunId, BScanSpatialViewportOperations.Reset(new(0, 0)),
+            ScanTimeViewportOperations.Create(.000002, .000006), 1, 8, 1,
+            Resampling: new(Scan2DInterpolationMode.Bilinear));
+        BScanRasterResult result = await delivery.GetRegionAsync(request);
+
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind, result.Error);
+        using BScanRasterRegion region = result.Region!;
+        Assert.IsTrue(region.ValidityMask.Span.ToArray().All(value => value == 1));
+        CollectionAssert.AreEqual(new byte[] { 1, 33, 96, 160, 223, 223, 160, 128 },
+            region.Pixels.Span.ToArray());
+        Assert.IsTrue(region.Provenance.Span.ToArray().All(value =>
+            value == (byte)Scan2DSampleProvenance.VisualDerived));
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task FullRasterUsesNoDataGapsStableTieAndSurvivesRingWrap()
     {
         var ingress = new BScanIngress(Options(maximumColumns: 2, minimumColumns: 2));
@@ -290,6 +318,8 @@ public sealed class BScanVisualDeliveryTests
         Assert.IsTrue(second.Snapshot.FullRefreshReason.HasFlag(BScanFullRefreshReason.RenderConfigurationChanged));
         second.Dispose();
         Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
+        Assert.IsGreaterThan(0L, delivery.Diagnostics.VisualBytesRented);
+        await delivery.DisposeAsync();
         Assert.AreEqual(0L, delivery.Diagnostics.VisualBytesRented);
         await ingress.DisposeAsync();
     }
@@ -320,10 +350,18 @@ public sealed class BScanVisualDeliveryTests
         Assert.AreEqual(BScanRasterResultKind.Available, result.Kind, result.Error);
         using BScanRasterRegion region = result.Region!;
         Assert.AreEqual(checked(1024 * 1024), region.Pixels.Length);
-        long expectedMaximum = mode == Scan2DInterpolationMode.Lanczos ? 8_755_200L : 8_650_752L;
+        long expectedMaximum = mode switch
+        {
+            Scan2DInterpolationMode.Bilinear => 8_470_576L,
+            Scan2DInterpolationMode.Bicubic => 8_552_496L,
+            Scan2DInterpolationMode.Lanczos => 8_585_264L,
+            _ => throw new AssertFailedException("Unexpected interpolating mode.")
+        };
         Assert.AreEqual(expectedMaximum, delivery.Diagnostics.MaximumVisualBytesRented);
         Assert.IsLessThanOrEqualTo(16L * 1024 * 1024, delivery.Diagnostics.MaximumVisualBytesRented);
         region.Dispose(); baseline.Dispose();
+        Assert.IsGreaterThan(0L, delivery.Diagnostics.VisualBytesRented);
+        await delivery.DisposeAsync();
         Assert.AreEqual(0L, delivery.Diagnostics.VisualBytesRented);
         await ingress.DisposeAsync();
     }
@@ -361,6 +399,8 @@ public sealed class BScanVisualDeliveryTests
         first.Dispose();
         second.Dispose();
         otherConsumer.Dispose();
+        Assert.IsGreaterThan(0L, delivery.Diagnostics.VisualBytesRented);
+        await delivery.DisposeAsync();
         Assert.AreEqual(0L, delivery.Diagnostics.VisualBytesRented);
         await ingress.DisposeAsync();
     }

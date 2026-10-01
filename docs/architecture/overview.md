@@ -63,6 +63,11 @@ El [ADR 0007](../adr/0007-frame-source-ownership.md) concreta frame RF `ReadOnly
 ## Frontera WPF/Avalonia
 Presentation no importa WPF ni Avalonia. Los servicios UI abstractos permanecen en App.Wpf, separados por carpetas de composición, vistas y servicios. El renderizador A-Scan se extrae a Visualization.Wpf conforme al ADR 0009; no contiene servicios de aplicación ni se inyecta en hardware.
 App.Wpf configura Hosting, DI por constructor, configuración y logging, construye las ventanas y coordina arranque/cierre. No es propietario de la lógica de sesión. Los servicios de plataforma no visuales se abstraen en la frontera neutral que los necesita; no se crea un proyecto Platform genérico.
+
+La preferencia visual B-Scan es un servicio singleton explícito de App.Wpf. Lee antes de construir el
+ViewModel de ventana y escribe de forma serializada y atómica en la configuración versionada del usuario.
+Presentation solo conoce el contrato neutral de escritura y nunca rutas, JSON ni tipos WPF; cada ventana
+y su ViewModel conservan lifetime propio, mientras la preferencia sobrevive a reaperturas.
 Solo proyectos .Wpf referencian WPF. Tipos UI como Brush, Color, Point, BitmapSource, WriteableBitmap, Dispatcher y Window no aparecen en APIs públicas del núcleo. Usar unidades, coordenadas y formatos de píxel neutrales explícitos.
 La raíz App.Wpf compone ViewModels independientes. MainWindow aloja A-Scan y gobierna la salida global. BScanWindow es la primera secundaria: posee ViewModel, suscripciones y consumer ID, toma prestados servicios compartidos y puede cerrarse sin detener sesión. No se crean scopes genéricos ni controles XAML por muestra.
 La futura UI Avalonia sustituirá adaptadores y composición. La portabilidad del núcleo no garantiza soporte Linux del SDK PCIe. Aislar también SDK de futuros PLC, robot y encoders.

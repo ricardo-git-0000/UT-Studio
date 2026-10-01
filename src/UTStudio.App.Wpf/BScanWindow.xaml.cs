@@ -6,6 +6,7 @@ using Microsoft.Win32;
 using UTStudio.App.Wpf.Adapters;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Wpf.Rendering;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.App.Wpf;
 
@@ -32,6 +33,7 @@ public partial class BScanWindow : Window
         _disposeViewModel = () => viewModel.DisposeAsync().AsTask();
         _beforeWindowClose = null;
         Closing += OnClosing;
+        InitializeResamplingSelector();
     }
 
     internal BScanWindow(BScanViewModel viewModel, Action disposeAdapter, Func<Task> disposeViewModel,
@@ -44,6 +46,32 @@ public partial class BScanWindow : Window
         _disposeViewModel = disposeViewModel;
         _beforeWindowClose = beforeWindowClose;
         Closing += OnClosing;
+        InitializeResamplingSelector();
+    }
+
+    private void InitializeResamplingSelector()
+    {
+        ResamplingSelector.ItemsSource = BScanResamplingDisplayOption.All;
+        ResamplingSelector.SelectedValuePath = nameof(BScanResamplingDisplayOption.Mode);
+        ResamplingSelector.DisplayMemberPath = nameof(BScanResamplingDisplayOption.DisplayName);
+        ResamplingSelector.SelectedValue = _viewModel.RequestedResamplingMode;
+    }
+
+    private void OnResamplingSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (ResamplingSelector.SelectedValue is not Scan2DInterpolationMode mode) return;
+        LanczosWarning.Visibility = mode == Scan2DInterpolationMode.Lanczos ? Visibility.Visible : Visibility.Collapsed;
+        if (_viewModel.ChangeResamplingModeCommand.CanExecute(mode)) _viewModel.ChangeResamplingModeCommand.Execute(mode);
+    }
+
+    internal sealed record BScanResamplingDisplayOption(Scan2DInterpolationMode Mode, string DisplayName)
+    {
+        internal static IReadOnlyList<BScanResamplingDisplayOption> All { get; } =
+        [new(Scan2DInterpolationMode.None, "Sin interpolación"),
+         new(Scan2DInterpolationMode.NearestNeighbor, "Vecino más próximo"),
+         new(Scan2DInterpolationMode.Bilinear, "Bilineal — recomendado"),
+         new(Scan2DInterpolationMode.Bicubic, "Bicúbica — recomendado"),
+         new(Scan2DInterpolationMode.Lanczos, "Lanczos-3 — alta calidad")];
     }
 
     internal string ConsumerId => _viewModel.ConsumerId;

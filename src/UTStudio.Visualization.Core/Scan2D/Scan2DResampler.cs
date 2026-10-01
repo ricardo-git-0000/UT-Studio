@@ -27,27 +27,42 @@ internal sealed class SharedLanczosTablePool : ILanczosTablePool
 
 internal readonly record struct LanczosTableMemory(long LogicalBytes, long RentedBytes);
 
-public sealed class Scan2DResampler : IScan2DResampler
+public sealed class Scan2DResampler : IScan2DResampler, IDisposable
 {
     private const int LanczosTapCount = 6;
     private const int LanczosFirstTapOffset = -2;
     private const int LanczosWeightStride = LanczosTapCount + 1;
     private readonly ILanczosTablePool _lanczosTablePool;
     private readonly Action<long>? _tableBytesChanged;
+    private readonly bool _reuseTables;
+    private readonly object _tableGate = new();
+    private CachedTableEntry? _cachedTables;
+    private bool _disposed;
+    private long _tablePreparationCount;
     internal Action<int>? AfterKernelRowProcessed { get; set; }
     internal Action<int, bool>? AfterLanczosCoordinatePrepared { get; set; }
     internal LanczosTableMemory LastLanczosTableMemory { get; private set; }
+    internal long TablePreparationCount => Interlocked.Read(ref _tablePreparationCount);
 
-    public Scan2DResampler() : this(SharedLanczosTablePool.Instance, null) { }
+    public Scan2DResampler() : this(SharedLanczosTablePool.Instance, null, false) { }
 
-    internal Scan2DResampler(ILanczosTablePool lanczosTablePool, Action<long>? tableBytesChanged = null)
+    internal Scan2DResampler(ILanczosTablePool lanczosTablePool, Action<long>? tableBytesChanged = null,
+        bool reuseTables = false)
     {
         _lanczosTablePool = lanczosTablePool ?? throw new ArgumentNullException(nameof(lanczosTablePool));
         _tableBytesChanged = tableBytesChanged;
+        _reuseTables = reuseTables;
     }
 
     public Scan2DRenderResult Render(Scan2DSourceGrid source, Scan2DRenderRequest request,
         IMemoryOwner<byte> destinationOwner, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return RenderCore(source, request, destinationOwner, cancellationToken);
+    }
+
+    private Scan2DRenderResult RenderCore(Scan2DSourceGrid source, Scan2DRenderRequest request,
+        IMemoryOwner<byte> destinationOwner, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(destinationOwner);
         if (source.Width != request.SourceWidth || source.Height != request.SourceHeight ||
@@ -77,8 +92,7 @@ public sealed class Scan2DResampler : IScan2DResampler
                     RenderKernel(source, request, result, cancellationToken);
                     break;
                 case Scan2DInterpolationMode.Lanczos:
-                    using (LanczosTables tables = PrepareLanczosTables(source, request, cancellationToken))
-                    { RenderLanczosPrepared(source, request, result, tables, cancellationToken); }
+                    RenderLanczos(source, request, result, cancellationToken);
                     break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(request), "Unsupported interpolation mode.");
@@ -107,41 +121,86 @@ public sealed class Scan2DResampler : IScan2DResampler
         }
     }
 
-    private static void RenderNearest(Scan2DSourceGrid source, Scan2DRenderRequest request,
+    private void RenderNearest(Scan2DSourceGrid source, Scan2DRenderRequest request,
         Scan2DRenderResult result, CancellationToken token)
     {
         Scan2DRectangle region = request.Viewport;
-        for (int y = region.Y; y < checked(region.Y + region.Height); y++)
+        if (_reuseTables)
+        {
+            using TableLease lease = AcquireTables(source, request, 1, token);
+            RenderNearestPrepared(source, request, result, lease.KernelTables, token);
+            return;
+        }
+        KernelTables? ownedTables = null;
+        KernelTables tables = GetKernelTables(source, request, 1, ref ownedTables, out bool prepare);
+        try
+        {
+            if (prepare)
+            {
+                PrepareNearestAxis(region.X, region.Width, request.DestinationGeometry.FirstCenterX,
+                    request.DestinationGeometry.CenterStepX, source.Geometry.FirstCenterX,
+                    source.Geometry.CenterStepX, source.Width, tables.XIndices, tables.XWeights, token);
+                PrepareNearestAxis(region.Y, region.Height, request.DestinationGeometry.FirstCenterY,
+                    request.DestinationGeometry.CenterStepY, source.Geometry.FirstCenterY,
+                    source.Geometry.CenterStepY, source.Height, tables.YIndices, tables.YWeights, token);
+            }
+            RenderNearestPrepared(source, request, result, tables, token);
+        }
+        catch { throw; }
+        finally { ownedTables?.Dispose(); }
+    }
+
+    private static void RenderNearestPrepared(Scan2DSourceGrid source, Scan2DRenderRequest request,
+        Scan2DRenderResult result, KernelTables tables, CancellationToken token)
+    {
+        Scan2DRectangle region = request.Viewport;
+        ReadOnlySpan<byte> sourceIntensities = source.Intensities.Span;
+        ReadOnlySpan<byte> sourceValidity = source.ValidityMask.Span;
+        ReadOnlySpan<byte> sourceProvenance = source.Provenance.Span;
+        Span<byte> destinationIntensities = result.Intensities.Span;
+        Span<byte> destinationValidity = result.ValidityMask.Span;
+        Span<byte> destinationProvenance = result.Provenance.Span;
+        for (int localY = 0; localY < region.Height; localY++)
         {
             token.ThrowIfCancellationRequested();
-            int sourceY = NearestIndex(request.DestinationGeometry.FirstCenterY + y * request.DestinationGeometry.CenterStepY,
-                source.Geometry.FirstCenterY, source.Geometry.CenterStepY, source.Height);
-            double coordinateY = SourceCoordinate(request.DestinationGeometry.FirstCenterY +
-                y * request.DestinationGeometry.CenterStepY, source.Geometry.FirstCenterY,
-                source.Geometry.CenterStepY);
-            for (int x = region.X; x < checked(region.X + region.Width); x++)
+            int y = checked(region.Y + localY);
+            int sourceY = tables.YIndices[localY];
+            double coordinateY = tables.YWeights[checked(localY * 2 + 1)];
+            for (int localX = 0; localX < region.Width; localX++)
             {
-                int sourceX = NearestIndex(request.DestinationGeometry.FirstCenterX + x * request.DestinationGeometry.CenterStepX,
-                    source.Geometry.FirstCenterX, source.Geometry.CenterStepX, source.Width);
-                double coordinateX = SourceCoordinate(request.DestinationGeometry.FirstCenterX +
-                    x * request.DestinationGeometry.CenterStepX, source.Geometry.FirstCenterX,
-                    source.Geometry.CenterStepX);
+                int x = checked(region.X + localX);
+                int sourceX = tables.XIndices[localX];
+                double coordinateX = tables.XWeights[checked(localX * 2 + 1)];
                 int sourceIndex = checked(sourceY * source.Stride + sourceX);
-                if (source.ValidityMask.Span[sourceIndex] == 0) { continue; }
+                if (sourceValidity[sourceIndex] == 0) { continue; }
                 int destinationIndex = checked(y * result.Stride + x);
-                result.Intensities.Span[destinationIndex] = source.Intensities.Span[sourceIndex];
-                result.ValidityMask.Span[destinationIndex] = 1;
-                result.Provenance.Span[destinationIndex] = IsExactSourceCenter(coordinateX, source.Width) &&
-                    IsExactSourceCenter(coordinateY, source.Height) ? source.Provenance.Span[sourceIndex] :
+                destinationIntensities[destinationIndex] = sourceIntensities[sourceIndex];
+                destinationValidity[destinationIndex] = 1;
+                destinationProvenance[destinationIndex] = IsExactSourceCenter(coordinateX, source.Width) &&
+                    IsExactSourceCenter(coordinateY, source.Height) ? sourceProvenance[sourceIndex] :
                     (byte)Scan2DSampleProvenance.VisualDerived;
             }
+        }
+    }
+
+    private static void PrepareNearestAxis(int firstDestination, int destinationCount,
+        double firstDestinationCenter, double destinationStep, double firstSourceCenter,
+        double sourceStep, int sourceLength, int[] indices, double[] coordinates,
+        CancellationToken token)
+    {
+        for (int local = 0; local < destinationCount; local++)
+        {
+            token.ThrowIfCancellationRequested();
+            int destination = checked(firstDestination + local);
+            double destinationCenter = firstDestinationCenter + destination * destinationStep;
+            indices[local] = NearestIndex(destinationCenter, firstSourceCenter, sourceStep, sourceLength);
+            coordinates[checked(local * 2 + 1)] = SourceCoordinate(destinationCenter, firstSourceCenter, sourceStep);
         }
     }
 
     private void RenderKernel(Scan2DSourceGrid source, Scan2DRenderRequest request,
         Scan2DRenderResult result, CancellationToken token)
     {
-        Scan2DRectangle region = request.Viewport;
         Scan2DInterpolationMode mode = request.Options.Mode;
         int tapCount = mode switch
         {
@@ -157,67 +216,299 @@ public sealed class Scan2DResampler : IScan2DResampler
             Scan2DInterpolationMode.Lanczos => -2,
             _ => throw new ArgumentOutOfRangeException(nameof(request), "Unsupported kernel mode.")
         };
-        for (int y = region.Y; y < checked(region.Y + region.Height); y++)
+        Scan2DRectangle region = request.Viewport;
+        if (_reuseTables)
+        {
+            using TableLease lease = AcquireTables(source, request, tapCount, token);
+            KernelTables cached = lease.KernelTables;
+            RenderPreparedKernel(source, request, result, tapCount, cached.XIndices, cached.XWeights,
+                cached.YIndices, cached.YWeights, token);
+            return;
+        }
+        KernelTables? ownedTables = null;
+        KernelTables tables = GetKernelTables(source, request, tapCount, ref ownedTables, out bool prepare);
+        try
+        {
+            if (prepare)
+            {
+                PrepareKernelAxis(region.X, region.Width, request.DestinationGeometry.FirstCenterX,
+                    request.DestinationGeometry.CenterStepX, source.Geometry.FirstCenterX,
+                    source.Geometry.CenterStepX, source.Width, tapCount, firstTapOffset, mode,
+                    request.Options, tables.XIndices, tables.XWeights, token);
+                PrepareKernelAxis(region.Y, region.Height, request.DestinationGeometry.FirstCenterY,
+                    request.DestinationGeometry.CenterStepY, source.Geometry.FirstCenterY,
+                    source.Geometry.CenterStepY, source.Height, tapCount, firstTapOffset, mode,
+                    request.Options, tables.YIndices, tables.YWeights, token);
+            }
+            RenderPreparedKernel(source, request, result, tapCount, tables.XIndices, tables.XWeights,
+                tables.YIndices, tables.YWeights, token);
+        }
+        catch { throw; }
+        finally { ownedTables?.Dispose(); }
+    }
+
+    private static void PrepareKernelAxis(int firstDestination, int destinationCount,
+        double firstDestinationCenter, double destinationStep, double firstSourceCenter,
+        double sourceStep, int sourceLength, int tapCount, int firstTapOffset,
+        Scan2DInterpolationMode mode, Scan2DResamplingOptions options, int[] indices,
+        double[] weights, CancellationToken token)
+    {
+        int weightStride = checked(tapCount + 1);
+        for (int local = 0; local < destinationCount; local++)
         {
             token.ThrowIfCancellationRequested();
-            double sourceY = SourceCoordinate(request.DestinationGeometry.FirstCenterY +
-                y * request.DestinationGeometry.CenterStepY, source.Geometry.FirstCenterY,
-                source.Geometry.CenterStepY);
-            int baseY = checked((int)Math.Floor(sourceY));
-            double fractionY = sourceY - baseY;
-            for (int x = region.X; x < checked(region.X + region.Width); x++)
+            int destination = checked(firstDestination + local);
+            double coordinate = SourceCoordinate(firstDestinationCenter + destination * destinationStep,
+                firstSourceCenter, sourceStep);
+            int baseIndex = checked((int)Math.Floor(coordinate));
+            double fraction = coordinate - baseIndex;
+            int indexOffset = checked(local * tapCount);
+            int weightOffset = checked(local * weightStride);
+            for (int tap = 0; tap < tapCount; tap++)
             {
-                double sourceX = SourceCoordinate(request.DestinationGeometry.FirstCenterX +
-                    x * request.DestinationGeometry.CenterStepX, source.Geometry.FirstCenterX,
-                    source.Geometry.CenterStepX);
-                int baseX = checked((int)Math.Floor(sourceX));
-                double fractionX = sourceX - baseX;
+                int offset = checked(firstTapOffset + tap);
+                indices[indexOffset + tap] = Math.Clamp(checked(baseIndex + offset), 0, sourceLength - 1);
+                weights[weightOffset + tap] = KernelWeight(mode, fraction - offset, options);
+            }
+            weights[weightOffset + tapCount] = coordinate;
+        }
+    }
+
+    private void RenderPreparedKernel(Scan2DSourceGrid source, Scan2DRenderRequest request,
+        Scan2DRenderResult result, int tapCount, int[] xIndices, double[] xWeights,
+        int[] yIndices, double[] yWeights, CancellationToken token)
+    {
+        Scan2DRectangle region = request.Viewport;
+        int weightStride = checked(tapCount + 1);
+        ReadOnlySpan<byte> sourceIntensities = source.Intensities.Span;
+        ReadOnlySpan<byte> sourceValidity = source.ValidityMask.Span;
+        ReadOnlySpan<byte> sourceSegments = source.SegmentIds.Span;
+        ReadOnlySpan<byte> sourceProvenance = source.Provenance.Span;
+        Span<byte> destinationIntensities = result.Intensities.Span;
+        Span<byte> destinationValidity = result.ValidityMask.Span;
+        Span<byte> destinationProvenance = result.Provenance.Span;
+        for (int localY = 0; localY < region.Height; localY++)
+        {
+            token.ThrowIfCancellationRequested();
+            int y = checked(region.Y + localY);
+            int yIndexOffset = checked(localY * tapCount);
+            int yWeightOffset = checked(localY * weightStride);
+            double sourceY = yWeights[yWeightOffset + tapCount];
+            for (int localX = 0; localX < region.Width; localX++)
+            {
+                int x = checked(region.X + localX);
+                int xIndexOffset = checked(localX * tapCount);
+                int xWeightOffset = checked(localX * weightStride);
+                double sourceX = xWeights[xWeightOffset + tapCount];
                 double accumulated = 0;
-                double combinedWeight = 0;
                 byte segment = 0;
                 bool valid = true;
                 for (int tapY = 0; tapY < tapCount && valid; tapY++)
                 {
-                    int unclampedY = checked(baseY + firstTapOffset + tapY);
-                    int sampleY = Math.Clamp(unclampedY, 0, source.Height - 1);
-                    double weightY = KernelWeight(mode, fractionY - (firstTapOffset + tapY), request.Options);
+                    int sampleY = yIndices[yIndexOffset + tapY];
+                    double weightY = yWeights[yWeightOffset + tapY];
                     for (int tapX = 0; tapX < tapCount; tapX++)
                     {
-                        int unclampedX = checked(baseX + firstTapOffset + tapX);
-                        int sampleX = Math.Clamp(unclampedX, 0, source.Width - 1);
+                        int sampleX = xIndices[xIndexOffset + tapX];
                         int sourceIndex = checked(sampleY * source.Stride + sampleX);
-                        if (source.ValidityMask.Span[sourceIndex] == 0)
+                        if (sourceValidity[sourceIndex] == 0)
                         { valid = false; break; }
-                        byte tapSegment = source.SegmentIds.Span[sourceIndex];
+                        byte tapSegment = sourceSegments[sourceIndex];
                         if (segment == 0) { segment = tapSegment; }
                         else if (tapSegment != segment) { valid = false; break; }
-                        double weightX = KernelWeight(mode, fractionX - (firstTapOffset + tapX), request.Options);
-                        double weight = weightY * weightX;
-                        accumulated += source.Intensities.Span[sourceIndex] * weight;
-                        combinedWeight += weight;
+                        double weight = weightY * xWeights[xWeightOffset + tapX];
+                        accumulated += sourceIntensities[sourceIndex] * weight;
                     }
                 }
                 if (!valid) { continue; }
-                if (mode == Scan2DInterpolationMode.Lanczos)
-                {
-                    if (!double.IsFinite(combinedWeight) ||
-                        Math.Abs(combinedWeight) < LanczosCoincidenceTolerance)
-                    { throw new InvalidOperationException("Lanczos normalization weight is zero."); }
-                    accumulated /= combinedWeight;
-                }
                 int destinationIndex = checked(y * result.Stride + x);
-                result.Intensities.Span[destinationIndex] = RoundIntensity(accumulated);
-                result.ValidityMask.Span[destinationIndex] = 1;
+                destinationIntensities[destinationIndex] = RoundIntensity(accumulated);
+                destinationValidity[destinationIndex] = 1;
                 if (IsExactSourceCenter(sourceX, source.Width) && IsExactSourceCenter(sourceY, source.Height))
                 {
                     int exactX = Math.Clamp(checked((int)sourceX), 0, source.Width - 1);
                     int exactY = Math.Clamp(checked((int)sourceY), 0, source.Height - 1);
-                    result.Provenance.Span[destinationIndex] =
-                        source.Provenance.Span[checked(exactY * source.Stride + exactX)];
+                    destinationProvenance[destinationIndex] = sourceProvenance[checked(exactY * source.Stride + exactX)];
                 }
-                else { result.Provenance.Span[destinationIndex] = (byte)Scan2DSampleProvenance.VisualDerived; }
+                else { destinationProvenance[destinationIndex] = (byte)Scan2DSampleProvenance.VisualDerived; }
             }
             AfterKernelRowProcessed?.Invoke(y);
+        }
+    }
+
+    private KernelTables GetKernelTables(Scan2DSourceGrid source, Scan2DRenderRequest request,
+        int tapCount, ref KernelTables? ownedTables, out bool prepare)
+    {
+        prepare = true;
+        return ownedTables = new KernelTables(_lanczosTablePool, _tableBytesChanged,
+            request.Viewport.Width, request.Viewport.Height, tapCount);
+    }
+
+    private void RenderLanczos(Scan2DSourceGrid source, Scan2DRenderRequest request,
+        Scan2DRenderResult result, CancellationToken token)
+    {
+        if (_reuseTables)
+        {
+            using TableLease lease = AcquireTables(source, request, LanczosTapCount, token);
+            RenderLanczosPrepared(source, request, result, lease.LanczosTables, token);
+            return;
+        }
+        using LanczosTables tables = PrepareLanczosTables(source, request, token);
+        RenderLanczosPrepared(source, request, result, tables, token);
+    }
+
+    private TableLease AcquireTables(Scan2DSourceGrid source, Scan2DRenderRequest request,
+        int tapCount, CancellationToken token)
+    {
+        TableKey key = TableKey.Create(source, request, tapCount);
+        lock (_tableGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_cachedTables is { } existing && existing.Key == key)
+            {
+                existing.Users++;
+                return new TableLease(this, existing);
+            }
+
+            CachedTableEntry created = CreateTableEntry(source, request, tapCount, key, token);
+            if (_cachedTables is { } previous)
+            {
+                previous.Retired = true;
+                if (previous.Users == 0) { previous.Dispose(); }
+            }
+            _cachedTables = created;
+            created.Users = 1;
+            return new TableLease(this, created);
+        }
+    }
+
+    private CachedTableEntry CreateTableEntry(Scan2DSourceGrid source, Scan2DRenderRequest request,
+        int tapCount, TableKey key, CancellationToken token)
+    {
+        if (request.Options.Mode == Scan2DInterpolationMode.Lanczos)
+        {
+            LanczosTables lanczos = PrepareLanczosTables(source, request, token);
+            Interlocked.Increment(ref _tablePreparationCount);
+            return new(key, lanczos);
+        }
+
+        Scan2DRectangle region = request.Viewport;
+        var tables = new KernelTables(_lanczosTablePool, _tableBytesChanged,
+            region.Width, region.Height, tapCount);
+        try
+        {
+            if (request.Options.Mode == Scan2DInterpolationMode.NearestNeighbor)
+            {
+                PrepareNearestAxis(region.X, region.Width, request.DestinationGeometry.FirstCenterX,
+                    request.DestinationGeometry.CenterStepX, source.Geometry.FirstCenterX,
+                    source.Geometry.CenterStepX, source.Width, tables.XIndices, tables.XWeights, token);
+                PrepareNearestAxis(region.Y, region.Height, request.DestinationGeometry.FirstCenterY,
+                    request.DestinationGeometry.CenterStepY, source.Geometry.FirstCenterY,
+                    source.Geometry.CenterStepY, source.Height, tables.YIndices, tables.YWeights, token);
+            }
+            else
+            {
+                int firstTapOffset = request.Options.Mode == Scan2DInterpolationMode.Bilinear ? 0 : -1;
+                PrepareKernelAxis(region.X, region.Width, request.DestinationGeometry.FirstCenterX,
+                    request.DestinationGeometry.CenterStepX, source.Geometry.FirstCenterX,
+                    source.Geometry.CenterStepX, source.Width, tapCount, firstTapOffset,
+                    request.Options.Mode, request.Options, tables.XIndices, tables.XWeights, token);
+                PrepareKernelAxis(region.Y, region.Height, request.DestinationGeometry.FirstCenterY,
+                    request.DestinationGeometry.CenterStepY, source.Geometry.FirstCenterY,
+                    source.Geometry.CenterStepY, source.Height, tapCount, firstTapOffset,
+                    request.Options.Mode, request.Options, tables.YIndices, tables.YWeights, token);
+            }
+            Interlocked.Increment(ref _tablePreparationCount);
+            return new(key, tables);
+        }
+        catch { tables.Dispose(); throw; }
+    }
+
+    public void Dispose()
+    {
+        lock (_tableGate)
+        {
+            if (_disposed) { return; }
+            _disposed = true;
+            if (_cachedTables is { } cached)
+            {
+                cached.Retired = true;
+                if (cached.Users == 0) { cached.Dispose(); }
+                _cachedTables = null;
+            }
+        }
+    }
+
+    private void Release(CachedTableEntry entry)
+    {
+        lock (_tableGate)
+        {
+            entry.Users--;
+            if (entry.Users == 0 && entry.Retired) { entry.Dispose(); }
+        }
+    }
+
+    private readonly record struct TableKey(
+        Scan2DInterpolationMode Mode, Scan2DResamplingOptions Options, int SourceWidth, int SourceHeight,
+        int DestinationWidth, int DestinationHeight, int ViewportWidth, int ViewportHeight, int TapCount,
+        double FirstSourceX, double FirstSourceY, double SourceStepX, double SourceStepY)
+    {
+        internal static TableKey Create(Scan2DSourceGrid source, Scan2DRenderRequest request, int tapCount)
+        {
+            Scan2DRectangle region = request.Viewport;
+            double firstX = SourceCoordinate(request.DestinationGeometry.FirstCenterX +
+                region.X * request.DestinationGeometry.CenterStepX,
+                source.Geometry.FirstCenterX, source.Geometry.CenterStepX);
+            double firstY = SourceCoordinate(request.DestinationGeometry.FirstCenterY +
+                region.Y * request.DestinationGeometry.CenterStepY,
+                source.Geometry.FirstCenterY, source.Geometry.CenterStepY);
+            return new(request.Options.Mode, request.Options, source.Width, source.Height,
+                request.DestinationWidth, request.DestinationHeight, region.Width, region.Height, tapCount,
+                firstX, firstY,
+                request.DestinationGeometry.CenterStepX / source.Geometry.CenterStepX,
+                request.DestinationGeometry.CenterStepY / source.Geometry.CenterStepY);
+        }
+    }
+
+    private sealed class CachedTableEntry : IDisposable
+    {
+        internal CachedTableEntry(TableKey key, KernelTables tables)
+        { Key = key; KernelTables = tables; }
+
+        internal CachedTableEntry(TableKey key, LanczosTables tables)
+        { Key = key; LanczosTables = tables; }
+
+        internal TableKey Key { get; }
+        internal KernelTables? KernelTables { get; }
+        internal LanczosTables? LanczosTables { get; }
+        internal int Users { get; set; }
+        internal bool Retired { get; set; }
+
+        public void Dispose()
+        {
+            KernelTables?.Dispose();
+            LanczosTables?.Dispose();
+        }
+    }
+
+    private sealed class TableLease : IDisposable
+    {
+        private Scan2DResampler? _owner;
+        private CachedTableEntry? _entry;
+
+        internal TableLease(Scan2DResampler owner, CachedTableEntry entry)
+        { _owner = owner; _entry = entry; }
+
+        internal KernelTables KernelTables => _entry?.KernelTables ??
+            throw new InvalidOperationException("The cached entry does not contain kernel tables.");
+        internal LanczosTables LanczosTables => _entry?.LanczosTables ??
+            throw new InvalidOperationException("The cached entry does not contain Lanczos tables.");
+
+        public void Dispose()
+        {
+            CachedTableEntry? entry = Interlocked.Exchange(ref _entry, null);
+            Scan2DResampler? owner = Interlocked.Exchange(ref _owner, null);
+            if (entry is not null && owner is not null) { owner.Release(entry); }
         }
     }
 
@@ -385,6 +676,67 @@ public sealed class Scan2DResampler : IScan2DResampler
             if (_xWeights is { } xWeights) { _xWeights = null; _pool.Return(xWeights); }
             if (_xIndices is { } xIndices) { _xIndices = null; _pool.Return(xIndices); }
             if (RentedBytes != 0) { _bytesChanged?.Invoke(-RentedBytes); RentedBytes = 0; }
+        }
+    }
+
+    private sealed class KernelTables : IDisposable
+    {
+        private readonly ILanczosTablePool _pool;
+        private readonly Action<long>? _bytesChanged;
+        private int[]? _xIndices;
+        private int[]? _yIndices;
+        private double[]? _xWeights;
+        private double[]? _yWeights;
+        private long _rentedBytes;
+
+        internal KernelTables(ILanczosTablePool pool, Action<long>? bytesChanged,
+            int width, int height, int tapCount)
+        {
+            _pool = pool;
+            _bytesChanged = bytesChanged;
+            int weightStride = checked(tapCount + 1);
+            try
+            {
+                _xIndices = RentIndices(checked(width * tapCount));
+                _xWeights = RentWeights(checked(width * weightStride));
+                _yIndices = RentIndices(checked(height * tapCount));
+                _yWeights = RentWeights(checked(height * weightStride));
+            }
+            catch { Dispose(); throw; }
+        }
+
+        internal int[] XIndices => _xIndices ?? throw new ObjectDisposedException(nameof(KernelTables));
+        internal int[] YIndices => _yIndices ?? throw new ObjectDisposedException(nameof(KernelTables));
+        internal double[] XWeights => _xWeights ?? throw new ObjectDisposedException(nameof(KernelTables));
+        internal double[] YWeights => _yWeights ?? throw new ObjectDisposedException(nameof(KernelTables));
+
+        private int[] RentIndices(int length)
+        {
+            int[] array = _pool.RentIndices(length);
+            try { Admit(checked((long)array.Length * sizeof(int))); return array; }
+            catch { _pool.Return(array); throw; }
+        }
+
+        private double[] RentWeights(int length)
+        {
+            double[] array = _pool.RentWeights(length);
+            try { Admit(checked((long)array.Length * sizeof(double))); return array; }
+            catch { _pool.Return(array); throw; }
+        }
+
+        private void Admit(long bytes)
+        {
+            _bytesChanged?.Invoke(bytes);
+            _rentedBytes = checked(_rentedBytes + bytes);
+        }
+
+        public void Dispose()
+        {
+            if (_yWeights is { } yWeights) { _yWeights = null; _pool.Return(yWeights); }
+            if (_yIndices is { } yIndices) { _yIndices = null; _pool.Return(yIndices); }
+            if (_xWeights is { } xWeights) { _xWeights = null; _pool.Return(xWeights); }
+            if (_xIndices is { } xIndices) { _xIndices = null; _pool.Return(xIndices); }
+            if (_rentedBytes != 0) { _bytesChanged?.Invoke(-_rentedBytes); _rentedBytes = 0; }
         }
     }
 

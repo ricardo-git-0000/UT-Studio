@@ -2,6 +2,7 @@ using System.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Presentation;
 
@@ -19,11 +20,15 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private readonly SafeRelayCommand _zoomTimeIn, _zoomTimeOut, _panTimeUp, _panTimeDown, _resetTime,
         _zoomSpatialIn, _zoomSpatialOut, _panSpatialLeft, _panSpatialRight, _resetSpatial, _resetAll,
         _decreaseLiveWindow, _increaseLiveWindow, _refresh, _cancelSelection;
+    private readonly SafeParameterRelayCommand _changeResamplingMode;
+    private readonly IBScanResamplingPreferenceWriter? _preferenceWriter;
     private BScanViewState _state = BScanViewState.Empty;
     private BScanVisualSnapshot? _latestMetadata;
     private CancellationTokenSource? _rasterCancellation;
     private Task _rasterOperation = Task.CompletedTask;
     private readonly HashSet<Task> _rasterOperations = [];
+    private readonly HashSet<Task> _persistenceOperations = [];
+    private readonly CancellationTokenSource _persistenceCancellation = new();
     private long _rasterGeneration;
     private int _pixelWidth = 1, _pixelHeight = 1;
     private int _liveWindowColumns;
@@ -44,15 +49,28 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
 
     public BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
         BScanSelectionCoordinator selection, IUiDispatcher dispatcher)
-        : this(source, timeViewport, selection, dispatcher, null) { }
+        : this(source, timeViewport, selection, dispatcher, Scan2DInterpolationMode.None, null, null) { }
+
+    public BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
+        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Scan2DInterpolationMode initialResamplingMode,
+        IBScanResamplingPreferenceWriter? preferenceWriter)
+        : this(source, timeViewport, selection, dispatcher, initialResamplingMode, preferenceWriter, null) { }
 
     internal BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
         BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Action<string>? afterCleanupStage)
+        : this(source, timeViewport, selection, dispatcher, Scan2DInterpolationMode.None, null, afterCleanupStage) { }
+
+    internal BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
+        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Scan2DInterpolationMode initialResamplingMode,
+        IBScanResamplingPreferenceWriter? preferenceWriter, Action<string>? afterCleanupStage)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _timeViewport = timeViewport ?? throw new ArgumentNullException(nameof(timeViewport));
         _selection = selection ?? throw new ArgumentNullException(nameof(selection));
         _afterCleanupStage = afterCleanupStage;
+        _preferenceWriter = preferenceWriter;
+        if (!Enum.IsDefined(initialResamplingMode)) { initialResamplingMode = Scan2DInterpolationMode.None; }
+        _state = BScanViewState.Empty with { RequestedResamplingMode = initialResamplingMode };
         if (!_source.RegisterConsumer(_consumerId))
         { throw new InvalidOperationException("The B-Scan raster consumer limit has been reached."); }
         _lifetime = new(dispatcher ?? throw new ArgumentNullException(nameof(dispatcher)));
@@ -75,6 +93,11 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             () => _liveWindowColumns < _maximumLiveWindowColumns);
         _refresh = Command(() => RequestRefresh(force: true, full: true), HasRenderableState);
         _cancelSelection = Command(() => _selection.Cancel(_consumerId), () => _state.Selection.IsPending);
+        _changeResamplingMode = new(parameter =>
+        {
+            if (parameter is Scan2DInterpolationMode mode) SetResamplingMode(mode);
+        }, parameter => !IsClosing && !_lifetime.IsClosed && parameter is Scan2DInterpolationMode mode &&
+            Enum.IsDefined(mode), _ => Interlocked.Increment(ref _observerErrors));
         try { _subscription = _source.Subscribe(new Observer(this)); }
         catch
         {
@@ -112,6 +135,63 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     public IRelayCommand IncreaseLiveWindowCommand => _increaseLiveWindow;
     public IRelayCommand RefreshCommand => _refresh;
     public IRelayCommand CancelSelectionCommand => _cancelSelection;
+    public IRelayCommand ChangeResamplingModeCommand => _changeResamplingMode;
+    public IReadOnlyList<BScanResamplingOption> AvailableResamplingModes => BScanResamplingOptions.All;
+    public Scan2DInterpolationMode RequestedResamplingMode
+    {
+        get => _state.RequestedResamplingMode;
+        set => SetResamplingMode(value);
+    }
+
+    public void SetResamplingMode(Scan2DInterpolationMode mode)
+    {
+        _lifetime.Post(() =>
+        {
+            if (!Enum.IsDefined(mode))
+            { ReplaceState(_state with { ConfigurationError = "Modo de remuestreo no compatible." }); return; }
+            ChangeResamplingMode(mode);
+        });
+    }
+
+    private void ChangeResamplingMode(Scan2DInterpolationMode mode)
+    {
+        if (IsClosing || mode == _state.RequestedResamplingMode) { return; }
+        ReplaceState(_state with
+        {
+            RequestedResamplingMode = mode,
+            IsRenderPending = HasRenderableState(),
+            RequiresFullRefresh = true,
+            BScanVisualError = null,
+            PersistenceError = null,
+            ConfigurationError = null
+        });
+        OnPropertyChanged(nameof(RequestedResamplingMode));
+        PersistResamplingMode(mode);
+        RequestRefresh(force: true, full: true);
+    }
+
+    private void PersistResamplingMode(Scan2DInterpolationMode mode)
+    {
+        if (_preferenceWriter is null) { return; }
+        Task operation = PersistResamplingModeAsync(mode);
+        lock (_gate) _persistenceOperations.Add(operation);
+        _ = operation.ContinueWith(completed =>
+        {
+            lock (_gate) _persistenceOperations.Remove(completed);
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private async Task PersistResamplingModeAsync(Scan2DInterpolationMode mode)
+    {
+        string? error;
+        try { error = await _preferenceWriter!.SaveAsync(mode, _persistenceCancellation.Token).ConfigureAwait(false); }
+        catch (Exception failure) { error = Message(failure); }
+        await _lifetime.InvokeAsync(() =>
+        {
+            if (!IsClosing && mode == _state.RequestedResamplingMode)
+            { ReplaceState(_state with { PersistenceError = error }); }
+        }).ConfigureAwait(false);
+    }
 
     public void SetRasterSize(int pixelWidth, int pixelHeight, ulong renderConfigurationVersion = 0)
     {
@@ -195,6 +275,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         ReplaceState(_state with { BScanIngressError = error }));
     public void ReportUiInteractionError(string? error) => _lifetime.Post(() =>
         ReplaceState(_state with { UiInteractionError = error }));
+    public void ReportPersistenceError(string? error) => _lifetime.Post(() =>
+        ReplaceState(_state with { PersistenceError = error }));
 
     public bool TryCopyPresentedRegion(BScanPresentedRegionToken token, Span<byte> destination,
         int destinationStride)
@@ -323,7 +405,13 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         _appliedMetadataGeneration = generation;
         bool newRun = _latestMetadata?.RunId != snapshot.RunId;
         _latestMetadata = snapshot;
-        if (newRun) { _ = _selection.SetRunAsync(snapshot.RunId); }
+        if (newRun)
+        {
+            _ = _selection.SetRunAsync(snapshot.RunId);
+            BScanRasterRegion? previousRegion;
+            lock (_gate) { previousRegion = _visibleRegion; _visibleRegion = null; }
+            previousRegion?.Dispose();
+        }
         BScanVisualDiagnostics diagnostics = _source.Diagnostics;
         int maximumLiveWindow = Math.Max(diagnostics.EffectiveCapacity, 1);
         int liveWindow = _liveWindowColumns == 0
@@ -365,7 +453,12 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             RequiresFullRefresh = newRun || metadataRequiresFull || _state.RequiresFullRefresh,
             Selection = newRun ? BScanSelectionState.Empty with { RunId = snapshot.RunId } : _selection.State,
             SelectionError = newRun ? null : _selection.State.SelectionError,
-            IsSpatialAutoFit = newRun || _state.IsSpatialAutoFit
+            IsSpatialAutoFit = newRun || _state.IsSpatialAutoFit,
+            Region = newRun ? null : _state.Region,
+            DisplayedRevision = newRun ? null : _state.DisplayedRevision,
+            PresentedResamplingMode = newRun ? null : _state.PresentedResamplingMode,
+            ConfirmedRenderSignature = newRun ? null : _state.ConfirmedRenderSignature,
+            IsRenderPending = true
         });
         _timeViewport.PublishDeferredChanges();
         _applyingMetadata = false;
@@ -413,9 +506,10 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                     displayed.Snapshot.TimeViewport, displayed.Snapshot.RasterWidth,
                     displayed.Snapshot.RasterHeight, displayed.Snapshot.RenderConfigurationVersion,
                     displayed.Snapshot.Resampling)) : null,
-            _state.IsSpatialAutoFit);
+            _state.IsSpatialAutoFit, new Scan2DResamplingOptions(_state.RequestedResamplingMode));
         if (!force && request == _lastRequested) { return; }
         _lastRequested = request;
+        if (!_state.IsRenderPending) ReplaceState(_state with { IsRenderPending = true });
         CancellationTokenSource cancellation;
         CancellationTokenSource? previousCancellation;
         long generation;
@@ -441,7 +535,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             lock (_gate) { _rasterOperations.Remove(completion.Task); }
             cancellation.Dispose();
             completion.TrySetResult();
-            ReplaceState(_state with { BScanVisualError = Message(error) });
+            ReplaceState(_state with { BScanVisualError = Message(error), IsRenderPending = false });
             return;
         }
         _ = CompleteRegionAsync(previous, request, generation, cancellation, completion);
@@ -486,7 +580,14 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     {
         BScanRasterResult? result = null;
         string? operationError = null;
-        try { result = await _source.GetRegionAsync(request, cancellation.Token).ConfigureAwait(false); }
+        // A visual source may implement ValueTask synchronously. Invoke it on the worker scheduler so
+        // CPU-heavy rasterization can never run inline on the UI dispatcher.
+        try
+        {
+            result = await Task.Run(async () =>
+                await _source.GetRegionAsync(request, cancellation.Token).ConfigureAwait(false),
+                CancellationToken.None).ConfigureAwait(false);
+        }
         catch (Exception error) { operationError = Message(error); }
         BScanRasterRegion? owned = result?.Region;
         BScanPresentedRegion? managed = owned is null ? null : new(new(Guid.NewGuid()), owned.Snapshot,
@@ -502,7 +603,9 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                 _latestMetadata is null || managed.Snapshot.Stream != _latestMetadata.Stream ||
                 (!initialAutoFit && !_state.IsSpatialAutoFit &&
                     managed.Snapshot.SpatialViewport != _state.SpatialViewport) ||
-                managed.Snapshot.TimeViewport != _timeViewport.Viewport) { return; }
+                managed.Snapshot.TimeViewport != _timeViewport.Viewport ||
+                EffectiveResampling(managed.Snapshot.Resampling) != request.EffectiveResampling ||
+                EffectiveResampling(managed.Snapshot.Resampling).Mode != _state.RequestedResamplingMode) { return; }
             if (!managed.Snapshot.RequiresFullRefresh && _state.DisplayedRevision is { } displayed &&
                 managed.Snapshot.BaseStoreRevision != displayed.StoreRevision)
             {
@@ -535,7 +638,12 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                             managed.Snapshot.SnapshotVersion),
                         _state.TimeViewportBinding?.Viewport ?? managed.Snapshot.TimeViewport),
                     RequiresFullRefresh = false,
-                    BScanVisualError = null
+                    BScanVisualError = null,
+                    PresentedResamplingMode = EffectiveResampling(managed.Snapshot.Resampling).Mode,
+                    ConfirmedRenderSignature = new(managed.Snapshot.SpatialViewport, managed.Snapshot.TimeViewport,
+                        managed.Snapshot.RasterWidth, managed.Snapshot.RasterHeight,
+                        managed.Snapshot.RenderConfigurationVersion, EffectiveResampling(managed.Snapshot.Resampling)),
+                    IsRenderPending = false
                 };
                 _state = nextState;
                 Volatile.Write(ref _recoveryPosted, 0);
@@ -557,7 +665,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             await _lifetime.InvokeAsync(() =>
             {
                 if (!IsClosing && generation == _rasterGeneration && request.RunId == _state.RunId)
-                { ReplaceState(_state with { BScanVisualError = visualError }); }
+                { ReplaceState(_state with { BScanVisualError = visualError, IsRenderPending = false }); }
             }).ConfigureAwait(false);
         }
         else if (managed is null && result?.Kind == BScanRasterResultKind.Stale)
@@ -568,12 +676,21 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                 { RequestRefresh(force: true); }
             }).ConfigureAwait(false);
         }
+        else if (managed is null)
+        {
+            await _lifetime.InvokeAsync(() =>
+            {
+                if (!IsClosing && generation == _rasterGeneration)
+                { ReplaceState(_state with { IsRenderPending = false }); }
+            }).ConfigureAwait(false);
+        }
         lock (_gate) { if (generation == _rasterGeneration) { _rasterCancellation = null; } }
     }
 
     private int CurrentRasterWidth()
     {
-        if (_state.IsSpatialAutoFit && _state.ResidentRange is { } resident)
+        if (_state.RequestedResamplingMode == Scan2DInterpolationMode.None &&
+            _state.IsSpatialAutoFit && _state.ResidentRange is { } resident)
         {
             decimal residentCount = checked((decimal)(resident.Last - resident.First) + 1);
             if (residentCount >= _liveWindowColumns && _liveWindowColumns <= 1024)
@@ -642,6 +759,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     {
         if (IsClosing || _lifetime.IsClosed) { return; }
         foreach (SafeRelayCommand command in Commands) { command.NotifyCanExecuteChanged(); }
+        _changeResamplingMode.NotifyCanExecuteChanged();
     }
     private SafeRelayCommand[] Commands => [_zoomTimeIn, _zoomTimeOut, _panTimeUp, _panTimeDown, _resetTime,
         _zoomSpatialIn, _zoomSpatialOut, _panSpatialLeft, _panSpatialRight, _resetSpatial, _resetAll,
@@ -693,9 +811,26 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         Task[] rasters;
         lock (_gate) { rasters = [.. _rasterOperations]; }
         await CaptureAsync("raster-operations", () => Task.WhenAll(rasters)).ConfigureAwait(false);
+        Task[] persistence;
+        lock (_gate) { persistence = [.. _persistenceOperations]; }
+        await CaptureAsync("preference-writes", async () =>
+        {
+            Task drain = Task.WhenAll(persistence);
+            if (await Task.WhenAny(drain, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false) != drain)
+            {
+                _persistenceCancellation.Cancel();
+                _ = drain.ContinueWith(completed => { _ = completed.Exception; }, CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+                Interlocked.Increment(ref _observerErrors);
+                return;
+            }
+            await drain.ConfigureAwait(false);
+        }).ConfigureAwait(false);
         await CaptureAsync("ui-state", () => _lifetime.InvokeAsync(() =>
         {
             foreach (SafeRelayCommand command in Commands) { command.NotifyCanExecuteChanged(); }
+            _changeResamplingMode.NotifyCanExecuteChanged();
             _state = _state with { Phase = BScanViewPhase.Closed, Region = null };
             OnPropertyChanged(nameof(State));
             OnPropertyChanged(nameof(Phase));
@@ -707,12 +842,15 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         Capture("raster-consumer", () => _source.UnregisterConsumer(_consumerId));
         await CaptureAsync("ui-barrier", _lifetime.BarrierAsync).ConfigureAwait(false);
         Capture("ui-lifetime", _lifetime.Close);
+        Capture("preference-cancellation", _persistenceCancellation.Dispose);
         if (failures.Count == 0) { completion.TrySetResult(); }
         else { completion.TrySetException(new CleanupFailureException("B-Scan ViewModel cleanup failed.", failures[0], failures.Skip(1).ToArray())); }
     }
 
     private static string Message(Exception error) => string.IsNullOrWhiteSpace(error.Message)
         ? error.GetType().Name : error.Message;
+    private static Scan2DResamplingOptions EffectiveResampling(Scan2DResamplingOptions options) =>
+        options == default ? Scan2DResamplingOptions.Default : options;
 
     protected override void OnObserverFailure(Exception error) => Interlocked.Increment(ref _observerErrors);
 

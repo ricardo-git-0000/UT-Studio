@@ -75,6 +75,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     internal int RetainedSnapshotCount { get { lock (_gate) { return _currentByConsumer.Count; } } }
     internal long RenderRequestCount => Interlocked.Read(ref _renderRequests);
     internal long FullIdentityRequestCount => Interlocked.Read(ref _fullIdentityRequests);
+    internal long ResamplingTablePreparationCount => _resampler.TablePreparationCount;
     internal BScanDisplayedVisualIdentity? GetAcknowledgedDisplay(string consumerId)
     { lock (_gate) { return _displayedByConsumer.GetValueOrDefault(consumerId); } }
 
@@ -86,7 +87,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         _ingress = ingress ?? throw new ArgumentNullException(nameof(ingress));
         _clock = timeProvider ?? TimeProvider.System;
         _pool = pool ?? throw new ArgumentNullException(nameof(pool));
-        _resampler = new Scan2DResampler(SharedLanczosTablePool.Instance, ChangeTableBytes);
+        _resampler = new Scan2DResampler(SharedLanczosTablePool.Instance, ChangeTableBytes,
+            reuseTables: true);
         _ingress.VisualStateChanged += OnVisualStateChanged;
         _worker = Task.Run(PublishLoopAsync);
     }
@@ -340,6 +342,15 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             }
 
             (int x, int width) = RasterColumns(request, dirtyFirst, dirtyLast, full);
+            if (horizontalPixelShift > 0 && (full || x != request.PixelWidth - horizontalPixelShift ||
+                width != horizontalPixelShift))
+            {
+                horizontalPixelShift = 0;
+                reason |= BScanFullRefreshReason.Recovery;
+                full = true;
+                x = 0;
+                width = request.PixelWidth;
+            }
             int cells = checked(width * request.PixelHeight);
             int length = checked(cells * 3);
             IMemoryOwner<byte> owner = _pool.Rent(length);
@@ -551,7 +562,6 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         ConventionalUtFrameMetadata metadata, int bucketSamples, BScanRenderRequest request,
         Memory<byte> destinationStorage, CancellationToken token)
     {
-        const int BlockRows = 64;
         bool lanczos = request.EffectiveResampling.Mode == Scan2DInterpolationMode.Lanczos;
         decimal requestedFirst = decimal.Floor(request.SpatialViewport.MinimumOffset);
         decimal requestedLastExclusive = decimal.Ceiling(request.SpatialViewport.MaximumOffset);
@@ -564,90 +574,119 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         decimal lastExclusive = Math.Min(requestedLastExclusive + (lanczos ? 3 : 0), residentLastExclusive);
         int sourceWidth = checked((int)(lastExclusive - firstOffset));
         ArgumentOutOfRangeException.ThrowIfLessThan(sourceWidth, 1);
-        int verticalHalo = request.EffectiveResampling.Mode switch
-        {
-            Scan2DInterpolationMode.Bilinear => 1,
-            Scan2DInterpolationMode.Bicubic => 2,
-            Scan2DInterpolationMode.Lanczos => 3,
-            _ => 0
-        };
         double rate = metadata.Configuration.SampleRateHz;
         double offset = metadata.Configuration.FirstSampleOffsetSeconds;
-        Span<int> sampleFirstByRow = stackalloc int[request.PixelHeight];
-        Span<int> sampleLastByRow = stackalloc int[request.PixelHeight];
-        for (int y = 0; y < request.PixelHeight; y++)
+        double visibleSampleMinimum = Math.Clamp(
+            (request.TimeViewport.VisibleMinimumSeconds - offset) * rate, 0, metadata.Configuration.SampleCount);
+        double visibleSampleMaximum = Math.Clamp(
+            (request.TimeViewport.VisibleMaximumSeconds - offset) * rate, 0, metadata.Configuration.SampleCount);
+        int visibleSampleFirst = Math.Clamp((int)Math.Floor(visibleSampleMinimum), 0, metadata.Configuration.SampleCount);
+        int visibleSampleLastExclusive = Math.Clamp((int)Math.Ceiling(visibleSampleMaximum),
+            0, metadata.Configuration.SampleCount);
+        int visibleSamples = Math.Max(1, visibleSampleLastExclusive - visibleSampleFirst);
+        int sourceHeight = Math.Min(request.PixelHeight, visibleSamples);
+        bool upsamplingTime = visibleSamples <= request.PixelHeight;
+        Span<int> sampleFirstByRow = stackalloc int[sourceHeight];
+        Span<int> sampleLastByRow = stackalloc int[sourceHeight];
+        for (int y = 0; y < sourceHeight; y++)
         {
-            double t0 = request.TimeViewport.VisibleMinimumSeconds +
-                request.TimeViewport.VisibleSpanSeconds * y / request.PixelHeight;
-            double t1 = request.TimeViewport.VisibleMinimumSeconds +
-                request.TimeViewport.VisibleSpanSeconds * (y + 1) / request.PixelHeight;
-            sampleFirstByRow[y] = Math.Clamp((int)Math.Floor((t0 - offset) * rate), 0, metadata.Configuration.SampleCount);
-            sampleLastByRow[y] = Math.Clamp((int)Math.Ceiling((t1 - offset) * rate), 0, metadata.Configuration.SampleCount);
+            if (upsamplingTime)
+            {
+                sampleFirstByRow[y] = Math.Min(visibleSampleFirst + y, metadata.Configuration.SampleCount - 1);
+                sampleLastByRow[y] = sampleFirstByRow[y] + 1;
+            }
+            else
+            {
+                double u0 = visibleSampleMinimum + (visibleSampleMaximum - visibleSampleMinimum) * y / sourceHeight;
+                double u1 = visibleSampleMinimum + (visibleSampleMaximum - visibleSampleMinimum) * (y + 1) / sourceHeight;
+                sampleFirstByRow[y] = Math.Clamp((int)Math.Floor(u0), 0, metadata.Configuration.SampleCount);
+                sampleLastByRow[y] = Math.Clamp((int)Math.Ceiling(u1), 0, metadata.Configuration.SampleCount);
+            }
         }
 
-        for (int blockY = 0; blockY < request.PixelHeight; blockY += BlockRows)
+        int sourceCells = checked(sourceWidth * sourceHeight);
+        IMemoryOwner<byte>? sourceIntensityOwner = null, sourceMaskOwner = null, sourceSegmentsOwner = null;
+        long sourceIntensityBytes = 0, sourceMaskBytes = 0, sourceSegmentsBytes = 0;
+        bool sourceIntensityAdmitted = false, sourceMaskAdmitted = false, sourceSegmentsAdmitted = false;
+        try
         {
-            int blockHeight = Math.Min(BlockRows, request.PixelHeight - blockY);
-            int sourceStartY = Math.Max(0, blockY - verticalHalo);
-            int sourceEndY = Math.Min(request.PixelHeight, checked(blockY + blockHeight + verticalHalo));
-            int blockSourceHeight = sourceEndY - sourceStartY;
-            int blockSourceCells = checked(sourceWidth * blockSourceHeight);
-            int blockDestinationCells = checked(request.PixelWidth * blockHeight);
-            int scratchLength = checked(checked(blockDestinationCells * 3) + checked(blockSourceCells * 4));
-            IMemoryOwner<byte> scratch = _pool.Rent(scratchLength);
-            long scratchBytes = scratch.Memory.Length;
-            AdmitScratchOwner(scratch, scratchBytes);
-            try
+            sourceIntensityOwner = _pool.Rent(sourceCells);
+            sourceIntensityBytes = sourceIntensityOwner.Memory.Length;
+            AdmitScratchOwner(sourceIntensityOwner, sourceIntensityBytes);
+            sourceIntensityAdmitted = true;
+            sourceMaskOwner = _pool.Rent(sourceCells);
+            sourceMaskBytes = sourceMaskOwner.Memory.Length;
+            AdmitScratchOwner(sourceMaskOwner, sourceMaskBytes);
+            sourceMaskAdmitted = true;
+            sourceSegmentsOwner = _pool.Rent(sourceCells);
+            sourceSegmentsBytes = sourceSegmentsOwner.Memory.Length;
+            AdmitScratchOwner(sourceSegmentsOwner, sourceSegmentsBytes);
+            sourceSegmentsAdmitted = true;
+            Memory<byte> sourceIntensity = sourceIntensityOwner.Memory[..sourceCells];
+            Memory<byte> sourceMask = sourceMaskOwner.Memory[..sourceCells];
+            Memory<byte> sourceSegments = sourceSegmentsOwner.Memory[..sourceCells];
+            // Valid source cells are always acquired support, so mask values 0/1 are also the exact
+            // NoData/AcquiredSupport provenance values. Sharing avoids another full-raster owner.
+            Memory<byte> sourceProvenance = sourceMask;
+            sourceIntensity.Span.Clear();
+            sourceMask.Span.Clear();
+            sourceSegments.Span.Clear();
+            byte segment = 1;
+            bool gap = false;
+            int leaseCursor = 0;
+            for (int sourceX = 0; sourceX < sourceWidth; sourceX++)
             {
-                Memory<byte> block = scratch.Memory[..scratchLength];
-                block.Span.Clear();
-                Memory<byte> sourceStorage = block.Slice(checked(blockDestinationCells * 3), checked(blockSourceCells * 4));
-                Memory<byte> sourceIntensity = sourceStorage[..blockSourceCells];
-                Memory<byte> sourceMask = sourceStorage.Slice(blockSourceCells, blockSourceCells);
-                Memory<byte> sourceSegments = sourceStorage.Slice(checked(blockSourceCells * 2), blockSourceCells);
-                Memory<byte> sourceProvenance = sourceStorage.Slice(checked(blockSourceCells * 3), blockSourceCells);
-                byte segment = 1;
-                bool gap = false;
-                for (int sourceX = 0; sourceX < sourceWidth; sourceX++)
+                token.ThrowIfCancellationRequested();
+                ulong? acquisitionIndex = TryAddOffset(request.SpatialViewport.OriginAcquisitionIndex,
+                    checked(firstOffset + sourceX));
+                int leaseIndex = -1;
+                if (acquisitionIndex is { } index)
                 {
-                    ulong? acquisitionIndex = TryAddOffset(request.SpatialViewport.OriginAcquisitionIndex,
-                        checked(firstOffset + sourceX));
-                    int leaseIndex = acquisitionIndex is { } index ? FindAcquisitionIndex(leases, count, index) : -1;
-                    if (leaseIndex < 0) { gap = true; continue; }
-                    if (gap) { segment = segment == byte.MaxValue ? (byte)1 : checked((byte)(segment + 1)); gap = false; }
-                    for (int localY = 0; localY < blockSourceHeight; localY++)
-                    {
-                        int y = sourceStartY + localY;
-                        bool found = false; short selected = 0; int magnitude = -1;
-                        SelectRange(leases[leaseIndex]!, bucketSamples, sampleFirstByRow[y], sampleLastByRow[y],
-                            ref selected, ref magnitude, ref found);
-                        if (!found) { continue; }
-                        int sourceIndex = checked(localY * sourceWidth + sourceX);
-                        sourceIntensity.Span[sourceIndex] = BScanBipolarIntensity8.Map(selected);
-                        sourceMask.Span[sourceIndex] = 1; sourceSegments.Span[sourceIndex] = segment;
-                        sourceProvenance.Span[sourceIndex] = (byte)Scan2DSampleProvenance.AcquiredSupport;
-                    }
+                    while (leaseCursor < count && leases[leaseCursor]!.Descriptor.AcquisitionIndex < index)
+                    { leaseCursor++; }
+                    if (leaseCursor < count && leases[leaseCursor]!.Descriptor.AcquisitionIndex == index)
+                    { leaseIndex = leaseCursor; }
                 }
-
-                var sourceGeometry = new Scan2DGridGeometry(firstOffset + .5, sourceStartY + .5, 1, 1);
-                var destinationGeometry = new Scan2DGridGeometry(
-                    (double)(request.SpatialViewport.MinimumOffset + request.SpatialViewport.Span /
-                        (2m * request.PixelWidth)), blockY + .5,
-                    (double)(request.SpatialViewport.Span / request.PixelWidth), 1);
-                var source = new Scan2DSourceGrid(sourceWidth, blockSourceHeight, sourceWidth, sourceGeometry,
-                    sourceIntensity, sourceMask, sourceSegments, sourceProvenance);
-                var renderRequest = new Scan2DRenderRequest(sourceGeometry, sourceWidth, blockSourceHeight,
-                    destinationGeometry, request.PixelWidth, blockHeight,
-                    new(0, 0, request.PixelWidth, blockHeight), request.EffectiveResampling);
-                using Scan2DRenderResult result = _resampler.Render(source, renderRequest,
-                    new BorrowedByteOwner(block[..checked(blockDestinationCells * 3)]), token);
-                CopyBlock(result.Intensities.Span, destinationStorage.Span, blockY, request.PixelWidth, 0);
-                CopyBlock(result.ValidityMask.Span, destinationStorage.Span, blockY, request.PixelWidth,
-                    checked(request.PixelWidth * request.PixelHeight));
-                CopyBlock(result.Provenance.Span, destinationStorage.Span, blockY, request.PixelWidth,
-                    checked(request.PixelWidth * request.PixelHeight * 2));
+                if (leaseIndex < 0) { gap = true; continue; }
+                if (gap) { segment = segment == byte.MaxValue ? (byte)1 : checked((byte)(segment + 1)); gap = false; }
+                for (int y = 0; y < sourceHeight; y++)
+                {
+                    bool found = false; short selected = 0; int magnitude = -1;
+                    SelectRange(leases[leaseIndex]!, bucketSamples, sampleFirstByRow[y], sampleLastByRow[y],
+                        ref selected, ref magnitude, ref found);
+                    if (!found) { continue; }
+                    int sourceIndex = checked(y * sourceWidth + sourceX);
+                    sourceIntensity.Span[sourceIndex] = BScanBipolarIntensity8.Map(selected);
+                    sourceMask.Span[sourceIndex] = 1; sourceSegments.Span[sourceIndex] = segment;
+                    sourceProvenance.Span[sourceIndex] = (byte)Scan2DSampleProvenance.AcquiredSupport;
+                }
             }
-            finally { scratch.Dispose(); ReleaseScratchBytes(scratchBytes); }
+            for (int index = 0; index < count; index++) { leases[index]!.Dispose(); }
+
+            double destinationStepY = (visibleSampleMaximum - visibleSampleMinimum) / request.PixelHeight;
+            double sourceFirstY = upsamplingTime ? visibleSampleFirst + .5 : visibleSampleMinimum + destinationStepY / 2;
+            double sourceStepY = upsamplingTime ? 1 : destinationStepY;
+            var sourceGeometry = new Scan2DGridGeometry(firstOffset + .5, sourceFirstY, 1, sourceStepY);
+            var destinationGeometry = new Scan2DGridGeometry(
+                (double)(request.SpatialViewport.MinimumOffset + request.SpatialViewport.Span /
+                    (2m * request.PixelWidth)), visibleSampleMinimum + destinationStepY / 2,
+                (double)(request.SpatialViewport.Span / request.PixelWidth), destinationStepY);
+            var source = new Scan2DSourceGrid(sourceWidth, sourceHeight, sourceWidth, sourceGeometry,
+                sourceIntensity, sourceMask, sourceSegments, sourceProvenance);
+            var renderRequest = new Scan2DRenderRequest(sourceGeometry, sourceWidth, sourceHeight,
+                destinationGeometry, request.PixelWidth, request.PixelHeight,
+                new(0, 0, request.PixelWidth, request.PixelHeight), request.EffectiveResampling);
+            using Scan2DRenderResult result = _resampler.Render(source, renderRequest,
+                new BorrowedByteOwner(destinationStorage), token);
+        }
+        finally
+        {
+            if (sourceSegmentsOwner is not null) sourceSegmentsOwner.Dispose();
+            if (sourceSegmentsAdmitted) ReleaseScratchBytes(sourceSegmentsBytes);
+            if (sourceMaskOwner is not null) sourceMaskOwner.Dispose();
+            if (sourceMaskAdmitted) ReleaseScratchBytes(sourceMaskBytes);
+            if (sourceIntensityOwner is not null) sourceIntensityOwner.Dispose();
+            if (sourceIntensityAdmitted) ReleaseScratchBytes(sourceIntensityBytes);
         }
     }
 
@@ -708,19 +747,6 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
         decimal magnitude = -integral;
         return magnitude <= origin ? origin - (ulong)magnitude : null;
-    }
-
-    private static int FindAcquisitionIndex(BScanTraceStore.BScanTraceLease?[] leases, int count, ulong target)
-    {
-        int low = 0, high = count - 1;
-        while (low <= high)
-        {
-            int middle = low + ((high - low) >> 1);
-            ulong value = leases[middle]!.Descriptor.AcquisitionIndex;
-            if (value == target) { return middle; }
-            if (value < target) { low = middle + 1; } else { high = middle - 1; }
-        }
-        return -1;
     }
 
     private sealed class BorrowedByteOwner(Memory<byte> memory) : IMemoryOwner<byte>
@@ -1114,6 +1140,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         try { await regions.ConfigureAwait(false); }
         catch (Exception error) { failures.Add(error); }
         try { await owners.ConfigureAwait(false); }
+        catch (Exception error) { failures.Add(error); }
+        try { _resampler.Dispose(); }
         catch (Exception error) { failures.Add(error); }
         if (failures.Count != 0) { throw new AggregateException("B-Scan visual drain failed.", failures); }
     }

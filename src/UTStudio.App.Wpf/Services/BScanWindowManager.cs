@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Threading;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.App.Wpf.Services;
 
@@ -14,6 +15,7 @@ public sealed class BScanWindowManager
     private readonly IUiDispatcher _dispatcher;
     private readonly Dispatcher _windowDispatcher;
     private readonly Func<BScanViewModel> _viewModelFactory;
+    private readonly BScanResamplingPreferenceStore? _preferenceStore;
     private readonly Func<BScanViewModel, BScanWindow> _windowFactory;
     private readonly Action<BScanWindow> _showWindow;
     private BScanWindow? _window;
@@ -28,16 +30,36 @@ public sealed class BScanWindowManager
 
     public BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
         BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher)
-        : this(source, viewport, selection, dispatcher, windowDispatcher, null, null, null) { }
+        : this(source, viewport, selection, dispatcher, windowDispatcher, null, null, null, null) { }
+
+    internal BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
+        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher,
+        BScanResamplingPreferenceStore preferenceStore)
+        : this(source, viewport, selection, dispatcher, windowDispatcher, preferenceStore, null, null, null) { }
 
     internal BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
         BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher,
         Func<BScanViewModel>? viewModelFactory, Func<BScanViewModel, BScanWindow>? windowFactory,
         Action<BScanWindow>? showWindow)
+        : this(source, viewport, selection, dispatcher, windowDispatcher, null, viewModelFactory, windowFactory,
+            showWindow)
+    { }
+
+    internal BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
+        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher,
+        BScanResamplingPreferenceStore? preferenceStore,
+        Func<BScanViewModel>? viewModelFactory, Func<BScanViewModel, BScanWindow>? windowFactory,
+        Action<BScanWindow>? showWindow)
     {
         _source = source; _viewport = viewport; _selection = selection; _dispatcher = dispatcher;
-        _windowDispatcher = windowDispatcher;
-        _viewModelFactory = viewModelFactory ?? (() => new(_source, _viewport, _selection, _dispatcher));
+        _windowDispatcher = windowDispatcher; _preferenceStore = preferenceStore;
+        _viewModelFactory = viewModelFactory ?? (() =>
+        {
+            var viewModel = new BScanViewModel(_source, _viewport, _selection, _dispatcher,
+                _preferenceStore?.Current ?? Scan2DInterpolationMode.None, _preferenceStore);
+            viewModel.ReportPersistenceError(_preferenceStore?.LastError);
+            return viewModel;
+        });
         _windowFactory = windowFactory ?? (viewModel => new(viewModel));
         _showWindow = showWindow ?? (window => window.Show());
     }

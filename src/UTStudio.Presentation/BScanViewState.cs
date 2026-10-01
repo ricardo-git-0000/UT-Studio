@@ -1,5 +1,6 @@
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Presentation;
 
@@ -40,7 +41,13 @@ public sealed record BScanViewState(
     string? BScanVisualError,
     string? SelectionError,
     string? UiInteractionError,
-    bool IsSpatialAutoFit = true)
+    bool IsSpatialAutoFit = true,
+    Scan2DInterpolationMode RequestedResamplingMode = Scan2DInterpolationMode.None,
+    Scan2DInterpolationMode? PresentedResamplingMode = null,
+    BScanRenderSignature? ConfirmedRenderSignature = null,
+    bool IsRenderPending = false,
+    string? PersistenceError = null,
+    string? ConfigurationError = null)
 {
     public static BScanViewState Empty { get; } = new(BScanViewPhase.NoData, null, null, null, null,
         null, null, null, null, null, null, true, null, BScanSelectionState.Empty,

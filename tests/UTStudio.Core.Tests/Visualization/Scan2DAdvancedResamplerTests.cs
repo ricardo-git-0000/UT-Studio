@@ -180,6 +180,48 @@ public sealed class Scan2DAdvancedResamplerTests
         Assert.AreEqual(1, owner.DisposeCount);
     }
 
+    [TestMethod]
+    [DataRow(Scan2DInterpolationMode.NearestNeighbor)]
+    [DataRow(Scan2DInterpolationMode.Bilinear)]
+    [DataRow(Scan2DInterpolationMode.Bicubic)]
+    [DataRow(Scan2DInterpolationMode.Lanczos)]
+    public void StableTranslatedGeometryReusesOneBoundedTableEntry(Scan2DInterpolationMode mode)
+    {
+        const int sourceSize = 6, destinationSize = 8;
+        byte[] values = Enumerable.Range(0, sourceSize * sourceSize)
+            .Select(value => checked((byte)(value * 7))).ToArray();
+        byte[] valid = Enumerable.Repeat((byte)1, values.Length).ToArray();
+        byte[] provenance = Enumerable.Repeat((byte)Scan2DSampleProvenance.AcquiredSupport,
+            values.Length).ToArray();
+        long tableBytes = 0;
+        var resampler = new Scan2DResampler(SharedLanczosTablePool.Instance,
+            delta => tableBytes += delta, reuseTables: true);
+
+        byte[]? firstPixels = null;
+        for (int translation = 0; translation < 2; translation++)
+        {
+            var sourceGeometry = new Scan2DGridGeometry(translation, 0, 1, 1);
+            var destinationGeometry = new Scan2DGridGeometry(
+                translation + (double)sourceSize / (2 * destinationSize) - .5,
+                (double)sourceSize / (2 * destinationSize) - .5,
+                (double)sourceSize / destinationSize, (double)sourceSize / destinationSize);
+            var source = new Scan2DSourceGrid(sourceSize, sourceSize, sourceSize, sourceGeometry,
+                values, valid, valid, provenance);
+            var request = new Scan2DRenderRequest(sourceGeometry, sourceSize, sourceSize,
+                destinationGeometry, destinationSize, destinationSize,
+                new(0, 0, destinationSize, destinationSize), new(mode));
+            using Scan2DRenderResult result = resampler.Render(source, request,
+                new Owner(destinationSize * destinationSize * 3));
+            if (firstPixels is null) { firstPixels = result.Intensities.ToArray(); }
+            else { CollectionAssert.AreEqual(firstPixels, result.Intensities.ToArray()); }
+        }
+
+        Assert.AreEqual(1L, resampler.TablePreparationCount);
+        Assert.IsGreaterThan(0L, tableBytes);
+        resampler.Dispose();
+        Assert.AreEqual(0L, tableBytes);
+    }
+
     private static void AssertRender(byte[] values, int width, int height, Scan2DGridGeometry destination,
         int destinationWidth, int destinationHeight, Scan2DInterpolationMode mode, byte[] expected,
         byte[] expectedMask, byte[]? mask = null, byte[]? segments = null)

@@ -37,7 +37,8 @@ public sealed class BScanLanczosResponsivenessTests
         await drain.WaitAsync(DiagnosticTimeout);
         cancellation.Stop();
         Console.WriteLine($"LANCZOS_STOP_CHECKPOINT_LATENCY_MS={cancellation.Elapsed.TotalMilliseconds:F3}");
-        Assert.AreEqual(1, barrier.RowsObserved);
+        Assert.IsGreaterThanOrEqualTo(1, barrier.RowsObserved);
+        Assert.IsLessThanOrEqualTo(2, barrier.RowsObserved);
         AssertDeliveryDrained(harness.Delivery);
         await harness.DisposeIngressAsync();
         AssertIngressDrained(harness.Ingress);

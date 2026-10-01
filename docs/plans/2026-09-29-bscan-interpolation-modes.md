@@ -1,6 +1,6 @@
 # Plan de implementación de modos de remuestreo B-Scan
 
-Estado: Fases 1–3 implementadas; fase 4 no autorizada. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
+Estado: Fases 1–4 implementadas. Fuente de diseño: [ADR 0014](../adr/0014-bscan-selectable-resampling.md).
 
 ## Alcance, propiedad y reglas
 
@@ -46,6 +46,17 @@ sin renormalizar taps inválidos y clamp final `[0,255]`.
 Aceptación: vectores exactos de constantes, rampas, impulsos y bordes; ausencia de overshoot en bilinear;
 overshoot bicubic controlado; gaps no cerrados; una base incremental recupera mediante una única full;
 cambio rápido de modo/zoom/resize produce una sola full vigente; sin starvation de Stop/cierre.
+
+Optimización posterior: Nearest, Bilinear y Bicubic preparan tablas X/Y acotadas por render, con índices,
+coordenadas y pesos calculados una sola vez por eje. No cambia el orden Y→X, la política conservadora ni
+la procedencia. La formación de malla usa además un cursor lineal sobre leases ordenados en lugar de una
+búsqueda binaria por columna. En la VM diagnóstica, un ShortRun 1024² (`1` proceso, `2` warmups y `3`
+iteraciones) midió 5,232/15,147/35,720 ms para Nearest/Bilinear/Bicubic respectivamente; no es baseline.
+Los picos rentados Bilinear/Bicubic fueron 8.470.576/8.552.496 bytes, bajo el límite de 16 MiB.
+El delivery reutiliza una sola entrada mientras no cambie la transformación relativa; un desplazamiento
+estable del rango lleno no la invalida. La sustitución utiliza lease/refcount para que supersession no
+espere al render anterior y para devolver tablas retiradas únicamente tras su último usuario. Stop y
+cierre vacían la entrada después de atravesar las barreras productivas.
 
 ## Fase 3 — Lanczos
 
@@ -96,6 +107,13 @@ Aceptación: default/fallback `None`; modo visible durante live y run detenida; 
 último valor; cambio genera exactamente una recuperación full; LUT se aplica después del remuestreo;
 WPF no interpola BGRA; selección sigue devolviendo traza adquirida; DPI 96/120/144/192, resize, zoom,
 pan, Stop y shutdown correctos; suscripciones, CTS, owners y buffers terminan a cero.
+
+Estado: implementada. Presentation expone cinco opciones neutrales y mantiene separados modo
+solicitado, candidato pendiente, modo presentado y firma confirmada. App.Wpf localiza el selector y
+persiste únicamente la preferencia mediante un singleton con esquema 1 y reemplazo atómico. La carga
+ocurre antes de construir cada ViewModel; los fallos usan `None`, se muestran por separado y no bloquean
+el cierre. Lanczos se etiqueta como alta calidad con cadencia reducida; Bilinear/Bicubic son los modos
+recomendados para interacción, no hay fallback silencioso y `None` continúa predeterminado.
 
 ## Fase separada — Reconstrucción GP/Kriging
 
@@ -155,5 +173,5 @@ universal o superficie pública hasta que C-Scan aporte requisitos y un segundo 
 
 Confirmadas para Fases 1–3: Kriging/GP separado, política conservadora de taps/segmentos,
 Keys `a=-0.5`, Lanczos-3 `a=3`, None compatible, Nearest explícito y composición en Visualization.Core sin proyecto
-`Scan2D.Core`. Continúan pendientes la persistencia de Fase 4 y aprobación de hardware,
+`Scan2D.Core`. Continúan pendientes la aprobación de hardware,
 metodología y objetivos antes de convertir los diagnósticos de rendimiento en gates.

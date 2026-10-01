@@ -1,6 +1,6 @@
 # ADR 0014 — Remuestreo B-Scan seleccionable y reconstrucción separada
 
-Fecha: 2026-09-29. Estado: Aceptado; Fases 1–3 implementadas.
+Fecha: 2026-09-29. Estado: Aceptado; Fases 1–4 implementadas.
 Trazabilidad: R01, R06, R08, R09, R13 y R14. Complementa, no sustituye,
 [ADR 0013](0013-bscan-bounded-live-visualization.md).
 
@@ -92,6 +92,13 @@ bucket de 64 muestras y el presupuesto son decisiones de Fase 1 que requieren be
 la firma siempre incluirá ambas geometrías. Reducir resolución continúa usando la política conservadora
 de extremo RF por huella para no perder picos; los kernels de este ADR no sustituyen esa reducción.
 
+La geometría temporal fuente también es independiente del raster destino. Cuando el viewport contiene
+menos muestras RF que filas físicas, se forma una fila fuente por celda de muestra y se remuestrea a la
+altura del control; no se repite primero cada muestra en varias filas. Cuando contiene más muestras que
+filas, la fuente conserva una fila por huella destino con selección de extremo para no perder picos y el
+paso vertical coincide deliberadamente. Los centros se expresan en coordenadas de muestra: `i+0.5` para
+la fuente nativa y centros uniformes dentro del viewport para el destino.
+
 La transformación entre centros es, por eje,
 `s = (d + 0.5) * sourceLength / destinationLength - 0.5`. Los índices geométricos se limitan al primer
 y último centro del mismo segmento. Una dimensión fuente de longitud uno usa ese único soporte con
@@ -165,6 +172,27 @@ Una convolución separable se descarta por ahora porque cambiaría el orden de a
 microbenchmarks la validación y la acumulación combinadas queda como P3 de profiling futuro, no como
 defecto funcional ni bloqueo de entrega.
 
+La misma preparación por eje se aplica posteriormente a Nearest, Bilinear y Bicubic. Cada render calcula
+una vez las coordenadas, índices clampados y pesos X/Y y los reutiliza en todo el raster; el bucle por
+píxel conserva la validación completa y el orden de acumulación Y→X. Las tablas se rentan y contabilizan
+de forma acotada y se devuelven en éxito, cancelación o excepción. En 1024², el pico rentado observado es
+8.470.576 bytes para Bilinear y 8.552.496 bytes para Bicubic; ambos permanecen bajo 16 MiB. En una campaña
+diagnóstica corta de una sola ejecución en la misma VM VMware (`2` warmups, `3` iteraciones), el pipeline
+B full 1024² midió 5,232 ms para Nearest, 15,147 ms para Bilinear y 35,720 ms para Bicubic. Estos datos no
+son baseline. El delivery conserva una única entrada de tablas mientras permanezca idéntica la
+transformación relativa, aunque el origen absoluto avance al desplazarse un B-Scan lleno. La clave incluye
+modo/opciones, dimensiones, viewport, longitudes fuente, coordenada fuente inicial relativa y pasos
+normalizados. Un cambio retira la entrada anterior; leases con recuento impiden devolver sus arrays hasta
+que termine el último render que la usa. Stop y cierre drenan los renders y devuelven también la entrada
+vigente, dejando la contabilidad a cero.
+
+En live, la malla fuente neutral se materializa en un owner acotado antes de ejecutar el kernel. Los
+leases del ring se liberan inmediatamente después de esa copia, de modo que Nearest/Bilinear/Bicubic/
+Lanczos no fijan slots durante el cálculo y no provocan pérdidas de adquisición. Tres owners separados
+guardan intensidad, máscara/procedencia adquirida compartida y segmentos: añaden
+`3 × anchoFuente × altoDestino` bytes lógicos (máximo 3 MiB en 1024²) y permanecen incluidos en el
+techo neutral de 16 MiB. No cambia máscara, segmentos, procedencia ni resultados del kernel.
+
 ## Gaussian Process / Kriging
 
 Kriging solo será evaluable cuando haya coordenadas físicas calibradas, unidades y semántica espacial
@@ -217,8 +245,10 @@ sellada; durante cálculo se muestra «Aplicando…» sin bloquear Stop o cierre
 
 Kriging aparece, como máximo, separado bajo «Reconstrucción avanzada (estimada)» y no seleccionable
 hasta aprobar su fase. Adquirido, derivado visual y estimado no dependerán únicamente del color para ser
-distinguibles. La preferencia no se persiste en las Fases 1–3; la Fase 4 decidirá si es solo de sesión o
-configuración UI versionada. Un valor desconocido siempre vuelve a `None` y nunca altera datos.
+distinguibles. La preferencia de modo se persiste como configuración UI versionada por usuario en
+`%LOCALAPPDATA%/UTStudio/settings.json`. Solo contiene `schemaVersion` y `bScan.resamplingMode`;
+ausencia, corrupción, versión futura o valor desconocido vuelven de forma segura a `None` y se
+diagnostican sin impedir adquisición, Stop ni cierre.
 
 ## Presupuesto inicial y degradación
 
@@ -301,6 +331,6 @@ contra datos adquiridos.
 
 Quedan confirmados: semántica compatible de None, Nearest explícito, Keys `a=-0.5`, Lanczos-3 `a=3`, política
 conservadora de todos los taps válidos, composición en Visualization.Core sin proyecto nuevo y
-exclusión de Kriging del selector visual. Continúan pendientes la persistencia de
-preferencia y conversión de objetivos diagnósticos de memoria/tiempo en gates sobre hardware acordado.
+exclusión de Kriging del selector visual. Continúa pendiente la conversión de objetivos diagnósticos
+de memoria/tiempo en gates sobre hardware acordado.
 Variograma, parámetros, unidades y UX de incertidumbre de Kriging quedan para su propio ADR.

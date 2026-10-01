@@ -2,12 +2,94 @@ using System.Buffers;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Core.Tests.Presentation;
 
 [TestClass]
 public sealed class BScanPresentationTests
 {
+    [TestMethod]
+    public async Task Synchronous_raster_source_runs_off_dispatcher_and_does_not_block_ui()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var source = new ManualBScanSource
+        {
+            IsOnUiThread = ui.CheckAccess
+        };
+        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider(), new AScanProjector());
+        var vm = new BScanViewModel(source, shared, coordinator, ui);
+        AcquisitionRunId run = new(Guid.NewGuid());
+
+        source.Emit(Snapshot(run, 1, 0, 10));
+        await ui.DriveUntilAsync(() => source.GetRegionCalls == 1 && !vm.State.IsRenderPending);
+        source.BeforeGetRegion = () =>
+        {
+            entered.Set();
+            Assert.IsTrue(release.Wait(TimeSpan.FromSeconds(5)), "Diagnostic raster barrier timed out.");
+        };
+        vm.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Lanczos);
+        Assert.IsTrue(ui.RunNext(), "The UI dispatcher must remain able to process the mode change.");
+        Assert.AreEqual(Scan2DInterpolationMode.Lanczos, vm.RequestedResamplingMode);
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)), "The Lanczos request did not reach the raster source.");
+        Assert.IsFalse(source.GetRegionRanOnUiThread);
+        release.Set();
+
+        await Drive(ui, vm.DisposeAsync().AsTask());
+        await Drive(ui, coordinator.DisposeAsync().AsTask());
+        await Drive(ui, shared.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task Resampling_command_exposes_five_modes_and_latest_request_wins_without_relabelling_visible_raster()
+    {
+        var ui = new ManualUiDispatcher();
+        var shared = new SharedScanTimeViewport(ui);
+        var source = new ManualBScanSource { PendRegions = true };
+        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider(), new AScanProjector());
+        var vm = new BScanViewModel(source, shared, coordinator, ui);
+        AcquisitionRunId run = new(Guid.NewGuid());
+        source.Emit(Snapshot(run, 1, 0, 10));
+        await ui.DriveUntilAsync(() => source.PendingRegions.Count == 1);
+
+        Assert.HasCount(5, vm.AvailableResamplingModes);
+        Assert.AreEqual(Scan2DInterpolationMode.None, vm.RequestedResamplingMode);
+        vm.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Lanczos);
+        await ui.DriveUntilAsync(() => vm.RequestedResamplingMode == Scan2DInterpolationMode.Lanczos);
+        vm.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Bicubic);
+        await ui.DriveUntilAsync(() => vm.RequestedResamplingMode == Scan2DInterpolationMode.Bicubic);
+        await ui.DriveUntilAsync(() => source.PendingRegions.Count >= 2);
+
+        BScanRenderRequest latest = source.PendingRegions[^1].Request;
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, latest.EffectiveResampling.Mode);
+        Assert.IsTrue(vm.State.IsRenderPending);
+        Assert.IsNull(vm.State.PresentedResamplingMode);
+        BScanVisualSnapshot raster = Snapshot(run, 2, 0, 10) with
+        {
+            ConsumerId = latest.ConsumerId,
+            SpatialViewport = latest.SpatialViewport,
+            TimeViewport = latest.TimeViewport,
+            RasterWidth = latest.PixelWidth,
+            RasterHeight = latest.PixelHeight,
+            RenderConfigurationVersion = latest.RenderConfigurationVersion,
+            Resampling = latest.EffectiveResampling
+        };
+        source.PendingRegions[^1].Completion.TrySetResult(BScanRasterResult.Available(new(raster, 0, 0,
+            latest.PixelWidth, latest.PixelHeight, new ByteOwner(new byte[latest.PixelWidth * latest.PixelHeight]),
+            () => source.ReturnedRegions++)));
+        await ui.DriveUntilAsync(() => vm.State.PresentedResamplingMode == Scan2DInterpolationMode.Bicubic);
+        Assert.IsFalse(vm.State.IsRenderPending);
+        Assert.AreEqual(Scan2DInterpolationMode.Bicubic, vm.State.ConfirmedRenderSignature!.Value.Resampling.Mode);
+
+        await Drive(ui, vm.DisposeAsync().AsTask());
+        Assert.IsFalse(vm.ChangeResamplingModeCommand.CanExecute(Scan2DInterpolationMode.None));
+        await Drive(ui, coordinator.DisposeAsync().AsTask());
+        await Drive(ui, shared.DisposeAsync().AsTask());
+    }
+
     [TestMethod]
     public async Task SelectionProjectsExactSamplesAndLatestSelectionWins()
     {
@@ -520,12 +602,14 @@ public sealed class BScanPresentationTests
     [DataRow("selection-cancel")]
     [DataRow("raster-cancel")]
     [DataRow("raster-operations")]
+    [DataRow("preference-writes")]
     [DataRow("ui-state")]
     [DataRow("time-viewport-consumer")]
     [DataRow("visible-region")]
     [DataRow("raster-consumer")]
     [DataRow("ui-barrier")]
     [DataRow("ui-lifetime")]
+    [DataRow("preference-cancellation")]
     public async Task BScanCloseAttemptsEveryStageWhenOneStageFails(string failingStage)
     {
         var ui = new ManualUiDispatcher();
@@ -546,8 +630,8 @@ public sealed class BScanPresentationTests
         Assert.AreSame(failure, error.PrimaryError);
         Assert.AreEqual(failingStage, error.PrimaryFailure.Stage);
         CollectionAssert.AreEqual(new[] { "subscription", "time-viewport-events", "selection-events",
-            "selection-cancel", "raster-cancel", "raster-operations", "ui-state", "time-viewport-consumer", "visible-region",
-            "raster-consumer", "ui-barrier", "ui-lifetime" }, visited);
+            "selection-cancel", "raster-cancel", "raster-operations", "preference-writes", "ui-state", "time-viewport-consumer", "visible-region",
+            "raster-consumer", "ui-barrier", "ui-lifetime", "preference-cancellation" }, visited);
         Assert.IsFalse(source.HasConsumer);
         Assert.IsFalse(source.HasObserver);
         Assert.AreSame(vm.DisposeAsync().AsTask(), vm.DisposeAsync().AsTask());
@@ -623,7 +707,7 @@ public sealed class BScanPresentationTests
         Assert.AreSame(first, second);
         await Drive(ui, first!);
 
-        Assert.HasCount(12, calls);
+        Assert.HasCount(14, calls);
         Assert.IsTrue(calls.Values.All(count => count == 1));
         Assert.AreSame(first, vm.DisposeAsync().AsTask());
         await Drive(ui, coordinator.DisposeAsync().AsTask());
@@ -713,7 +797,7 @@ public sealed class BScanPresentationTests
         private string? _consumerId;
         internal Func<BScanRenderRequest, BScanRasterResult>? RegionFactory { get; set; }
         internal bool PendRegions { get; init; }
-        internal List<PendingRegion> PendingRegions { get; } = [];
+        internal LockedList<PendingRegion> PendingRegions { get; } = new();
         internal int ReturnedRegions { get; set; }
         internal bool HasConsumer => _consumerId is not null;
         internal bool HasObserver => _observer is not null;
@@ -722,6 +806,12 @@ public sealed class BScanPresentationTests
         internal int SubscriptionDisposeAttempts { get; private set; }
         internal int UnregisterAttempts { get; private set; }
         internal int EffectiveCapacity { get; init; } = 10;
+        private Action? _beforeGetRegion;
+        private int _getRegionRanOnUiThread, _getRegionCalls;
+        internal Action? BeforeGetRegion { get => Volatile.Read(ref _beforeGetRegion); set => Volatile.Write(ref _beforeGetRegion, value); }
+        internal Func<bool>? IsOnUiThread { get; init; }
+        internal bool GetRegionRanOnUiThread => Volatile.Read(ref _getRegionRanOnUiThread) != 0;
+        internal int GetRegionCalls => Volatile.Read(ref _getRegionCalls);
         public BScanVisualDiagnostics Diagnostics => new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, new(0, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero),
             BScanVisualCloseState.Open, 0, null)
@@ -749,6 +839,9 @@ public sealed class BScanPresentationTests
         public ValueTask<BScanRasterResult> GetRegionAsync(BScanRenderRequest request,
             CancellationToken cancellationToken = default)
         {
+            if (IsOnUiThread?.Invoke() == true) Interlocked.Exchange(ref _getRegionRanOnUiThread, 1);
+            Interlocked.Increment(ref _getRegionCalls);
+            BeforeGetRegion?.Invoke();
             if (!PendRegions)
             {
                 return new(RegionFactory?.Invoke(request) ?? BScanRasterResult.NotAvailable());
@@ -760,6 +853,18 @@ public sealed class BScanPresentationTests
         }
         internal sealed record PendingRegion(BScanRenderRequest Request, CancellationToken CancellationToken,
             TaskCompletionSource<BScanRasterResult> Completion);
+        internal sealed class LockedList<T> : IReadOnlyList<T>
+        {
+            private readonly object _gate = new();
+            private readonly List<T> _items = [];
+            public int Count { get { lock (_gate) return _items.Count; } }
+            public T this[int index] { get { lock (_gate) return _items[index]; } }
+            public T this[Index index] { get { lock (_gate) return _items[index]; } }
+            internal void Add(T item) { lock (_gate) _items.Add(item); }
+            public IEnumerator<T> GetEnumerator()
+            { lock (_gate) return ((IEnumerable<T>)[.. _items]).GetEnumerator(); }
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        }
         private sealed class Subscription(Action dispose) : IDisposable { public void Dispose() => dispose(); }
     }
 }

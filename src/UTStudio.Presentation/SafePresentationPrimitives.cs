@@ -64,3 +64,20 @@ internal sealed class SafeRelayCommand(Action execute, Func<bool> canExecute,
         }
     }
 }
+
+internal sealed class SafeParameterRelayCommand(Action<object?> execute, Func<object?, bool> canExecute,
+    Action<Exception>? observerFailure = null) : IRelayCommand
+{
+    private readonly object _gate = new();
+    private EventHandler? _canExecuteChanged;
+    public event EventHandler? CanExecuteChanged
+    { add { lock (_gate) _canExecuteChanged += value; } remove { lock (_gate) _canExecuteChanged -= value; } }
+    public bool CanExecute(object? parameter) => canExecute(parameter);
+    public void Execute(object? parameter) { if (CanExecute(parameter)) execute(parameter); }
+    public void NotifyCanExecuteChanged()
+    {
+        EventHandler? handlers; lock (_gate) handlers = _canExecuteChanged;
+        foreach (EventHandler handler in handlers?.GetInvocationList() ?? [])
+        { try { handler(this, EventArgs.Empty); } catch (Exception error) { observerFailure?.Invoke(error); } }
+    }
+}

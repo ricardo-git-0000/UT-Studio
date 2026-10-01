@@ -182,7 +182,7 @@ public sealed class DesktopRuntime
     internal static Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, string[]? args, TimeProvider clock,
         Action<string>? checkpoint) => CreateAsync(dispatcher, args, clock, checkpoint, null, null, null, null, null, null);
 
-    internal static Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, string[]? args, TimeProvider clock,
+    internal static async Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, string[]? args, TimeProvider clock,
         Action<string>? checkpoint, IUtFrameSource? controlledSource,
         ConventionalAcquisitionConfiguration? controlledConfiguration, BScanOptions? bScanOptions,
         IShortArrayPool? tracePool, IByteOwnerPool? rasterPool, Action<string>? lifecycleObserver)
@@ -228,8 +228,11 @@ public sealed class DesktopRuntime
             var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, configuration,
                 readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges, timeViewport: timeViewport,
                 selectionCoordinator: selection);
+            System.Windows.Threading.Dispatcher windowDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+            var preferenceStore = new BScanResamplingPreferenceStore(BScanResamplingPreferenceStore.DefaultPath);
+            await preferenceStore.LoadAsync().ConfigureAwait(false);
             var bScanWindows = runtime._bScanWindows = new BScanWindowManager(bScanVisual, timeViewport, selection,
-                dispatcher, System.Windows.Threading.Dispatcher.CurrentDispatcher);
+                dispatcher, windowDispatcher, preferenceStore);
             // Instance registrations, including aliases, are borrowed and never disposed by DI.
             if (simulator is not null) { builder.Services.AddSingleton(simulator); }
             builder.Services.AddSingleton<IUtFrameSource>(source);
@@ -246,6 +249,7 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton<IBScanVisualSource>(bScanVisual);
             builder.Services.AddSingleton(selection);
             builder.Services.AddSingleton(bScanWindows);
+            builder.Services.AddSingleton(preferenceStore);
             builder.Services.AddSingleton(interactionGate);
             builder.Services.AddSingleton(dispatcher);
             builder.Services.AddSingleton(clock);
@@ -256,7 +260,7 @@ public sealed class DesktopRuntime
             checkpoint?.Invoke("host");
         }
         catch (Exception error) { runtime.InitializationError = error; }
-        return Task.FromResult(runtime);
+        return runtime;
     }
 
     // Remains usable before Host exists and after its logging providers are disposed.
