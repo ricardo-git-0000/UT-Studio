@@ -185,7 +185,8 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
                 destinationValidity[destinationIndex] = 1;
                 destinationProvenance[destinationIndex] = IsExactSourceCenter(coordinateX, source.Width) &&
                     IsExactSourceCenter(coordinateY, source.Height) ? sourceProvenance[sourceIndex] :
-                    (byte)Scan2DSampleProvenance.VisualDerived;
+                    DerivedProvenance(sourceProvenance[sourceIndex] ==
+                        (byte)Scan2DSampleProvenance.SpatialEstimated);
             }
         }
     }
@@ -310,6 +311,7 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
                 double accumulated = 0;
                 byte segment = 0;
                 bool valid = true;
+                bool hasContributingSpatialEstimate = false;
                 for (int tapY = 0; tapY < tapCount && valid; tapY++)
                 {
                     int sampleY = yIndices[yIndexOffset + tapY];
@@ -325,6 +327,9 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
                         else if (tapSegment != segment) { valid = false; break; }
                         double weight = weightY * xWeights[xWeightOffset + tapX];
                         accumulated += sourceIntensities[sourceIndex] * weight;
+                        if (weight != 0 && sourceProvenance[sourceIndex] ==
+                            (byte)Scan2DSampleProvenance.SpatialEstimated)
+                        { hasContributingSpatialEstimate = true; }
                     }
                 }
                 if (!valid) { continue; }
@@ -337,7 +342,7 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
                     int exactY = Math.Clamp(checked((int)sourceY), 0, source.Height - 1);
                     destinationProvenance[destinationIndex] = sourceProvenance[checked(exactY * source.Stride + exactX)];
                 }
-                else { destinationProvenance[destinationIndex] = (byte)Scan2DSampleProvenance.VisualDerived; }
+                else { destinationProvenance[destinationIndex] = DerivedProvenance(hasContributingSpatialEstimate); }
             }
             AfterKernelRowProcessed?.Invoke(y);
         }
@@ -584,6 +589,7 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
                 double combinedWeight = 0;
                 byte segment = 0;
                 bool valid = true;
+                bool hasContributingSpatialEstimate = false;
                 for (int tapY = 0; tapY < LanczosTapCount && valid; tapY++)
                 {
                     int sampleY = tables.YIndices[yIndexOffset + tapY];
@@ -601,6 +607,9 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
                         double weight = weightY * weightX;
                         accumulated += source.Intensities.Span[sourceIndex] * weight;
                         combinedWeight += weight;
+                        if (weight != 0 && source.Provenance.Span[sourceIndex] ==
+                            (byte)Scan2DSampleProvenance.SpatialEstimated)
+                        { hasContributingSpatialEstimate = true; }
                     }
                 }
                 if (!valid) { continue; }
@@ -617,11 +626,15 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
                     result.Provenance.Span[destinationIndex] =
                         source.Provenance.Span[checked(exactY * source.Stride + exactX)];
                 }
-                else { result.Provenance.Span[destinationIndex] = (byte)Scan2DSampleProvenance.VisualDerived; }
+                else { result.Provenance.Span[destinationIndex] = DerivedProvenance(hasContributingSpatialEstimate); }
             }
             AfterKernelRowProcessed?.Invoke(y);
         }
     }
+
+    private static byte DerivedProvenance(bool hasContributingSpatialEstimate) =>
+        hasContributingSpatialEstimate ? (byte)Scan2DSampleProvenance.SpatialEstimated :
+            (byte)Scan2DSampleProvenance.VisualDerived;
 
     internal sealed class LanczosTables : IDisposable
     {

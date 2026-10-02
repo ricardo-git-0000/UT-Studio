@@ -21,7 +21,7 @@ public sealed class Scan2DAdvancedResamplerTests
     [DataRow(Scan2DInterpolationMode.Bilinear)]
     [DataRow(Scan2DInterpolationMode.Bicubic)]
     [DataRow(Scan2DInterpolationMode.Lanczos)]
-    public void VisualModesNeverProduceSpatialEstimated(Scan2DInterpolationMode mode)
+    public void VisualModesNeverOriginateSpatialEstimatedFromAcquiredSupport(Scan2DInterpolationMode mode)
     {
         int destinationSize = mode == Scan2DInterpolationMode.None ? 2 : 3;
         Scan2DGridGeometry destination = mode == Scan2DInterpolationMode.None

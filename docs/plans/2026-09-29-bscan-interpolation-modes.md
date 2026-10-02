@@ -9,6 +9,11 @@ selección exacta. El agente principal es propietario de los archivos de cada fa
 lectura. No se añaden paquetes. Cada fase preserva los presupuestos, latest-only, cierre y fronteras del
 ADR 0013. Kriging/GP no forma parte de las fases 1–4.
 
+`SpatialEstimated` solo puede ser originado por una futura reconstrucción avanzada explícita. Los modos
+visuales nunca originan `SpatialEstimated`, pero preservan y propagan esa procedencia cuando existe en el
+soporte fuente contribuyente. Los taps de peso combinado exactamente cero conservan su papel en la
+validación conservadora de máscara y segmento, sin contaminar la procedencia.
+
 ## Fase 0 — Documentación y aprobación
 
 Entregables: ADR 0014, este plan y cambios limitados en arquitectura, pipeline, requisitos e índice ADR.

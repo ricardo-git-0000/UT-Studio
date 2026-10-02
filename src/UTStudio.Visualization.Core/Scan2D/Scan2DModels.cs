@@ -7,8 +7,8 @@ public enum Scan2DInterpolationMode { None = 0, NearestNeighbor = 1, Bilinear = 
 public enum Scan2DMaskPolicy { AllRequiredSupportValidAndSameSegment = 0 }
 
 /// <summary>
-/// Neutral sample origin. SpatialEstimated is reserved for a future explicit reconstruction module;
-/// visual resamplers never produce it.
+/// Neutral sample origin. SpatialEstimated can originate only in a future explicit reconstruction module.
+/// Visual resamplers never originate it, but preserve and propagate it from contributing source support.
 /// </summary>
 public enum Scan2DSampleProvenance : byte
 {

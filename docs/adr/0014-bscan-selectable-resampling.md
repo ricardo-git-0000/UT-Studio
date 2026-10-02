@@ -14,7 +14,8 @@ selección B→A se resuelve contra el rango residente y recupera una traza adqu
 Esta decisión distingue dos operaciones que no son intercambiables:
 
 - **Remuestreo visual**: cambia la rejilla de presentación de una intensidad neutral. No modifica RF,
-  store, identidades, coordenadas ni selección; sus resultados son `VisualDerived`.
+  store, identidades, coordenadas ni selección; origina resultados `VisualDerived` y conserva o propaga
+  `SpatialEstimated` cuando esa procedencia ya existe en el soporte fuente.
 - **Reconstrucción espacial**: estima valores no medidos o ausentes. Tiene significado NDT, exige
   coordenadas físicas y un modelo declarado, produce `SpatialEstimated` con incertidumbre y nunca se
   presenta como adquirido.
@@ -49,8 +50,8 @@ Se implementan en la carpeta/namespace `Scan2D` de `Visualization.Core`, sin cre
 - `ScanRaster2D`/vista equivalente: ancho, alto, stride, formato de intensidad, máscara de validez,
   procedencia y región, sin ownership implícito.
 - `RasterSampleProvenance`: `NoData`, `AcquiredSupport`, `VisualDerived`, `SpatialEstimated`. El último
-  queda reservado para un futuro módulo explícito de reconstrucción; los modos visuales solo producen
-  los tres primeros.
+  solo puede ser originado por un futuro módulo explícito de reconstrucción. Los modos visuales nunca
+  originan `SpatialEstimated`, pero preservan y propagan esa procedencia cuando existe en el soporte fuente.
 - `RasterRenderSignature`: transformaciones, dimensiones, modo, parámetros canónicos, revisión de
   configuración y versión del algoritmo.
 - una interfaz pequeña `IScan2DResampler` o estrategia interna equivalente, pura y cancelable. El
@@ -71,7 +72,10 @@ operaciones simples y acotadas; compactarla exige benchmark, no cambia su semán
 La intensidad `0` actual seguirá siendo compatible como codificación externa de `NoData`, pero los
 kernels consultarán la máscara autoritativa y nunca usarán cero como muestra numérica. La procedencia
 del destino es `AcquiredSupport` si corresponde exactamente a una celda adquirida sin mezcla,
-`VisualDerived` si combina o replica soporte adquirido y `NoData` si el soporte exigido no es válido.
+`VisualDerived` si combina o replica exclusivamente soporte adquirido y `NoData` si el soporte exigido
+no es válido. En una interpolación, `SpatialEstimated` domina si aparece en cualquier tap con peso
+combinado matemáticamente no nulo; los taps de peso cero siguen validando máscara y segmento, pero no
+contaminan la procedencia. Una coincidencia geométrica exacta conserva la procedencia exacta de la celda.
 
 Full e incremental ejecutan el mismo algoritmo y deben ser idénticos. Un incremental amplía su dirty
 region por el halo del kernel; si falta soporte, cambia la firma, hay wrap o no puede probarse la base,
