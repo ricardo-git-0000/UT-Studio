@@ -55,6 +55,7 @@ internal sealed class BoundedBScanVisualBufferPool : IAsyncDisposable
     private TaskCompletionSource? _drained;
 
     internal Action<BScanVisualBufferKind>? AfterBackingStorageAcquired { get; set; }
+    internal Action<BScanVisualBufferKind>? AfterOwnerReturned { get; set; }
 
     internal BoundedBScanVisualBufferPool(long limitBytes)
     {
@@ -250,6 +251,7 @@ internal sealed class BoundedBScanVisualBufferPool : IAsyncDisposable
             ValidateUnderLock();
             CompleteDrainUnderLock();
         }
+        AfterOwnerReturned?.Invoke(key.Kind);
     }
 
     private void CompleteDrainUnderLock()

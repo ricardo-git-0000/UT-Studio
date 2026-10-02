@@ -4,10 +4,11 @@ namespace UTStudio.Visualization.Core;
 public sealed class BScanOptions
 {
     public const long DefaultTraceMemoryBudgetBytes = 32L * 1024 * 1024;
+    public const long MaximumVisualMemoryBudgetBytes = checked(16L * 1024 * 1024);
 
     public BScanOptions(
         long traceMemoryBudgetBytes = DefaultTraceMemoryBudgetBytes,
-        long visualMemoryBudgetBytes = 16L * 1024 * 1024,
+        long visualMemoryBudgetBytes = MaximumVisualMemoryBudgetBytes,
         int maximumColumns = 1024,
         int minimumColumns = 128,
         int indexBucketSamples = 64,
@@ -17,6 +18,8 @@ public sealed class BScanOptions
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(traceMemoryBudgetBytes, sizeof(short));
         ArgumentOutOfRangeException.ThrowIfLessThan(visualMemoryBudgetBytes, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(
+            visualMemoryBudgetBytes, MaximumVisualMemoryBudgetBytes);
         ArgumentOutOfRangeException.ThrowIfLessThan(maximumColumns, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(maximumColumns, 1024);
         ArgumentOutOfRangeException.ThrowIfLessThan(minimumColumns, 1);

@@ -268,34 +268,10 @@ public sealed class BScanVisualDeliveryTests
     }
 
     [TestMethod]
-    public async Task CandidateIsStaleWhenAlgorithmVersionChangesBeforeTransactionalCommit()
+    public void UnknownAlgorithmVersionIsRejectedBeforeDelivery()
     {
-        var ingress = new BScanIngress(Options(2, 2));
-        ConventionalUtFrameMetadata metadata = Metadata(2);
-        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
-        ingress.OpenRun(metadata);
-        await using var delivery = new BScanVisualDelivery(ingress);
-        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[] { 1, 2 });
-        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        BScanRenderRequest request = Request(metadata.RunId, new(0, 1), 2, 2) with
-        { Resampling = new(Scan2DInterpolationMode.Lanczos, algorithmVersion: 2) };
-        var entered = new ManualResetEventSlim();
-        var release = new ManualResetEventSlim();
-        delivery.BeforeRasterCandidateCommit = () => { entered.Set(); release.Wait(); };
-
-        Task<BScanRasterResult> pending = Task.Run(async () => await delivery.GetRegionAsync(request));
-        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
-        delivery.RequestRender(request with
-        { Resampling = new(Scan2DInterpolationMode.Lanczos, algorithmVersion: 3) });
-        release.Set();
-
-        Assert.AreEqual(BScanRasterResultKind.Stale,
-            (await pending.WaitAsync(TimeSpan.FromSeconds(10))).Kind);
-        delivery.BeforeRasterCandidateCommit = null;
-        Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
-        await delivery.DisposeAsync();
-        await ingress.DisposeAsync();
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new Scan2DResamplingOptions(Scan2DInterpolationMode.Lanczos, algorithmVersion: 2));
     }
 
     [TestMethod]
@@ -849,6 +825,40 @@ public sealed class BScanVisualDeliveryTests
         Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
         await delivery.DisposeAsync();
         await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task Post_capture_build_failure_drains_every_resource_twenty_times()
+    {
+        for (int iteration = 0; iteration < 20; iteration++)
+        {
+            var ingress = new BScanIngress(Options(2, 2));
+            ConventionalUtFrameMetadata metadata = Metadata(2);
+            var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+            ingress.OpenRun(metadata);
+            var delivery = new BScanVisualDelivery(ingress);
+            ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, [1, 2]);
+            await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            delivery.BeforeRasterCandidateValidation = () =>
+                throw new InvalidOperationException("synthetic post-capture build failure");
+
+            BScanRasterResult result = await delivery.GetRegionAsync(
+                Request(metadata.RunId, new(0, 1), 2, 2));
+
+            Assert.AreEqual(BScanRasterResultKind.Faulted, result.Kind);
+            Assert.AreEqual(0, ingress.Diagnostics.ActiveReadLeases);
+            Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
+            Assert.AreEqual(0, delivery.Diagnostics.ActiveBuilds);
+            Assert.AreEqual(delivery.Diagnostics.ObserverCallbacksStarted,
+                delivery.Diagnostics.ObserverCallbacksCompleted);
+            await delivery.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            await ingress.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            BScanVisualMemorySnapshot memory = delivery.VisualMemorySnapshot;
+            Assert.AreEqual(0, memory.ActiveOwners);
+            Assert.AreEqual(0L, memory.OwnedBytes);
+            Assert.AreEqual(0, memory.RetainedBuffers);
+        }
     }
 
     [TestMethod]

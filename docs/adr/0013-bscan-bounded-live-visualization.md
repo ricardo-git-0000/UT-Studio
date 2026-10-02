@@ -163,6 +163,12 @@ objetivo de 512, raster máximo 1.024 × 1.024 e índice min/max inicialmente po
 32 bloques permiten 256 columnas dentro de 32 MiB. `ArrayPool` no garantiza ese tamaño: si devuelve
 arrays mayores, la capacidad efectiva disminuye o la apertura falla por no alcanzar `MinimumColumns`.
 
+El presupuesto visual puede configurarse a un valor positivo menor, pero 16 MiB es también su máximo
+contractual: ninguna configuración, composición o prueba puede construir `BScanOptions` por encima de
+ese límite. La captura regional entrega un batch de leases completo o ninguno. Un fallo o cancelación
+revierte owners y leases parciales en orden inverso, conserva la causa principal y agrega los errores
+de cleanup como secundarios; el cierre concurrente espera únicamente batches ya transferidos.
+
 Estimación histórica no normativa de buffers neutrales y WPF que pueden coexistir. Esta tabla no define
 el ledger estricto de 16 MiB: `WriteableBitmap`, staging y backup pertenecen al presupuesto WPF separado.
 

@@ -122,16 +122,42 @@ public sealed class Scan2DResamplerTests
     }
 
     [TestMethod]
-    public void UnknownPreferenceFallsBackToNoneAndInvalidArgumentsOverflowAreRejected()
+    public void UnknownModeIsRejectedAndInvalidArgumentsOverflowAreRejected()
     {
-        Assert.AreEqual(Scan2DInterpolationMode.None,
-            new Scan2DResamplingOptions((Scan2DInterpolationMode)999).Mode);
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new Scan2DResamplingOptions((Scan2DInterpolationMode)999));
         Assert.Throws<ArgumentOutOfRangeException>(() => new Scan2DGridGeometry(0, 0, 0, 1));
         Assert.Throws<OverflowException>(() => new Scan2DSourceGrid(int.MaxValue, 2, int.MaxValue,
             new(0, 0, 1, 1), Array.Empty<byte>(), Array.Empty<byte>(), Array.Empty<byte>(),
             Array.Empty<byte>()));
         Assert.Throws<OverflowException>(() => new Scan2DRenderRequest(new(0, 0, 1, 1), 1, 1,
             new(0, 0, 1, 1), int.MaxValue, 2, new(0, 0, 1, 1), Scan2DResamplingOptions.Default));
+    }
+
+    [TestMethod]
+    public void ExactDefaultIsCanonicalizedBeforeStorageAndSignature()
+    {
+        Scan2DGridGeometry geometry = new(0, 0, 1, 1);
+        var fromRawDefault = new Scan2DRenderRequest(geometry, 1, 1, geometry, 1, 1,
+            new(0, 0, 1, 1), default);
+        var fromCanonicalDefault = new Scan2DRenderRequest(geometry, 1, 1, geometry, 1, 1,
+            new(0, 0, 1, 1), Scan2DResamplingOptions.Default);
+
+        Assert.AreEqual(Scan2DResamplingOptions.Default, fromRawDefault.Options);
+        Assert.AreEqual(fromCanonicalDefault.Options, fromRawDefault.Options);
+        Assert.AreEqual(Scan2DResamplingOptions.CurrentAlgorithmVersion,
+            fromRawDefault.Options.AlgorithmVersion);
+        Assert.AreNotEqual(0u, fromRawDefault.Options.AlgorithmVersion);
+    }
+
+    [TestMethod]
+    public void UnsupportedAlgorithmVersionsAreRejectedBeforeARequestCanBeCreated()
+    {
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new Scan2DResamplingOptions(
+            Scan2DInterpolationMode.None, algorithmVersion: 0));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new Scan2DResamplingOptions(
+            Scan2DInterpolationMode.None,
+            algorithmVersion: checked(Scan2DResamplingOptions.CurrentAlgorithmVersion + 1)));
     }
 
     [TestMethod]

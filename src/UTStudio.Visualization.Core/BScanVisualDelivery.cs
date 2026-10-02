@@ -163,12 +163,14 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private void QueueBootstrap(string consumerId)
     {
         BScanRenderRequest? previousRequest = null;
-        BScanTraceStore.BScanTraceLease?[] leases =
-            new BScanTraceStore.BScanTraceLease?[_ingress.Options.MaximumColumns];
-        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.Options.MaximumColumns),
-            out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
+        BScanVisualLeaseBatch? batch = null;
+        Exception? primary = null;
+        Exception? swallowed = null;
         try
         {
+            batch = _ingress.CaptureVisualLeases(_shutdown.Token,
+                out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
+            int count = batch?.Count ?? 0;
             ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
             if (metadata is null || count == 0 || state.ResidentRange is not { } resident) { return; }
             lock (_gate)
@@ -202,11 +204,13 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 Resampling: previousRequest?.EffectiveResampling ?? Scan2DResamplingOptions.Default));
             AfterBootstrapRequestQueued?.Invoke(consumerId, metadata.RunId);
         }
-        catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException) { }
+        catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException)
+        { swallowed = error; }
+        catch (Exception error) { primary = error; throw; }
         finally
         {
-            for (int index = 0; index < count; index++) { leases[index]?.Dispose(); }
-            Array.Clear(leases);
+            if (swallowed is not null) { batch?.DisposeAfterSwallowed(swallowed); }
+            else { batch?.Dispose(primary); }
         }
     }
 
@@ -442,14 +446,16 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         long visualStateEpoch, long consumerLifetime, CancellationToken token)
     {
         BScanRenderRequest admittedRequest = request;
-        BScanTraceStore.BScanTraceLease?[] leases =
-            new BScanTraceStore.BScanTraceLease?[_ingress.Options.MaximumColumns];
-        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.Options.MaximumColumns),
-            out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
-        Audit(BScanVisualAuditEventKind.BuildStarted, request.ConsumerId, ingressState,
-            requestGeneration, request);
+        BScanVisualLeaseBatch? batch = null;
+        Exception? primary = null;
         try
         {
+            batch = _ingress.CaptureVisualLeases(token,
+                out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
+            BScanTraceStore.BScanTraceLease?[] leases = batch?.Items ?? [];
+            int count = batch?.Count ?? 0;
+            Audit(BScanVisualAuditEventKind.BuildStarted, request.ConsumerId, ingressState,
+                requestGeneration, request);
             ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
             if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null)
             { return BScanRasterResult.NotAvailable(); }
@@ -603,11 +609,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             return BScanRasterResult.Available(new(snapshot!, x, 0, width, request.PixelHeight,
                 owner, () => ReleaseOwner(request.ConsumerId, actualBytes)));
         }
-        finally
-        {
-            for (int index = 0; index < count; index++) { leases[index]?.Dispose(); }
-            Array.Clear(leases);
-        }
+        catch (Exception error) { primary = error; throw; }
+        finally { batch?.Dispose(primary); }
     }
 
     private static BScanRenderRequest ReconcileLiveWindow(BScanRenderRequest request,
@@ -1149,12 +1152,14 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private void PublishMetadata(BScanRenderRequest request, long requestGeneration)
     {
-        BScanTraceStore.BScanTraceLease?[] leases =
-            new BScanTraceStore.BScanTraceLease?[_ingress.Options.MaximumColumns];
-        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.Options.MaximumColumns),
-            out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
+        BScanVisualLeaseBatch? batch = null;
+        Exception? primary = null;
         try
         {
+            batch = _ingress.CaptureVisualLeases(_shutdown.Token,
+                out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
+            BScanTraceStore.BScanTraceLease?[] leases = batch?.Items ?? [];
+            int count = batch?.Count ?? 0;
             ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
             if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null) { return; }
             Array.Sort(leases, 0, count, BScanLeaseComparer.Instance);
@@ -1246,11 +1251,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             foreach (Subscription subscription in observers)
             { subscription.Offer(update, callbackAudit); }
         }
-        finally
-        {
-            for (int index = 0; index < count; index++) { leases[index]?.Dispose(); }
-            Array.Clear(leases);
-        }
+        catch (Exception error) { primary = error; throw; }
+        finally { batch?.Dispose(primary); }
     }
 
     private static BScanVisualSnapshot CreateSnapshot(ConventionalUtFrameMetadata metadata, BScanRenderRequest request,

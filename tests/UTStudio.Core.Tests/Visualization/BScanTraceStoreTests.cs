@@ -14,6 +14,15 @@ public sealed class BScanTraceStoreTests
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new BScanOptions(maximumColumns: 1025));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new BScanOptions(maximumColumns: 2, minimumColumns: 3));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new BScanOptions(visualMemoryBudgetBytes: 0));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new BScanOptions(visualMemoryBudgetBytes: -1));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new BScanOptions(
+            visualMemoryBudgetBytes: checked(BScanOptions.MaximumVisualMemoryBudgetBytes + 1)));
+        Assert.AreEqual(1, new BScanOptions(visualMemoryBudgetBytes: 1).VisualMemoryBudgetBytes);
+        Assert.AreEqual(BScanOptions.MaximumVisualMemoryBudgetBytes,
+            new BScanOptions().VisualMemoryBudgetBytes);
+        Assert.AreEqual(BScanOptions.MaximumVisualMemoryBudgetBytes,
+            new BScanOptions(visualMemoryBudgetBytes: BScanOptions.MaximumVisualMemoryBudgetBytes)
+                .VisualMemoryBudgetBytes);
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new BScanOptions(indexBucketSamples: 0));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new BScanOptions(acceptDiagnosticBudget: TimeSpan.Zero));
     }
@@ -216,17 +225,208 @@ public sealed class BScanTraceStoreTests
             Assert.IsTrue(store.CommitIndex(identity, 1,
                 [new(checked((short)(sequence + 1)), 0, checked((short)(sequence + 2)), 1)]));
         }
-        var leases = new BScanTraceStore.BScanTraceLease?[4];
-        Assert.AreEqual(4, store.CaptureVisualLeases(leases, out _));
-        Assert.AreEqual(0, store.Statistics.ActiveLeases);
+        using (BScanVisualLeaseBatch batch = store.CaptureVisualLeases(CancellationToken.None, out _)!)
+        {
+            Assert.AreEqual(4, batch.Count);
+            Assert.AreEqual(0, store.Statistics.ActiveLeases);
 
-        BScanTraceStore.StoreWriteReservation writer = store.BeginWrite(2);
-        Assert.AreEqual(StoreWriteKind.Accepted, writer.Kind);
-        writer.Abort();
+            BScanTraceStore.StoreWriteReservation writer = store.BeginWrite(2);
+            Assert.AreEqual(StoreWriteKind.Accepted, writer.Kind);
+            writer.Abort();
+        }
 
-        foreach (BScanTraceStore.BScanTraceLease? lease in leases) { lease?.Dispose(); }
         await store.CloseAsync();
         Assert.AreEqual(pool.RentCount, pool.ReturnCount);
+    }
+
+    [TestMethod]
+    public async Task Second_capture_rent_failure_rolls_back_transactionally_one_hundred_times()
+    {
+        for (int iteration = 0; iteration < 100; iteration++)
+        {
+            var visual = new BoundedBScanVisualBufferPool(BScanOptions.MaximumVisualMemoryBudgetBytes);
+            var store = CreateIndexedStore(4, visual);
+            BScanVisualMemorySnapshot baseline = visual.Snapshot;
+            int detachedRent = 0;
+            visual.AfterBackingStorageAcquired = kind =>
+            {
+                if ((kind is BScanVisualBufferKind.DetachedSamples or BScanVisualBufferKind.DetachedIndex) &&
+                    Interlocked.Increment(ref detachedRent) == 3)
+                { throw new InvalidOperationException("synthetic second-capture rent failure"); }
+            };
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                store.CaptureVisualLeases(CancellationToken.None, out _));
+            Assert.AreEqual(0, store.Statistics.ActiveLeases);
+            Assert.AreEqual(baseline.ActiveOwners, visual.Snapshot.ActiveOwners);
+            Assert.AreEqual(baseline.ActiveBytes, visual.Snapshot.ActiveBytes);
+
+            visual.AfterBackingStorageAcquired = null;
+            if ((iteration & 1) == 0)
+            {
+                using BScanVisualLeaseBatch recovered =
+                    store.CaptureVisualLeases(CancellationToken.None, out _)!;
+                Assert.AreEqual(4, recovered.Count);
+            }
+            await store.CloseAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await visual.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            AssertVisualPoolDrained(visual);
+        }
+    }
+
+    [TestMethod]
+    public async Task Capture_failure_matrix_cancels_cleans_and_recovers_twenty_times()
+    {
+        for (int iteration = 0; iteration < 100; iteration++)
+        {
+            var visual = new BoundedBScanVisualBufferPool(BScanOptions.MaximumVisualMemoryBudgetBytes);
+            var store = CreateIndexedStore(5, visual);
+            BScanVisualMemorySnapshot baseline = visual.Snapshot;
+            int scenario = iteration / 20;
+            using var cancellation = new CancellationTokenSource();
+            int detachedRent = 0;
+            if (scenario <= 2)
+            {
+                int failAt = scenario switch { 0 => 1, 1 => 3, _ => 8 };
+                visual.AfterBackingStorageAcquired = kind =>
+                {
+                    if ((kind is BScanVisualBufferKind.DetachedSamples or BScanVisualBufferKind.DetachedIndex) &&
+                        Interlocked.Increment(ref detachedRent) == failAt)
+                    { throw new InvalidOperationException($"synthetic rent failure {failAt}"); }
+                };
+                Assert.ThrowsExactly<InvalidOperationException>(() =>
+                    store.CaptureVisualLeases(CancellationToken.None, out _));
+            }
+            else if (scenario == 3)
+            {
+                store.VisualLeaseCaptureProbe = (stage, count) =>
+                {
+                    if (stage == BScanVisualLeaseCaptureStage.AfterCapture && count == 2)
+                    { cancellation.Cancel(); }
+                };
+                Assert.ThrowsExactly<OperationCanceledException>(() =>
+                    store.CaptureVisualLeases(cancellation.Token, out _));
+            }
+            else
+            {
+                store.VisualLeaseCaptureProbe = (stage, count) =>
+                {
+                    if (stage == BScanVisualLeaseCaptureStage.AfterLeaseAcquired && count == 4)
+                    { throw new InvalidOperationException("synthetic post-lease failure"); }
+                };
+                Assert.ThrowsExactly<InvalidOperationException>(() =>
+                    store.CaptureVisualLeases(CancellationToken.None, out _));
+            }
+
+            Assert.AreEqual(0, store.Statistics.ActiveLeases);
+            Assert.AreEqual(baseline.ActiveOwners, visual.Snapshot.ActiveOwners);
+            Assert.AreEqual(baseline.ActiveBytes, visual.Snapshot.ActiveBytes);
+            visual.AfterBackingStorageAcquired = null;
+            store.VisualLeaseCaptureProbe = null;
+            using (BScanVisualLeaseBatch recovered =
+                store.CaptureVisualLeases(CancellationToken.None, out _)!)
+            { Assert.AreEqual(5, recovered.Count); }
+            await store.CloseAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await visual.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            AssertVisualPoolDrained(visual);
+        }
+    }
+
+    [TestMethod]
+    public async Task Capture_preserves_primary_and_attempts_all_cleanup_after_secondary_failures()
+    {
+        var visual = new BoundedBScanVisualBufferPool(BScanOptions.MaximumVisualMemoryBudgetBytes);
+        var store = CreateIndexedStore(4, visual);
+        int returns = 0;
+        visual.AfterOwnerReturned = kind =>
+        {
+            if (kind is BScanVisualBufferKind.DetachedSamples or BScanVisualBufferKind.DetachedIndex)
+            {
+                Interlocked.Increment(ref returns);
+                throw new ApplicationException("synthetic cleanup failure");
+            }
+        };
+        store.VisualLeaseCaptureProbe = (stage, count) =>
+        {
+            if (stage == BScanVisualLeaseCaptureStage.AfterCapture && count == 2)
+            { throw new InvalidOperationException("primary capture failure"); }
+        };
+
+        AggregateException error = Assert.ThrowsExactly<AggregateException>(() =>
+            store.CaptureVisualLeases(CancellationToken.None, out _));
+        Assert.IsInstanceOfType<InvalidOperationException>(error.InnerExceptions[0]);
+        Assert.AreEqual("primary capture failure", error.InnerExceptions[0].Message);
+        Assert.AreEqual(4, returns);
+        Assert.AreEqual(0, store.Statistics.ActiveLeases);
+
+        visual.AfterOwnerReturned = null;
+        store.VisualLeaseCaptureProbe = null;
+        await store.CloseAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await visual.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        AssertVisualPoolDrained(visual);
+    }
+
+    [TestMethod]
+    public async Task Concurrent_close_waits_for_capture_rollback_and_then_completes()
+    {
+        var visual = new BoundedBScanVisualBufferPool(BScanOptions.MaximumVisualMemoryBudgetBytes);
+        var store = CreateIndexedStore(4, visual);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        store.VisualLeaseCaptureProbe = (stage, count) =>
+        {
+            if (stage == BScanVisualLeaseCaptureStage.BeforeOwnerTransfer && count == 1)
+            {
+                entered.Set();
+                Assert.IsTrue(release.Wait(TimeSpan.FromSeconds(10)));
+                throw new InvalidOperationException("synthetic capture failure");
+            }
+        };
+        Task capture = Task.Run(() => Assert.ThrowsExactly<InvalidOperationException>(() =>
+            store.CaptureVisualLeases(CancellationToken.None, out _)));
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+        var closeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task close = Task.Run(async () =>
+        {
+            closeEntered.SetResult();
+            await store.CloseAsync();
+        });
+        await closeEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsFalse(close.IsCompleted);
+        release.Set();
+        await capture.WaitAsync(TimeSpan.FromSeconds(10));
+        await close.WaitAsync(TimeSpan.FromSeconds(10));
+        await visual.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(0, store.Statistics.ActiveLeases);
+        AssertVisualPoolDrained(visual);
+    }
+
+    private static BScanTraceStore CreateIndexedStore(int columns,
+        BoundedBScanVisualBufferPool visual)
+    {
+        var store = new BScanTraceStore(2,
+            new BScanOptions(traceMemoryBudgetBytes: 4096, maximumColumns: columns,
+                minimumColumns: columns, indexBucketSamples: 2),
+            new DeterministicShortPool(), visual);
+        for (ulong sequence = 0; sequence < (ulong)columns; sequence++)
+        {
+            BScanTraceIdentity identity = Identity(sequence);
+            short first = checked((short)(sequence + 1));
+            short second = checked((short)(sequence + 2));
+            Commit(store, identity, [first, second]);
+            Assert.IsTrue(store.CommitIndex(identity, 1, [new(first, 0, second, 1)]));
+        }
+        return store;
+    }
+
+    private static void AssertVisualPoolDrained(BoundedBScanVisualBufferPool visual)
+    {
+        BScanVisualMemorySnapshot snapshot = visual.Snapshot;
+        Assert.AreEqual(0, snapshot.ActiveOwners);
+        Assert.AreEqual(0, snapshot.RetainedBuffers);
+        Assert.AreEqual(0L, snapshot.OwnedBytes);
+        Assert.AreEqual(0L, snapshot.ActiveBytes);
+        Assert.AreEqual(0L, snapshot.RetainedBytes);
     }
 
     private static void Commit(BScanTraceStore store, BScanTraceIdentity identity, short[] samples)

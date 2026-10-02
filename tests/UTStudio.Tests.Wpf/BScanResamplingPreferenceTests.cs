@@ -25,8 +25,15 @@ public sealed class BScanResamplingPreferenceTests
             Assert.IsNotNull(corrupt.LastError);
 
             await File.WriteAllTextAsync(path, "{\"schemaVersion\":1,\"bScan\":{\"resamplingMode\":\"Kriging\"}}");
-            Assert.AreEqual(Scan2DInterpolationMode.None,
-                await new BScanResamplingPreferenceStore(path).LoadAsync());
+            var unknown = new BScanResamplingPreferenceStore(path);
+            Assert.AreEqual(Scan2DInterpolationMode.None, await unknown.LoadAsync());
+            Assert.IsNotNull(unknown.LastError);
+            Assert.IsNull(await unknown.SaveAsync(unknown.Current));
+            using (JsonDocument canonical = JsonDocument.Parse(await File.ReadAllTextAsync(path)))
+            {
+                Assert.AreEqual("None", canonical.RootElement.GetProperty("bScan")
+                    .GetProperty("resamplingMode").GetString());
+            }
 
             await File.WriteAllTextAsync(path, "{\"schemaVersion\":2,\"bScan\":{\"resamplingMode\":\"Bicubic\"}}");
             Assert.AreEqual(Scan2DInterpolationMode.None,

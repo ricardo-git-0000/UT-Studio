@@ -56,6 +56,12 @@ Se implementan en la carpeta/namespace `Scan2D` de `Visualization.Core`, sin cre
 - una interfaz pequeña `IScan2DResampler` o estrategia interna equivalente, pura y cancelable. El
   delivery conserva pools, owners, concurrencia y publicación.
 
+El valor exacto `default(Scan2DResamplingOptions)` se canoniza una sola vez a `Default` en la frontera
+de `Scan2DRenderRequest`, antes de almacenarlo, firmarlo o renderizarlo. Cualquier enum desconocido,
+versión distinta de la vigente o parametrización parcial/inconsistente se rechaza. El fallback a
+`None` existe exclusivamente al leer o guardar una preferencia UI incompatible; Core nunca degrada
+silenciosamente una petición inválida ni permite que una versión cero alcance un kernel.
+
 `BScanRenderRequest`, snapshot e identidad mostrada incorporarán la configuración estructural; no se
 confiará únicamente en un `ulong` opaco. La máscara inicial podrá ocupar un byte por celda para mantener
 operaciones simples y acotadas; compactarla exige benchmark, no cambia su semántica.

@@ -524,13 +524,13 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     internal BScanOptions Options => _options;
     internal ConventionalUtFrameMetadata? CurrentMetadata { get { lock (_gate) { return _disposed ? null : _metadata; } } }
     internal BScanIngressVisualState? CurrentVisualState => Volatile.Read(ref _visualState);
-    internal int CaptureVisualLeases(Span<BScanTraceStore.BScanTraceLease?> destination,
+    internal BScanVisualLeaseBatch? CaptureVisualLeases(CancellationToken cancellationToken,
         out BScanIngressVisualState? visualState, out BScanStoreVisualState state)
     {
         visualState = Volatile.Read(ref _visualState);
         if (visualState is not { IsOpen: true } current)
-        { state = null!; return 0; }
-        return current.Store.CaptureVisualLeases(current.StoreState, destination, out state);
+        { state = null!; return null; }
+        return current.Store.CaptureVisualLeases(current.StoreState, cancellationToken, out state);
     }
 
     private void PublishVisualState(BScanTraceStore store)

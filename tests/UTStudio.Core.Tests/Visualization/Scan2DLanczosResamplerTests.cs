@@ -156,8 +156,8 @@ public sealed class Scan2DLanczosResamplerTests
         Assert.AreEqual(3u, options.AlgorithmVersion);
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
             new Scan2DResamplingOptions(Scan2DInterpolationMode.Lanczos, lanczosRadius: 2));
-        Assert.AreNotEqual(options, new Scan2DResamplingOptions(Scan2DInterpolationMode.Lanczos,
-            algorithmVersion: 4));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new Scan2DResamplingOptions(
+            Scan2DInterpolationMode.Lanczos, algorithmVersion: 4));
     }
 
     [TestMethod]

@@ -111,9 +111,11 @@ public readonly record struct Scan2DResamplingOptions
         uint algorithmVersion = CurrentAlgorithmVersion, double cubicA = CatmullRomA,
         int lanczosRadius = LanczosRadius)
     {
-        Mode = Enum.IsDefined(mode) ? mode : Scan2DInterpolationMode.None;
+        if (!Enum.IsDefined(mode)) { throw new ArgumentOutOfRangeException(nameof(mode)); }
+        Mode = mode;
         if (!Enum.IsDefined(maskPolicy)) { throw new ArgumentOutOfRangeException(nameof(maskPolicy)); }
-        if (algorithmVersion == 0) { throw new ArgumentOutOfRangeException(nameof(algorithmVersion)); }
+        if (algorithmVersion != CurrentAlgorithmVersion)
+        { throw new ArgumentOutOfRangeException(nameof(algorithmVersion)); }
         if (!double.IsFinite(cubicA) || cubicA != CatmullRomA)
         { throw new ArgumentOutOfRangeException(nameof(cubicA), "Phase 2 supports only Keys/Catmull-Rom a=-0.5."); }
         if (lanczosRadius != LanczosRadius)
@@ -128,6 +130,13 @@ public readonly record struct Scan2DResamplingOptions
     public double CubicA { get; }
     public int LanczosA { get; }
     public static Scan2DResamplingOptions Default => new(Scan2DInterpolationMode.None);
+
+    internal static Scan2DResamplingOptions Canonicalize(Scan2DResamplingOptions options)
+    {
+        if (options == default) { return Default; }
+        return new(options.Mode, options.MaskPolicy, options.AlgorithmVersion,
+            options.CubicA, options.LanczosA);
+    }
 }
 
 public readonly record struct Scan2DRenderRequest
@@ -147,7 +156,7 @@ public readonly record struct Scan2DRenderRequest
         SourceGeometry = sourceGeometry; SourceWidth = sourceWidth; SourceHeight = sourceHeight;
         DestinationGeometry = destinationGeometry; DestinationWidth = destinationWidth;
         DestinationHeight = destinationHeight; Viewport = viewport.ValidateWithin(destinationWidth, destinationHeight);
-        Options = options;
+        Options = Scan2DResamplingOptions.Canonicalize(options);
     }
 
     private static void ValidateLastCenter(Scan2DGridGeometry geometry, int width, int height, string parameter)

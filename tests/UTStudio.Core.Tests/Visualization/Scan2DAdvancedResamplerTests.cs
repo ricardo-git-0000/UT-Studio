@@ -184,8 +184,8 @@ public sealed class Scan2DAdvancedResamplerTests
             Scan2DInterpolationMode.Bicubic, algorithmVersion: 2, cubicA: -0.75));
         Assert.Throws<ArgumentOutOfRangeException>(() => new Scan2DResamplingOptions(
             Scan2DInterpolationMode.Bicubic, algorithmVersion: 2, cubicA: double.NaN));
-        Assert.AreNotEqual(bicubic, new Scan2DResamplingOptions(Scan2DInterpolationMode.Bicubic,
-            algorithmVersion: 4));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new Scan2DResamplingOptions(
+            Scan2DInterpolationMode.Bicubic, algorithmVersion: 4));
     }
 
     [TestMethod]

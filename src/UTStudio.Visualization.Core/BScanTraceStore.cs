@@ -361,75 +361,108 @@ internal sealed class BScanTraceStore
         lock (_gate) { _superseded++; }
     }
 
-    internal int CaptureVisualLeases(BScanStoreVisualState expected,
-        Span<BScanTraceLease?> destination, out BScanStoreVisualState state)
+    internal Action<BScanVisualLeaseCaptureStage, int>? VisualLeaseCaptureProbe { get; set; }
+
+    internal BScanVisualLeaseBatch? CaptureVisualLeases(BScanStoreVisualState expected,
+        CancellationToken cancellationToken, out BScanStoreVisualState state)
     {
         lock (_gate)
         {
-            if (destination.Length < _slots.Length)
-            {
-                throw new ArgumentException("Visual capture requires storage for the complete ring.", nameof(destination));
-            }
+            state = expected;
             if (!_leasesAllowed || !ReferenceEquals(_visualState, expected) || !expected.IsComplete)
             {
-                state = expected;
-                return 0;
+                return null;
             }
+            var captured = new BScanTraceLease?[_slots.Length];
             int count = 0;
-            ulong minimum = ulong.MaxValue, maximum = 0;
-            for (int slotIndex = 0; slotIndex < _slots.Length; slotIndex++)
+            try
             {
-                Slot slot = _slots[slotIndex];
-                if (!slot.Committed || slot.Writing || slot.IndexedGeneration != slot.Generation) { continue; }
-                if (count == destination.Length) { break; }
-                BScanTraceDescriptor descriptor = slot.Descriptor!;
-                if (IsWriteHeadroomSlot(slotIndex))
+                for (int slotIndex = 0; slotIndex < _slots.Length; slotIndex++)
                 {
-                    IBScanVisualBufferOwner<short> samplesOwner = _visualBuffers.Rent<short>(
-                        _sampleCount, BScanVisualBufferKind.DetachedSamples);
-                    IBScanVisualBufferOwner<BScanIndexedMinMax>? indexOwner = null;
-                    try
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Slot slot = _slots[slotIndex];
+                    if (!slot.Committed || slot.Writing || slot.IndexedGeneration != slot.Generation) { continue; }
+                    VisualLeaseCaptureProbe?.Invoke(BScanVisualLeaseCaptureStage.BeforeCapture, count);
+                    BScanTraceDescriptor descriptor = slot.Descriptor!;
+                    BScanTraceLease lease;
+                    if (IsWriteHeadroomSlot(slotIndex))
                     {
-                        indexOwner = _visualBuffers.Rent<BScanIndexedMinMax>(
-                            _bucketCount, BScanVisualBufferKind.DetachedIndex);
-                        short[] samples = samplesOwner.Array;
-                        BScanIndexedMinMax[] index = indexOwner.Array;
-                        _blocks[slot.BlockIndex].Samples.AsSpan(slot.Offset, _sampleCount).CopyTo(samples);
-                        slot.Index.AsSpan().CopyTo(index);
-                        destination[count++] = new(descriptor, samples.AsMemory(0, _sampleCount),
-                            index.AsMemory(0, _bucketCount), slot.VisualRevision, () =>
-                            {
-                                samplesOwner.Dispose();
-                                indexOwner.Dispose();
-                            });
+                        lease = CaptureDetachedLease(slot, descriptor, count);
                     }
-                    catch
+                    else
                     {
-                        indexOwner?.Dispose();
-                        samplesOwner.Dispose();
-                        throw;
+                        slot.Leases++;
+                        _activeLeases++;
+                        _maximumLeases = Math.Max(_maximumLeases, _activeLeases);
+                        lease = new(this, slotIndex, slot.Generation, descriptor,
+                            _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount), slot.Index,
+                            slot.VisualRevision);
+                        try
+                        { VisualLeaseCaptureProbe?.Invoke(BScanVisualLeaseCaptureStage.AfterLeaseAcquired, count); }
+                        catch (Exception original)
+                        { BScanVisualLeaseBatch.ThrowAfterCleanup(original, [lease]); throw; }
                     }
+                    captured[count] = lease;
+                    count++;
+                    VisualLeaseCaptureProbe?.Invoke(BScanVisualLeaseCaptureStage.AfterCapture, count);
                 }
-                else
-                {
-                    slot.Leases++;
-                    _activeLeases++;
-                    _maximumLeases = Math.Max(_maximumLeases, _activeLeases);
-                    destination[count++] = new(this, slotIndex, slot.Generation, descriptor,
-                        _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount), slot.Index,
-                        slot.VisualRevision);
-                }
-                minimum = Math.Min(minimum, descriptor.AcquisitionIndex);
-                maximum = Math.Max(maximum, descriptor.AcquisitionIndex);
+                state = _visualState;
+                return new(captured, count);
             }
-            state = _visualState;
-            return count;
+            catch (Exception original)
+            {
+                BScanVisualLeaseBatch.ThrowAfterCleanup(original, captured.AsSpan(0, count));
+                throw;
+            }
         }
     }
 
-    internal int CaptureVisualLeases(Span<BScanTraceLease?> destination,
+    internal BScanVisualLeaseBatch? CaptureVisualLeases(CancellationToken cancellationToken,
         out BScanStoreVisualState state) =>
-        CaptureVisualLeases(CurrentVisualState, destination, out state);
+        CaptureVisualLeases(CurrentVisualState, cancellationToken, out state);
+
+    private BScanTraceLease CaptureDetachedLease(Slot slot, BScanTraceDescriptor descriptor, int capturedCount)
+    {
+        IBScanVisualBufferOwner<short>? samplesOwner = null;
+        IBScanVisualBufferOwner<BScanIndexedMinMax>? indexOwner = null;
+        try
+        {
+            samplesOwner = _visualBuffers.Rent<short>(_sampleCount, BScanVisualBufferKind.DetachedSamples);
+            indexOwner = _visualBuffers.Rent<BScanIndexedMinMax>(_bucketCount, BScanVisualBufferKind.DetachedIndex);
+            short[] samples = samplesOwner.Array;
+            BScanIndexedMinMax[] index = indexOwner.Array;
+            _blocks[slot.BlockIndex].Samples.AsSpan(slot.Offset, _sampleCount).CopyTo(samples);
+            slot.Index.AsSpan().CopyTo(index);
+            IBScanVisualBufferOwner<short> transferredSamples = samplesOwner;
+            IBScanVisualBufferOwner<BScanIndexedMinMax> transferredIndex = indexOwner;
+            var lease = new BScanTraceLease(descriptor, samples.AsMemory(0, _sampleCount),
+                index.AsMemory(0, _bucketCount), slot.VisualRevision, () =>
+                {
+                    List<Exception>? errors = null;
+                    try { transferredIndex.Dispose(); }
+                    catch (Exception error) { (errors ??= []).Add(error); }
+                    try { transferredSamples.Dispose(); }
+                    catch (Exception error) { (errors ??= []).Add(error); }
+                    if (errors is not null) { throw new AggregateException(errors); }
+                });
+            VisualLeaseCaptureProbe?.Invoke(BScanVisualLeaseCaptureStage.BeforeOwnerTransfer, capturedCount);
+            samplesOwner = null;
+            indexOwner = null;
+            return lease;
+        }
+        catch (Exception original)
+        {
+            var errors = new List<Exception>();
+            BScanVisualLeaseBatch.AddFlattened(errors, original);
+            if (indexOwner is not null) try { indexOwner.Dispose(); }
+                catch (Exception error) { BScanVisualLeaseBatch.AddFlattened(errors, error); }
+            if (samplesOwner is not null) try { samplesOwner.Dispose(); }
+                catch (Exception error) { BScanVisualLeaseBatch.AddFlattened(errors, error); }
+            if (errors.Count == 1)
+            { System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(original).Throw(); }
+            throw new AggregateException(errors);
+        }
+    }
 
     private BScanStoreVisualState CreateVisualStateUnderLock()
     {
@@ -699,3 +732,77 @@ internal readonly record struct StoreStatistics(
     ulong Accepted, ulong RejectedPinned, ulong Evicted, ulong Superseded,
     int ActiveLeases, int MaximumLeases, int BlocksRented, int BlocksReturned,
     long LogicalBytes, long RentedBytes, long VisualLogicalBytes, int Capacity, bool Closed);
+
+internal enum BScanVisualLeaseCaptureStage
+{
+    BeforeCapture,
+    AfterLeaseAcquired,
+    BeforeOwnerTransfer,
+    AfterCapture
+}
+
+internal sealed class BScanVisualLeaseBatch : IDisposable
+{
+    private BScanTraceStore.BScanTraceLease?[]? _leases;
+
+    internal BScanVisualLeaseBatch(BScanTraceStore.BScanTraceLease?[] leases, int count)
+    {
+        _leases = leases;
+        Count = count;
+    }
+
+    internal int Count { get; }
+    internal BScanTraceStore.BScanTraceLease?[] Items =>
+        _leases ?? throw new ObjectDisposedException(nameof(BScanVisualLeaseBatch));
+
+    public void Dispose() => Dispose(null);
+
+    internal void Dispose(Exception? primary) => DisposeCore(primary, true);
+
+    internal void DisposeAfterSwallowed(Exception primary) => DisposeCore(primary, false);
+
+    private void DisposeCore(Exception? primary, bool rethrowPrimary)
+    {
+        BScanTraceStore.BScanTraceLease?[]? leases = Interlocked.Exchange(ref _leases, null);
+        if (leases is null)
+        {
+            if (primary is not null && rethrowPrimary)
+            { System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw(); }
+            return;
+        }
+        Cleanup(primary, leases.AsSpan(0, Count), rethrowPrimary);
+    }
+
+    internal static void ThrowAfterCleanup(Exception? primary,
+        Span<BScanTraceStore.BScanTraceLease?> leases)
+        => Cleanup(primary, leases, true);
+
+    private static void Cleanup(Exception? primary,
+        Span<BScanTraceStore.BScanTraceLease?> leases, bool rethrowPrimary)
+    {
+        var errors = new List<Exception>();
+        if (primary is not null) { AddFlattened(errors, primary); }
+        int primaryCount = errors.Count;
+        for (int index = leases.Length - 1; index >= 0; index--)
+        {
+            BScanTraceStore.BScanTraceLease? lease = leases[index];
+            leases[index] = null;
+            if (lease is null) { continue; }
+            try { lease.Dispose(); }
+            catch (Exception error) { AddFlattened(errors, error); }
+        }
+        if (errors.Count == 0 || !rethrowPrimary && errors.Count == primaryCount) { return; }
+        if (errors.Count == 1 && primary is not null && rethrowPrimary)
+        { System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw(); }
+        throw new AggregateException(errors);
+    }
+
+    internal static void AddFlattened(List<Exception> errors, Exception error)
+    {
+        if (error is AggregateException aggregate)
+        {
+            foreach (Exception inner in aggregate.InnerExceptions) { AddFlattened(errors, inner); }
+        }
+        else { errors.Add(error); }
+    }
+}
