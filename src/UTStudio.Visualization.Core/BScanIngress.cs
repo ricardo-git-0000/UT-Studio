@@ -11,6 +11,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     private readonly BScanOptions _options;
     private readonly IShortArrayPool _arrayPool;
     private readonly ITraceCopyOwnerPool _copyPool;
+    private readonly BoundedBScanVisualBufferPool _visualBuffers;
     private readonly TimeProvider _timeProvider;
     private readonly SemaphoreSlim _copyQuota = new(2, 2);
     private readonly long[] _durations = new long[DurationWindow];
@@ -31,6 +32,8 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     private string? _workerError;
     private int _providerOperations;
     private TaskCompletionSource? _providerDrain;
+    private long _visualEpoch;
+    private BScanIngressVisualState? _visualState;
 
     internal Action? BeforeIndexBatch { get; set; }
     internal Action<BScanTraceIdentity>? AfterIndexCommit { get; set; }
@@ -41,16 +44,20 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     internal event Action? VisualStateChanged;
 
     public BScanIngress(BScanOptions? options = null, TimeProvider? timeProvider = null)
-        : this(options, timeProvider, SharedShortArrayPool.Instance, SharedTraceCopyOwnerPool.Instance) { }
+        : this(options, timeProvider, SharedShortArrayPool.Instance, null, null) { }
 
     internal BScanIngress(BScanOptions? options, TimeProvider? timeProvider,
-        IShortArrayPool arrayPool, ITraceCopyOwnerPool copyPool)
+        IShortArrayPool arrayPool, ITraceCopyOwnerPool? copyPool,
+        BoundedBScanVisualBufferPool? visualBuffers = null)
     {
         _options = options ?? new();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _arrayPool = arrayPool ?? throw new ArgumentNullException(nameof(arrayPool));
-        _copyPool = copyPool ?? throw new ArgumentNullException(nameof(copyPool));
+        _visualBuffers = visualBuffers ?? new(_options.VisualMemoryBudgetBytes);
+        _copyPool = copyPool ?? new BoundedTraceCopyOwnerPool(_visualBuffers);
     }
+
+    internal BoundedBScanVisualBufferPool VisualBuffers => _visualBuffers;
 
     public void OpenRun(ConventionalUtFrameMetadata metadata)
     {
@@ -72,7 +79,8 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var store = new BScanTraceStore(metadata.Configuration.SampleCount, _options, _arrayPool);
+            var store = new BScanTraceStore(metadata.Configuration.SampleCount, _options, _arrayPool,
+                _visualBuffers);
             var wake = new SemaphoreSlim(0, 1);
             var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
             _metadata = metadata;
@@ -90,7 +98,10 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
             _durationMaximum = 0;
             Array.Clear(_durations);
             _worker = Task.Run(() => RunIndexWorkerAsync(store, wake, cancellation.Token));
+            Volatile.Write(ref _visualState, new(checked(++_visualEpoch), metadata, store,
+                store.CurrentVisualState, true));
         }
+        NotifyVisualStateChanged();
     }
 
     public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
@@ -163,6 +174,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
 
     public void CloseRun(AcquisitionRunId runId)
     {
+        bool changed = false;
         if (!runId.IsValid) { throw new ArgumentException("Invalid run identifier.", nameof(runId)); }
         lock (_gate)
         {
@@ -170,7 +182,11 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
             _open = false;
             _store!.StopAccepting();
             _closeTask ??= FreezeCoreAsync(_store, _worker!, _wake!, _runCancellation!);
+            Volatile.Write(ref _visualState, new(checked(++_visualEpoch), _metadata, _store,
+                _store.CurrentVisualState, true));
+            changed = true;
         }
+        if (changed) { NotifyVisualStateChanged(); }
     }
 
     public ValueTask WaitForCloseAsync(AcquisitionRunId runId)
@@ -291,18 +307,31 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
 
     internal void Stop()
     {
+        bool notify = false;
         lock (_gate)
         {
             if (_disposed) { return; }
             _disposed = true;
             _lifetimeCancellation.Cancel();
-            if (_open) { CloseRun(_metadata!.RunId); }
+            if (_open)
+            {
+                _open = false;
+                _store!.StopAccepting();
+                _closeTask ??= FreezeCoreAsync(_store, _worker!, _wake!, _runCancellation!);
+            }
+            if (_store is not null && _metadata is not null)
+            {
+                Volatile.Write(ref _visualState, new(checked(++_visualEpoch), _metadata, _store,
+                    _store.CurrentVisualState, false));
+                notify = true;
+            }
             Task closeAndReturn = CloseAndReturnStoreAsync(_closeTask ?? Task.CompletedTask, _store);
             _drainTask ??= DrainCoreAsync(
                 closeAndReturn,
                 _providerOperations == 0 ? Task.CompletedTask :
                     (_providerDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task);
         }
+        if (notify) { NotifyVisualStateChanged(); }
     }
 
     internal Task WaitForDrainAsync(CancellationToken cancellationToken = default)
@@ -317,6 +346,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     {
         Stop();
         await WaitForDrainAsync().ConfigureAwait(false);
+        await _visualBuffers.DisposeAsync().ConfigureAwait(false);
         _lifetimeCancellation.Dispose();
     }
 
@@ -392,7 +422,10 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
 
     private async Task IndexLoopAsync(BScanTraceStore store, SemaphoreSlim wake, CancellationToken token)
     {
-        var buckets = new BScanIndexedMinMax[store.BucketCount];
+        using IBScanVisualBufferOwner<BScanIndexedMinMax> bucketsOwner =
+            _visualBuffers.Rent<BScanIndexedMinMax>(store.BucketCount,
+                BScanVisualBufferKind.DetachedIndex);
+        BScanIndexedMinMax[] buckets = bucketsOwner.Array;
         var candidates = new BScanIndexCandidate[store.Capacity];
         while (true)
         {
@@ -414,6 +447,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
                 BuildIndexedIndex(lease.Samples.Span, _options.IndexBucketSamples, buckets);
                 if (store.CommitIndex(identity, generation, buckets))
                 {
+                    PublishVisualState(store);
                     AfterIndexCommit?.Invoke(identity);
                     NotifyVisualStateChanged();
                 }
@@ -489,40 +523,24 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
     internal long VisualBytesReserved { get { lock (_gate) { return _store?.VisualLogicalBytes ?? 0; } } }
     internal BScanOptions Options => _options;
     internal ConventionalUtFrameMetadata? CurrentMetadata { get { lock (_gate) { return _disposed ? null : _metadata; } } }
+    internal BScanIngressVisualState? CurrentVisualState => Volatile.Read(ref _visualState);
     internal int CaptureVisualLeases(Span<BScanTraceStore.BScanTraceLease?> destination,
-        out ConventionalUtFrameMetadata? metadata, out BScanStoreVisualState state)
+        out BScanIngressVisualState? visualState, out BScanStoreVisualState state)
     {
-        BScanTraceStore? store;
-        lock (_gate)
-        {
-            store = _disposed ? null : _store;
-            metadata = store is null ? null : _metadata;
-        }
-        if (store is null) { state = default; return 0; }
-        return store.CaptureVisualLeases(destination, out state);
+        visualState = Volatile.Read(ref _visualState);
+        if (visualState is not { IsOpen: true } current)
+        { state = null!; return 0; }
+        return current.Store.CaptureVisualLeases(current.StoreState, destination, out state);
     }
 
-    internal bool IsVisualStateCurrent(ConventionalUtFrameMetadata metadata, ulong revision, ulong wrapGeneration)
+    private void PublishVisualState(BScanTraceStore store)
     {
-        BScanTraceStore? store;
         lock (_gate)
         {
-            if (_disposed || _metadata != metadata) { return false; }
-            store = _store;
+            if (_disposed || !ReferenceEquals(_store, store) || _metadata is null) { return; }
+            Volatile.Write(ref _visualState, new(checked(++_visualEpoch), _metadata, store,
+                store.CurrentVisualState, _open));
         }
-        return store is not null && store.IsVisualStateCurrent(revision, wrapGeneration);
-    }
-
-    internal bool IsBootstrapStateCompatible(ConventionalUtFrameMetadata metadata, ulong revision,
-        ulong wrapGeneration)
-    {
-        BScanTraceStore? store;
-        lock (_gate)
-        {
-            if (_disposed || _metadata != metadata) { return false; }
-            store = _store;
-        }
-        return store is not null && store.IsBootstrapStateCompatible(revision, wrapGeneration);
     }
 
     private static bool IsCompatible(ConventionalUtFrameMetadata expected, ConventionalUtFrameMetadata actual) =>
@@ -573,4 +591,15 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
 
     private static string Message(Exception error) =>
         string.IsNullOrWhiteSpace(error.Message) ? error.GetType().Name : error.Message;
+}
+
+internal sealed record BScanIngressVisualState(
+    long Epoch,
+    ConventionalUtFrameMetadata Metadata,
+    BScanTraceStore Store,
+    BScanStoreVisualState StoreState,
+    bool IsOpen)
+{
+    internal BScanStreamIdentity Stream => new(Metadata.SourceId, Metadata.RunId,
+        Metadata.Configuration.PhysicalChannelId);
 }

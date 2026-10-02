@@ -17,7 +17,7 @@ No asumir respuestas ni bloquear la fase documental por estas incógnitas. Resol
 | Q11 | Instalación, actualización y plataformas Linux realmente requeridas | solution_architect |
 | Q12 | Primera secundaria BScanWindow, propiedad, presupuesto y cierre resueltos en ADR 0013; otras inspecciones/ventanas concurrentes permanecen abiertas | wpf_mvvm_specialist |
 | Q13 | Fan-out visual A/B por copia propia resuelto en ADR 0013; ownership, orden y backpressure de procesamiento/persistencia siguen pendientes | solution_architect |
-| Q14 | Remuestreo B-Scan: aprobar malla fuente, política estricta de máscara, Keys `a=-0.5`, Lanczos `a=3`, persistencia y objetivos/hardware de benchmark; decidir si GP/Kriging queda prohibido sobre índice ordinal y definir después geometría, modelo e incertidumbre física | ut_visualization / ut_domain_specialist |
+| Q14 | Remuestreo B-Scan resuelto por ADR 0014: malla, máscara estricta, Keys `a=-0.5`, Lanczos `a=3`, selector y persistencia están aprobados e implementados. Siguen abiertos el hardware, metodología y objetivos para convertir diagnósticos en gates, y una futura decisión separada sobre geometría, modelo e incertidumbre física de GP/Kriging | ut_visualization / ut_domain_specialist |
 
 La representación binaria de rectificadas reales sigue abierta; inicialmente solo RF bipolar `ReadOnlyMemory<short>`. Véanse [ADR 0007](../adr/0007-frame-source-ownership.md), [ADR 0008](../adr/0008-latest-only-visual-delivery.md) y [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 

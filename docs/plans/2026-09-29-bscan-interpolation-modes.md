@@ -17,15 +17,15 @@ Criterios: distinción remuestreo/reconstrucción inequívoca; decisiones pendie
 `git diff --check` correctos; ningún cambio de código/proyecto/paquete; aprobación del usuario de los
 parámetros y presupuestos que condicionan implementación.
 
-## Fase 1 — Contrato neutral, máscara, None y Nearest
+## Fase 1 — Contrato neutral, máscara, None y NearestNeighbor
 
-Alcance previsto: modelos Scan2D en Visualization.Core; máscara/procedencia; firma estructural; servicio
-cancelable; adaptación interna de B; `None` y `Nearest`, inicialmente full. Sin UI de usuario todavía.
+Resultado implementado: modelos Scan2D en Visualization.Core; máscara/procedencia; firma estructural;
+servicio cancelable; adaptación interna de B; `None` y `NearestNeighbor`, inicialmente full.
 
 Aceptación:
 
 - `None` es byte a byte idéntico al comportamiento actual en full e incremental;
-- Nearest usa centros, tie hacia índice menor, singletons y bordes definidos;
+- `NearestNeighbor` usa centros, tie hacia índice menor, singletons y bordes definidos;
 - valores `short.MinValue`, cero y `short.MaxValue` conservan el mapping canónico;
 - gaps/NoData nunca participan como cero ni se cruzan;
 - firma antigua, token cancelado, run/revisión/viewport/tamaño obsoleto no confirman;
@@ -39,7 +39,7 @@ consume intensidad y máscara y no infiere validez del byte cero.
 
 ## Fase 2 — Bilinear y Bicubic
 
-Implementar full con máscara conservadora. Bilinear y Bicubic permanecen full-only en esta fase;
+Bilinear y Bicubic están implementados full con máscara conservadora y permanecen full-only en esta fase;
 incremental con halos queda aplazado. Bicubic usa Keys/Catmull–Rom `a=-0.5`, acumulación determinista,
 sin renormalizar taps inválidos y clamp final `[0,255]`.
 
@@ -47,11 +47,11 @@ Aceptación: vectores exactos de constantes, rampas, impulsos y bordes; ausencia
 overshoot bicubic controlado; gaps no cerrados; una base incremental recupera mediante una única full;
 cambio rápido de modo/zoom/resize produce una sola full vigente; sin starvation de Stop/cierre.
 
-Optimización posterior: Nearest, Bilinear y Bicubic preparan tablas X/Y acotadas por render, con índices,
+Optimización posterior: NearestNeighbor, Bilinear y Bicubic preparan tablas X/Y acotadas por render, con índices,
 coordenadas y pesos calculados una sola vez por eje. No cambia el orden Y→X, la política conservadora ni
 la procedencia. La formación de malla usa además un cursor lineal sobre leases ordenados en lugar de una
 búsqueda binaria por columna. En la VM diagnóstica, un ShortRun 1024² (`1` proceso, `2` warmups y `3`
-iteraciones) midió 5,232/15,147/35,720 ms para Nearest/Bilinear/Bicubic respectivamente; no es baseline.
+iteraciones) midió 5,232/15,147/35,720 ms para NearestNeighbor/Bilinear/Bicubic respectivamente; no es baseline.
 Los picos rentados Bilinear/Bicubic fueron 8.470.576/8.552.496 bytes, bajo el límite de 16 MiB.
 El delivery reutiliza una sola entrada mientras no cambie la transformación relativa; un desplazamiento
 estable del rango lleno no la invalida. La sustitución utiliza lease/refcount para que supersession no
@@ -137,7 +137,7 @@ kernel gráfico.
 | Arquitectura | Core/Presentation sin WPF; interpoladores sin tipos B; Wpf solo referencia Core |
 
 La aritmética esperada se prueba con tolerancia explícita solo donde haya coma flotante; identidad,
-máscaras, `None`, Nearest y determinismo son exactos. No se actualizan golden files sin explicar la
+máscaras, `None`, `NearestNeighbor` y determinismo son exactos. No se actualizan golden files sin explicar la
 diferencia semántica.
 
 ## Benchmarks y presupuesto
@@ -151,6 +151,20 @@ Objetivos iniciales del ADR 0014 son hipótesis. El incremento no sale si excede
 coexistencia real, si un incremental difiere del full o si Stop/cierre pierde capacidad de respuesta. Si
 no alcanza 30 Hz, la aceptación permite menor cadencia efectiva latest-only con diagnóstico y último
 raster válido; no permite cambiar modo o ocultar gaps.
+
+## Endurecimiento del presupuesto neutral
+
+La capacidad neutral se gobierna mediante un allocator propio y un ledger único de 16 MiB. El cargo
+es la capacidad real de payload de arrays activos y retenidos, no su longitud lógica. Incluye índices
+persistentes, copias detached, selección exacta, raster current/candidate, scratch y tablas de kernels.
+Los bloques RF permanecen bajo su presupuesto separado; metadata fija, headers CLR, heap total y
+working set no forman parte de la garantía.
+
+La admisión reserva de forma linealizable antes de crear capacidad. Devolver a la caché propia conserva
+el cargo; reutilizar no lo duplica; descartar una referencia lo libera. El cierre vacía la retención y
+espera owners prestados. Las regresiones cubren concurrencia, cancelación o fallo entre adquisición y
+transferencia, límite exacto y exceso, overflow, tercer owner/readmisión, fragmentación, cierre con
+retención o préstamo y coherencia monotónica del ledger.
 
 ## Migración incremental y compatibilidad futura
 
@@ -171,7 +185,7 @@ universal o superficie pública hasta que C-Scan aporte requisitos y un segundo 
 
 ## Estado de decisiones
 
-Confirmadas para Fases 1–3: Kriging/GP separado, política conservadora de taps/segmentos,
-Keys `a=-0.5`, Lanczos-3 `a=3`, None compatible, Nearest explícito y composición en Visualization.Core sin proyecto
+Confirmadas para Fases 1–4: Kriging/GP separado, política conservadora de taps/segmentos,
+Keys `a=-0.5`, Lanczos-3 `a=3`, None compatible, `NearestNeighbor` explícito y composición en Visualization.Core sin proyecto
 `Scan2D.Core`. Continúan pendientes la aprobación de hardware,
 metodología y objetivos antes de convertir los diagnósticos de rendimiento en gates.

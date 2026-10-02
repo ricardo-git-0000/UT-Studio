@@ -1,6 +1,6 @@
 # Arquitectura inicial
 
-Estado: estructura aprobada el 2026-09-09, A-Scan implementado y primer B-Scan aprobado documentalmente el 2026-09-22. Trazabilidad: R01–R14; ADR 0001–0013.
+Estado: estructura aprobada el 2026-09-09, A-Scan implementado y primer B-Scan aprobado documentalmente el 2026-09-22. Trazabilidad: R01–R14; ADR 0001–0014.
 
 ## Estructura inicial aprobada
 
@@ -76,8 +76,8 @@ El B-Scan mantiene la frontera reutilizable: Core define raster/viewports neutra
 dibuja y emite intenciones; Presentation posee estado y memoria pooled; App.Wpf adapta y posee la
 ventana. Los ViewModels A/B no se referencian y comparten coordinadores neutrales.
 
-El [ADR 0014 propuesto](../adr/0014-bscan-selectable-resampling.md) prepara remuestreo 2D reutilizable
-sin anticipar C-Scan. `Visualization.Core` alojará por composición modelos pequeños de raster, máscara,
+El [ADR 0014 aceptado](../adr/0014-bscan-selectable-resampling.md) implementa remuestreo 2D reutilizable
+sin anticipar C-Scan. `Visualization.Core` aloja por composición modelos pequeños de raster, máscara,
 procedencia, firma e interpoladores neutrales; B-Scan conservará formación RF, identidad, ejes y
 selección exacta. No se crea aún un proyecto `Scan2D.Core`, una clase base de scans ni un control WPF
 universal. La separación en proyecto o una superficie común se reconsiderarán cuando los requisitos
@@ -95,4 +95,4 @@ SignalProcessing, Storage y Visualization.Core mantendrán dependencias neutrale
 
 Q12: propiedad de la primera secundaria B-Scan resuelta por ADR 0013; concurrencia de otras inspecciones sigue abierta. Q13: fan-out visual por copia propia resuelto para A/B; procesamiento, persistencia y su ownership continúan abiertos. Q06 conserva datos crudos/procesados y durabilidad.
 
-Pendientes mocking/CI y paquetes adicionales (Q10), renderizadores de otros scans y benchmarks (Q09), y futuras integraciones. Los modos visuales B-Scan y su separación de GP/Kriging están propuestos en ADR 0014 y no implementados. ChannelCapacity=4 y BufferCount=8 son internos configurables del simulador sujetos a benchmarks, no del contrato general. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).
+Pendientes mocking/CI y paquetes adicionales (Q10), renderizadores de otros scans, gates de rendimiento sobre hardware acordado (Q09/Q14) y futuras integraciones. Los modos `None`, `NearestNeighbor`, `Bilinear`, `Bicubic` y `Lanczos`, el selector y la preferencia versionada están implementados conforme al ADR 0014; `None` es predeterminado y Lanczos es alta calidad con cadencia reducida. GP/Kriging permanece como reconstrucción futura separada. ChannelCapacity=4 y BufferCount=8 son internos configurables del simulador sujetos a benchmarks, no del contrato general. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).

@@ -6,7 +6,17 @@ public enum Scan2DInterpolationMode { None = 0, NearestNeighbor = 1, Bilinear = 
 
 public enum Scan2DMaskPolicy { AllRequiredSupportValidAndSameSegment = 0 }
 
-public enum Scan2DSampleProvenance : byte { NoData = 0, AcquiredSupport = 1, VisualDerived = 2 }
+/// <summary>
+/// Neutral sample origin. SpatialEstimated is reserved for a future explicit reconstruction module;
+/// visual resamplers never produce it.
+/// </summary>
+public enum Scan2DSampleProvenance : byte
+{
+    NoData = 0,
+    AcquiredSupport = 1,
+    VisualDerived = 2,
+    SpatialEstimated = 3
+}
 
 public readonly record struct Scan2DGridGeometry
 {

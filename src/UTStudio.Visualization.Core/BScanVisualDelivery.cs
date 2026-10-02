@@ -1,13 +1,21 @@
 using System.Buffers;
+using System.Numerics;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Visualization.Core;
 
-internal interface IByteOwnerPool { IMemoryOwner<byte> Rent(int minimumLength); }
+internal interface IByteOwnerPool
+{
+    int GetMaximumRentalLength(int minimumLength) => minimumLength;
+    IMemoryOwner<byte> Rent(int minimumLength);
+    IMemoryOwner<byte> Rent(int minimumLength, BScanVisualBufferKind kind) => Rent(minimumLength);
+}
 internal sealed class SharedByteOwnerPool : IByteOwnerPool
 {
     internal static SharedByteOwnerPool Instance { get; } = new();
+    public int GetMaximumRentalLength(int minimumLength) => Math.Max(4096,
+        checked((int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(1, minimumLength))));
     public IMemoryOwner<byte> Rent(int minimumLength) => MemoryPool<byte>.Shared.Rent(minimumLength);
 }
 
@@ -29,14 +37,22 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private readonly Dictionary<string, BScanRenderRequest> _pending = [];
     private readonly Dictionary<string, BScanRenderRequest> _lastRequests = [];
     private readonly Dictionary<string, long> _pendingGenerations = [];
+    private readonly Dictionary<string, long> _committedGenerations = [];
     private readonly Dictionary<string, int> _consumerOwners = [];
     private readonly Dictionary<string, long> _consumerOwnerBytes = [];
     private readonly Dictionary<string, BScanVisualSnapshot> _currentByConsumer = [];
     private readonly Dictionary<string, BScanDisplayedVisualIdentity> _displayedByConsumer = [];
+    private readonly Dictionary<string, long> _consumerLifetimes = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _presentationEpochs = [];
     private readonly HashSet<string> _consumers = [];
     private readonly HashSet<string> _bootstrapConsumers = [];
+    private readonly Dictionary<string, BScanConsumerBootstrapState> _bootstrapStates = [];
     private readonly HashSet<string> _retiringConsumers = [];
     private long _requestGeneration;
+    private long _consumerLifetime;
+    private long _presentationEpoch;
+    private long _visualStateEpoch;
+    private AcquisitionRunId? _latestVisualRunId;
     private long _renderRequests;
     private long _fullIdentityRequests;
     private bool _coalesced;
@@ -61,7 +77,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private bool _closed;
     private Task? _drain;
     private string? _lastError;
+    private BScanVisualAudit? _audit;
+    private BScanMetadataCandidateAudit? _lastMetadataCandidateAudit;
+    private BScanRequestGenerationReason _lastGenerationReason;
     internal Action? BeforeRasterCandidateValidation { get; set; }
+    internal Action? BeforeRasterCandidateCommit { get; set; }
     /// <summary>Diagnostic seam invoked after a real Lanczos row and before the next cancellation checkpoint.</summary>
     internal Action<int>? AfterLanczosKernelRowProcessed
     {
@@ -70,24 +90,36 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     }
     internal Action<int, int>? AfterRasterColumnReleased { get; set; }
     internal Action? BeforeMetadataCandidateValidation { get; set; }
+    internal Action<BScanVisualSnapshot>? BeforeMetadataCandidateCommit { get; set; }
+    internal Action<string, AcquisitionRunId>? AfterBootstrapRequestQueued { get; set; }
     internal int ActiveConsumerCount { get { lock (_gate) { return _consumers.Count; } } }
     internal int PendingBootstrapCount { get { lock (_gate) { return _bootstrapConsumers.Count; } } }
     internal int RetainedSnapshotCount { get { lock (_gate) { return _currentByConsumer.Count; } } }
     internal long RenderRequestCount => Interlocked.Read(ref _renderRequests);
     internal long FullIdentityRequestCount => Interlocked.Read(ref _fullIdentityRequests);
     internal long ResamplingTablePreparationCount => _resampler.TablePreparationCount;
+    internal BScanMetadataCandidateAudit? LastMetadataCandidateAudit
+    { get { lock (_gate) { return _lastMetadataCandidateAudit; } } }
+    internal void EnableAudit(int capacity) => Volatile.Write(ref _audit, new(capacity));
+    internal BScanVisualAuditSnapshot AuditSnapshot =>
+        Volatile.Read(ref _audit)?.Snapshot() ?? new([], 0);
+    internal BScanVisualMemorySnapshot VisualMemorySnapshot => _ingress.VisualBuffers.Snapshot;
     internal BScanDisplayedVisualIdentity? GetAcknowledgedDisplay(string consumerId)
     { lock (_gate) { return _displayedByConsumer.GetValueOrDefault(consumerId); } }
+    internal BScanRenderRequest? GetLastRequest(string consumerId)
+    { lock (_gate) { return _lastRequests.GetValueOrDefault(consumerId); } }
 
     public BScanVisualDelivery(BScanIngress ingress, TimeProvider? timeProvider = null)
-        : this(ingress, timeProvider, SharedByteOwnerPool.Instance) { }
+        : this(ingress, timeProvider,
+            new BoundedByteOwnerPool((ingress ?? throw new ArgumentNullException(nameof(ingress))).VisualBuffers))
+    { }
 
     internal BScanVisualDelivery(BScanIngress ingress, TimeProvider? timeProvider, IByteOwnerPool pool)
     {
         _ingress = ingress ?? throw new ArgumentNullException(nameof(ingress));
         _clock = timeProvider ?? TimeProvider.System;
         _pool = pool ?? throw new ArgumentNullException(nameof(pool));
-        _resampler = new Scan2DResampler(SharedLanczosTablePool.Instance, ChangeTableBytes,
+        _resampler = new Scan2DResampler(new BoundedLanczosTablePool(_ingress.VisualBuffers), ChangeTableBytes,
             reuseTables: true);
         _ingress.VisualStateChanged += OnVisualStateChanged;
         _worker = Task.Run(PublishLoopAsync);
@@ -102,6 +134,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             if (_consumers.Contains(consumerId)) { return true; }
             if (_consumers.Count >= _ingress.Options.MaximumRasterConsumers) { return false; }
             _consumers.Add(consumerId);
+            _consumerLifetimes[consumerId] = ++_consumerLifetime;
+            _presentationEpochs[consumerId] = 0;
             _consumerOwners[consumerId] = 0;
             _consumerOwnerBytes[consumerId] = 0;
         }
@@ -117,36 +151,62 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             if (!_consumers.Contains(consumerId))
             { throw new InvalidOperationException("The raster consumer is not registered."); }
             if (!_bootstrapConsumers.Add(consumerId)) { return; }
+            _bootstrapStates[consumerId] = new(
+                _ingress.CurrentVisualState is { IsOpen: true } current ? current.Metadata.RunId : null,
+                BScanBootstrapPhase.Requested, 0, null);
         }
+        Audit(BScanVisualAuditEventKind.BootstrapRequested, consumerId,
+            _ingress.CurrentVisualState, 0, null);
         QueueBootstrap(consumerId);
     }
 
     private void QueueBootstrap(string consumerId)
     {
+        BScanRenderRequest? previousRequest = null;
         BScanTraceStore.BScanTraceLease?[] leases =
-            ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Rent(_ingress.VisualCapacity);
-        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.VisualCapacity),
-            out ConventionalUtFrameMetadata? metadata, out BScanStoreVisualState state);
+            new BScanTraceStore.BScanTraceLease?[_ingress.Options.MaximumColumns];
+        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.Options.MaximumColumns),
+            out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
         try
         {
+            ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
             if (metadata is null || count == 0 || state.ResidentRange is not { } resident) { return; }
             lock (_gate)
             {
-                if (!_consumers.Contains(consumerId)) { return; }
-                if (_lastRequests.TryGetValue(consumerId, out BScanRenderRequest? current) &&
-                    current.RunId == metadata.RunId) { _bootstrapConsumers.Remove(consumerId); return; }
+                if (!_consumers.Contains(consumerId) || ingressState is null ||
+                    !ReferenceEquals(ingressState, _ingress.CurrentVisualState)) { return; }
+                if (_lastRequests.TryGetValue(consumerId, out BScanRenderRequest? current))
+                {
+                    if (current.RunId == metadata.RunId)
+                    {
+                        if (_bootstrapStates.TryGetValue(consumerId, out BScanConsumerBootstrapState? bootstrap) &&
+                            bootstrap.RunId == metadata.RunId &&
+                            bootstrap.Phase is BScanBootstrapPhase.Pending or BScanBootstrapPhase.Admitted)
+                        { return; }
+                        previousRequest = current;
+                    }
+                    else { previousRequest = current; }
+                }
                 _bootstrapConsumers.Add(consumerId);
+                _bootstrapStates[consumerId] = new(metadata.RunId, BScanBootstrapPhase.Pending,
+                    state.StoreRevision, null);
             }
+            Audit(BScanVisualAuditEventKind.BootstrapPending, consumerId, ingressState, 0, null);
             double minimum = metadata.Configuration.FirstSampleOffsetSeconds;
             double maximum = minimum + metadata.Configuration.SampleCount / metadata.Configuration.SampleRateHz;
             RequestRender(new(metadata.RunId, BScanSpatialViewportOperations.Reset(resident),
-                ScanTimeViewportOperations.Create(minimum, maximum), 1, 1, 0, ConsumerId: consumerId));
+                ScanTimeViewportOperations.Create(minimum, maximum),
+                previousRequest?.PixelWidth ?? 1, previousRequest?.PixelHeight ?? 1,
+                previousRequest?.RenderConfigurationVersion ?? 0, ConsumerId: consumerId,
+                FollowLiveWindow: previousRequest?.FollowLiveWindow ?? false,
+                Resampling: previousRequest?.EffectiveResampling ?? Scan2DResamplingOptions.Default));
+            AfterBootstrapRequestQueued?.Invoke(consumerId, metadata.RunId);
         }
         catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException) { }
         finally
         {
             for (int index = 0; index < count; index++) { leases[index]?.Dispose(); }
-            ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Return(leases, clearArray: true);
+            Array.Clear(leases);
         }
     }
 
@@ -159,15 +219,22 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             _pending.Remove(consumerId);
             _lastRequests.Remove(consumerId);
             _pendingGenerations.Remove(consumerId);
+            _committedGenerations.Remove(consumerId);
             _currentByConsumer.Remove(consumerId);
             _displayedByConsumer.Remove(consumerId);
+            _consumerLifetimes.Remove(consumerId);
+            _presentationEpochs.TryRemove(consumerId, out _);
             _bootstrapConsumers.Remove(consumerId);
+            _bootstrapStates.Remove(consumerId);
+            _recoveryConsumers.Remove(consumerId);
             if (_consumerOwners.GetValueOrDefault(consumerId) == 0)
             {
                 _consumerOwners.Remove(consumerId); _consumerOwnerBytes.Remove(consumerId);
                 _consumers.Remove(consumerId); _retiringConsumers.Remove(consumerId);
             }
         }
+        Audit(BScanVisualAuditEventKind.ConsumerRemoved, consumerId,
+            _ingress.CurrentVisualState, 0, null, BScanVisualAuditResult.Closed);
     }
 
     public BScanVisualDiagnostics Diagnostics
@@ -201,17 +268,43 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_ingress.CurrentVisualState is { IsOpen: true } visualState &&
+                request.RunId != visualState.Metadata.RunId)
+            { return; }
             if (request.ConsumerId == "default" && !_consumers.Contains("default"))
-            { _consumers.Add("default"); _consumerOwners["default"] = 0; _consumerOwnerBytes["default"] = 0; }
+            {
+                _consumers.Add("default"); _consumerLifetimes["default"] = ++_consumerLifetime;
+                _presentationEpochs["default"] = 0;
+                _consumerOwners["default"] = 0; _consumerOwnerBytes["default"] = 0;
+            }
             if (!_consumers.Contains(request.ConsumerId))
             { throw new InvalidOperationException("The raster consumer is not registered."); }
+            if (_pending.TryGetValue(request.ConsumerId, out BScanRenderRequest? pending) &&
+                HasSameRenderSignature(pending, request))
+            { return; }
             Interlocked.Increment(ref _renderRequests);
             if (request.DisplayedSnapshotVersion is null) { Interlocked.Increment(ref _fullIdentityRequests); }
             if (_pending.ContainsKey(request.ConsumerId)) { _coalesced = true; _updatesCoalesced++; }
             _lastRequests[request.ConsumerId] = request;
-            _bootstrapConsumers.Remove(request.ConsumerId);
+            if (_bootstrapStates.TryGetValue(request.ConsumerId, out BScanConsumerBootstrapState? bootstrap) &&
+                bootstrap.RunId == request.RunId &&
+                bootstrap.Phase is BScanBootstrapPhase.Requested or BScanBootstrapPhase.Pending)
+            {
+                _bootstrapStates[request.ConsumerId] = bootstrap with
+                { Phase = BScanBootstrapPhase.Admitted, RequestGeneration = _requestGeneration + 1 };
+            }
+            else
+            {
+                _bootstrapConsumers.Remove(request.ConsumerId);
+                _bootstrapStates.Remove(request.ConsumerId);
+            }
             _pending[request.ConsumerId] = request;
             _pendingGenerations[request.ConsumerId] = ++_requestGeneration;
+            _presentationEpochs[request.ConsumerId] = ++_presentationEpoch;
+            _lastGenerationReason = BScanRequestGenerationReason.RequestRender;
+            Audit(BScanVisualAuditEventKind.BuildAdmitted, request.ConsumerId,
+                _ingress.CurrentVisualState, _requestGeneration, request,
+                BScanVisualAuditResult.Accepted);
             if (_wake.CurrentCount == 0) { _wake.Release(); }
         }
     }
@@ -243,6 +336,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             {
                 _pending[consumerId] = acknowledged;
                 _pendingGenerations[consumerId] = ++_requestGeneration;
+                _lastGenerationReason = BScanRequestGenerationReason.AcknowledgeDisplayed;
             }
         }
     }
@@ -256,7 +350,13 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             var subscription = new Subscription(this, observer);
             _subscriptions.Add(subscription);
             foreach (BScanVisualSnapshot snapshot in _currentByConsumer.Values)
-            { subscription.Offer(new(snapshot)); }
+            {
+                _lastRequests.TryGetValue(snapshot.ConsumerId, out BScanRenderRequest? request);
+                BScanIngressVisualState? ingressState = _ingress.CurrentVisualState is { } current &&
+                    current.Metadata.RunId == snapshot.RunId ? current : null;
+                subscription.Offer(new(snapshot), CaptureCallbackAuditContext(snapshot.ConsumerId,
+                    ingressState, _committedGenerations.GetValueOrDefault(snapshot.ConsumerId), request));
+            }
             return subscription;
         }
     }
@@ -266,10 +366,16 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(request);
         request.Validate();
+        long requestGeneration;
+        long visualStateEpoch;
+        long consumerLifetime;
         lock (_gate)
         {
             if (_disposed) { return BScanRasterResult.NotAvailable(); }
             _regionOperations++;
+            requestGeneration = _pendingGenerations.GetValueOrDefault(request.ConsumerId);
+            visualStateEpoch = _visualStateEpoch;
+            consumerLifetime = _consumerLifetimes.GetValueOrDefault(request.ConsumerId);
         }
         long started = _clock.GetTimestamp();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdown.Token);
@@ -279,13 +385,19 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             lock (_gate)
             {
                 if (request.ConsumerId == "default" && !_consumers.Contains("default"))
-                { _consumers.Add("default"); _consumerOwners["default"] = 0; _consumerOwnerBytes["default"] = 0; }
+                {
+                    _consumers.Add("default"); _consumerLifetimes["default"] = ++_consumerLifetime;
+                    _presentationEpochs["default"] = 0;
+                    _consumerOwners["default"] = 0; _consumerOwnerBytes["default"] = 0;
+                    consumerLifetime = _consumerLifetimes["default"];
+                }
                 if (!_consumers.Contains(request.ConsumerId)) { return BScanRasterResult.NotAvailable(); }
                 if (_consumerOwners.GetValueOrDefault(request.ConsumerId) >=
                     _ingress.Options.MaximumRasterOwnersPerConsumer)
                 { return BScanRasterResult.ResourceLimit("The consumer raster owner quota is exhausted."); }
             }
-            BScanRasterResult result = BuildRegion(request, linked.Token);
+            BScanRasterResult result = BuildRegion(request, requestGeneration, visualStateEpoch,
+                consumerLifetime, linked.Token);
             return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -299,7 +411,24 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
         catch (Exception error)
         {
-            lock (_gate) { _lastError = Message(error); _recoveryConsumers.Add(request.ConsumerId); }
+            lock (_gate)
+            {
+                bool current = _consumerLifetimes.GetValueOrDefault(request.ConsumerId) == consumerLifetime &&
+                    _pendingGenerations.GetValueOrDefault(request.ConsumerId) == requestGeneration &&
+                    (!_lastRequests.TryGetValue(request.ConsumerId, out BScanRenderRequest? latest) ||
+                    HasSameRenderSignature(request, latest));
+                if (current)
+                {
+                    _lastError = Message(error);
+                    RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request);
+                }
+                else
+                {
+                    Audit(BScanVisualAuditEventKind.CandidateRejectedStale, request.ConsumerId,
+                        _ingress.CurrentVisualState, requestGeneration, request,
+                        BScanVisualAuditResult.Faulted, BScanVisualAuditRejection.Generation);
+                }
+            }
             return BScanRasterResult.Faulted(error);
         }
         finally
@@ -309,13 +438,19 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
     }
 
-    private BScanRasterResult BuildRegion(BScanRenderRequest request, CancellationToken token)
+    private BScanRasterResult BuildRegion(BScanRenderRequest request, long requestGeneration,
+        long visualStateEpoch, long consumerLifetime, CancellationToken token)
     {
-        BScanTraceStore.BScanTraceLease?[] leases = ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Rent(_ingress.VisualCapacity);
-        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.VisualCapacity),
-            out ConventionalUtFrameMetadata? metadata, out BScanStoreVisualState state);
+        BScanRenderRequest admittedRequest = request;
+        BScanTraceStore.BScanTraceLease?[] leases =
+            new BScanTraceStore.BScanTraceLease?[_ingress.Options.MaximumColumns];
+        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.Options.MaximumColumns),
+            out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
+        Audit(BScanVisualAuditEventKind.BuildStarted, request.ConsumerId, ingressState,
+            requestGeneration, request);
         try
         {
+            ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
             if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null)
             { return BScanRasterResult.NotAvailable(); }
             Array.Sort(leases, 0, count, BScanLeaseComparer.Instance);
@@ -353,30 +488,28 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             }
             int cells = checked(width * request.PixelHeight);
             int length = checked(cells * 3);
-            IMemoryOwner<byte> owner = _pool.Rent(length);
-            if (owner.Memory.Length < length) { owner.Dispose(); throw new InvalidOperationException("Raster pool returned an undersized owner."); }
-            long actualBytes = owner.Memory.Length;
-            long budget = checked(_ingress.Options.VisualMemoryBudgetBytes - _ingress.VisualBytesReserved);
-            lock (_gate)
+            int reservationLength = _pool.GetMaximumRentalLength(length);
+            if (reservationLength < length)
+            { throw new InvalidOperationException("Raster pool returned an invalid reservation quote."); }
+            if (!TryReserveRasterOwner(request.ConsumerId, reservationLength))
             {
-                long consumerCeiling = _ingress.Options.VisualMemoryBudgetBytes /
-                    _ingress.Options.MaximumRasterConsumers;
-                long consumerBytes = _consumerOwnerBytes.GetValueOrDefault(request.ConsumerId);
-                if (!_consumers.Contains(request.ConsumerId) ||
-                    _consumerOwners.GetValueOrDefault(request.ConsumerId) >=
-                        _ingress.Options.MaximumRasterOwnersPerConsumer ||
-                    checked(_activeOwnerBytes + actualBytes) > budget ||
-                    checked(consumerBytes + actualBytes) > consumerCeiling)
-                {
-                    owner.Dispose();
-                    return BScanRasterResult.ResourceLimit("The B-Scan visual memory quota is exhausted.");
-                }
-                _activeOwnerBytes += actualBytes;
-                _activeOwners++;
-                _consumerOwners[request.ConsumerId] = _consumerOwners.GetValueOrDefault(request.ConsumerId) + 1;
-                _consumerOwnerBytes[request.ConsumerId] = consumerBytes + actualBytes;
-                _maximumOwners = Math.Max(_maximumOwners, _activeOwners);
-                _maximumOwnerBytes = Math.Max(_maximumOwnerBytes, _activeOwnerBytes);
+                return BScanRasterResult.ResourceLimit("The B-Scan visual memory quota is exhausted.");
+            }
+            IMemoryOwner<byte> owner;
+            try { owner = _pool.Rent(length); }
+            catch { DiscardOwner(request.ConsumerId, reservationLength); throw; }
+            if (owner.Memory.Length < length || owner.Memory.Length > reservationLength)
+            {
+                owner.Dispose();
+                DiscardOwner(request.ConsumerId, reservationLength);
+                throw new InvalidOperationException("Raster pool violated its rental reservation quote.");
+            }
+            long actualBytes = owner.Memory.Length;
+            if (!TryAdjustRasterReservation(request.ConsumerId, reservationLength, actualBytes))
+            {
+                owner.Dispose();
+                DiscardOwner(request.ConsumerId, reservationLength);
+                return BScanRasterResult.ResourceLimit("The B-Scan visual memory quota is exhausted.");
             }
             Memory<byte> storage = owner.Memory[..length];
             storage.Span.Clear();
@@ -397,6 +530,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 }
                 BeforeRasterCandidateValidation?.Invoke();
                 token.ThrowIfCancellationRequested();
+                BeforeRasterCandidateCommit?.Invoke();
             }
             catch
             {
@@ -404,52 +538,75 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 DiscardOwner(request.ConsumerId, actualBytes);
                 throw;
             }
-            bool bootstrap = request.DisplayedSnapshotVersion is null && request.DisplayedStoreRevision is null &&
-                request.DisplayedWrapGeneration is null && request.Displayed is null;
-            if (!_ingress.IsVisualStateCurrent(metadata, state.StoreRevision, state.WrapGeneration) &&
-                !((bootstrap || request.FollowLiveWindow) && _ingress.IsBootstrapStateCompatible(
-                    metadata, state.StoreRevision, state.WrapGeneration)))
-            {
-                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes);
-                lock (_gate) { _staleCandidates++; _recoveryConsumers.Add(request.ConsumerId); }
-                return BScanRasterResult.Stale();
-            }
-            bool superseded;
-            lock (_gate)
-            {
-                superseded = _lastRequests.TryGetValue(request.ConsumerId, out BScanRenderRequest? latest) &&
-                    !HasSameRenderSignature(request, latest);
-                if (superseded) { _staleCandidates++; _recoveryConsumers.Add(request.ConsumerId); }
-            }
-            if (superseded)
-            {
-                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes);
-                return BScanRasterResult.Stale();
-            }
-
-            ulong version;
-            lock (_gate) { version = ++_snapshotVersion; }
             var dirty = new BScanDirtyRange(dirtyFirst, dirtyLast,
                 request.DisplayedStoreRevision.GetValueOrDefault(), state.StoreRevision);
-            var snapshot = CreateSnapshot(metadata, request, state, version, dirty,
+            var candidate = CreateSnapshot(metadata, request, state, 0, dirty,
                 new(x, 0, width, request.PixelHeight), full, reason, leases, count) with
             { HorizontalPixelShift = horizontalPixelShift };
+            Audit(BScanVisualAuditEventKind.BuildCompleted, request.ConsumerId, ingressState,
+                requestGeneration, request, BScanVisualAuditResult.Accepted);
+            Audit(BScanVisualAuditEventKind.CommitAttempted, request.ConsumerId, ingressState,
+                requestGeneration, request);
+            BScanVisualSnapshot? snapshot = null;
+            bool stale;
             bool active;
+            BScanVisualAuditRejection staleRejection = BScanVisualAuditRejection.None;
             lock (_gate)
             {
                 active = !_disposed && _consumers.Contains(request.ConsumerId) &&
-                    !_retiringConsumers.Contains(request.ConsumerId);
-                if (active) { _currentByConsumer[request.ConsumerId] = snapshot; _recoveryConsumers.Remove(request.ConsumerId); }
+                    !_retiringConsumers.Contains(request.ConsumerId) &&
+                    _consumerLifetimes.GetValueOrDefault(request.ConsumerId) == consumerLifetime;
+                bool generationCurrent =
+                    _pendingGenerations.GetValueOrDefault(request.ConsumerId) == requestGeneration;
+                bool presentationCurrent = _visualStateEpoch == visualStateEpoch;
+                bool ingressCurrent = ingressState is not null &&
+                    ReferenceEquals(ingressState, _ingress.CurrentVisualState);
+                bool storeCurrent = ingressState is not null &&
+                    ReferenceEquals(ingressState.StoreState, ingressState.Store.CurrentVisualState);
+                bool stateCurrent = presentationCurrent && ingressCurrent && storeCurrent;
+                bool signatureCurrent = !_lastRequests.TryGetValue(request.ConsumerId,
+                    out BScanRenderRequest? latest) || HasSameRenderSignature(admittedRequest, latest);
+                stale = active && (!generationCurrent || !stateCurrent || !signatureCurrent);
+                if (stale)
+                {
+                    staleRejection = !generationCurrent ? BScanVisualAuditRejection.Generation :
+                        !presentationCurrent ? BScanVisualAuditRejection.Presentation :
+                        !ingressCurrent ? BScanVisualAuditRejection.IngressState :
+                        !storeCurrent ? BScanVisualAuditRejection.StoreState :
+                        BScanVisualAuditRejection.Signature;
+                    _staleCandidates++;
+                    RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request);
+                }
+                else if (active)
+                {
+                    snapshot = candidate with { SnapshotVersion = ++_snapshotVersion };
+                    _currentByConsumer[request.ConsumerId] = snapshot;
+                    _recoveryConsumers.Remove(request.ConsumerId);
+                }
+            }
+            if (stale)
+            {
+                Audit(BScanVisualAuditEventKind.CandidateRejectedStale, request.ConsumerId,
+                    ingressState, requestGeneration, request, BScanVisualAuditResult.Stale,
+                    staleRejection);
+                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes); return BScanRasterResult.Stale();
             }
             if (!active)
-            { owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes); return BScanRasterResult.NotAvailable(); }
-            return BScanRasterResult.Available(new(snapshot, x, 0, width, request.PixelHeight,
+            {
+                Audit(BScanVisualAuditEventKind.CandidateRejectedClosed, request.ConsumerId,
+                    ingressState, requestGeneration, request, BScanVisualAuditResult.Closed,
+                    BScanVisualAuditRejection.Consumer);
+                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes); return BScanRasterResult.NotAvailable();
+            }
+            Audit(BScanVisualAuditEventKind.CandidateCommitted, request.ConsumerId, ingressState,
+                requestGeneration, request, BScanVisualAuditResult.Committed);
+            return BScanRasterResult.Available(new(snapshot!, x, 0, width, request.PixelHeight,
                 owner, () => ReleaseOwner(request.ConsumerId, actualBytes)));
         }
         finally
         {
             for (int index = 0; index < count; index++) { leases[index]?.Dispose(); }
-            ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Return(leases, clearArray: true);
+            Array.Clear(leases);
         }
     }
 
@@ -470,6 +627,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         left.RunId == right.RunId && left.SpatialViewport == right.SpatialViewport &&
         left.TimeViewport == right.TimeViewport && left.PixelWidth == right.PixelWidth &&
         left.PixelHeight == right.PixelHeight &&
+        left.FollowLiveWindow == right.FollowLiveWindow &&
         left.RenderConfigurationVersion == right.RenderConfigurationVersion &&
         left.EffectiveResampling == right.EffectiveResampling &&
         left.DisplayedSnapshotVersion == right.DisplayedSnapshotVersion &&
@@ -610,17 +768,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         bool sourceIntensityAdmitted = false, sourceMaskAdmitted = false, sourceSegmentsAdmitted = false;
         try
         {
-            sourceIntensityOwner = _pool.Rent(sourceCells);
-            sourceIntensityBytes = sourceIntensityOwner.Memory.Length;
-            AdmitScratchOwner(sourceIntensityOwner, sourceIntensityBytes);
+            sourceIntensityOwner = RentScratchOwner(request.ConsumerId, sourceCells, out sourceIntensityBytes);
             sourceIntensityAdmitted = true;
-            sourceMaskOwner = _pool.Rent(sourceCells);
-            sourceMaskBytes = sourceMaskOwner.Memory.Length;
-            AdmitScratchOwner(sourceMaskOwner, sourceMaskBytes);
+            sourceMaskOwner = RentScratchOwner(request.ConsumerId, sourceCells, out sourceMaskBytes);
             sourceMaskAdmitted = true;
-            sourceSegmentsOwner = _pool.Rent(sourceCells);
-            sourceSegmentsBytes = sourceSegmentsOwner.Memory.Length;
-            AdmitScratchOwner(sourceSegmentsOwner, sourceSegmentsBytes);
+            sourceSegmentsOwner = RentScratchOwner(request.ConsumerId, sourceCells, out sourceSegmentsBytes);
             sourceSegmentsAdmitted = true;
             Memory<byte> sourceIntensity = sourceIntensityOwner.Memory[..sourceCells];
             Memory<byte> sourceMask = sourceMaskOwner.Memory[..sourceCells];
@@ -682,31 +834,84 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         finally
         {
             if (sourceSegmentsOwner is not null) sourceSegmentsOwner.Dispose();
-            if (sourceSegmentsAdmitted) ReleaseScratchBytes(sourceSegmentsBytes);
+            if (sourceSegmentsAdmitted) ReleaseScratchBytes(request.ConsumerId, sourceSegmentsBytes);
             if (sourceMaskOwner is not null) sourceMaskOwner.Dispose();
-            if (sourceMaskAdmitted) ReleaseScratchBytes(sourceMaskBytes);
+            if (sourceMaskAdmitted) ReleaseScratchBytes(request.ConsumerId, sourceMaskBytes);
             if (sourceIntensityOwner is not null) sourceIntensityOwner.Dispose();
-            if (sourceIntensityAdmitted) ReleaseScratchBytes(sourceIntensityBytes);
+            if (sourceIntensityAdmitted) ReleaseScratchBytes(request.ConsumerId, sourceIntensityBytes);
         }
     }
 
-    private void AdmitScratchOwner(IMemoryOwner<byte> owner, long bytes)
+    private IMemoryOwner<byte> RentScratchOwner(string consumerId, int requestedBytes, out long actualBytes)
+    {
+        int reservationBytes = _pool.GetMaximumRentalLength(requestedBytes);
+        if (reservationBytes < requestedBytes)
+        { throw new InvalidOperationException("Raster pool returned an invalid reservation quote."); }
+        if (!TryReserveScratchBytes(consumerId, reservationBytes))
+        { throw new InvalidOperationException("The B-Scan visual scratch quota is exhausted."); }
+        IMemoryOwner<byte> owner;
+        try { owner = _pool.Rent(requestedBytes, BScanVisualBufferKind.Scratch); }
+        catch { ReleaseScratchBytes(consumerId, reservationBytes); throw; }
+        actualBytes = owner.Memory.Length;
+        if (actualBytes < requestedBytes || actualBytes > reservationBytes)
+        {
+            owner.Dispose();
+            ReleaseScratchBytes(consumerId, reservationBytes);
+            throw new InvalidOperationException("Raster pool violated its scratch reservation quote.");
+        }
+        if (TryAdjustScratchReservation(consumerId, reservationBytes, actualBytes)) { return owner; }
+        owner.Dispose();
+        ReleaseScratchBytes(consumerId, reservationBytes);
+        throw new InvalidOperationException("The B-Scan visual scratch quota is exhausted.");
+    }
+
+    private bool TryReserveScratchBytes(string consumerId, long requestedBytes)
     {
         lock (_gate)
         {
             long budget = checked(_ingress.Options.VisualMemoryBudgetBytes - _ingress.VisualBytesReserved);
-            if (owner.Memory.Length == 0 || checked(_activeOwnerBytes + bytes) > budget)
-            { owner.Dispose(); throw new InvalidOperationException("The B-Scan visual scratch quota is exhausted."); }
-            _activeOwnerBytes += bytes;
+            long consumerCeiling = _ingress.Options.VisualMemoryBudgetBytes /
+                Math.Max(1, _consumers.Count);
+            long consumerBytes = _consumerOwnerBytes.GetValueOrDefault(consumerId);
+            if (requestedBytes == 0 || !_consumers.Contains(consumerId) ||
+                checked(_activeOwnerBytes + requestedBytes) > budget ||
+                checked(consumerBytes + requestedBytes) > consumerCeiling)
+            { return false; }
+            _activeOwnerBytes += requestedBytes;
+            _consumerOwnerBytes[consumerId] = checked(consumerBytes + requestedBytes);
             _maximumOwnerBytes = Math.Max(_maximumOwnerBytes, _activeOwnerBytes);
+            return true;
         }
     }
 
-    private void ReleaseScratchBytes(long bytes)
+    private bool TryAdjustScratchReservation(string consumerId, long reservedBytes, long actualBytes)
+    {
+        long delta = checked(actualBytes - reservedBytes);
+        if (delta == 0) { return true; }
+        lock (_gate)
+        {
+            long budget = checked(_ingress.Options.VisualMemoryBudgetBytes - _ingress.VisualBytesReserved);
+            long consumerCeiling = _ingress.Options.VisualMemoryBudgetBytes /
+                Math.Max(1, _consumers.Count);
+            long consumerBytes = _consumerOwnerBytes.GetValueOrDefault(consumerId);
+            if (delta > 0 && (checked(_activeOwnerBytes + delta) > budget ||
+                checked(consumerBytes + delta) > consumerCeiling)) { return false; }
+            _activeOwnerBytes += delta;
+            _consumerOwnerBytes[consumerId] = checked(consumerBytes + delta);
+            _maximumOwnerBytes = Math.Max(_maximumOwnerBytes, _activeOwnerBytes);
+            return true;
+        }
+    }
+
+    private void ReleaseScratchBytes(string consumerId, long bytes)
     {
         lock (_gate)
         {
             _activeOwnerBytes -= bytes;
+            long consumerBytes = checked(_consumerOwnerBytes.GetValueOrDefault(consumerId) - bytes);
+            if (consumerBytes < 0)
+            { throw new InvalidOperationException("The B-Scan consumer scratch ledger is inconsistent."); }
+            _consumerOwnerBytes[consumerId] = consumerBytes;
         }
     }
 
@@ -944,11 +1149,13 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private void PublishMetadata(BScanRenderRequest request, long requestGeneration)
     {
-        BScanTraceStore.BScanTraceLease?[] leases = ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Rent(_ingress.VisualCapacity);
-        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.VisualCapacity),
-            out ConventionalUtFrameMetadata? metadata, out BScanStoreVisualState state);
+        BScanTraceStore.BScanTraceLease?[] leases =
+            new BScanTraceStore.BScanTraceLease?[_ingress.Options.MaximumColumns];
+        int count = _ingress.CaptureVisualLeases(leases.AsSpan(0, _ingress.Options.MaximumColumns),
+            out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
         try
         {
+            ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
             if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null) { return; }
             Array.Sort(leases, 0, count, BScanLeaseComparer.Instance);
             request = WithAcknowledgedDisplay(request);
@@ -971,31 +1178,78 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             var snapshot = CreateSnapshot(metadata, request, state, version, dirty,
                 new(0, 0, request.PixelWidth, request.PixelHeight), full, reason, leases, count) with
             { HorizontalPixelShift = horizontalPixelShift };
+            BeforeMetadataCandidateCommit?.Invoke(snapshot);
             BeforeMetadataCandidateValidation?.Invoke();
-            if (!_ingress.IsVisualStateCurrent(metadata, state.StoreRevision, state.WrapGeneration))
-            { lock (_gate) { _staleCandidates++; _recoveryConsumers.Add(request.ConsumerId); } return; }
+            Audit(BScanVisualAuditEventKind.CommitAttempted, request.ConsumerId, ingressState,
+                requestGeneration, request);
+            Subscription[] observers;
+            BScanVisualCallbackAuditContext? callbackAudit = null;
             lock (_gate)
             {
-                if (_disposed) { return; }
-                if (_pendingGenerations.GetValueOrDefault(request.ConsumerId) != requestGeneration)
+                if (_disposed)
                 {
+                    Audit(BScanVisualAuditEventKind.CandidateRejectedClosed, request.ConsumerId,
+                        ingressState, requestGeneration, request, BScanVisualAuditResult.Closed,
+                        BScanVisualAuditRejection.Closed);
+                    return;
+                }
+                bool ingressCurrent = ingressState is not null &&
+                    ReferenceEquals(ingressState, _ingress.CurrentVisualState);
+                bool storeCurrent = ingressState is not null &&
+                    ReferenceEquals(ingressState.StoreState, ingressState.Store.CurrentVisualState);
+                long currentGeneration = _pendingGenerations.GetValueOrDefault(request.ConsumerId);
+                if (!ingressCurrent || !storeCurrent || currentGeneration != requestGeneration)
+                {
+                    _lastMetadataCandidateAudit = new(request.RunId, requestGeneration,
+                        currentGeneration, ingressCurrent, storeCurrent, false,
+                        _lastGenerationReason, request);
+                    Audit(BScanVisualAuditEventKind.CandidateRejectedStale, request.ConsumerId,
+                        ingressState, requestGeneration, request, BScanVisualAuditResult.Stale,
+                        !ingressCurrent ? BScanVisualAuditRejection.IngressState :
+                        !storeCurrent ? BScanVisualAuditRejection.StoreState :
+                        BScanVisualAuditRejection.Generation);
                     _staleCandidates++;
-                    _recoveryConsumers.Add(request.ConsumerId);
+                    RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request);
+                    long latestGeneration = _pendingGenerations.GetValueOrDefault(request.ConsumerId);
+                    if (_committedGenerations.GetValueOrDefault(request.ConsumerId) != latestGeneration &&
+                        !_pending.ContainsKey(request.ConsumerId) &&
+                        _lastRequests.TryGetValue(request.ConsumerId, out BScanRenderRequest? latest) &&
+                        _ingress.CurrentVisualState is { IsOpen: true } current &&
+                        latest.RunId == current.Metadata.RunId)
+                    { _pending[request.ConsumerId] = latest; }
+                    if (_pending.ContainsKey(request.ConsumerId) && _wake.CurrentCount == 0)
+                    { _wake.Release(); }
                     return;
                 }
                 _lastPublication = _clock.GetTimestamp();
+                _lastMetadataCandidateAudit = new(request.RunId, requestGeneration,
+                    requestGeneration, true, true, true, _lastGenerationReason, request);
                 _currentByConsumer[request.ConsumerId] = snapshot;
+                _committedGenerations[request.ConsumerId] = requestGeneration;
+                if (_bootstrapStates.TryGetValue(request.ConsumerId, out BScanConsumerBootstrapState? bootstrap) &&
+                    bootstrap.RunId == request.RunId)
+                {
+                    _bootstrapConsumers.Remove(request.ConsumerId);
+                    _bootstrapStates.Remove(request.ConsumerId);
+                }
                 _updatesPublished++;
                 if (full) { _fullRefreshes++; } else { _incrementalRefreshes++; }
                 _coalesced = false;
                 _recoveryConsumers.Remove(request.ConsumerId);
-                foreach (Subscription subscription in _subscriptions) { subscription.Offer(new(snapshot)); }
+                observers = [.. _subscriptions];
+                callbackAudit = CaptureCallbackAuditContext(request.ConsumerId, ingressState,
+                    requestGeneration, request);
+                Audit(BScanVisualAuditEventKind.CandidateCommitted, request.ConsumerId,
+                    ingressState, requestGeneration, request, BScanVisualAuditResult.Committed);
             }
+            var update = new BScanVisualUpdate(snapshot);
+            foreach (Subscription subscription in observers)
+            { subscription.Offer(update, callbackAudit); }
         }
         finally
         {
             for (int index = 0; index < count; index++) { leases[index]?.Dispose(); }
-            ArrayPool<BScanTraceStore.BScanTraceLease?>.Shared.Return(leases, clearArray: true);
+            Array.Clear(leases);
         }
     }
 
@@ -1022,17 +1276,34 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private void OnVisualStateChanged()
     {
-        AcquisitionRunId? currentRun = _ingress.CurrentMetadata?.RunId;
+        AcquisitionRunId? currentRun = _ingress.CurrentVisualState is { IsOpen: true } state
+            ? state.Metadata.RunId : null;
         string[] bootstrap;
         lock (_gate)
         {
             if (_disposed) { return; }
             _columnsIndexed++;
+            _visualStateEpoch++;
+            _latestVisualRunId = currentRun;
             foreach ((string consumerId, BScanRenderRequest request) in _lastRequests)
             {
+                if (currentRun is { } run && request.RunId != run)
+                {
+                    _pending.Remove(consumerId);
+                    _pendingGenerations[consumerId] = ++_requestGeneration;
+                    _lastGenerationReason = BScanRequestGenerationReason.RunChanged;
+                    _currentByConsumer.Remove(consumerId);
+                    _displayedByConsumer.Remove(consumerId);
+                    RequestRecoveryUnderLock(consumerId,
+                        _pendingGenerations.GetValueOrDefault(consumerId), request);
+                    _bootstrapConsumers.Add(consumerId);
+                    _bootstrapStates[consumerId] = new(run, BScanBootstrapPhase.Requested, 0, null);
+                    continue;
+                }
                 if (_pending.ContainsKey(consumerId)) { _coalesced = true; _updatesCoalesced++; }
                 _pending[consumerId] = request;
                 _pendingGenerations[consumerId] = ++_requestGeneration;
+                _lastGenerationReason = BScanRequestGenerationReason.VisualStateChanged;
             }
             bootstrap =
             [
@@ -1052,6 +1323,50 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await using ITimer timer = _clock.CreateTimer(_ => completion.TrySetResult(), null, due, Timeout.InfiniteTimeSpan);
         await completion.Task.WaitAsync(token).ConfigureAwait(false);
+    }
+
+    private bool TryReserveRasterOwner(string consumerId, long requestedBytes)
+    {
+        lock (_gate)
+        {
+            long budget = checked(_ingress.Options.VisualMemoryBudgetBytes - _ingress.VisualBytesReserved);
+            long consumerCeiling = _ingress.Options.VisualMemoryBudgetBytes /
+                Math.Max(1, _consumers.Count);
+            long consumerBytes = _consumerOwnerBytes.GetValueOrDefault(consumerId);
+            if (!_consumers.Contains(consumerId) ||
+                _consumerOwners.GetValueOrDefault(consumerId) >=
+                    _ingress.Options.MaximumRasterOwnersPerConsumer ||
+                checked(_activeOwnerBytes + requestedBytes) > budget ||
+                checked(consumerBytes + requestedBytes) > consumerCeiling)
+            { return false; }
+            _activeOwnerBytes += requestedBytes;
+            _activeOwners++;
+            _consumerOwners[consumerId] = _consumerOwners.GetValueOrDefault(consumerId) + 1;
+            _consumerOwnerBytes[consumerId] = consumerBytes + requestedBytes;
+            _maximumOwners = Math.Max(_maximumOwners, _activeOwners);
+            _maximumOwnerBytes = Math.Max(_maximumOwnerBytes, _activeOwnerBytes);
+            return true;
+        }
+    }
+
+    private bool TryAdjustRasterReservation(string consumerId, long reservedBytes, long actualBytes)
+    {
+        long delta = checked(actualBytes - reservedBytes);
+        if (delta == 0) { return true; }
+        lock (_gate)
+        {
+            long budget = checked(_ingress.Options.VisualMemoryBudgetBytes - _ingress.VisualBytesReserved);
+            long consumerCeiling = _ingress.Options.VisualMemoryBudgetBytes /
+                Math.Max(1, _consumers.Count);
+            long consumerBytes = _consumerOwnerBytes.GetValueOrDefault(consumerId);
+            if (delta > 0 && (checked(_activeOwnerBytes + delta) > budget ||
+                checked(consumerBytes + delta) > consumerCeiling))
+            { return false; }
+            _activeOwnerBytes += delta;
+            _consumerOwnerBytes[consumerId] = consumerBytes + delta;
+            _maximumOwnerBytes = Math.Max(_maximumOwnerBytes, _activeOwnerBytes);
+            return true;
+        }
     }
 
     private void ReleaseOwner(string consumerId, long bytes)
@@ -1106,6 +1421,12 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             _pending.Clear();
             _lastRequests.Clear();
             _currentByConsumer.Clear();
+            _bootstrapConsumers.Clear();
+            _bootstrapStates.Clear();
+            _recoveryConsumers.Clear();
+            _pendingGenerations.Clear();
+            _committedGenerations.Clear();
+            _displayedByConsumer.Clear();
             Subscription[] subscriptions = [.. _subscriptions];
             _subscriptions.Clear();
             Task regions = _regionOperations == 0 ? Task.CompletedTask :
@@ -1180,6 +1501,39 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private static string Message(Exception error) => string.IsNullOrWhiteSpace(error.Message) ? error.GetType().Name : error.Message;
 
+    private void Audit(BScanVisualAuditEventKind kind, string consumerId,
+        BScanIngressVisualState? ingressState, long requestGeneration, BScanRenderRequest? request,
+        BScanVisualAuditResult result = BScanVisualAuditResult.None,
+        BScanVisualAuditRejection rejection = BScanVisualAuditRejection.None) =>
+        Volatile.Read(ref _audit)?.Record(kind, consumerId, ingressState, requestGeneration,
+            _presentationEpochs.GetValueOrDefault(consumerId), request, result, rejection);
+
+    private BScanVisualCallbackAuditContext? CaptureCallbackAuditContext(string consumerId,
+        BScanIngressVisualState? ingressState, long requestGeneration, BScanRenderRequest? request)
+    {
+        if (Volatile.Read(ref _audit) is null) { return null; }
+        return new(ingressState, requestGeneration,
+            _presentationEpochs.GetValueOrDefault(consumerId), request);
+    }
+
+    private void Audit(BScanVisualAuditEventKind kind, string consumerId,
+        BScanVisualCallbackAuditContext? context,
+        BScanVisualAuditResult result = BScanVisualAuditResult.None)
+    {
+        BScanVisualAudit? audit = Volatile.Read(ref _audit);
+        if (audit is null || context is not { } captured) { return; }
+        audit.Record(kind, consumerId, captured.IngressState, captured.RequestGeneration,
+            captured.PresentationEpoch, captured.Request, result);
+    }
+
+    private void RequestRecoveryUnderLock(string consumerId, long requestGeneration,
+        BScanRenderRequest? request)
+    {
+        if (!_recoveryConsumers.Add(consumerId)) { return; }
+        Audit(BScanVisualAuditEventKind.RecoveryRequested, consumerId,
+            _ingress.CurrentVisualState, requestGeneration, request, BScanVisualAuditResult.Accepted);
+    }
+
     private sealed class BScanLeaseComparer : IComparer<BScanTraceStore.BScanTraceLease?>
     {
         internal static BScanLeaseComparer Instance { get; } = new();
@@ -1190,15 +1544,17 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private sealed class Subscription(BScanVisualDelivery owner, IObserver<BScanVisualUpdate> observer) : IDisposable
     {
         private readonly object _gate = new();
-        private BScanVisualUpdate? _pending;
+        private BScanPendingCallback? _pending;
         private Task _pump = Task.CompletedTask;
         private bool _detached;
-        internal void Offer(BScanVisualUpdate update)
+        internal void Offer(BScanVisualUpdate update, BScanVisualCallbackAuditContext? audit)
         {
             lock (_gate)
             {
                 if (_detached) { return; }
-                _pending = update;
+                _pending = new(update, audit);
+                owner.Audit(BScanVisualAuditEventKind.CallbackQueued,
+                    update.Snapshot.ConsumerId, audit);
                 if (_pump.IsCompleted) { _pump = Task.Run(Pump); }
             }
         }
@@ -1206,13 +1562,23 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         {
             while (true)
             {
-                BScanVisualUpdate? update;
-                lock (_gate) { if (_detached || _pending is null) { return; } update = _pending; _pending = null; }
+                BScanPendingCallback pending;
+                lock (_gate)
+                {
+                    if (_detached || _pending is not { } available) { return; }
+                    pending = available;
+                    _pending = null;
+                }
                 try
                 {
                     lock (owner._gate) { owner._observerCallbacksStarted++; }
-                    observer.OnNext(update);
+                    owner.Audit(BScanVisualAuditEventKind.CallbackStarted,
+                        pending.Update.Snapshot.ConsumerId, pending.Audit);
+                    observer.OnNext(pending.Update);
                     lock (owner._gate) { owner._observerCallbacksCompleted++; }
+                    owner.Audit(BScanVisualAuditEventKind.CallbackCompleted,
+                        pending.Update.Snapshot.ConsumerId, pending.Audit,
+                        BScanVisualAuditResult.Committed);
                 }
                 catch (Exception error)
                 {
@@ -1239,5 +1605,42 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             if (Task.CurrentId != pump.Id) { pump.GetAwaiter().GetResult(); }
         }
     }
+
+    private readonly record struct BScanPendingCallback(
+        BScanVisualUpdate Update,
+        BScanVisualCallbackAuditContext? Audit);
 }
+
+internal readonly record struct BScanVisualCallbackAuditContext(
+    BScanIngressVisualState? IngressState,
+    long RequestGeneration,
+    long PresentationEpoch,
+    BScanRenderRequest? Request);
+
+internal sealed record BScanMetadataCandidateAudit(
+    AcquisitionRunId RunId,
+    long CandidateGeneration,
+    long CurrentGeneration,
+    bool IngressCurrent,
+    bool StoreCurrent,
+    bool Committed,
+    BScanRequestGenerationReason LastGenerationReason,
+    BScanRenderRequest CandidateRequest);
+
+internal enum BScanRequestGenerationReason
+{
+    None,
+    RequestRender,
+    AcknowledgeDisplayed,
+    RunChanged,
+    VisualStateChanged
+}
+
+internal enum BScanBootstrapPhase { Requested, Pending, Admitted }
+
+internal sealed record BScanConsumerBootstrapState(
+    AcquisitionRunId? RunId,
+    BScanBootstrapPhase Phase,
+    ulong StoreRevision,
+    long? RequestGeneration);
 // End of the neutral B-Scan delivery implementation.

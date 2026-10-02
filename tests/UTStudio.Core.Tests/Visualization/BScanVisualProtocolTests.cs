@@ -320,7 +320,7 @@ public sealed class BScanVisualProtocolTests
     }
 
     [TestMethod]
-    public async Task Bootstrap_candidate_survives_revision_advance_within_same_run_and_wrap()
+    public async Task Bootstrap_candidate_is_stale_when_revision_advances_before_commit()
     {
         await using Harness harness = await Harness.CreateAsync(columns: 4);
         BScanRenderRequest request = harness.Request();
@@ -334,16 +334,12 @@ public sealed class BScanVisualProtocolTests
         release.Set();
 
         BScanRasterResult result = await candidate.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
-        using BScanRasterRegion region = result.Region!;
-        Assert.IsTrue(region.Snapshot.RequiresFullRefresh);
-        Assert.AreEqual(1UL, region.Snapshot.StoreRevision);
-        Assert.AreEqual(0UL, region.Snapshot.WrapGeneration);
+        Assert.AreEqual(BScanRasterResultKind.Stale, result.Kind);
         harness.Delivery.BeforeRasterCandidateValidation = null;
     }
 
     [TestMethod]
-    public async Task Wide_live_window_candidate_survives_concurrent_signal_and_can_continue_sliding()
+    public async Task Wide_live_window_candidate_is_stale_after_concurrent_revision()
     {
         await using Harness harness = await Harness.CreateAsync(columns: 1024);
         for (ulong index = 1; index < 1024; index++)
@@ -372,14 +368,7 @@ public sealed class BScanVisualProtocolTests
         release.Set();
 
         BScanRasterResult result = await candidate.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
-        using BScanRasterRegion region = result.Region!;
-        Assert.AreEqual(1025UL, region.Snapshot.StoreRevision);
-        Assert.AreEqual(new BScanSpatialViewport(1, 0, 1024), region.Snapshot.SpatialViewport);
-        Assert.IsFalse(region.Snapshot.RequiresFullRefresh);
-        Assert.AreEqual(1, region.Snapshot.HorizontalPixelShift);
-        Assert.AreEqual(new BScanRasterRectangle(1023, 0, 1, 4), region.Snapshot.AffectedRegion);
-        Assert.AreEqual(4, region.Pixels.Length);
+        Assert.AreEqual(BScanRasterResultKind.Stale, result.Kind);
         harness.Delivery.BeforeRasterCandidateValidation = null;
     }
 

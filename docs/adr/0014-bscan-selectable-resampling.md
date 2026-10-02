@@ -19,7 +19,7 @@ Esta decisión distingue dos operaciones que no son intercambiables:
   coordenadas físicas y un modelo declarado, produce `SpatialEstimated` con incertidumbre y nunca se
   presenta como adquirido.
 
-`None`, `Nearest`, `Bilinear`, `Bicubic` y `Lanczos` son modos visuales, siempre que operen dentro de
+`None`, `NearestNeighbor` (nearest neighbor), `Bilinear`, `Bicubic` y `Lanczos` son modos visuales, siempre que operen dentro de
 soporte adquirido válido y no cierren gaps. Gaussian Process/Kriging es reconstrucción; queda fuera del
 primer incremento y requerirá otra decisión y aceptación NDT.
 
@@ -39,18 +39,18 @@ primer incremento y requerirá otra decisión y aceptación NDT.
 - Se elige composición de servicios y modelos neutrales; no una jerarquía pública B/C-Scan ni un
   control universal.
 
-## Modelo neutral propuesto
+## Modelo neutral implementado
 
-Se introducirán inicialmente en una carpeta/namespace `Scan2D` de `Visualization.Core`, sin crear ni
-renombrar proyectos:
+Se implementan en la carpeta/namespace `Scan2D` de `Visualization.Core`, sin crear ni renombrar proyectos:
 
-- `Scan2DInterpolationMode`: `None`, `Nearest`, `Bilinear`, `Bicubic`, `Lanczos`.
+- `Scan2DInterpolationMode`: `None`, `NearestNeighbor`, `Bilinear`, `Bicubic`, `Lanczos`.
 - `Scan2DResamplingOptions`: valor inmutable y validado, con modo, parámetros normalizados y versión de
   algoritmo. No contendrá parámetros de Kriging.
 - `ScanRaster2D`/vista equivalente: ancho, alto, stride, formato de intensidad, máscara de validez,
   procedencia y región, sin ownership implícito.
-- `RasterSampleProvenance`: `NoData`, `AcquiredSupport`, `VisualDerived`, `SpatialEstimated`. En este
-  incremento el remuestreador solo puede producir los tres primeros.
+- `RasterSampleProvenance`: `NoData`, `AcquiredSupport`, `VisualDerived`, `SpatialEstimated`. El último
+  queda reservado para un futuro módulo explícito de reconstrucción; los modos visuales solo producen
+  los tres primeros.
 - `RasterRenderSignature`: transformaciones, dimensiones, modo, parámetros canónicos, revisión de
   configuración y versión del algoritmo.
 - una interfaz pequeña `IScan2DResampler` o estrategia interna equivalente, pura y cancelable. El
@@ -107,7 +107,7 @@ peso uno. La acumulación usa orden fijo, precisión definida por implementació
 | Modo | Soporte/kernel | Bordes, `NoData` y gaps | Coste por píxel | Riesgos |
 | --- | --- | --- | ---: | --- |
 | None | Camino actual; sin rejilla intermedia obligatoria | Conserva exactamente el sentinel y discontinuidades actuales | O(1) más formación | Es la referencia de compatibilidad |
-| Nearest | Centro más próximo; empate hacia el índice menor | Válido solo si la celda elegida es válida y del segmento | 1 tap | Bloques/aliasing; no inventa valores |
+| NearestNeighbor | Centro más próximo; empate hacia el índice menor | Válido solo si la celda elegida es válida y del segmento | 1 tap | Bloques/aliasing; no inventa valores |
 | Bilinear | Separable 2×2, radio 1 | Los cuatro taps requeridos deben ser válidos y del mismo segmento; si no, `NoData` | 4 taps | Suavizado, sin overshoot |
 | Bicubic | Keys separable 4×4, radio 2 | Los 16 taps deben ser válidos y del mismo segmento; bordes repiten solo dentro del segmento | 16 taps | Overshoot; clamp final a intensidad [0,255] |
 | Lanczos | `sinc(x)sinc(x/3)`, separable 6×6 con `a=3` fijo | Los 36 taps requeridos son válidos y del mismo segmento; normalización completa determinista; no cruza gaps | 36 taps | Ringing y overshoot; clamp final [0,255] |
@@ -172,13 +172,13 @@ Una convolución separable se descarta por ahora porque cambiaría el orden de a
 microbenchmarks la validación y la acumulación combinadas queda como P3 de profiling futuro, no como
 defecto funcional ni bloqueo de entrega.
 
-La misma preparación por eje se aplica posteriormente a Nearest, Bilinear y Bicubic. Cada render calcula
+La misma preparación por eje se aplica posteriormente a NearestNeighbor, Bilinear y Bicubic. Cada render calcula
 una vez las coordenadas, índices clampados y pesos X/Y y los reutiliza en todo el raster; el bucle por
 píxel conserva la validación completa y el orden de acumulación Y→X. Las tablas se rentan y contabilizan
 de forma acotada y se devuelven en éxito, cancelación o excepción. En 1024², el pico rentado observado es
 8.470.576 bytes para Bilinear y 8.552.496 bytes para Bicubic; ambos permanecen bajo 16 MiB. En una campaña
 diagnóstica corta de una sola ejecución en la misma VM VMware (`2` warmups, `3` iteraciones), el pipeline
-B full 1024² midió 5,232 ms para Nearest, 15,147 ms para Bilinear y 35,720 ms para Bicubic. Estos datos no
+B full 1024² midió 5,232 ms para NearestNeighbor, 15,147 ms para Bilinear y 35,720 ms para Bicubic. Estos datos no
 son baseline. El delivery conserva una única entrada de tablas mientras permanezca idéntica la
 transformación relativa, aunque el origen absoluto avance al desplazarse un B-Scan lleno. La clave incluye
 modo/opciones, dimensiones, viewport, longitudes fuente, coordenada fuente inicial relativa y pasos
@@ -187,7 +187,7 @@ que termine el último render que la usa. Stop y cierre drenan los renders y dev
 vigente, dejando la contabilidad a cero.
 
 En live, la malla fuente neutral se materializa en un owner acotado antes de ejecutar el kernel. Los
-leases del ring se liberan inmediatamente después de esa copia, de modo que Nearest/Bilinear/Bicubic/
+leases del ring se liberan inmediatamente después de esa copia, de modo que NearestNeighbor/Bilinear/Bicubic/
 Lanczos no fijan slots durante el cálculo y no provocan pérdidas de adquisición. Tres owners separados
 guardan intensidad, máscara/procedencia adquirida compartida y segmentos: añaden
 `3 × anchoFuente × altoDestino` bytes lógicos (máximo 3 MiB en 1024²) y permanecen incluidos en el
@@ -237,7 +237,7 @@ prioridad y esperan owners/operaciones con las barreras existentes.
 
 ## Experiencia de usuario
 
-La ventana ofrece un `ComboBox` etiquetado: None, Nearest, Bilinear, Bicubic y Lanczos. El modo activo
+La ventana ofrece un `ComboBox` etiquetado: None, Vecino más próximo (`NearestNeighbor`), Bilinear, Bicubic y Lanczos. El modo activo
 permanece visible junto al raster y accesible mediante nombre, ayuda, estado y teclado; no reutiliza los
 atajos de navegación actuales. Editores específicos aparecen solo cuando proceda, con rango, unidad,
 validación en línea y conservación del último valor válido. El cambio funciona en live y sobre run
@@ -254,7 +254,7 @@ diagnostican sin impedir adquisición, Stop ni cierre.
 
 Son objetivos diagnósticos, no garantías ni baseline aprobada:
 
-| Resolución full | None/Nearest | Bilinear | Bicubic | Lanczos-3 |
+| Resolución full | None/NearestNeighbor | Bilinear | Bicubic | Lanczos-3 |
 | --- | ---: | ---: | ---: | ---: |
 | 256×256 | ≤2 ms | ≤4 ms | ≤8 ms | ≤12 ms |
 | 1024×1024 | ≤12 ms | ≤20 ms | ≤45 ms | ≤80 ms |
@@ -265,6 +265,13 @@ byte fuente+destino 2 MiB, procedencia compacta hasta 1 MiB y scratch reutilizab
 pico neutral adicional objetivo ≤6 MiB (≤0,5 MiB a 256²), que debe probarse dentro de los 16 MiB
 visuales existentes contando owners coexistentes. El pico WPF actual de aproximadamente 12 MiB por
 control se mantiene separado.
+
+La garantía de 16 MiB se expresa como capacidad real de payload poseída, no como working set. Raster,
+scratch, tablas de índices/pesos y copias detached usan el mismo allocator neutral con buckets de
+capacidad conocida. El ledger suma buffers activos y buffers retenidos; no infiere máximos de
+`MemoryPool.Shared` ni `ArrayPool.Shared`. Reutilizar un buffer retenido no duplica el cargo y reemplazar
+una tabla conserva el cargo de la retirada mientras existan usuarios. El overhead CLR y los buffers WPF
+permanecen fuera y se documentan por separado.
 
 Si un modo no alcanza 30 Hz, se coalescen/cancelan candidatos, se conserva el último raster confirmado
 y baja la cadencia efectiva. Nunca se cambia de kernel, se rellena `NoData` o se publica una calidad
@@ -294,19 +301,19 @@ una base pública WPF, un control universal, identidad genérica de scan ni tipo
 extracciones se reconsideran con requisitos C concretos.
 
 La migración conserva las API `BScan*`: primero se añaden tipos neutrales; después `None` demuestra
-equivalencia; Nearest entra full-first; Bilinear/Bicubic y Lanczos incorporan full antes de incremental;
+equivalencia; NearestNeighbor entra full-first; Bilinear/Bicubic y Lanczos incorporan full antes de incremental;
 por último UI y persistencia. Pruebas de arquitectura prohibirán WPF en Core/Presentation, referencias
 de interpoladores a tipos `BScan*`, y dependencia de Visualization.Wpf distinta de Visualization.Core.
 
 En la Fase 1 implementada, `Scan2DSourceGrid` es una vista no propietaria con centros expresados como
 `FirstCenter + index * CenterStep`, stride independiente y buffers separados de intensidad, máscara,
 segmento y procedencia. El resultado usa un único owner acotado con tres slices contiguos byte por celda
-(intensidad, máscara y procedencia). Nearest forma y remuestrea bloques de hasta 64 filas con un owner
+(intensidad, máscara y procedencia). NearestNeighbor forma y remuestrea bloques de hasta 64 filas con un owner
 scratch separado de intensidad, máscara, segmento compacto y procedencia; se contabiliza contra el
 presupuesto global y se libera antes de transferir el resultado. La máscara se transporta
 hasta la LUT WPF y es la única autoridad de NoData. `NearestNeighbor` es full-only en esta fase: una
 petición con base previa fuerza una full por cambio de configuración, porque el dirty B actual describe
-la huella de `None` y todavía no prueba el soporte inverso de Nearest.
+la huella de `None` y todavía no prueba el soporte inverso de NearestNeighbor.
 
 ## Alternativas descartadas
 
@@ -329,7 +336,7 @@ contra datos adquiridos.
 
 ## Parámetros y decisiones aplazadas
 
-Quedan confirmados: semántica compatible de None, Nearest explícito, Keys `a=-0.5`, Lanczos-3 `a=3`, política
+Quedan confirmados: semántica compatible de None, `NearestNeighbor` explícito, Keys `a=-0.5`, Lanczos-3 `a=3`, política
 conservadora de todos los taps válidos, composición en Visualization.Core sin proyecto nuevo y
 exclusión de Kriging del selector visual. Continúa pendiente la conversión de objetivos diagnósticos
 de memoria/tiempo en gates sobre hardware acordado.

@@ -163,7 +163,8 @@ objetivo de 512, raster máximo 1.024 × 1.024 e índice min/max inicialmente po
 32 bloques permiten 256 columnas dentro de 32 MiB. `ArrayPool` no garantiza ese tamaño: si devuelve
 arrays mayores, la capacidad efectiva disminuye o la apertura falla por no alcanzar `MinimumColumns`.
 
-Buffers visuales controlados que pueden coexistir:
+Estimación histórica no normativa de buffers neutrales y WPF que pueden coexistir. Esta tabla no define
+el ledger estricto de 16 MiB: `WriteableBitmap`, staging y backup pertenecen al presupuesto WPF separado.
 
 | Categoría | Máximo de diseño |
 | --- | ---: |
@@ -189,8 +190,29 @@ La derivación por escenario usa el bucket esperado, ancho raster igual al núme
 | 65.535 × 1.024 | 127,998 | 0,125 | 4,000 | 1,000 | 4,000 | 0,004 | 0,250 | 1,000 | ≈138,377 MiB |
 
 La tabla no afirma que todos los escenarios quepan en los defaults: con 32 MiB de trazas, N=65.535
-queda limitado aproximadamente a 256 columnas. El presupuesto visual excluye RF y suma las demás
-categorías; nunca supera ≈10,379 MiB en estos escenarios lógicos.
+queda limitado aproximadamente a 256 columnas. El presupuesto RF es independiente. El límite neutral
+de 16 MiB cubre la capacidad de payload de todos los arrays poseídos por el subsistema visual: payload
+activo más payload retenido por su pool propio. Se carga la capacidad real del backing storage
+(`Array.Length * sizeof(T)`), no la longitud lógica de un slice. Incluye índices persistentes, copias
+detached, selección exacta, raster current y candidate, intensidad, máscara, procedencia, scratch y
+tablas de índices/pesos.
+
+El allocator neutral usa buckets deterministas y un ledger único y linealizable. Reserva capacidad
+conocida antes de crear un array; devolver un buffer activo lo mueve a retenido sin duplicar el cargo,
+y descartar definitivamente su referencia reduce el total poseído. Los buffers retenidos siguen
+contando dentro de los 16 MiB. El cierre elimina referencias retenidas y espera a los owners prestados
+sin liberarlos por fuerza, hasta que el ledger queda en cero.
+
+La cuota proporcional de cada consumidor carga conjuntamente su raster y el scratch transitorio del
+build. Un segundo candidato del mismo consumidor se rechaza si invadiría la cuota del siguiente.
+Tablas de kernel, índices persistentes y detached son payload compartido: se cargan una sola vez al
+ledger global, se mantienen acotados y su capacidad reduce el saldo disponible antes de nuevas
+admisiones; no se duplican artificialmente por consumidor.
+
+Quedan fuera únicamente los bloques RF autoritativos, cubiertos por su presupuesto separado, la
+metadata fija y acotada, y el overhead no portable de objetos y headers del CLR. Los 16 MiB no son una
+garantía sobre working set, tamaño total del heap ni memoria física del proceso: son un límite estricto
+sobre capacidad de payload gestionada y fuertemente referenciada por el subsistema visual neutral.
 
 WPF mantiene un solo bitmap visible. Antes de bloquearlo materializa `AffectedRegion` en staging BGRA32
 rentado. Un refresco completo usa además un bitmap candidato y lo publica solo tras completarlo; un
@@ -245,12 +267,11 @@ nivel fuerzan resincronización. Core produce una región coherente bajo leases 
 del store durante rasterización costosa y valida identidad/revisión antes de publicarla. Un resultado
 obsoleto se descarta. WPF recrea bitmap solo por dimensión física, DPI, formato o run.
 
-El full de establecimiento de una superficie que todavía no tiene base compatible —bootstrap inicial
-o cambio de dimensiones/configuración— puede publicar la revisión coherente capturada bajo leases aunque
-durante su rasterización avance la revisión visual, siempre que sigan siendo la misma run y generación
-de wrap. Así la apertura, reapertura y resize bajo live no sufren inanición; la siguiente publicación
-alcanza el estado reciente. Cualquier candidato incremental, con base compatible previa, o que cruce
-run o wrap conserva la validación estricta y se descarta como obsoleto.
+Todo candidato, incluido el full de bootstrap o de cambio de dimensiones/configuración, se confirma
+solo si conserva exactamente el ticket visual inmutable capturado bajo leases. Si durante el raster
+avanza la revisión visual, cambia la run, el wrap o la firma de render, el candidato queda obsoleto y
+la transición vigente programa o coalesce una nueva recuperación full. No existen excepciones de epoch
+para bootstrap o follow-live.
 
 La Fase 3 distingue la revisión de admisión interna de la revisión visual publicada. Esta última avanza
 al confirmar cada índice y es la que ocupan `BaseStoreRevision` y `StoreRevision` en el protocolo

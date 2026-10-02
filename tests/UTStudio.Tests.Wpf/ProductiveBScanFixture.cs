@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Buffers;
 using System.ComponentModel;
 using System.Windows;
@@ -7,6 +8,7 @@ using UTStudio.App.Wpf.Services;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 using UTStudio.Visualization.Wpf.Controls;
 
 namespace UTStudio.Tests.Wpf;
@@ -18,8 +20,12 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     private readonly TrackingBytePool _rasters = new();
     private readonly Window _host;
     private ulong _sequence;
+    private TaskCompletionSource? _bootstrapRequested;
+    private AcquisitionRunId? _expectedBootstrapRun;
+    private TaskCompletionSource? _metadataCandidateReady;
+    private ManualResetEventSlim? _releaseMetadataCandidate;
 
-    private ProductiveBScanFixture(int preloadedColumns)
+    private ProductiveBScanFixture(int preloadedColumns, bool useSystemDeliveryClock)
     {
         Clock = new();
         var options = new BScanOptions(4 * 1024 * 1024, 16 * 1024 * 1024, 512, 8, 2);
@@ -36,7 +42,18 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
                 Enumerable.Range(0, Metadata.Configuration.SampleCount).Select(value => (short)(value + column)).ToArray());
             if (!indexed.Wait(TimeSpan.FromSeconds(10))) { throw new InvalidOperationException("B-Scan preload did not index."); }
         }
-        Delivery = new(Ingress, Clock, _rasters);
+        Delivery = new(Ingress, useSystemDeliveryClock ? TimeProvider.System : Clock, _rasters);
+        Delivery.AfterBootstrapRequestQueued = (_, runId) =>
+        {
+            if (runId == _expectedBootstrapRun) { _bootstrapRequested?.TrySetResult(); }
+        };
+        Delivery.BeforeMetadataCandidateCommit = snapshot =>
+        {
+            if (snapshot.RunId != _expectedBootstrapRun) { return; }
+            _metadataCandidateReady?.TrySetResult();
+            if (_releaseMetadataCandidate?.Wait(TimeSpan.FromSeconds(10)) == false)
+            { throw new TimeoutException("The metadata candidate barrier was not released."); }
+        };
         Dispatcher = new(System.Windows.Threading.Dispatcher.CurrentDispatcher);
         SharedViewport = new(Dispatcher);
         Selection = new(Dispatcher, Ingress, new AScanProjector());
@@ -63,8 +80,9 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     internal int TraceOwnersOutstanding => _traces.Outstanding;
     internal int RasterOwnersOutstanding => _rasters.Outstanding;
 
-    internal static Task<ProductiveBScanFixture> CreateAsync(int preloadedColumns = 0) =>
-        Task.FromResult(new ProductiveBScanFixture(preloadedColumns));
+    internal static Task<ProductiveBScanFixture> CreateAsync(int preloadedColumns = 0,
+        bool useSystemDeliveryClock = false) =>
+        Task.FromResult(new ProductiveBScanFixture(preloadedColumns, useSystemDeliveryClock));
 
     internal async Task SeedAsync(ulong acquisitionIndex = 0)
     {
@@ -101,8 +119,36 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         await Ingress.WaitForCloseAsync(previous);
         Metadata = new(Metadata.SourceId, new(runId), Metadata.Configuration,
             Metadata.RunStartedAtUtc.AddSeconds(1));
+        _expectedBootstrapRun = Metadata.RunId;
+        _bootstrapRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        _metadataCandidateReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        _releaseMetadataCandidate = new();
         Ingress.OpenRun(Metadata);
     }
+
+    internal Task WaitForBootstrapRequestAsync() =>
+        (_bootstrapRequested ?? throw new InvalidOperationException("No bootstrap is expected."))
+        .Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+    internal Task WaitForMetadataCandidateAsync() =>
+        (_metadataCandidateReady ?? throw new InvalidOperationException("No metadata candidate is expected."))
+        .Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+    internal void ReleaseMetadataCandidate() => _releaseMetadataCandidate?.Set();
+
+    internal async Task WaitForPublicationAsync(AcquisitionRunId runId)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using IDisposable subscription = Delivery.Subscribe(new PublicationObserver(update =>
+        {
+            if (update.Snapshot.ConsumerId == ViewModel.ConsumerId && update.Snapshot.RunId == runId)
+            { completion.TrySetResult(); }
+        }));
+        await completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    internal PublicationProbe ObservePublications(AcquisitionRunId runId) =>
+        new(Delivery, ViewModel.ConsumerId, runId);
 
     internal BScanRenderRequest Request() => new(Metadata.RunId,
         BScanSpatialViewportOperations.Reset(new(0, 127)), ScanTimeViewportOperations.Create(0, .000016),
@@ -110,53 +156,43 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
 
     internal async Task WaitForRevisionAsync(ulong revision)
     {
-        if (ViewModel.State.DisplayedRevision?.StoreRevision >= revision) { return; }
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        PropertyChangedEventHandler handler = (_, args) =>
-        {
-            if (args.PropertyName == nameof(BScanViewModel.State) &&
-                ViewModel.State.DisplayedRevision?.StoreRevision >= revision) { completion.TrySetResult(); }
-        };
-        ViewModel.PropertyChanged += handler;
-        try { await completion.Task.WaitAsync(TimeSpan.FromSeconds(10)); }
-        finally { ViewModel.PropertyChanged -= handler; }
+        await WaitForStateAsync(() => ViewModel.State.DisplayedRevision?.StoreRevision >= revision);
     }
 
     internal async Task WaitForRunAsync(AcquisitionRunId runId, ulong revision)
     {
-        if (ViewModel.State is
-            {
-                RunId: var currentRun,
-                StoreRevision: var currentRevision,
-                Region.Snapshot.RunId: var regionRun
-            } && currentRun == runId && currentRevision >= revision && regionRun == runId) { return; }
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        PropertyChangedEventHandler handler = (_, args) =>
+        await WaitForStateAsync(() => ViewModel.State is
         {
-            if (args.PropertyName == nameof(BScanViewModel.State) && ViewModel.State is
-                {
-                    RunId: var currentRun,
-                    StoreRevision: var currentRevision,
-                    Region.Snapshot.RunId: var regionRun
-                } && currentRun == runId &&
-                currentRevision >= revision && regionRun == runId) { completion.TrySetResult(); }
-        };
-        ViewModel.PropertyChanged += handler;
-        try { await completion.Task.WaitAsync(TimeSpan.FromSeconds(10)); }
-        finally { ViewModel.PropertyChanged -= handler; }
+            RunId: var currentRun,
+            StoreRevision: var currentRevision,
+            Region.Snapshot.RunId: var regionRun
+        } && currentRun == runId && currentRevision >= revision && regionRun == runId);
     }
 
     internal async Task WaitForTokenChangeAsync(BScanPresentedRegionToken token)
     {
-        if (ViewModel.State.Region is { Token: var current } && current != token) { return; }
+        await WaitForStateAsync(() =>
+            ViewModel.State.Region is { Token: var current } && current != token);
+    }
+
+    internal Task WaitForPresentedModeAsync(Scan2DInterpolationMode mode) =>
+        WaitForStateAsync(() => ViewModel.State.PresentedResamplingMode == mode &&
+            Control.AppliedSnapshot?.Resampling.Mode == mode);
+
+    private async Task WaitForStateAsync(Func<bool> predicate)
+    {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         PropertyChangedEventHandler handler = (_, args) =>
         {
-            if (args.PropertyName == nameof(BScanViewModel.State) &&
-                ViewModel.State.Region is { Token: var current } && current != token) { completion.TrySetResult(); }
+            if (args.PropertyName == nameof(BScanViewModel.State) && predicate())
+            { completion.TrySetResult(); }
         };
         ViewModel.PropertyChanged += handler;
-        try { await completion.Task.WaitAsync(TimeSpan.FromSeconds(10)); }
+        try
+        {
+            if (predicate()) { completion.TrySetResult(); }
+            await completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
         finally { ViewModel.PropertyChanged -= handler; }
     }
 
@@ -169,6 +205,11 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        Delivery.AfterBootstrapRequestQueued = null;
+        Delivery.BeforeMetadataCandidateCommit = null;
+        Delivery.BeforeRasterCandidateCommit = null;
+        _releaseMetadataCandidate?.Set();
+        _releaseMetadataCandidate?.Dispose();
         Adapter.Dispose();
         await ViewModel.DisposeAsync();
         Assert.AreEqual(0, Delivery.ActiveConsumerCount);
@@ -217,5 +258,45 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         private T[]? _buffer = buffer;
         public Memory<T> Memory => _buffer ?? throw new ObjectDisposedException(nameof(Owner<T>));
         public void Dispose() { if (Interlocked.Exchange(ref _buffer, null) is not null) { release(); } }
+    }
+
+    private sealed class PublicationObserver(Action<BScanVisualUpdate> onNext) : IObserver<BScanVisualUpdate>
+    {
+        public void OnNext(BScanVisualUpdate value) => onNext(value);
+        public void OnError(Exception error) { }
+        public void OnCompleted() { }
+    }
+
+    internal sealed class PublicationProbe : IObserver<BScanVisualUpdate>, IDisposable
+    {
+        private readonly string _consumerId;
+        private readonly AcquisitionRunId _runId;
+        private readonly IDisposable _subscription;
+        private readonly TaskCompletionSource _first =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _count;
+        private readonly ConcurrentQueue<Scan2DInterpolationMode> _publishedModes = new();
+
+        internal PublicationProbe(BScanVisualDelivery delivery, string consumerId,
+            AcquisitionRunId runId)
+        {
+            _consumerId = consumerId;
+            _runId = runId;
+            _subscription = delivery.Subscribe(this);
+        }
+
+        internal int Count => Volatile.Read(ref _count);
+        internal Scan2DInterpolationMode[] PublishedModes => _publishedModes.ToArray();
+        internal Task WaitForFirstAsync() => _first.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        public void OnNext(BScanVisualUpdate value)
+        {
+            if (value.Snapshot.ConsumerId != _consumerId || value.Snapshot.RunId != _runId) { return; }
+            _publishedModes.Enqueue(value.Snapshot.Resampling.Mode);
+            Interlocked.Increment(ref _count);
+            _first.TrySetResult();
+        }
+        public void OnError(Exception error) { }
+        public void OnCompleted() { }
+        public void Dispose() => _subscription.Dispose();
     }
 }

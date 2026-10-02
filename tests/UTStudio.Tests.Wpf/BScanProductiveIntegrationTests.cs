@@ -13,6 +13,137 @@ namespace UTStudio.Tests.Wpf;
 public sealed class BScanProductiveIntegrationTests
 {
     [TestMethod]
+    public Task Resampling_selector_tracks_programmatic_user_and_reopen_changes_once() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
+        await fixture.WaitForRevisionAsync(4);
+        long beforeInitialWindow = fixture.Delivery.RenderRequestCount;
+        var first = new BScanWindow(fixture.ViewModel, () => { }, () => Task.CompletedTask);
+        Assert.AreEqual(beforeInitialWindow, fixture.Delivery.RenderRequestCount,
+            "Constructing the selector must not echo the initial ViewModel value.");
+        first.Show();
+        try
+        {
+            await first.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            long afterInitialSettled = fixture.Delivery.RenderRequestCount;
+            await first.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(afterInitialSettled, fixture.Delivery.RenderRequestCount,
+                "Initial ViewModel-to-selector synchronization must not echo a second render request.");
+            long beforeProgrammatic = fixture.Delivery.RenderRequestCount;
+            long intentions = first.ResamplingIntentCount;
+            fixture.ViewModel.SetResamplingMode(Scan2DInterpolationMode.Lanczos);
+            await first.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(Scan2DInterpolationMode.Lanczos, first.SelectedResamplingMode);
+            Assert.IsTrue(first.IsLanczosWarningVisible);
+            Assert.AreEqual(intentions, first.ResamplingIntentCount);
+            Assert.AreEqual(beforeProgrammatic + 1, fixture.Delivery.RenderRequestCount);
+
+            long beforeUser = fixture.Delivery.RenderRequestCount;
+            first.SelectResamplingMode(Scan2DInterpolationMode.Bicubic);
+            await first.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(Scan2DInterpolationMode.Bicubic,
+                fixture.ViewModel.State.RequestedResamplingMode);
+            Assert.IsFalse(first.IsLanczosWarningVisible);
+            Assert.AreEqual(intentions + 1, first.ResamplingIntentCount);
+            Assert.AreEqual(beforeUser + 1, fixture.Delivery.RenderRequestCount);
+            long afterUser = fixture.Delivery.RenderRequestCount;
+
+            first.SelectResamplingMode(Scan2DInterpolationMode.Bicubic);
+            await first.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(afterUser, fixture.Delivery.RenderRequestCount);
+            Assert.AreEqual(intentions + 1, first.ResamplingIntentCount);
+
+            long beforeRapid = fixture.Delivery.RenderRequestCount;
+            using ProductiveBScanFixture.PublicationProbe rapidPublications =
+                fixture.ObservePublications(fixture.Metadata.RunId);
+            await rapidPublications.WaitForFirstAsync();
+            int publicationsBeforeRapid = rapidPublications.Count;
+            using var firstCandidateEntered = new ManualResetEventSlim();
+            using var releaseFirstCandidate = new ManualResetEventSlim();
+            int blockedCandidate = 0;
+            fixture.Delivery.BeforeRasterCandidateCommit = () =>
+            {
+                if (Interlocked.CompareExchange(ref blockedCandidate, 1, 0) != 0) { return; }
+                firstCandidateEntered.Set();
+                releaseFirstCandidate.Wait();
+            };
+            first.SelectResamplingMode(Scan2DInterpolationMode.None);
+            Assert.IsTrue(await Task.Run(() => firstCandidateEntered.Wait(TimeSpan.FromSeconds(5))));
+            first.SelectResamplingMode(Scan2DInterpolationMode.Bilinear);
+            first.SelectResamplingMode(Scan2DInterpolationMode.Lanczos);
+            releaseFirstCandidate.Set();
+            await first.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(intentions + 4, first.ResamplingIntentCount);
+            Assert.AreEqual(beforeRapid + 3, fixture.Delivery.RenderRequestCount);
+            Assert.AreEqual(Scan2DInterpolationMode.Lanczos,
+                fixture.ViewModel.State.RequestedResamplingMode);
+            Assert.IsTrue(first.IsLanczosWarningVisible);
+
+            await fixture.Clock.NextTimerAsync();
+            fixture.Clock.Advance(BScanVisualDelivery.MinimumPublicationInterval);
+            await fixture.WaitForPresentedModeAsync(Scan2DInterpolationMode.Lanczos);
+            fixture.Delivery.BeforeRasterCandidateCommit = null;
+            CollectionAssert.AreEqual(
+                new[] { Scan2DInterpolationMode.Lanczos },
+                rapidPublications.PublishedModes.Skip(publicationsBeforeRapid).ToArray(),
+                "Only the last rapid user intention may be published.");
+
+            Guid nextRun = Guid.Parse("99000000-0000-0000-0000-000000000101");
+            var nextRunId = new AcquisitionRunId(nextRun);
+            await fixture.StartNewRunAsync(nextRun);
+            await fixture.AddIndexedAsync(1000);
+            await fixture.WaitForBootstrapRequestAsync();
+            await fixture.Clock.NextTimerAsync();
+            fixture.Clock.Advance(BScanVisualDelivery.MinimumPublicationInterval);
+            await fixture.WaitForMetadataCandidateAsync();
+            fixture.ReleaseMetadataCandidate();
+            await fixture.WaitForRunAsync(nextRunId, 1);
+            await first.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(Scan2DInterpolationMode.Lanczos,
+                fixture.ViewModel.State.RequestedResamplingMode);
+            Assert.AreEqual(Scan2DInterpolationMode.Lanczos, first.SelectedResamplingMode);
+            Assert.IsTrue(first.IsLanczosWarningVisible);
+        }
+        finally { await first.CloseOwnedAsync(); }
+
+        long closedIntentions = first.ResamplingIntentCount;
+        fixture.ViewModel.SetResamplingMode(Scan2DInterpolationMode.Bicubic);
+        await first.Dispatcher.InvokeAsync(() => { },
+            System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        Assert.AreEqual(Scan2DInterpolationMode.Lanczos, first.SelectedResamplingMode,
+            "A closed window must be detached from ViewModel changes.");
+        Assert.IsTrue(first.IsLanczosWarningVisible);
+        Assert.AreEqual(closedIntentions, first.ResamplingIntentCount);
+
+        long beforeReopenedWindow = fixture.Delivery.RenderRequestCount;
+        var reopened = new BScanWindow(fixture.ViewModel, () => { }, () => Task.CompletedTask);
+        Assert.AreEqual(beforeReopenedWindow, fixture.Delivery.RenderRequestCount,
+            "Reconstructing the selector must not echo the current ViewModel value.");
+        reopened.Show();
+        try
+        {
+            await reopened.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(Scan2DInterpolationMode.Bicubic, reopened.SelectedResamplingMode);
+            Assert.IsFalse(reopened.IsLanczosWarningVisible);
+            Assert.AreEqual(0L, reopened.ResamplingIntentCount);
+            long afterReopenSettled = fixture.Delivery.RenderRequestCount;
+            await reopened.Dispatcher.InvokeAsync(() => { },
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(afterReopenSettled, fixture.Delivery.RenderRequestCount,
+                "Reopening must reflect the current preference without a selector echo.");
+        }
+        finally { await reopened.CloseOwnedAsync(); }
+    });
+
+    [TestMethod]
     public Task Active_store_survives_window_close_and_reopens_with_balanced_consumers() => StaTest.Run(async () =>
     {
         await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
@@ -89,18 +220,62 @@ public sealed class BScanProductiveIntegrationTests
     {
         await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
         await fixture.WaitForRevisionAsync(4);
-        ulong publicationsBefore = fixture.Delivery.Diagnostics.VisualUpdatesPublished;
+        fixture.Delivery.EnableAudit(128);
+        BScanRenderRequest lateRunA = fixture.Request();
+        using ProductiveBScanFixture.PublicationProbe priorRunPublications =
+            fixture.ObservePublications(fixture.Metadata.RunId);
+        await priorRunPublications.WaitForFirstAsync();
+        Assert.AreEqual(1, priorRunPublications.Count);
         Guid nextRun = Guid.Parse("99000000-0000-0000-0000-000000000100");
+        var nextRunId = new AcquisitionRunId(nextRun);
+        using ProductiveBScanFixture.PublicationProbe publications =
+            fixture.ObservePublications(nextRunId);
 
         await fixture.StartNewRunAsync(nextRun);
         await fixture.AddIndexedAsync(1000);
+        await fixture.WaitForBootstrapRequestAsync();
+        BScanRenderRequest bootstrapB = fixture.Delivery.GetLastRequest(fixture.ViewModel.ConsumerId)!;
+        Assert.AreEqual(nextRunId, bootstrapB.RunId);
+        long requestsAfterBootstrapB = fixture.Delivery.RenderRequestCount;
+        BScanVisualAuditEntry admittedB = fixture.Delivery.AuditSnapshot.Entries.Single(entry =>
+            entry.Kind == BScanVisualAuditEventKind.BuildAdmitted && entry.RunId == nextRunId);
+
+        fixture.Delivery.RequestRender(lateRunA);
+
+        Assert.AreEqual(requestsAfterBootstrapB, fixture.Delivery.RenderRequestCount);
+        Assert.AreEqual(bootstrapB,
+            fixture.Delivery.GetLastRequest(fixture.ViewModel.ConsumerId));
+        Assert.AreEqual(1, fixture.Delivery.PendingBootstrapCount);
+        Assert.IsFalse(fixture.Delivery.AuditSnapshot.Entries.Any(entry =>
+            entry.Kind == BScanVisualAuditEventKind.BuildAdmitted &&
+            entry.RunId == lateRunA.RunId &&
+            entry.Sequence > admittedB.Sequence));
         await fixture.Clock.NextTimerAsync();
         fixture.Clock.Advance(BScanVisualDelivery.MinimumPublicationInterval);
-        await fixture.WaitForRunAsync(new(nextRun), 1);
+        await fixture.WaitForMetadataCandidateAsync();
+        fixture.ReleaseMetadataCandidate();
+        try { await publications.WaitForFirstAsync(); }
+        catch (TimeoutException)
+        {
+            Assert.Fail($"New-run publication was not committed; " +
+                $"lastError={fixture.Delivery.Diagnostics.LastVisualError}; " +
+                $"pendingBootstrap={fixture.Delivery.PendingBootstrapCount}; " +
+                $"audit={fixture.Delivery.LastMetadataCandidateAudit}; " +
+                $"lastRequest={fixture.Delivery.GetLastRequest(fixture.ViewModel.ConsumerId)}; " +
+                $"published={fixture.Delivery.Diagnostics.VisualUpdatesPublished}.");
+        }
+        await fixture.WaitForRunAsync(nextRunId, 1);
+        await System.Windows.Threading.Dispatcher.Yield(
+            System.Windows.Threading.DispatcherPriority.ApplicationIdle);
 
-        Assert.AreEqual(new AcquisitionRunId(nextRun), fixture.Control.AppliedSnapshot!.RunId);
+        Assert.AreEqual(nextRunId, fixture.Control.AppliedSnapshot!.RunId);
         Assert.IsTrue(fixture.Control.AppliedSnapshot.RequiresFullRefresh);
-        Assert.AreEqual(publicationsBefore + 1, fixture.Delivery.Diagnostics.VisualUpdatesPublished);
+        Assert.AreEqual(1, priorRunPublications.Count);
+        Assert.AreEqual(1, publications.Count);
+        Assert.IsTrue(fixture.Delivery.AuditSnapshot.Entries.Any(entry =>
+            entry.Kind == BScanVisualAuditEventKind.CandidateCommitted &&
+            entry.RunId == nextRunId &&
+            entry.RequestGeneration == admittedB.RequestGeneration));
         Assert.AreEqual(0, fixture.Delivery.PendingBootstrapCount);
         Assert.AreEqual(1, fixture.Delivery.RetainedSnapshotCount);
         fixture.AssertOpenBalances();

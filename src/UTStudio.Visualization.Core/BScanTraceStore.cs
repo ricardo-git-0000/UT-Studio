@@ -32,11 +32,14 @@ internal sealed class BScanTraceStore
     private const int VisualWriteHeadroom = 4;
     private readonly object _gate = new();
     private readonly IShortArrayPool _pool;
+    private readonly BoundedBScanVisualBufferPool _visualBuffers;
+    private readonly bool _ownsVisualBuffers;
     private readonly int _sampleCount;
     private readonly int _bucketCount;
     private readonly int _bucketSamples;
     private readonly Block[] _blocks;
     private readonly Slot[] _slots;
+    private readonly List<IBScanVisualBufferOwner<BScanIndexedMinMax>> _slotIndexOwners = [];
     private readonly HashSet<BScanTraceIdentity> _evicted = [];
     private readonly Queue<BScanTraceIdentity> _evictionOrder = [];
     private TaskCompletionSource? _leaseDrain;
@@ -50,12 +53,15 @@ internal sealed class BScanTraceStore
     private ulong _wrapGeneration;
     private ulong _visualRevision;
     private ulong _visualWrapGeneration;
+    private BScanStoreVisualState _visualState;
+    private BScanStoreVisualState? _writeBaselineVisualState;
     private int _activeLeases;
     private int _activeWriters;
     private int _maximumLeases;
     private ulong _accepted, _rejectedPinned, _evictions, _superseded;
 
-    internal BScanTraceStore(int sampleCount, BScanOptions options, IShortArrayPool? pool = null)
+    internal BScanTraceStore(int sampleCount, BScanOptions options, IShortArrayPool? pool = null,
+        BoundedBScanVisualBufferPool? visualBuffers = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentOutOfRangeException.ThrowIfLessThan(sampleCount, 1);
@@ -63,6 +69,8 @@ internal sealed class BScanTraceStore
         _bucketSamples = options.IndexBucketSamples;
         _bucketCount = checked((sampleCount + _bucketSamples - 1) / _bucketSamples);
         _pool = pool ?? SharedShortArrayPool.Instance;
+        _visualBuffers = visualBuffers ?? new(options.VisualMemoryBudgetBytes);
+        _ownsVisualBuffers = visualBuffers is null;
         var blocks = new List<Block>();
         long rentedBytes = 0;
         int columns = 0;
@@ -118,12 +126,17 @@ internal sealed class BScanTraceStore
             {
                 for (int column = 0; column < _blocks[blockIndex].Columns; column++)
                 {
-                    _slots[slotIndex++] = new(blockIndex, checked(column * sampleCount), _bucketCount);
+                    IBScanVisualBufferOwner<BScanIndexedMinMax> indexOwner =
+                        _visualBuffers.Rent<BScanIndexedMinMax>(_bucketCount,
+                            BScanVisualBufferKind.StoreIndex);
+                    _slotIndexOwners.Add(indexOwner);
+                    _slots[slotIndex++] = new(blockIndex, checked(column * sampleCount), indexOwner.Array);
                 }
             }
             RentedBytes = rentedBytes;
             LogicalBytes = checked((long)columns * sampleCount * sizeof(short));
             VisualLogicalBytes = checked(fixedVisualBytes + checked((long)columns * visualBytesPerColumn));
+            _visualState = new(0, 0, _sampleCount, _bucketSamples, null, true);
         }
         catch (Exception original)
         {
@@ -133,6 +146,9 @@ internal sealed class BScanTraceStore
                 try { _pool.Return(block.Samples); }
                 catch (Exception error) { cleanup.Add(error); }
             }
+            foreach (IBScanVisualBufferOwner<BScanIndexedMinMax> owner in _slotIndexOwners)
+            { owner.Dispose(); }
+            _slotIndexOwners.Clear();
             if (cleanup.Count != 0) { throw new AggregateException([original, .. cleanup]); }
             throw;
         }
@@ -161,6 +177,8 @@ internal sealed class BScanTraceStore
             ulong nextGeneration = checked(slot.Generation + 1);
             slot.Writing = true;
             _activeWriters++;
+            _writeBaselineVisualState = _visualState;
+            Volatile.Write(ref _visualState, _visualState with { IsComplete = false });
             return new(this, _nextSlot, nextGeneration,
                 _blocks[slot.BlockIndex].Samples.AsMemory(slot.Offset, _sampleCount));
         }
@@ -172,6 +190,7 @@ internal sealed class BScanTraceStore
         lock (_gate)
         {
             Slot slot = _slots[slotIndex];
+            bool visualChanged = false;
             try
             {
                 if (!_accepting || !slot.Writing || generation != checked(slot.Generation + 1))
@@ -193,12 +212,17 @@ internal sealed class BScanTraceStore
                 _nextSlot = (_nextSlot + 1) % _slots.Length;
                 if (_nextSlot == 0) { _wrapGeneration = checked(_wrapGeneration + 1); }
                 _accepted++;
+                visualChanged = true;
                 return new(StoreWriteKind.Accepted, slot.Descriptor);
             }
             finally
             {
                 slot.Writing = false;
                 _activeWriters--;
+                Volatile.Write(ref _visualState, visualChanged
+                    ? CreateVisualStateUnderLock()
+                    : _writeBaselineVisualState ?? CreateVisualStateUnderLock());
+                _writeBaselineVisualState = null;
                 if (_activeWriters == 0) { drain = _writerDrain; }
                 drain?.TrySetResult();
             }
@@ -214,6 +238,9 @@ internal sealed class BScanTraceStore
             if (!slot.Writing || generation != checked(slot.Generation + 1)) { return; }
             slot.Writing = false;
             _activeWriters--;
+            Volatile.Write(ref _visualState,
+                _writeBaselineVisualState ?? CreateVisualStateUnderLock());
+            _writeBaselineVisualState = null;
             if (_activeWriters == 0) { drain = _writerDrain; }
         }
         drain?.TrySetResult();
@@ -286,8 +313,14 @@ internal sealed class BScanTraceStore
             slot.IndexedGeneration = generation;
             slot.VisualRevision = checked(++_visualRevision);
             _visualWrapGeneration = Math.Max(_visualWrapGeneration, slot.AcceptedWrapGeneration);
+            Volatile.Write(ref _visualState, CreateVisualStateUnderLock());
             return true;
         }
+    }
+
+    internal BScanStoreVisualState CurrentVisualState
+    {
+        get => Volatile.Read(ref _visualState);
     }
 
     internal BScanMinMax[]? CopyIndex(BScanTraceIdentity identity)
@@ -328,7 +361,8 @@ internal sealed class BScanTraceStore
         lock (_gate) { _superseded++; }
     }
 
-    internal int CaptureVisualLeases(Span<BScanTraceLease?> destination, out BScanStoreVisualState state)
+    internal int CaptureVisualLeases(BScanStoreVisualState expected,
+        Span<BScanTraceLease?> destination, out BScanStoreVisualState state)
     {
         lock (_gate)
         {
@@ -336,9 +370,9 @@ internal sealed class BScanTraceStore
             {
                 throw new ArgumentException("Visual capture requires storage for the complete ring.", nameof(destination));
             }
-            if (!_leasesAllowed)
+            if (!_leasesAllowed || !ReferenceEquals(_visualState, expected) || !expected.IsComplete)
             {
-                state = default;
+                state = expected;
                 return 0;
             }
             int count = 0;
@@ -351,23 +385,28 @@ internal sealed class BScanTraceStore
                 BScanTraceDescriptor descriptor = slot.Descriptor!;
                 if (IsWriteHeadroomSlot(slotIndex))
                 {
-                    short[] samples = ArrayPool<short>.Shared.Rent(_sampleCount);
-                    BScanIndexedMinMax[] index = ArrayPool<BScanIndexedMinMax>.Shared.Rent(_bucketCount);
+                    IBScanVisualBufferOwner<short> samplesOwner = _visualBuffers.Rent<short>(
+                        _sampleCount, BScanVisualBufferKind.DetachedSamples);
+                    IBScanVisualBufferOwner<BScanIndexedMinMax>? indexOwner = null;
                     try
                     {
+                        indexOwner = _visualBuffers.Rent<BScanIndexedMinMax>(
+                            _bucketCount, BScanVisualBufferKind.DetachedIndex);
+                        short[] samples = samplesOwner.Array;
+                        BScanIndexedMinMax[] index = indexOwner.Array;
                         _blocks[slot.BlockIndex].Samples.AsSpan(slot.Offset, _sampleCount).CopyTo(samples);
                         slot.Index.AsSpan().CopyTo(index);
                         destination[count++] = new(descriptor, samples.AsMemory(0, _sampleCount),
                             index.AsMemory(0, _bucketCount), slot.VisualRevision, () =>
                             {
-                                ArrayPool<short>.Shared.Return(samples);
-                                ArrayPool<BScanIndexedMinMax>.Shared.Return(index);
+                                samplesOwner.Dispose();
+                                indexOwner.Dispose();
                             });
                     }
                     catch
                     {
-                        ArrayPool<short>.Shared.Return(samples);
-                        ArrayPool<BScanIndexedMinMax>.Shared.Return(index);
+                        indexOwner?.Dispose();
+                        samplesOwner.Dispose();
                         throw;
                     }
                 }
@@ -383,10 +422,28 @@ internal sealed class BScanTraceStore
                 minimum = Math.Min(minimum, descriptor.AcquisitionIndex);
                 maximum = Math.Max(maximum, descriptor.AcquisitionIndex);
             }
-            state = new(_visualRevision, _visualWrapGeneration, _sampleCount, _bucketSamples, count == 0 ? null :
-                new(minimum, maximum));
+            state = _visualState;
             return count;
         }
+    }
+
+    internal int CaptureVisualLeases(Span<BScanTraceLease?> destination,
+        out BScanStoreVisualState state) =>
+        CaptureVisualLeases(CurrentVisualState, destination, out state);
+
+    private BScanStoreVisualState CreateVisualStateUnderLock()
+    {
+        ulong minimum = ulong.MaxValue, maximum = 0;
+        bool any = false;
+        foreach (Slot slot in _slots)
+        {
+            if (!slot.Committed || slot.Writing || slot.IndexedGeneration != slot.Generation) { continue; }
+            any = true;
+            minimum = Math.Min(minimum, slot.Descriptor!.AcquisitionIndex);
+            maximum = Math.Max(maximum, slot.Descriptor.AcquisitionIndex);
+        }
+        return new(_visualRevision, _visualWrapGeneration, _sampleCount, _bucketSamples,
+            any ? new(minimum, maximum) : null, HasCompleteVisualStateUnderLock());
     }
 
     private bool IsWriteHeadroomSlot(int slotIndex)
@@ -423,6 +480,7 @@ internal sealed class BScanTraceStore
         {
             _accepting = false;
             _leasesAllowed = false;
+            Volatile.Write(ref _visualState, _visualState with { IsComplete = false });
             return _closeTask ??= CloseCoreAsync();
         }
     }
@@ -455,6 +513,7 @@ internal sealed class BScanTraceStore
                 (_leaseDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
         }
         await Task.WhenAll(writers, leases).ConfigureAwait(false);
+        bool disposeOwnedVisualBuffers = false;
         lock (_gate)
         {
             if (_returned) { return; }
@@ -470,9 +529,14 @@ internal sealed class BScanTraceStore
                 }
                 catch (Exception error) { errors.Add(error); }
             }
+            foreach (IBScanVisualBufferOwner<BScanIndexedMinMax> owner in _slotIndexOwners)
+            { owner.Dispose(); }
+            _slotIndexOwners.Clear();
             _returned = errors.Count == 0 && BlocksReturned == BlocksRented;
+            disposeOwnedVisualBuffers = _ownsVisualBuffers;
             if (errors.Count != 0) { throw new AggregateException(errors); }
         }
+        if (disposeOwnedVisualBuffers) { await _visualBuffers.DisposeAsync().ConfigureAwait(false); }
     }
 
     internal StoreStatistics Statistics
@@ -558,7 +622,7 @@ internal sealed class BScanTraceStore
         internal int Columns { get; } = columns;
         internal bool ReturnAttempted;
     }
-    private sealed class Slot(int blockIndex, int offset, int bucketCount)
+    private sealed class Slot(int blockIndex, int offset, BScanIndexedMinMax[] index)
     {
         internal int BlockIndex { get; } = blockIndex;
         internal int Offset { get; } = offset;
@@ -570,7 +634,7 @@ internal sealed class BScanTraceStore
         internal int Leases;
         internal bool Committed;
         internal bool Writing;
-        internal BScanIndexedMinMax[] Index { get; } = new BScanIndexedMinMax[bucketCount];
+        internal BScanIndexedMinMax[] Index { get; } = index;
     }
 
     internal sealed class StoreWriteReservation
@@ -624,12 +688,13 @@ internal enum BScanResidence { Available, NotAvailable, Evicted }
 internal readonly record struct BScanIndexCandidate(BScanTraceIdentity Identity, ulong Generation);
 internal readonly record struct BScanIndexedMinMax(
     short Minimum, ushort MinimumOffset, short Maximum, ushort MaximumOffset);
-internal readonly record struct BScanStoreVisualState(
+internal sealed record BScanStoreVisualState(
     ulong StoreRevision,
     ulong WrapGeneration,
     int SampleCount,
     int IndexBucketSamples,
-    BScanAcquisitionRange? ResidentRange);
+    BScanAcquisitionRange? ResidentRange,
+    bool IsComplete);
 internal readonly record struct StoreStatistics(
     ulong Accepted, ulong RejectedPinned, ulong Evicted, ulong Superseded,
     int ActiveLeases, int MaximumLeases, int BlocksRented, int BlocksReturned,

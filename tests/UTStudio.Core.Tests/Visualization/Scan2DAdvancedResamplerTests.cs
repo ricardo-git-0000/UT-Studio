@@ -7,6 +7,36 @@ namespace UTStudio.Core.Tests.Visualization;
 public sealed class Scan2DAdvancedResamplerTests
 {
     [TestMethod]
+    public void PublicEnumValuesRemainStableAndSpatialEstimatedIsReserved()
+    {
+        CollectionAssert.AreEqual(new[] { 0, 1, 2, 3, 4 },
+            Enum.GetValues<Scan2DInterpolationMode>().Select(value => (int)value).ToArray());
+        CollectionAssert.AreEqual(new byte[] { 0, 1, 2, 3 },
+            Enum.GetValues<Scan2DSampleProvenance>().Select(value => (byte)value).ToArray());
+    }
+
+    [TestMethod]
+    [DataRow(Scan2DInterpolationMode.None)]
+    [DataRow(Scan2DInterpolationMode.NearestNeighbor)]
+    [DataRow(Scan2DInterpolationMode.Bilinear)]
+    [DataRow(Scan2DInterpolationMode.Bicubic)]
+    [DataRow(Scan2DInterpolationMode.Lanczos)]
+    public void VisualModesNeverProduceSpatialEstimated(Scan2DInterpolationMode mode)
+    {
+        int destinationSize = mode == Scan2DInterpolationMode.None ? 2 : 3;
+        Scan2DGridGeometry destination = mode == Scan2DInterpolationMode.None
+            ? new(0, 0, 1, 1)
+            : SameExtent(2, 2, destinationSize, destinationSize);
+        using Scan2DRenderResult result = Render([10, 20, 30, 40], 2, 2,
+            destination, destinationSize, destinationSize, mode);
+
+        Assert.IsFalse(result.Provenance.Span.Contains((byte)Scan2DSampleProvenance.SpatialEstimated));
+        Assert.IsTrue(result.Provenance.Span.ToArray().All(value => value is
+            (byte)Scan2DSampleProvenance.AcquiredSupport or
+            (byte)Scan2DSampleProvenance.VisualDerived));
+    }
+
+    [TestMethod]
     [DataRow(Scan2DInterpolationMode.Bilinear)]
     [DataRow(Scan2DInterpolationMode.Bicubic)]
     [DataRow(Scan2DInterpolationMode.Lanczos)]

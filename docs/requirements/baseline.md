@@ -34,16 +34,18 @@ sobrevive a la expulsión de su columna; nueva run la invalida. Encoder, distanc
 profundidad, gates y PA quedan fuera. Diseño en [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md)
 y ejecución en el [plan por fases](../plans/2026-09-22-bscan-first-increment.md).
 
-## Diseño de remuestreo B-Scan propuesto (2026-09-29)
+## Remuestreo B-Scan aprobado e implementado (2026-09-29)
 
 La petición vigente confirma como invariantes que los modos de presentación no modifican RF, store,
 identidades, coordenadas ni selección exacta; `None` reproduce el comportamiento actual; `NoData` y
 gaps permanecen autoritativos; la intensidad se procesa antes de LUT y los recursos/cálculos siguen
-acotados y cancelables. None, Nearest, Bilinear, Bicubic y Lanczos son remuestreo visual. GP/Kriging se
-clasifica como reconstrucción avanzada pendiente de aprobación, con procedencia e incertidumbre
-obligatorias. Las elecciones de kernels, persistencia, presupuesto y fase GP siguen propuestas, no
-requisitos aprobados. Véanse [ADR 0014](../adr/0014-bscan-selectable-resampling.md) y el
-[plan](../plans/2026-09-29-bscan-interpolation-modes.md).
+acotados y cancelables. `None`, `NearestNeighbor`, `Bilinear`, `Bicubic` y `Lanczos` están implementados
+como remuestreo visual; `None` es el valor predeterminado. El selector UI y la preferencia versionada
+también están implementados. Bilinear, Bicubic y Lanczos permanecen full-only; Lanczos se ofrece como
+alta calidad con cadencia reducida. Los resultados de rendimiento son diagnósticos, no baseline ni
+garantía. GP/Kriging no está implementado: continúa como reconstrucción avanzada futura, con geometría,
+procedencia `SpatialEstimated`, incertidumbre y ADR propios. Véanse [ADR 0014](../adr/0014-bscan-selectable-resampling.md)
+y el [plan](../plans/2026-09-29-bscan-interpolation-modes.md).
 
 ## Aceptación de la fase documental inicial (histórico)
 Configuración y once perfiles presentes; reglas de escritor único; documentación de requisitos, arquitectura y ADR enlazada; cinco áreas revisadas en paralelo por especialistas; pendientes explícitos; sin implementación, proyectos C#, paquetes ni commit.

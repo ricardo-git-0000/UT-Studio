@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Numerics;
 
 namespace UTStudio.Visualization.Core.Scan2D;
 
@@ -10,6 +11,8 @@ public interface IScan2DResampler
 
 internal interface ILanczosTablePool
 {
+    int GetMaximumIndicesLength(int minimumLength) => minimumLength;
+    int GetMaximumWeightsLength(int minimumLength) => minimumLength;
     int[] RentIndices(int minimumLength);
     double[] RentWeights(int minimumLength);
     void Return(int[] array);
@@ -19,10 +22,14 @@ internal interface ILanczosTablePool
 internal sealed class SharedLanczosTablePool : ILanczosTablePool
 {
     internal static SharedLanczosTablePool Instance { get; } = new();
+    public int GetMaximumIndicesLength(int minimumLength) => GetMaximumLength(minimumLength);
+    public int GetMaximumWeightsLength(int minimumLength) => GetMaximumLength(minimumLength);
     public int[] RentIndices(int minimumLength) => ArrayPool<int>.Shared.Rent(minimumLength);
     public double[] RentWeights(int minimumLength) => ArrayPool<double>.Shared.Rent(minimumLength);
     public void Return(int[] array) => ArrayPool<int>.Shared.Return(array);
     public void Return(double[] array) => ArrayPool<double>.Shared.Return(array);
+    private static int GetMaximumLength(int minimumLength) => Math.Max(16,
+        checked((int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(1, minimumLength))));
 }
 
 internal readonly record struct LanczosTableMemory(long LogicalBytes, long RentedBytes);
@@ -651,22 +658,52 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
 
         private int[] RentIndices(int length)
         {
-            int[] array = _pool.RentIndices(length);
-            try { Admit(checked((long)array.Length * sizeof(int))); return array; }
-            catch { _pool.Return(array); throw; }
+            int reservedLength = _pool.GetMaximumIndicesLength(length);
+            if (reservedLength < length) { throw new InvalidOperationException("Lanczos pool returned an invalid indices quote."); }
+            long reserved = checked((long)reservedLength * sizeof(int));
+            _bytesChanged?.Invoke(reserved);
+            int[]? array = null;
+            try
+            {
+                array = _pool.RentIndices(length);
+                if (array.Length < length || array.Length > reservedLength)
+                { throw new InvalidOperationException("Lanczos pool violated its indices reservation quote."); }
+                long actual = checked((long)array.Length * sizeof(int));
+                _bytesChanged?.Invoke(checked(actual - reserved));
+                RentedBytes = checked(RentedBytes + actual);
+                return array;
+            }
+            catch
+            {
+                if (array is not null) { _pool.Return(array); }
+                _bytesChanged?.Invoke(-reserved);
+                throw;
+            }
         }
 
         private double[] RentWeights(int length)
         {
-            double[] array = _pool.RentWeights(length);
-            try { Admit(checked((long)array.Length * sizeof(double))); return array; }
-            catch { _pool.Return(array); throw; }
-        }
-
-        private void Admit(long bytes)
-        {
-            _bytesChanged?.Invoke(bytes);
-            RentedBytes = checked(RentedBytes + bytes);
+            int reservedLength = _pool.GetMaximumWeightsLength(length);
+            if (reservedLength < length) { throw new InvalidOperationException("Lanczos pool returned an invalid weights quote."); }
+            long reserved = checked((long)reservedLength * sizeof(double));
+            _bytesChanged?.Invoke(reserved);
+            double[]? array = null;
+            try
+            {
+                array = _pool.RentWeights(length);
+                if (array.Length < length || array.Length > reservedLength)
+                { throw new InvalidOperationException("Lanczos pool violated its weights reservation quote."); }
+                long actual = checked((long)array.Length * sizeof(double));
+                _bytesChanged?.Invoke(checked(actual - reserved));
+                RentedBytes = checked(RentedBytes + actual);
+                return array;
+            }
+            catch
+            {
+                if (array is not null) { _pool.Return(array); }
+                _bytesChanged?.Invoke(-reserved);
+                throw;
+            }
         }
 
         public void Dispose()
@@ -712,22 +749,52 @@ public sealed class Scan2DResampler : IScan2DResampler, IDisposable
 
         private int[] RentIndices(int length)
         {
-            int[] array = _pool.RentIndices(length);
-            try { Admit(checked((long)array.Length * sizeof(int))); return array; }
-            catch { _pool.Return(array); throw; }
+            int reservedLength = _pool.GetMaximumIndicesLength(length);
+            if (reservedLength < length) { throw new InvalidOperationException("Lanczos pool returned an invalid indices quote."); }
+            long reserved = checked((long)reservedLength * sizeof(int));
+            _bytesChanged?.Invoke(reserved);
+            int[]? array = null;
+            try
+            {
+                array = _pool.RentIndices(length);
+                if (array.Length < length || array.Length > reservedLength)
+                { throw new InvalidOperationException("Lanczos pool violated its indices reservation quote."); }
+                long actual = checked((long)array.Length * sizeof(int));
+                _bytesChanged?.Invoke(checked(actual - reserved));
+                _rentedBytes = checked(_rentedBytes + actual);
+                return array;
+            }
+            catch
+            {
+                if (array is not null) { _pool.Return(array); }
+                _bytesChanged?.Invoke(-reserved);
+                throw;
+            }
         }
 
         private double[] RentWeights(int length)
         {
-            double[] array = _pool.RentWeights(length);
-            try { Admit(checked((long)array.Length * sizeof(double))); return array; }
-            catch { _pool.Return(array); throw; }
-        }
-
-        private void Admit(long bytes)
-        {
-            _bytesChanged?.Invoke(bytes);
-            _rentedBytes = checked(_rentedBytes + bytes);
+            int reservedLength = _pool.GetMaximumWeightsLength(length);
+            if (reservedLength < length) { throw new InvalidOperationException("Lanczos pool returned an invalid weights quote."); }
+            long reserved = checked((long)reservedLength * sizeof(double));
+            _bytesChanged?.Invoke(reserved);
+            double[]? array = null;
+            try
+            {
+                array = _pool.RentWeights(length);
+                if (array.Length < length || array.Length > reservedLength)
+                { throw new InvalidOperationException("Lanczos pool violated its weights reservation quote."); }
+                long actual = checked((long)array.Length * sizeof(double));
+                _bytesChanged?.Invoke(checked(actual - reserved));
+                _rentedBytes = checked(_rentedBytes + actual);
+                return array;
+            }
+            catch
+            {
+                if (array is not null) { _pool.Return(array); }
+                _bytesChanged?.Invoke(-reserved);
+                throw;
+            }
         }
 
         public void Dispose()
