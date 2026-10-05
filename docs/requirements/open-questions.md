@@ -18,7 +18,13 @@ No asumir respuestas ni bloquear la fase documental por estas incógnitas. Resol
 | Q12 | Primera secundaria BScanWindow, propiedad, presupuesto y cierre resueltos en ADR 0013; otras inspecciones/ventanas concurrentes permanecen abiertas | wpf_mvvm_specialist |
 | Q13 | Fan-out visual A/B por copia propia resuelto en ADR 0013; ownership, orden y backpressure de procesamiento/persistencia siguen pendientes | solution_architect |
 | Q14 | Remuestreo B-Scan resuelto por ADR 0014: malla, máscara estricta, Keys `a=-0.5`, Lanczos `a=3`, selector y persistencia están aprobados e implementados. Siguen abiertos el hardware, metodología y objetivos para convertir diagnósticos en gates, y una futura decisión separada sobre geometría, modelo e incertidumbre física de GP/Kriging | ut_visualization / ut_domain_specialist |
+| Q15 | Persistencia futura: tamaño de chunk persistente, contenedor/formato o base de datos, compresión, checksum, memoria mapeada, política de flush/durabilidad y respuesta definitiva ante disco lento | ut_storage_formats / ut_acquisition |
+| Q16 | Identidad hardware/PA: ámbito de `Sequence`, agrupación de trigger/imagen, relaciones canal–elemento–beam–ley y layout phased-array | ut_domain_specialist / ut_acquisition |
+| Q17 | Señal y posición: encoding/unidades de rectificada, crudo/derivados a conservar, encoder, sistema de coordenadas, calibración y calidad | ut_domain_specialist / ut_processing |
+| Q18 | C-Scan posterior: definición de gates, geometría/celdas/tiles, multirresolución y gates de rendimiento sobre hardware acordado | ut_processing / ut_visualization |
 
 La representación binaria de rectificadas reales sigue abierta; inicialmente solo RF bipolar `ReadOnlyMemory<short>`. Véanse [ADR 0007](../adr/0007-frame-source-ownership.md), [ADR 0008](../adr/0008-latest-only-visual-delivery.md) y [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 
-Q01–Q04 condicionan la adquisición real. Q06 condiciona el formato persistente. Q08 condiciona la selección PDF. No incorporar NuGet antes de justificarlo y obtener aprobación.
+Q01–Q04 condicionan la adquisición real. Q06 y Q15–Q17 condicionan las fases persistentes y PA;
+Q18 condiciona C-Scan. Q08 condiciona la selección PDF. El [ADR 0015](../adr/0015-authoritative-inspection-data-store.md)
+no resuelve estas cuestiones sin evidencia. No incorporar NuGet antes de justificarlo y obtener aprobación.

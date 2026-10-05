@@ -1,6 +1,8 @@
 # Adquisición, caudal y memoria
 
-Trazabilidad: R03–R07, R13; ADR 0002, [ADR 0005](../adr/0005-initial-solution-structure.md) y [ADR 0006](../adr/0006-session-window-lifecycle.md). Sección vertical y políticas de ramas aprobadas el 2026-09-09; mecanismos iniciales aceptados el 2026-09-11 en [ADR 0007](../adr/0007-frame-source-ownership.md) y [ADR 0008](../adr/0008-latest-only-visual-delivery.md). Revisado el 2026-09-13: fuente simulada, sesión y entrega A-Scan neutral implementadas; sin protocolos reales ni integración UI.
+Trazabilidad: R03–R07, R10, R13; ADR 0002, [ADR 0005](../adr/0005-initial-solution-structure.md),
+[ADR 0006](../adr/0006-session-window-lifecycle.md) y [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
+La canalización A/B actual sigue implementada; el store autoritativo está diseñado, no implementado.
 
 Fuentes GigE, PCIe, simulador y reproducción entregarán datos bajo el mismo contrato propio. El adaptador PCIe encierra el SDK y sus reglas de memoria. Separar canal físico, elemento, beam y ley focal; no inferir leyes del número de elementos.
 
@@ -19,6 +21,16 @@ Convencional: sumar A-Scans/s × muestras × 2 de todos los flujos activos. Dete
 Unidades decimales: MB = 10^6 bytes. GigE nominal representa 1.000 Mbit/s antes de overhead: el primer caso ya lo excede; el segundo requiere medición y margen. El tercero NO establece 256 como límite de leyes. Ocho frames de ese tamaño retienen 268.431.360 bytes de payload, sin contar otras etapas.
 
 ## Flujo y propiedad
+
+Flujo objetivo por fases: fuente → `ApplicationSession` → `IInspectionDataWriter` → store →
+`IUtTraceProvider`/`IInspectionRangeProvider` → entregas visuales. `ApplicationSession` presta la
+memoria fuente solo hasta completar `AppendAsync`; el store reserva presupuesto y copia/adquiere
+ownership antes de completarlo. La visualización latest-only sucede después del commit. En Fase 1 RAM,
+`Accepted` y `Committed` existen y `Durable` es siempre false.
+
+Hay un writer por run y lectores concurrentes. Commit de traza es todo-o-nada; identidad confirmada no
+se sobrescribe. Duplicate, Conflict, CapacityExceeded, Cancelled y Faulted son resultados explícitos.
+Cancelación precommit revierte; después del commit no deshace datos.
 
 Flujo actual implementado: simulador -> Channel -> ApplicationSession (único lector) -> fan-out visual síncrono aislado. A conserva su proyección latest-only y B copia RF/metadata a un ring propio; índice, regiones y UI se ejecutan después, fuera del préstamo. Véase [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
 
@@ -77,3 +89,13 @@ Métricas: bytes/frames recibidos y, cuando exista almacenamiento, persistidos; 
 Requisito confirmado de suscripciones: un callback que ya comenzó puede terminar después del cierre; no deben comenzar nuevos callbacks tras cancelar la suscripción o completar la entrega. Las entregas A/B y sus ViewModels aplican barreras de cierre antes de liberar owners. Cerrar MainWindow bloquea nuevas ventanas B, cierra adaptadores/ViewModels, drena sesión y fan-out y después libera deliveries, store, coordinadores y Host.
 
 Las referencias históricas de ADR 0007 sobre owners en el mailbox visual quedan sustituidas por ADR 0008 para esta rama. ADR 0006 y la arquitectura general ya reflejan el ciclo de vida y la composición A/B actuales.
+
+Para Fase 1, la admisión se limita por bytes realmente poseídos y nunca usa drop ni expulsión. Si no
+puede reservar una traza completa, aplica backpressure cancelable o devuelve `CapacityExceeded`.
+El cierre bloquea starts, detiene fuente, drena, cierra admisión, resuelve appends, sella chunks/run,
+espera commits y leases y libera. Un timeout solo diagnostica. Disco lento y persistencia siguen
+abiertos para fases posteriores.
+
+Payload puro por stream: 2.048 muestras de 16 bits son 4.096 B/traza y 0,2048/0,4096/4,096 MB/s a
+50/100/1.000 trazas/s; 65.535 son 131.070 B y 6,5535/13,107/131,07 MB/s. Multiplicar por streams solo
+para una configuración concreta validada. Las tablas completas están en ADR 0015.

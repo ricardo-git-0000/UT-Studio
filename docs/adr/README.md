@@ -17,5 +17,8 @@ Aceptado identifica decisiones aprobadas, sin autorizar paquetes ni implementaci
 - [0012-shared-scan-time-navigation](0012-shared-scan-time-navigation.md): navegación temporal reutilizable, identidad latest-only, ciclo de vida y sincronización bidireccional entre scans.
 - [0013-bscan-bounded-live-visualization](0013-bscan-bounded-live-visualization.md): B-Scan acotado, fan-out, leases, selección exacta, entrega incremental y ventana secundaria.
 - [0014-bscan-selectable-resampling](0014-bscan-selectable-resampling.md): decisión aceptada e implementada de remuestreo visual seleccionable y máscara/procedencia 2D; GP/Kriging continúa futuro y separado.
+- [0015-authoritative-inspection-data-store](0015-authoritative-inspection-data-store.md): decisión aceptada
+  de autoridad única neutral; contratos, store RAM acotado, commits de traza, lectura, ownership,
+  backpressure y migración A/B; implementación y persistencia pendientes.
 
-Renderizadores C/S/D-Scan, paquetes adicionales y benchmarks siguen pendientes. Véanse el [plan vertical](../plans/2026-09-09-first-vertical-increment.md), el [plan B-Scan](../plans/2026-09-22-bscan-first-increment.md), el [plan de remuestreo B-Scan](../plans/2026-09-29-bscan-interpolation-modes.md) y las [cuestiones](../requirements/open-questions.md).
+Renderizadores C/S/D-Scan, paquetes adicionales y benchmarks siguen pendientes. Véanse el [plan vertical](../plans/2026-09-09-first-vertical-increment.md), el [plan B-Scan](../plans/2026-09-22-bscan-first-increment.md), el [plan de remuestreo B-Scan](../plans/2026-09-29-bscan-interpolation-modes.md), el [plan del store](../plans/2026-10-05-inspection-data-store.md) y las [cuestiones](../requirements/open-questions.md).

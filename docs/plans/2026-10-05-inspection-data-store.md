@@ -1,0 +1,113 @@
+# Plan por fases del almacén autoritativo de inspección
+
+Estado: Fase 0 aprobada; implementación pendiente.
+Fuente normativa: [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
+
+## Reglas transversales
+
+Una sola autoridad por fase; memoria y colas acotadas por bytes y elementos; ownership explícito;
+almacenamiento sin pérdida silenciosa y visualización latest-only; lectura parcial; operaciones largas
+cancelables; contratos neutrales; ninguna combinación de máximos se promete sin validación completa.
+Cada fase futura debe definir propietarios de archivos, pruebas de integridad/carga/cierre, budgets,
+benchmarks reproducibles, revisión de diff y gates antes de avanzar.
+
+## Fase 0 — ADR y plan
+
+Alcance: ADR 0015, este plan y actualización coherente de requisitos, arquitectura, pipeline,
+almacenamiento, índice ADR y cuestiones abiertas. Sin código, proyectos, paquetes ni pruebas.
+
+Salida: ADR 0015 Aceptado, decisiones y pendientes diferenciados, cálculos trazables, enlaces válidos
+y `git diff --check`. No se crean proyectos ni código en esta fase.
+
+## Fase 1 — Contratos y store acotado en memoria
+
+Crear, solo en esta fase futura, contratos neutrales en `UTStudio.Contracts/Inspection` y el proyecto
+`UTStudio.Inspection.Core` para un store append-only exclusivamente en memoria. No crear
+`UTStudio.Inspection.Storage`.
+
+`TraceIdentity` contendrá InspectionId, AcquisitionRunId, UtSourceId, PhysicalChannelId, BeamId o
+FocalLawId opcionales/tipados y AcquisitionIndex; Sequence permanece separado y nunca sustituye el
+índice. Habrá un writer por run y lectores concurrentes.
+
+`AppendAsync` recibe memoria prestada hasta completar: reserva presupuesto antes de copiar/adquirir
+ownership, publica commit de traza todo-o-nada y devuelve estados explícitos Accepted/Committed,
+Duplicate, Conflict, CapacityExceeded, Cancelled o Faulted. `Durable` es siempre false. Cancelación
+precommit revierte; postcommit no deshace. Una identidad confirmada nunca se sobrescribe.
+
+Lectura exacta por identidad y rango por stream+AcquisitionIndex devuelve
+Available/NotAvailable/Gap/Cancelled/Faulted. Leases inmutables tienen Dispose idempotente; cierre los
+espera; snapshots independientes son opcionales.
+
+El presupuesto configurable cuenta capacidad realmente poseída y metadata acotada; evita pools
+compartidos si ocultan el límite, no expulsa datos autoritativos y diagnostica active/retained/maximum
+bytes. Chunks RAM de tamaño provisional configurable se sellan por capacidad, cambio incompatible o
+cierre; no definen formato de archivo y sus índices solo apuntan a commits confirmados.
+
+Gate: límites demostrados; backpressure o CapacityExceeded sin overwrite/drop; ownership único;
+lecturas concurrentes coherentes; ninguna traza parcial; cierre espera leases; Durable=false.
+
+## Fase 2 — Integración ApplicationSession/simulador
+
+Convertir el store en autoridad única; `ApplicationSession` presta memoria solo durante `AppendAsync`
+y el store copia o adquiere ownership antes de completarlo.
+Retirar el fan-out autoritativo, conservar adaptadores visuales derivados y propagar backpressure/fallo
+observable. Simulador y futuras fuentes siguen `IUtFrameSource`.
+
+Gate: cada frame válido queda aceptado o rechazado explícitamente y se libera una vez; gaps y cierre
+ordenado cubiertos; no dual-write.
+
+## Fase 3 — A-Scan sobre IUtTraceProvider
+
+Live consume la última traza confirmada mediante mailbox latest-only; Selected obtiene snapshot por
+identidad. Mantener navegación temporal, límites de publicación y cierre del ViewModel.
+
+Gate: coalescencia visual no afecta contadores del store; selección exacta sobre revisión estable.
+
+## Fase 4 — B-Scan sobre rangos
+
+Consumir páginas/rangos del provider; mantener temporalmente `BScanTraceStore` solo como caché derivada
+o adaptador, migrar selección B→A y retirarlo progresivamente. Conservar rango residente vs dirty,
+gaps, resync, budgets, leases breves y cierre/reapertura de ventana.
+
+Gate: el store es la única autoridad; `BScanTraceStore` es solo cache/proyección derivada temporal;
+selección B→A usa `TraceIdentity`; cerrar B no pierde datos; ventanas 256/1.024 respetan budget.
+
+## Fase 5 — Persistencia incremental
+
+Implementar chunks, commits, journal, versiones, checksum e índice reconstruible tras aprobar las
+decisiones tecnológicas necesarias. Inyectar disco lento/lleno, truncamientos y corrupción. Medir
+append/commit/flush, capacidad de absorción y recuperación.
+
+Gate: ningún dato aceptado desaparece silenciosamente; estados Accepted/Committed/Durable verificables;
+recovery en cada frontera y cierre bajo presión.
+
+## Fase 6 — Lectura desde archivo
+
+Abrir inspecciones grandes sin carga completa; cache hot/cold, consultas exactas y parciales, paginación,
+replay controlable e importadores separados. No confundir reader con `IUtFrameSource`: un adaptador de
+reproducción implementa la fuente común sobre el reader.
+
+Gate: 15 y 29 GB sintéticos generados fuera de Git; RAM estable; índice reconstruible; errores y run
+incompleta observables.
+
+## Fase 7 — C-Scan en otro incremento
+
+Definir requisitos de encoder, geometría, PA, gates, tiles, multirresolución y rendimiento antes de
+elegir contratos visuales. Derivar desde `TraceIdentity` + `InspectionRevision`; no cambiar la autoridad.
+
+Gate: ADR y plan propios aprobados. Esta fase no está autorizada por el presente documento.
+
+## Riesgos priorizados
+
+- P1: ownership ambiguo, dos autoridades, drop silencioso, commit parcial, cierre falso y backpressure
+  incompatible con hardware.
+- P2: identidad insuficiente, leases largos, revisión ambigua, índice no reconstruible, consultas densas
+  y doble conteo de memoria.
+- P3: optimizar prematuramente chunks/layout, elegir formato/compresión/checksum/mmap sin evidencia o
+  generalizar C-Scan antes de encoder, PA y gates.
+
+## Decisiones previas a fases afectadas
+
+Antes de Fase 5: formato, tamaño de chunk persistente, compresión, checksum, durabilidad y política ante disco lento.
+Antes de PA/rectificada: grouping/layout, Sequence y encoding. Antes de Fase 7: encoder, coordenadas,
+gates y objetivos medidos. Ninguna queda resuelta por este plan.

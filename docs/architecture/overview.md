@@ -1,6 +1,7 @@
 # Arquitectura inicial
 
-Estado: estructura aprobada el 2026-09-09, A-Scan implementado y primer B-Scan aprobado documentalmente el 2026-09-22. Trazabilidad: R01–R14; ADR 0001–0014.
+Estado: estructura aprobada el 2026-09-09, A/B implementados y almacén autoritativo diseñado en Fase 0
+el 2026-10-05. Trazabilidad: R01–R14; ADR 0001–0015.
 
 ## Estructura inicial aprobada
 
@@ -46,6 +47,12 @@ flowchart TD
 
 Core.Tests se omite del diagrama productivo. Application publica datos/snapshots mediante Contracts y no conoce Visualization.Core. Presentation coordina la transformación neutral antes de entregar el modelo al ViewModel; esto no obliga al ViewModel ni al hilo UI a procesar cada frame.
 
+La estructura futura conserva esos límites. Los contratos se alojarán en
+`UTStudio.Contracts/Inspection`; Fase 1 añadirá `UTStudio.Inspection.Core` como store neutral solo RAM,
+dependiente de Domain y Contracts. Application coordina, Visualization.Core consume providers y
+App.Wpf compone. No se crea todavía `UTStudio.Inspection.Storage`; el futuro adaptador persistente no
+dependerá de Application ni UI. Véase [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
+
 ## Contratos y límites
 
 Contracts se organiza conceptualmente en `Acquisition`, `Application`, `Presentation` y `Diagnostics`: fuente y capacidades; casos de uso y sesión; intercambios neutrales compartidos de presentación; estado y contadores diagnósticos, respectivamente. No crear contratos futuros innecesarios ni un proyecto por carpeta. Los modelos A-Scan pertenecen a Visualization.Core; no se duplican en Contracts ni hacen que Contracts lo referencie.
@@ -90,6 +97,20 @@ No crear todavía SignalProcessing, Storage, Acquisition.GigE, Acquisition.Pcie,
 GigE, PCIe, simulador y reproducción compartirán un contrato de fuente con capacidades explícitas, sin fingir controles hardware en archivos. GigE encapsulará su protocolo; PCIe, su SDK y memoria. La reproducción comenzará como adaptador de Storage con lectura parcial y ritmo controlable, sin requerir decodificación de paquetes. Importar formatos es una responsabilidad distinta.
 
 SignalProcessing, Storage y Visualization.Core mantendrán dependencias neutrales hacia Domain/Contracts; los adaptadores reales también. Reporting conservará el modelo neutral y Reporting.Pdf será su renderizador separado. Avalonia tendrá composición propia; 3D, PLC y robot se incorporarán mediante límites neutrales y adaptadores cuando exista un caso de uso. PLC y robot no son automáticamente fuentes de muestras UT.
+
+## Autoridad de datos de inspección
+
+El flujo objetivo es fuente común → `ApplicationSession` → `InspectionDataStore` → proveedores A/B y
+futuros C/S/D → backing persistente incremental. Store es la única autoridad; las vistas conservan
+solo presentación y caches acotadas. `BScanTraceStore` se mantendrá temporalmente como cache/proyección
+visual derivada y se retirará progresivamente, sin dual-write autoritativo. La selección B→A usa
+`TraceIdentity`.
+
+La autoridad publica únicamente trazas committed mediante `InspectionRevision`. Lecturas exactas y por
+rango son dispersas, acotadas y revisadas. En Fase 1 no hay expulsión autoritativa ni almacenamiento
+frío: al agotar presupuesto hay backpressure o `CapacityExceeded`. El rango confirmado,
+el residente caliente, el representado y la región dirty son conceptos distintos. Cerrar una ventana
+libera su consumidor, no los datos; cierre global drena admisión, commits y leases antes de liberar.
 
 ## Decisiones abiertas y siguiente incremento
 

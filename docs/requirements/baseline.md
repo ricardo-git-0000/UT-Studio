@@ -47,5 +47,27 @@ garantía. GP/Kriging no está implementado: continúa como reconstrucción avan
 procedencia `SpatialEstimated`, incertidumbre y ADR propios. Véanse [ADR 0014](../adr/0014-bscan-selectable-resampling.md)
 y el [plan](../plans/2026-09-29-bscan-interpolation-modes.md).
 
+## Almacén autoritativo de inspección aprobado en Fase 0 (2026-10-05)
+
+El flujo futuro tendrá una sola autoridad neutral entre `ApplicationSession` y los proveedores de
+A/B/C/S/D. Controles, ViewModels y caches visuales no poseen la inspección; cerrar una ventana no
+elimina datos. El store usa memoria, colas, chunks y leases acotados, escritura incremental, commits
+atómicos, índice reconstruible y lectura parcial por identidad/rango. Distingue recepción, aceptación,
+commit y durabilidad; almacenamiento no descarta silenciosamente y visualización puede ser latest-only.
+
+El modelo separa `InspectionId`, `AcquisitionRunId`, fuente, canal físico, elemento, beam, ley focal,
+`AcquisitionIndex`, `Sequence`, tiempo, posición, eje de muestra, RF/rectificada, gaps, procedencia y
+calidad. No presupone cubo rectangular ni combina máximos como garantía. El diseño y sus decisiones
+abiertas están en [ADR 0015](../adr/0015-authoritative-inspection-data-store.md) y el
+[plan por fases](../plans/2026-10-05-inspection-data-store.md).
+
+Fase 1 será exclusivamente RAM en `UTStudio.Inspection.Core`, con contratos en
+`UTStudio.Contracts/Inspection` y sin `UTStudio.Inspection.Storage`. `TraceIdentity` incluye inspección,
+run, fuente, canal físico, beam o ley focal opcionales y `AcquisitionIndex`; Sequence queda separado.
+La memoria fuente se presta solo hasta completar `AppendAsync`, que reserva antes de copiar/adquirir
+ownership y confirma cada traza todo-o-nada. `Accepted` y `Committed` están disponibles,
+`Durable=false`; no hay expulsión, overwrite ni pérdida silenciosa. Capacidad insuficiente aplica
+backpressure o `CapacityExceeded`. Lecturas usan lease inmutable o snapshot independiente.
+
 ## Aceptación de la fase documental inicial (histórico)
 Configuración y once perfiles presentes; reglas de escritor único; documentación de requisitos, arquitectura y ADR enlazada; cinco áreas revisadas en paralelo por especialistas; pendientes explícitos; sin implementación, proyectos C#, paquetes ni commit.
