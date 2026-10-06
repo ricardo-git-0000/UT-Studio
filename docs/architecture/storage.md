@@ -16,14 +16,17 @@ Una cola acotada protege memoria, no garantiza escritura sin pérdidas ante disc
 contratos en `UTStudio.Contracts/Inspection`, exclusivamente en RAM y sin crear
 `UTStudio.Inspection.Storage`. Agrupa inspecciones, runs, streams, trazas y gaps dispersos en chunks
 append-only. Cada traza completa aparece atómicamente en una nueva `InspectionRevision`; índices solo
-apuntan a commits confirmados. `Accepted` y `Committed` están disponibles y `Durable=false`.
+apuntan a commits confirmados. `WasAccepted` distingue admisión, `IsCommitted` distingue commit y
+`Durable=false`.
 
-El presupuesto configurable mide bytes realmente poseídos y metadata acotada. No usa pools compartidos
+`SampleCapacityBudgetBytes` limita reservas y arrays propios de muestras; `MaximumEntries` acota por
+separado metadata e índices sin prometer un límite exacto del heap o working set. No usa pools compartidos
 si impiden demostrar el límite, ni expulsa datos autoritativos. Capacidad insuficiente causa
 backpressure o `CapacityExceeded`, nunca overwrite/drop. Chunks RAM tienen tamaño provisional
 configurable —no formato de archivo— y se sellan por capacidad, cambio incompatible o cierre de run.
 Lecturas exactas/rangos usan lease estable con Dispose idempotente o snapshot independiente; cierre
-espera leases. Diagnósticos incluyen active, retained y maximum bytes.
+espera leases. Diagnósticos separan bytes lógicos, reservados, materializados y máximo materializado
+de muestras, además de límites/uso de entradas, writers, leases y chunks.
 
 ## Persistencia futura
 

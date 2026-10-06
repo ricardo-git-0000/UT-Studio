@@ -1,6 +1,6 @@
 # Plan por fases del almacén autoritativo de inspección
 
-Estado: Fase 0 aprobada; implementación pendiente.
+Estado: Fase 0 aprobada; Fase 1 implementada, pendiente de aprobación final.
 Fuente normativa: [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
 
 ## Reglas transversales
@@ -30,18 +30,22 @@ FocalLawId opcionales/tipados y AcquisitionIndex; Sequence permanece separado y 
 índice. Habrá un writer por run y lectores concurrentes.
 
 `AppendAsync` recibe memoria prestada hasta completar: reserva presupuesto antes de copiar/adquirir
-ownership, publica commit de traza todo-o-nada y devuelve estados explícitos Accepted/Committed,
-Duplicate, Conflict, CapacityExceeded, Cancelled o Faulted. `Durable` es siempre false. Cancelación
-precommit revierte; postcommit no deshace. Una identidad confirmada nunca se sobrescribe.
+ownership y publica commit de traza todo-o-nada. El resultado indica por separado `WasAccepted`
+(admitido como writer antes del cierre), `IsCommitted` y `Durable=false`, y conserva estados terminales
+`Committed`, `Duplicate`, `Conflict`, `CapacityExceeded`, `Closed`, `Cancelled` o `Faulted`.
+`WasAccepted` no es un resultado terminal. Cancelación precommit revierte; postcommit no deshace. Una
+identidad confirmada nunca se sobrescribe.
 
 Lectura exacta por identidad y rango por stream+AcquisitionIndex devuelve
 Available/NotAvailable/Gap/Cancelled/Faulted. Leases inmutables tienen Dispose idempotente; cierre los
 espera; snapshots independientes son opcionales.
 
-El presupuesto configurable cuenta capacidad realmente poseída y metadata acotada; evita pools
-compartidos si ocultan el límite, no expulsa datos autoritativos y diagnostica active/retained/maximum
-bytes. Chunks RAM de tamaño provisional configurable se sellan por capacidad, cambio incompatible o
-cierre; no definen formato de archivo y sus índices solo apuntan a commits confirmados.
+`SampleCapacityBudgetBytes` cuenta exactamente reservas y arrays propios de muestras;
+`MaximumEntries` acota por separado metadata e índices administrados. No se promete un límite exacto
+del heap o working set del CLR. Los diagnósticos separan bytes reservados, materializados, lógicos y
+máximo materializado. No se expulsan datos autoritativos. Chunks RAM de tamaño provisional configurable
+se sellan por capacidad, cambio incompatible o cierre; no definen formato de archivo y sus índices
+solo apuntan a commits confirmados.
 
 Gate: límites demostrados; backpressure o CapacityExceeded sin overwrite/drop; ownership único;
 lecturas concurrentes coherentes; ninguna traza parcial; cierre espera leases; Durable=false.
@@ -78,7 +82,7 @@ Implementar chunks, commits, journal, versiones, checksum e índice reconstruibl
 decisiones tecnológicas necesarias. Inyectar disco lento/lleno, truncamientos y corrupción. Medir
 append/commit/flush, capacidad de absorción y recuperación.
 
-Gate: ningún dato aceptado desaparece silenciosamente; estados Accepted/Committed/Durable verificables;
+Gate: ningún dato aceptado desaparece silenciosamente; admisión, commit y durabilidad verificables;
 recovery en cada frontera y cierre bajo presión.
 
 ## Fase 6 — Lectura desde archivo

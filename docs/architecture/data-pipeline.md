@@ -2,7 +2,8 @@
 
 Trazabilidad: R03–R07, R10, R13; ADR 0002, [ADR 0005](../adr/0005-initial-solution-structure.md),
 [ADR 0006](../adr/0006-session-window-lifecycle.md) y [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
-La canalización A/B actual sigue implementada; el store autoritativo está diseñado, no implementado.
+La canalización A/B actual sigue implementada; el store autoritativo RAM de Fase 1 está implementado
+pero todavía no integrado con ApplicationSession ni con los consumidores visuales.
 
 Fuentes GigE, PCIe, simulador y reproducción entregarán datos bajo el mismo contrato propio. El adaptador PCIe encierra el SDK y sus reglas de memoria. Separar canal físico, elemento, beam y ley focal; no inferir leyes del número de elementos.
 
@@ -26,7 +27,8 @@ Flujo objetivo por fases: fuente → `ApplicationSession` → `IInspectionDataWr
 `IUtTraceProvider`/`IInspectionRangeProvider` → entregas visuales. `ApplicationSession` presta la
 memoria fuente solo hasta completar `AppendAsync`; el store reserva presupuesto y copia/adquiere
 ownership antes de completarlo. La visualización latest-only sucede después del commit. En Fase 1 RAM,
-`Accepted` y `Committed` existen y `Durable` es siempre false.
+`WasAccepted` indica que el append fue admitido antes del cierre, `IsCommitted` que quedó visible
+atómicamente y `Durable` es siempre false.
 
 Hay un writer por run y lectores concurrentes. Commit de traza es todo-o-nada; identidad confirmada no
 se sobrescribe. Duplicate, Conflict, CapacityExceeded, Cancelled y Faulted son resultados explícitos.

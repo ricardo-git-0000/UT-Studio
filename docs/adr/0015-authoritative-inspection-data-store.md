@@ -66,9 +66,12 @@ de trigger/grupo para detectar imágenes incompletas; no se inventa en esta fase
 Las firmas exactas pertenecen a Fase 1; la semántica aceptada es:
 
 - `IInspectionDataWriter`: una sola autoridad de escritura por run; acepta append de descriptor y
-  memoria prestada, publica resultado explícito y permite drenar/sellar. En Fase 1, `Accepted` indica
-  que el store adquirió/copia los bytes y `Committed` que la traza completa es visible atómicamente;
-  `Durable` es siempre `false` porque no existe backing durable.
+  memoria prestada, publica resultado explícito y permite drenar/sellar. En Fase 1, `WasAccepted`
+  indica que la operación superó la validación inicial y fue admitida como writer antes del cierre;
+  no es un resultado terminal. `IsCommitted` indica que identidad, descriptor, muestras, chunk,
+  índices y revisión ya son visibles atómicamente. `Durable` es siempre `false` porque no existe
+  backing durable. El estado terminal distingue `Committed`, `Duplicate`, `Conflict`,
+  `CapacityExceeded`, `Closed`, `Cancelled` y `Faulted`.
 - `IInspectionDataReader`: abre un snapshot lógico acotado de una `InspectionRevision` y consulta
   metadatos, runs, chunks y gaps sin cargar la inspección completa.
 - `IUtTraceProvider`: obtiene exactamente una `TraceIdentity` y devuelve
@@ -112,14 +115,17 @@ destructivamente sin autorización. Ninguna de esas decisiones forma parte de Fa
 
 ## Memoria de Fase 1 y almacenamiento futuro
 
-Fase 1 tiene presupuesto configurable en bytes sobre capacidad real poseída: payloads, chunks abiertos
-y sellados, índices, metadata acotada, snapshots y cualquier copia retenida. No usa `ArrayPool` o
-`MemoryPool` compartidos si impiden demostrar el límite. No expulsa datos autoritativos mientras no
-exista almacenamiento durable. Si no puede reservar toda una traza, espera mediante backpressure o
-devuelve `CapacityExceeded`; nunca sobrescribe ni descarta.
+Fase 1 usa límites independientes explícitos. `SampleCapacityBudgetBytes` limita exactamente la suma
+de reservas y arrays propios materializados para muestras. `MaximumEntries` limita por cantidad la
+metadata, chunks e índices administrados; no pretende medir su tamaño físico ni limitar exactamente el
+heap o working set del CLR. No usa `ArrayPool` o `MemoryPool` compartidos para las muestras. No expulsa
+datos autoritativos mientras no exista almacenamiento durable. Si no puede reservar toda una traza,
+espera mediante backpressure o devuelve `CapacityExceeded`; nunca sobrescribe ni descarta.
 
-La admisión exige aritmética comprobada: `active bytes + reservation ≤ configured budget`. Los
-diagnósticos exponen `ActiveBytes`, `RetainedBytes` y `MaximumBytes`, además de presupuesto y reservas.
+La admisión exige aritmética comprobada:
+`OwnedSampleCapacityBytes + ReservedSampleCapacityBytes ≤ SampleCapacityBudgetBytes`. Los
+diagnósticos separan bytes lógicos, reservados, materializados y máximo materializado, además de
+`MaximumEntries`, entradas confirmadas, writers, leases y resultados acumulados.
 Un lease ofrece memoria estable e inmutable, su `Dispose` es idempotente y el cierre espera leases sin
 forzarlos. Un snapshot opcional posee una copia independiente y también cuenta contra presupuesto.
 
@@ -148,10 +154,11 @@ flush y supervivencia a fallos comienzan con persistencia incremental en una fas
 
 ## Diagnósticos
 
-En Fase 1: trazas/bytes recibidos, aceptados y committed; `Durable=false`; `ActiveBytes`,
-`RetainedBytes`, `MaximumBytes`, presupuesto y reservas; chunks abiertos/sellados; resultados y
-latencias de append/commit; leases activos, bytes, edad y consumidor; gaps, sellado/cierre y primer/
-último error. El muestreo de publicación no pierde eventos del recuento.
+En Fase 1: admisiones, rechazos por cierre antes de admisión, cancelaciones y commits; `Durable=false`; bytes lógicos,
+reservados y materializados de muestras, máximo materializado y presupuesto; entradas máximas y
+confirmadas; writers activos, máximo y pendientes durante cierre; chunks abiertos/sellados y leases
+activos/máximos. El muestreo de publicación no pierde eventos del recuento. Latencias, edad/consumidor
+de leases y primer/último error podrán ampliarse sin confundirlos con los límites exactos actuales.
 
 I/O, flush, caché fría, journal, checksum y recuperación añadirán diagnósticos solo cuando exista
 persistencia.

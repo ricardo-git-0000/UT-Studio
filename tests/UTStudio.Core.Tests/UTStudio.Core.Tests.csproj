@@ -22,6 +22,7 @@
     <ProjectReference Include="../../src/UTStudio.Acquisition.Simulator/UTStudio.Acquisition.Simulator.csproj" />
     <ProjectReference Include="../../src/UTStudio.Visualization.Core/UTStudio.Visualization.Core.csproj" />
     <ProjectReference Include="../../src/UTStudio.Presentation/UTStudio.Presentation.csproj" />
+    <ProjectReference Include="../../src/UTStudio.Inspection.Core/UTStudio.Inspection.Core.csproj" />
     <ProjectReference Include="../../tools/UTStudio.LoadTests/UTStudio.LoadTests.csproj" />
   </ItemGroup>
 </Project>

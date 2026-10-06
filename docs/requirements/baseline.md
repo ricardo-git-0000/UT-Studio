@@ -61,12 +61,12 @@ calidad. No presupone cubo rectangular ni combina máximos como garantía. El di
 abiertas están en [ADR 0015](../adr/0015-authoritative-inspection-data-store.md) y el
 [plan por fases](../plans/2026-10-05-inspection-data-store.md).
 
-Fase 1 será exclusivamente RAM en `UTStudio.Inspection.Core`, con contratos en
+Fase 1 está implementada exclusivamente en RAM en `UTStudio.Inspection.Core`, con contratos en
 `UTStudio.Contracts/Inspection` y sin `UTStudio.Inspection.Storage`. `TraceIdentity` incluye inspección,
 run, fuente, canal físico, beam o ley focal opcionales y `AcquisitionIndex`; Sequence queda separado.
 La memoria fuente se presta solo hasta completar `AppendAsync`, que reserva antes de copiar/adquirir
-ownership y confirma cada traza todo-o-nada. `Accepted` y `Committed` están disponibles,
-`Durable=false`; no hay expulsión, overwrite ni pérdida silenciosa. Capacidad insuficiente aplica
+ownership y confirma cada traza todo-o-nada. `WasAccepted` indica admisión previa al cierre,
+`IsCommitted` confirma visibilidad atómica y `Durable=false`; no hay expulsión, overwrite ni pérdida silenciosa. Capacidad insuficiente aplica
 backpressure o `CapacityExceeded`. Lecturas usan lease inmutable o snapshot independiente.
 
 ## Aceptación de la fase documental inicial (histórico)
