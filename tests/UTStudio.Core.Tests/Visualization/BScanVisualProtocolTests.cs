@@ -296,7 +296,7 @@ public sealed class BScanVisualProtocolTests
     }
 
     [TestMethod]
-    public async Task StoreRevisionChangeDisposesStaleCandidateAndForcesRecovery()
+    public async Task RetainedCandidateLeaseDelaysIndexingUntilCandidateCompletes()
     {
         await using Harness harness = await Harness.CreateAsync(columns: 4);
         using BScanRasterRegion baseline = await harness.RenderAsync(harness.Request());
@@ -304,42 +304,73 @@ public sealed class BScanVisualProtocolTests
         baseline.Dispose();
         await harness.AddAsync(1, 1, [4, 5, 6, 7]);
         BScanRenderRequest request = harness.From(baselineSnapshot);
-        var entered = new ManualResetEventSlim();
-        var release = new ManualResetEventSlim();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
         harness.Delivery.BeforeRasterCandidateValidation = () => { entered.Set(); release.Wait(); };
-        Task<BScanRasterResult> candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
-        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
-        await harness.AddAsync(2, 2, [8, 9, 10, 11]);
-        release.Set();
-        Assert.AreEqual(BScanRasterResultKind.Stale, (await candidate.WaitAsync(TimeSpan.FromSeconds(10))).Kind);
+        Task<BScanRasterResult>? candidate = null;
+        Task? indexing = null;
+        BScanRasterRegion? candidateRegion = null;
+        try
+        {
+            candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.IsFalse(candidate.IsCompleted);
+            indexing = harness.AddAsync(2, 2, [8, 9, 10, 11]);
+            Assert.IsFalse(indexing.IsCompleted, "Indexing must wait while the candidate retains its leases.");
+        }
+        finally { release.Set(); }
+        BScanRasterResult result = await candidate!.WaitAsync(TimeSpan.FromSeconds(10));
+        candidateRegion = result.Region;
+        candidateRegion?.Dispose();
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
+        await indexing!.WaitAsync(TimeSpan.FromSeconds(10));
         harness.Delivery.BeforeRasterCandidateValidation = null;
-        using BScanRasterRegion recovered = await harness.RenderAsync(request);
-        AssertFull(recovered.Snapshot, BScanFullRefreshReason.Recovery,
-            baselineSnapshot.StoreRevision, 3, harness.Metadata.RunId);
-        Assert.AreEqual(1, harness.Delivery.Diagnostics.ActiveRasterOwners);
+        await harness.DisposeAsync();
+        Assert.AreEqual(0, harness.Ingress.Diagnostics.ActiveReadLeases);
+        Assert.AreEqual(0, harness.Delivery.Diagnostics.ActiveBuilds);
+        Assert.AreEqual(0, harness.Delivery.Diagnostics.ActiveRasterOwners);
+        Assert.AreEqual(harness.Delivery.Diagnostics.ObserverCallbacksStarted,
+            harness.Delivery.Diagnostics.ObserverCallbacksCompleted);
+        Assert.AreEqual(0, harness.Delivery.PendingBootstrapCount);
+        Assert.IsTrue(harness.Ingress.Diagnostics.IsClosed);
     }
 
     [TestMethod]
-    public async Task Bootstrap_candidate_is_stale_when_revision_advances_before_commit()
+    public async Task Bootstrap_candidate_releases_lease_before_pending_index_completes()
     {
         await using Harness harness = await Harness.CreateAsync(columns: 4);
         BScanRenderRequest request = harness.Request();
-        var entered = new ManualResetEventSlim();
-        var release = new ManualResetEventSlim();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
         harness.Delivery.BeforeRasterCandidateValidation = () => { entered.Set(); release.Wait(); };
-        Task<BScanRasterResult> candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
-        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
-
-        await harness.AddAsync(1, 1, [4, 5, 6, 7]);
-        release.Set();
-
-        BScanRasterResult result = await candidate.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.AreEqual(BScanRasterResultKind.Stale, result.Kind);
+        Task<BScanRasterResult>? candidate = null;
+        Task? indexing = null;
+        try
+        {
+            candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.IsFalse(candidate.IsCompleted);
+            indexing = harness.AddAsync(1, 1, [4, 5, 6, 7]);
+            Assert.IsFalse(indexing.IsCompleted);
+        }
+        finally { release.Set(); }
+        BScanRasterResult result = await candidate!.WaitAsync(TimeSpan.FromSeconds(10));
+        result.Region?.Dispose();
+        await indexing!.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
         harness.Delivery.BeforeRasterCandidateValidation = null;
+        await harness.DisposeAsync();
+        Assert.AreEqual(0, harness.Ingress.Diagnostics.ActiveReadLeases);
+        Assert.AreEqual(0, harness.Delivery.Diagnostics.ActiveBuilds);
+        Assert.AreEqual(0, harness.Delivery.Diagnostics.ActiveRasterOwners);
+        Assert.AreEqual(harness.Delivery.Diagnostics.ObserverCallbacksStarted,
+            harness.Delivery.Diagnostics.ObserverCallbacksCompleted);
+        Assert.AreEqual(0, harness.Delivery.PendingBootstrapCount);
+        Assert.IsTrue(harness.Ingress.Diagnostics.IsClosed);
     }
 
     [TestMethod]
-    public async Task Wide_live_window_candidate_is_stale_after_concurrent_revision()
+    public async Task Wide_live_window_candidate_releases_lease_before_pending_index_completes()
     {
         await using Harness harness = await Harness.CreateAsync(columns: 1024);
         for (ulong index = 1; index < 1024; index++)
@@ -358,18 +389,34 @@ public sealed class BScanVisualProtocolTests
                     baseline.Snapshot.RasterWidth, baseline.Snapshot.RasterHeight,
                     baseline.Snapshot.RenderConfigurationVersion))
         };
-        var entered = new ManualResetEventSlim();
-        var release = new ManualResetEventSlim();
+        baseline.Dispose();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
         harness.Delivery.BeforeRasterCandidateValidation = () => { entered.Set(); release.Wait(); };
-        Task<BScanRasterResult> candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
-        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
-
-        await harness.AddAsync(1025, 1025, [8, 9, 10, 11]);
-        release.Set();
-
-        BScanRasterResult result = await candidate.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.AreEqual(BScanRasterResultKind.Stale, result.Kind);
+        Task<BScanRasterResult>? candidate = null;
+        Task? indexing = null;
+        try
+        {
+            candidate = Task.Run(async () => await harness.Delivery.GetRegionAsync(request));
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.IsFalse(candidate.IsCompleted);
+            indexing = harness.AddAsync(1025, 1025, [8, 9, 10, 11]);
+            Assert.IsFalse(indexing.IsCompleted);
+        }
+        finally { release.Set(); }
+        BScanRasterResult result = await candidate!.WaitAsync(TimeSpan.FromSeconds(10));
+        result.Region?.Dispose();
+        await indexing!.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
         harness.Delivery.BeforeRasterCandidateValidation = null;
+        await harness.DisposeAsync();
+        Assert.AreEqual(0, harness.Ingress.Diagnostics.ActiveReadLeases);
+        Assert.AreEqual(0, harness.Delivery.Diagnostics.ActiveBuilds);
+        Assert.AreEqual(0, harness.Delivery.Diagnostics.ActiveRasterOwners);
+        Assert.AreEqual(harness.Delivery.Diagnostics.ObserverCallbacksStarted,
+            harness.Delivery.Diagnostics.ObserverCallbacksCompleted);
+        Assert.AreEqual(0, harness.Delivery.PendingBootstrapCount);
+        Assert.IsTrue(harness.Ingress.Diagnostics.IsClosed);
     }
 
     [TestMethod]
