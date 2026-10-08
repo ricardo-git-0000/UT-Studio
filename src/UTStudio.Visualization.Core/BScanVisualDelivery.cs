@@ -51,7 +51,6 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private long _requestGeneration;
     private long _consumerLifetime;
     private long _presentationEpoch;
-    private long _visualStateEpoch;
     private AcquisitionRunId? _latestVisualRunId;
     private long _renderRequests;
     private long _fullIdentityRequests;
@@ -371,14 +370,12 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(request);
         request.Validate();
         long requestGeneration;
-        long visualStateEpoch;
         long consumerLifetime;
         lock (_gate)
         {
             if (_disposed) { return BScanRasterResult.NotAvailable(); }
             _regionOperations++;
             requestGeneration = _pendingGenerations.GetValueOrDefault(request.ConsumerId);
-            visualStateEpoch = _visualStateEpoch;
             consumerLifetime = _consumerLifetimes.GetValueOrDefault(request.ConsumerId);
         }
         long started = _clock.GetTimestamp();
@@ -400,7 +397,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     _ingress.Options.MaximumRasterOwnersPerConsumer)
                 { return BScanRasterResult.ResourceLimit("The consumer raster owner quota is exhausted."); }
             }
-            BScanRasterResult result = BuildRegion(request, requestGeneration, visualStateEpoch,
+            BScanRasterResult result = BuildRegion(request, requestGeneration,
                 consumerLifetime, linked.Token);
             return result;
         }
@@ -443,7 +440,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     }
 
     private BScanRasterResult BuildRegion(BScanRenderRequest request, long requestGeneration,
-        long visualStateEpoch, long consumerLifetime, CancellationToken token)
+        long consumerLifetime, CancellationToken token)
     {
         BScanRenderRequest admittedRequest = request;
         BScanVisualLeaseBatch? batch = null;
@@ -564,21 +561,12 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     _consumerLifetimes.GetValueOrDefault(request.ConsumerId) == consumerLifetime;
                 bool generationCurrent =
                     _pendingGenerations.GetValueOrDefault(request.ConsumerId) == requestGeneration;
-                bool presentationCurrent = _visualStateEpoch == visualStateEpoch;
-                bool ingressCurrent = ingressState is not null &&
-                    ReferenceEquals(ingressState, _ingress.CurrentVisualState);
-                bool storeCurrent = ingressState is not null &&
-                    ReferenceEquals(ingressState.StoreState, ingressState.Store.CurrentVisualState);
-                bool stateCurrent = presentationCurrent && ingressCurrent && storeCurrent;
                 bool signatureCurrent = !_lastRequests.TryGetValue(request.ConsumerId,
                     out BScanRenderRequest? latest) || HasSameRenderSignature(admittedRequest, latest);
-                stale = active && (!generationCurrent || !stateCurrent || !signatureCurrent);
+                stale = active && (!generationCurrent || !signatureCurrent);
                 if (stale)
                 {
                     staleRejection = !generationCurrent ? BScanVisualAuditRejection.Generation :
-                        !presentationCurrent ? BScanVisualAuditRejection.Presentation :
-                        !ingressCurrent ? BScanVisualAuditRejection.IngressState :
-                        !storeCurrent ? BScanVisualAuditRejection.StoreState :
                         BScanVisualAuditRejection.Signature;
                     _staleCandidates++;
                     RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request);
@@ -1203,15 +1191,13 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 bool storeCurrent = ingressState is not null &&
                     ReferenceEquals(ingressState.StoreState, ingressState.Store.CurrentVisualState);
                 long currentGeneration = _pendingGenerations.GetValueOrDefault(request.ConsumerId);
-                if (!ingressCurrent || !storeCurrent || currentGeneration != requestGeneration)
+                if (currentGeneration != requestGeneration)
                 {
                     _lastMetadataCandidateAudit = new(request.RunId, requestGeneration,
                         currentGeneration, ingressCurrent, storeCurrent, false,
                         _lastGenerationReason, request);
                     Audit(BScanVisualAuditEventKind.CandidateRejectedStale, request.ConsumerId,
                         ingressState, requestGeneration, request, BScanVisualAuditResult.Stale,
-                        !ingressCurrent ? BScanVisualAuditRejection.IngressState :
-                        !storeCurrent ? BScanVisualAuditRejection.StoreState :
                         BScanVisualAuditRejection.Generation);
                     _staleCandidates++;
                     RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request);
@@ -1285,7 +1271,6 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         {
             if (_disposed) { return; }
             _columnsIndexed++;
-            _visualStateEpoch++;
             _latestVisualRunId = currentRun;
             foreach ((string consumerId, BScanRenderRequest request) in _lastRequests)
             {
@@ -1304,7 +1289,6 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 }
                 if (_pending.ContainsKey(consumerId)) { _coalesced = true; _updatesCoalesced++; }
                 _pending[consumerId] = request;
-                _pendingGenerations[consumerId] = ++_requestGeneration;
                 _lastGenerationReason = BScanRequestGenerationReason.VisualStateChanged;
             }
             bootstrap =

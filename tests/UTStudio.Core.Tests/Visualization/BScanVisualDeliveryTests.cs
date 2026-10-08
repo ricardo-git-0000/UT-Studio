@@ -663,6 +663,40 @@ public sealed class BScanVisualDeliveryTests
     }
 
     [TestMethod]
+    public async Task LiveAppendDoesNotInvalidateCapturedRasterCandidate()
+    {
+        var ingress = new BScanIngress(Options(4, 2));
+        ConventionalUtFrameMetadata metadata = Metadata(2);
+        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
+        ingress.OpenRun(metadata);
+        await using var delivery = new BScanVisualDelivery(ingress);
+        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, [1, 2]);
+        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        BScanRenderRequest request = Request(metadata.RunId, new(0, 3), 4, 2);
+        delivery.RequestRender(request);
+        var entered = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        delivery.BeforeRasterCandidateCommit = () => { entered.Set(); release.Wait(); };
+        Task<BScanRasterResult> candidate = Task.Run(async () => await delivery.GetRegionAsync(request));
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)));
+
+        var secondIndexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.AfterIndexCommit = _ => secondIndexed.TrySetResult();
+        ingress.Accept(metadata, 1, 1, TimeSpan.Zero, null, [3, 4]);
+        await secondIndexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        release.Set();
+
+        using BScanRasterRegion region = (await candidate.WaitAsync(TimeSpan.FromSeconds(10))).Region!;
+        Assert.AreEqual(new BScanAcquisitionRange(0, 0), region.Snapshot.ResidentRange);
+        Assert.AreEqual(0UL, delivery.Diagnostics.VisualBuildsSuperseded);
+        region.Dispose();
+        Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
+        await delivery.DisposeAsync();
+        await ingress.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task RemovingConsumerWithPendingBuildRejectsWithoutCallbackOrRetainedState()
     {
         var ingress = new BScanIngress(Options(2, 2));
