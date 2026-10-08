@@ -130,6 +130,85 @@ public readonly record struct InspectionTraceInput
     public ReadOnlyMemory<short> Samples { get; }
 }
 
+public enum InspectionGapCause
+{
+    Unknown,
+    SourceSequenceDiscontinuity,
+    SourceReportedLoss,
+    TransportLoss,
+    CorruptFrame
+}
+
+/// <summary>An inclusive Sequence interval confirmed by the later observed frame.</summary>
+public readonly record struct GapRecord
+{
+    public GapRecord(UtStreamIdentity stream, ulong firstMissingSequence, ulong lastMissingSequence,
+        ulong previousAdmittedSequence, ulong subsequentObservedSequence, InspectionGapCause cause,
+        InspectionRevision confirmedRevision = default)
+    {
+        if (!stream.IsValid) { throw new ArgumentException("A valid stream is required.", nameof(stream)); }
+        if (!Enum.IsDefined(cause) || cause == InspectionGapCause.Unknown)
+        { throw new ArgumentOutOfRangeException(nameof(cause)); }
+        if (firstMissingSequence > lastMissingSequence)
+        { throw new ArgumentException("The inclusive missing range cannot be empty or inverted."); }
+        if (previousAdmittedSequence == ulong.MaxValue || firstMissingSequence <= previousAdmittedSequence)
+        { throw new ArgumentException("The missing range must follow the admitted sequence."); }
+        if (lastMissingSequence == ulong.MaxValue || subsequentObservedSequence != lastMissingSequence + 1)
+        { throw new ArgumentException("The observed sequence must immediately follow the missing range."); }
+        Stream = stream;
+        FirstMissingSequence = firstMissingSequence;
+        LastMissingSequence = lastMissingSequence;
+        PreviousAdmittedSequence = previousAdmittedSequence;
+        SubsequentObservedSequence = subsequentObservedSequence;
+        Cause = cause;
+        ConfirmedRevision = confirmedRevision;
+    }
+
+    public UtStreamIdentity Stream { get; }
+    public ulong FirstMissingSequence { get; }
+    public ulong LastMissingSequence { get; }
+    public ulong PreviousAdmittedSequence { get; }
+    public ulong SubsequentObservedSequence { get; }
+    public InspectionGapCause Cause { get; }
+    public InspectionRevision ConfirmedRevision { get; init; }
+    public bool IsValid => Stream.IsValid && Cause != InspectionGapCause.Unknown &&
+        FirstMissingSequence <= LastMissingSequence && PreviousAdmittedSequence != ulong.MaxValue &&
+        FirstMissingSequence > PreviousAdmittedSequence && LastMissingSequence != ulong.MaxValue &&
+        SubsequentObservedSequence == LastMissingSequence + 1;
+    public override string ToString() =>
+        $"stream={Stream};missing={FirstMissingSequence}..{LastMissingSequence};previous={PreviousAdmittedSequence};subsequent={SubsequentObservedSequence};cause={Cause};revision={ConfirmedRevision.Value}";
+}
+
+public readonly record struct InspectionCommitInput
+{
+    public InspectionCommitInput(InspectionTraceInput trace, IReadOnlyList<GapRecord>? gaps = null)
+    {
+        if (trace.Descriptor is null) { throw new ArgumentException("A trace is required.", nameof(trace)); }
+        Trace = trace;
+        Gaps = Array.AsReadOnly((gaps ?? []).ToArray());
+        if (Gaps.Count > 1)
+        { throw new ArgumentException("A single trace can confirm at most one contiguous Sequence gap.", nameof(gaps)); }
+        if (Gaps.Any(gap => !gap.IsValid || gap.Stream != trace.Descriptor.Identity.Stream ||
+            gap.SubsequentObservedSequence != trace.Descriptor.Sequence ||
+            gap.ConfirmedRevision != InspectionRevision.Initial))
+        { throw new ArgumentException("Every unconfirmed gap must be valid and belong to the trace stream.", nameof(gaps)); }
+    }
+    public InspectionTraceInput Trace { get; }
+    public IReadOnlyList<GapRecord> Gaps { get; }
+}
+
+public enum InspectionRunState { Unknown, Open, Sealing, Sealed, Faulted }
+
+public readonly record struct InspectionRunSealResult(AcquisitionRunId RunId, InspectionRevision FinalRevision,
+    ulong? MinimumAcquisitionIndex, ulong? MaximumAcquisitionIndex, ulong? MinimumSequence,
+    ulong? MaximumSequence, int TraceCount, int GapCount);
+
+public readonly record struct RunStoreDiagnostics(AcquisitionRunId RunId, InspectionRunState State,
+    int ActiveWriters, int PendingOperations, int CommittedTraces, int ConfirmedGaps,
+    ulong DuplicateCount, ulong ConflictCount, ulong CancellationCount, ulong RejectionCount,
+    InspectionRevision? FinalRevision, ulong? MinimumAcquisitionIndex, ulong? MaximumAcquisitionIndex,
+    ulong? MinimumSequence, ulong? MaximumSequence);
+
 public enum InspectionAppendStatus { Unknown, Committed, Duplicate, Conflict, CapacityExceeded, Closed, Cancelled, Faulted }
 public readonly record struct InspectionAppendResult
 {
@@ -161,7 +240,7 @@ public readonly record struct InspectionAppendResult
 }
 
 /// <summary>
-/// Phase 1 returns NotAvailable for an absent index because it has no authoritative closed-range
+/// The in-memory store returns NotAvailable for an absent index because it has no authoritative closed-range
 /// watermark. Gap and OutOfRange are reserved for later producers that can prove those states.
 /// </summary>
 public enum InspectionReadStatus { Available, NotAvailable, Gap, OutOfRange, Cancelled, Closed, Faulted }
@@ -194,7 +273,10 @@ public readonly record struct StoreDiagnostics(long LogicalSampleBytes, long Res
     int MaximumEntries, int CommittedEntries, int ActiveWriters, int MaximumActiveWriters,
     int WritersPendingDuringClose, int ActiveLeases, int MaximumActiveLeases, ulong CommittedTraces,
     ulong CancelledAppends, ulong PreAdmissionClosedRejections, ulong DuplicateCount, ulong ConflictCount,
-    ulong CapacityRejections, int ActiveChunks, int SealedChunks, bool IsClosed)
+    ulong CapacityRejections, int ActiveChunks, int SealedChunks, bool IsClosed,
+    int OpenRuns = 0, int SealingRuns = 0, int SealedRuns = 0, int ActiveRunWriters = 0,
+    int ConfirmedGaps = 0, int PendingSealOperations = 0,
+    IReadOnlyList<RunStoreDiagnostics>? Runs = null)
 {
     public bool Durable => false;
 }

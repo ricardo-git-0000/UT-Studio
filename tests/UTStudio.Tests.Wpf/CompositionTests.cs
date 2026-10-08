@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using UTStudio.Acquisition.Simulator;
 using UTStudio.Application;
+using UTStudio.Inspection.Core;
 using UTStudio.App.Wpf;
 using UTStudio.App.Wpf.Composition;
 using UTStudio.App.Wpf.Services;
@@ -84,6 +85,7 @@ public sealed class CompositionTests
             var services = runtime.Host.Services;
             Assert.AreSame(services.GetRequiredService<SimulatorUtFrameSource>(), services.GetRequiredService<IUtFrameSource>());
             Assert.AreSame(services.GetRequiredService<ApplicationSession>(), services.GetRequiredService<IApplicationSession>());
+            Assert.IsNotNull(services.GetRequiredService<InspectionDataStoreRegistry>());
             Assert.AreSame(services.GetRequiredService<ConventionalFrameSinkFanOut>(), services.GetRequiredService<IConventionalFrameSink>());
             Assert.AreSame(services.GetRequiredService<AScanVisualDelivery>(), services.GetRequiredService<IObservable<AScanSnapshot>>());
             var vm = services.GetRequiredService<AScanViewModel>();

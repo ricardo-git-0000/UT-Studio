@@ -17,7 +17,7 @@ public sealed class ApplicationSessionTests
     public async Task StartStopDispose_OrderAndBorrowedSource()
     {
         var source = new ManualSessionSource();
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             var initial = session.Snapshot;
@@ -49,7 +49,7 @@ public sealed class ApplicationSessionTests
     {
         var source = new ManualSessionSource();
         source.Connect.Held = true;
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             var start = session.StartAsync(Configuration, NewRun());
@@ -75,7 +75,7 @@ public sealed class ApplicationSessionTests
         var source = new ManualSessionSource();
         var step = phase switch { "Connect" => source.Connect, "Configure" => source.Configure, _ => source.Start };
         step.Held = true;
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             var start = session.StartAsync(Configuration, NewRun());
@@ -98,7 +98,7 @@ public sealed class ApplicationSessionTests
         var source = new ManualSessionSource();
         source.Start.Held = true;
         source.Rollback.Held = true;
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             var start = session.StartAsync(Configuration, NewRun());
@@ -127,7 +127,7 @@ public sealed class ApplicationSessionTests
         var original = new InvalidOperationException("preparation failed");
         step.Error = original;
         source.StopError = new InvalidOperationException("stop failed");
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => Watch(session.StartAsync(Configuration, NewRun())));
@@ -148,7 +148,7 @@ public sealed class ApplicationSessionTests
         using var cancellation = new CancellationTokenSource();
         ManualSessionSource.CountingOwner? owner = null;
         source.AfterRunCreated = () => { owner = source.QueueFrame(0); cancellation.Cancel(); };
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Assert.ThrowsAsync<OperationCanceledException>(() => Watch(session.StartAsync(Configuration, NewRun(), cancellation.Token)));
@@ -166,7 +166,7 @@ public sealed class ApplicationSessionTests
     {
         var source = new ManualSessionSource();
         using var cancellation = new CancellationTokenSource();
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun(), cancellation.Token));
@@ -186,7 +186,7 @@ public sealed class ApplicationSessionTests
     public async Task DrainingAndReleaseBarrierAreIndependentOfProducerCompletion()
     {
         var source = new ManualSessionSource { HoldProducer = true, HoldReleaseBarrier = true };
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -220,7 +220,7 @@ public sealed class ApplicationSessionTests
     public async Task CancelledStopWaitDoesNotCancelSharedCleanup()
     {
         var source = new ManualSessionSource { HoldReleaseBarrier = true };
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -245,7 +245,7 @@ public sealed class ApplicationSessionTests
     public async Task FailedReleaseBarrierCannotAuthorizeDisconnectOrRestart(bool cancelled)
     {
         var source = new ManualSessionSource { HoldReleaseBarrier = true };
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -273,7 +273,7 @@ public sealed class ApplicationSessionTests
             var wrong = new ConventionalUtFrameMetadata(source.SourceId, NewRun(), Configuration, DateTimeOffset.UnixEpoch);
             owners = [source.QueueFrame(0, wrong), source.QueueFrame(1), source.QueueFrame(2)];
         };
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -292,7 +292,7 @@ public sealed class ApplicationSessionTests
     public async Task ProducerFailureTriggersAutomaticCleanupWithoutStopCommand()
     {
         var source = new ManualSessionSource();
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -313,7 +313,7 @@ public sealed class ApplicationSessionTests
         ManualSessionSource.CountingOwner[] owners = [];
         source.AfterRunCreated = () => owners =
             [source.QueueFrame(0, releaseError: new InvalidOperationException("owner failed after return")), source.QueueFrame(1)];
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -333,7 +333,7 @@ public sealed class ApplicationSessionTests
     {
         var source = new ManualSessionSource();
         source.Disconnect.Held = true;
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -354,7 +354,7 @@ public sealed class ApplicationSessionTests
     public async Task FullChannelStopCancelsWriterWhileSoleReaderContinuesDraining()
     {
         var source = new ManualSessionSource { HoldProducer = true };
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         var returning = ManualSessionSource.Signal();
         var allowReturn = ManualSessionSource.Signal();
         Task? writer = null;
@@ -403,7 +403,7 @@ public sealed class ApplicationSessionTests
     {
         var source = new ManualSessionSource();
         source.Disconnect.Error = new InvalidOperationException("disconnect failed");
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             await Watch(session.StartAsync(Configuration, NewRun()));
@@ -427,7 +427,7 @@ public sealed class ApplicationSessionTests
     {
         var source = new ManualSessionSource();
         source.Connect.Held = true;
-        var session = new ApplicationSession(source);
+        var session = TestInspectionAuthority.CreateSession(source);
         try
         {
             var start = session.StartAsync(Configuration, NewRun());
@@ -445,7 +445,7 @@ public sealed class ApplicationSessionTests
     {
         var clock = new ManualSimulatorTimeProvider();
         await using var source = new SimulatorUtFrameSource(new UtSourceId("session-integration"), timeProvider: clock);
-        await using var session = new ApplicationSession(source);
+        await using var session = TestInspectionAuthority.CreateSession(source);
         var first = NewRun();
         await Watch(session.StartAsync(SimulatorUtFrameSource.DefaultConfiguration, first));
         await clock.NextTimerAsync(); // The first frame has been accepted, without advancing real time.

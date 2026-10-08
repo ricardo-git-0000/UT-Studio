@@ -23,7 +23,7 @@ public sealed class ConventionalFrameSinkFanOutTests
         var a = new ManualSink("A", calls) { FailAccept = failing is "A" or "Both" };
         var b = new ManualSink("B", calls) { FailAccept = failing is "B" or "Both" };
         var fanOut = new ConventionalFrameSinkFanOut(a, b);
-        await using var session = new ApplicationSession(source, fanOut);
+        await using var session = TestInspectionAuthority.CreateSession(source, fanOut);
         await session.StartAsync(Metadata.Configuration, RunId).WaitAsync(TimeSpan.FromSeconds(10));
 
         var first = source.QueueFrame(0);

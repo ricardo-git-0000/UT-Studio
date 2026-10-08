@@ -1,6 +1,6 @@
 # Plan por fases del almacén autoritativo de inspección
 
-Estado: Fase 0 aprobada; Fase 1 implementada, pendiente de aprobación final.
+Estado: Fases 0, 1 y 2 completadas y validadas.
 Fuente normativa: [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
 
 ## Reglas transversales
@@ -59,6 +59,19 @@ observable. Simulador y futuras fuentes siguen `IUtFrameSource`.
 
 Gate: cada frame válido queda aceptado o rechazado explícitamente y se libera una vez; gaps y cierre
 ordenado cubiertos; no dual-write.
+
+Implementado: `ApplicationSession` valida identidad/cabecera, confirma un gap antes de avanzar el
+watermark observado y antes de validar índice/tiempo, espera el commit transaccional de cada traza
+admitida y solo después alimenta el fan-out A-Scan/B-Scan como proyección derivada. Un rechazo o fallo del store es
+un fallo observable de ingestión, detiene la ejecución y drena/libera los frames. El runtime crea un
+`InspectionId` estable y un store en memoria único para la inspección; las runs sucesivas comparten
+su presupuesto global y conservan identidades separadas. Cada run tiene un único writer ligado, se
+sella idempotentemente tras drenar operaciones admitidas y no puede reabrirse. `GapRecord` conserva
+rangos inclusivos de `Sequence` sin inferir `AcquisitionIndex`; cada unidad confirmada y su revisión se
+publican atómicamente. El store se cierra después de la sesión y antes de liberar la
+fuente. El gate de Fase 2 queda satisfecho por pruebas deterministas de atomicidad, exclusividad,
+sellado, cierre, ownership y runs sucesivas. La validación específica y la suite Core completa están
+verdes; las tres regresiones B-Scan que bloqueaban la suite se corrigieron únicamente en pruebas.
 
 ## Fase 3 — A-Scan sobre IUtTraceProvider
 

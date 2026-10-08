@@ -11,7 +11,7 @@ public sealed class ApplicationSessionPortTests
     public async Task ContractReportsAdmissionThroughPendingReleaseAndHealthyStop()
     {
         await using var source = new ManualSessionSource { HoldReleaseBarrier = true };
-        await using var implementation = new ApplicationSession(source);
+        await using var implementation = TestInspectionAuthority.CreateSession(source);
         IApplicationSession session = implementation;
         try
         {

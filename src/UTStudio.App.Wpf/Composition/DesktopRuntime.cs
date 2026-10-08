@@ -10,6 +10,8 @@ using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
+using UTStudio.Inspection.Core;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
 
@@ -29,6 +31,7 @@ public sealed class DesktopRuntime
     private BScanSelectionCoordinator? _selection;
     private BScanWindowManager? _bScanWindows;
     private ApplicationSession? _session;
+    private InspectionDataStoreRegistry? _inspectionStores;
     private AScanViewModel? _viewModel;
     private SharedScanTimeViewport? _timeViewport;
     private ShutdownInteractionGate? _interactionGate;
@@ -108,6 +111,7 @@ public sealed class DesktopRuntime
         await TryDisposeAsync(() => _bScanIngress?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _selection?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _visual?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
+        await TryDisposeAsync(() => _inspectionStores?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _timeViewport?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _source?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         if (_session is not null && _session.Snapshot.Phase != SessionPhase.Disposed)
@@ -221,8 +225,15 @@ public sealed class DesktopRuntime
                 ? new BScanVisualDelivery(bScanIngress, clock)
                 : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
             var fanOut = new ConventionalFrameSinkFanOut(visual, bScanIngress);
+            var inspectionOptions = new InMemoryInspectionStoreOptions(
+                builder.Configuration.GetValue<long?>("InspectionStore:SampleCapacityBudgetBytes") ?? 256L * 1024 * 1024,
+                builder.Configuration.GetValue<int?>("InspectionStore:MaximumEntries") ?? 100_000,
+                builder.Configuration.GetValue<int?>("InspectionStore:TargetChunkBytes") ?? 4 * 1024 * 1024);
+            var inspectionStores = runtime._inspectionStores = new InspectionDataStoreRegistry(
+                new InspectionId(Guid.NewGuid()), inspectionOptions);
             checkpoint?.Invoke("visual");
-            var session = runtime._session = new ApplicationSession(source, fanOut);
+            var session = runtime._session = new ApplicationSession(source, inspectionStores.InspectionId,
+                runId => inspectionStores.OpenRun(runId), fanOut);
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selection = runtime._selection = new BScanSelectionCoordinator(dispatcher, bScanIngress, new AScanProjector());
             var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, configuration,
@@ -241,6 +252,7 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton<IConventionalFrameSink>(fanOut);
             builder.Services.AddSingleton<IObservable<AScanSnapshot>>(visual);
             builder.Services.AddSingleton(session);
+            builder.Services.AddSingleton(inspectionStores);
             builder.Services.AddSingleton<IApplicationSession>(session);
             builder.Services.AddSingleton(viewModel);
             builder.Services.AddSingleton(timeViewport);

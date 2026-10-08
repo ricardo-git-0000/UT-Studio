@@ -10,6 +10,7 @@
     <ProjectReference Include="../../src/UTStudio.Domain/UTStudio.Domain.csproj" />
     <ProjectReference Include="../../src/UTStudio.Contracts/UTStudio.Contracts.csproj" />
     <ProjectReference Include="../../src/UTStudio.Application/UTStudio.Application.csproj" />
+    <ProjectReference Include="../../src/UTStudio.Inspection.Core/UTStudio.Inspection.Core.csproj" />
     <ProjectReference Include="../../src/UTStudio.Acquisition.Simulator/UTStudio.Acquisition.Simulator.csproj" />
     <ProjectReference Include="../../src/UTStudio.Visualization.Core/UTStudio.Visualization.Core.csproj" />
   </ItemGroup>

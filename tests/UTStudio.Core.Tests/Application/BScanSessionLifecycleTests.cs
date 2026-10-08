@@ -21,7 +21,7 @@ public sealed class BScanSessionLifecycleTests
         var ascan = new PassiveSink();
         var fanOut = new ConventionalFrameSinkFanOut(ascan, bscan);
         await using var source = new ManualSessionSource();
-        await using var session = new ApplicationSession(source, fanOut);
+        await using var session = TestInspectionAuthority.CreateSession(source, fanOut);
         var configuration = new ConventionalAcquisitionConfiguration(default, 3, 50_000_000);
         var firstRun = new AcquisitionRunId(Guid.NewGuid());
         await session.StartAsync(configuration, firstRun).WaitAsync(TimeSpan.FromSeconds(10));

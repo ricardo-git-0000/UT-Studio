@@ -4,6 +4,8 @@ using UTStudio.Application;
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
+using UTStudio.Inspection.Core;
 using UTStudio.Visualization.Core;
 
 namespace UTStudio.LoadTests;
@@ -38,7 +40,11 @@ internal sealed class LoadRunner
         var visual = new AScanVisualDelivery(new InstrumentedProjector(new AScanProjector(1024), telemetry));
         IDisposable subscription = visual.Subscribe(new SnapshotObserver(telemetry));
         var observedSource = new RunCaptureSource(source);
-        var session = new ApplicationSession(observedSource, new InstrumentedFrameSink(visual, telemetry));
+        var inspectionId = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspectionId,
+            new InMemoryInspectionStoreOptions(512L * 1024 * 1024, 1_000_000));
+        var session = new ApplicationSession(observedSource, inspectionId, stores.OpenRun,
+            new InstrumentedFrameSink(visual, telemetry));
         var configuration = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), options.SampleCount, 50_000_000);
         using var process = Process.GetCurrentProcess();
         TimeSpan cpuOrigin = process.TotalProcessorTime, cpuActiveStart = cpuOrigin, cpuActiveEnd = cpuOrigin;

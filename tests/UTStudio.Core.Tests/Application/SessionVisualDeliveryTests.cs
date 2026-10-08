@@ -20,7 +20,7 @@ public sealed class SessionVisualDeliveryTests
         var clock = new ManualSimulatorTimeProvider();
         await using var source = new ManualSessionSource();
         await using var delivery = new AScanVisualDelivery(timeProvider: clock);
-        await using var session = new ApplicationSession(source, delivery);
+        await using var session = TestInspectionAuthority.CreateSession(source, delivery);
         var entered = ManualSessionSource.Signal();
         var unblock = ManualSessionSource.Signal();
         AScanSnapshot? first = null;
@@ -68,7 +68,7 @@ public sealed class SessionVisualDeliveryTests
     {
         await using var source = new ManualSessionSource();
         var sink = new FailingSink(failingOperation);
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await Watch(session.StartAsync(Configuration, new AcquisitionRunId(Guid.NewGuid())));
         var first = source.QueueFrame(0);
         await Watch(first.Returned.Task);
@@ -92,7 +92,7 @@ public sealed class SessionVisualDeliveryTests
         await using var source = new ManualSessionSource();
         await using var delivery = new AScanVisualDelivery(new FailingProjector(), new ManualSimulatorTimeProvider());
         using var subscription = delivery.Subscribe(new Observer());
-        await using var session = new ApplicationSession(source, delivery);
+        await using var session = TestInspectionAuthority.CreateSession(source, delivery);
         await Watch(session.StartAsync(Configuration, new AcquisitionRunId(Guid.NewGuid())));
         var first = source.QueueFrame(0);
         await Watch(first.Returned.Task);

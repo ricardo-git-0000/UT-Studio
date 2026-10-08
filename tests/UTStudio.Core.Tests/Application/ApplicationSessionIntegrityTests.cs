@@ -17,7 +17,7 @@ public sealed class ApplicationSessionIntegrityTests
     {
         await using var source = new ManualSessionSource();
         var sink = new RecordingSink();
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
         var invalid = source.QueueFrame(0, acquisitionIndex: 9, elapsed: TimeSpan.Zero);
         await invalid.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -37,7 +37,7 @@ public sealed class ApplicationSessionIntegrityTests
     {
         await using var source = new ManualSessionSource();
         var sink = new RecordingSink();
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
         var first = source.QueueFrame(0, acquisitionIndex: 0, elapsed: TimeSpan.Zero);
         await first.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -65,7 +65,7 @@ public sealed class ApplicationSessionIntegrityTests
     {
         await using var source = new ManualSessionSource();
         var sink = new RecordingSink();
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
         var coordinate = new ScanSpatialCoordinate(12.5, ScanSpatialUnit.Millimetres, new ScanAxisId("scan-x"));
 
@@ -87,7 +87,7 @@ public sealed class ApplicationSessionIntegrityTests
     {
         await using var source = new ManualSessionSource();
         var sink = new RecordingSink();
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
 
         var owners = new[]
@@ -111,7 +111,7 @@ public sealed class ApplicationSessionIntegrityTests
     {
         await using var source = new ManualSessionSource();
         var sink = new RecordingSink();
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
 
         var owners = new List<ManualSessionSource.CountingOwner>();
@@ -151,7 +151,7 @@ public sealed class ApplicationSessionIntegrityTests
     {
         await using var source = new ManualSessionSource();
         var sink = new RecordingSink();
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
 
         var owners = new List<ManualSessionSource.CountingOwner>();
@@ -181,7 +181,7 @@ public sealed class ApplicationSessionIntegrityTests
     {
         await using var source = new ManualSessionSource();
         var sink = new RecordingSink();
-        await using var session = new ApplicationSession(source, sink);
+        await using var session = TestInspectionAuthority.CreateSession(source, sink);
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
 
         var owners = new[]

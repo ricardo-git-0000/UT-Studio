@@ -39,9 +39,10 @@ proveedores neutrales. No se crea todavía `UTStudio.Inspection.Storage`.
 
 - Una `InspectionId` agrupa una inspección y puede contener varias adquisiciones o reaperturas.
 - Cada inicio/reanudación crea una `AcquisitionRunId`; no se finge continuidad entre runs.
-- Una run declara fuente, revisiones de configuración y streams. Un stream conserva por separado
-  `UtSourceId`, canal físico, elemento, beam y ley focal; los opcionales y sus combinaciones se validan
-  contra la configuración, nunca se deducen entre sí.
+- Una run declara fuente, revisiones de configuración y streams. La adquisición convencional de estas
+  fases conserva `UtSourceId`, canal físico, beam y ley focal por separado. No expone todavía dimensión
+  de elemento; cuando una modalidad la incorpore deberá usar identidad tipada propia, sin colapsarla ni
+  deducirla de canal, beam o ley.
 - En Fase 1, `TraceIdentity` contiene `InspectionId`, `AcquisitionRunId`, `UtSourceId`,
   `PhysicalChannelId`, `BeamId?` o `FocalLawId?` tipados y `AcquisitionIndex`. Beam y ley no se
   colapsan ni se infieren; las combinaciones válidas se comprueban contra la configuración.
@@ -52,8 +53,9 @@ proveedores neutrales. No se crea todavía `UTStudio.Inspection.Storage`.
   representación RF/rectificada, encoding, procedencia y calidad.
 - La posición es un snapshot disperso de coordenadas tipadas con eje, unidad, referencia/revisión y
   calidad. No exige X/Y/Z ni un encoder concreto.
-- `GapRecord` representa intervalos ausentes o incompletos con stream, Sequence y, cuando se conozcan,
-  rangos de índice/tiempo/posición, causa y evidencia. Un gap no es una traza de ceros.
+- `GapRecord` representa en esta fase intervalos ausentes o incompletos con stream, `Sequence`, causa y
+  evidencia observada. Rangos de índice/tiempo/posición requerirán una extensión contractual futura;
+  no se inventan a partir de `Sequence`. Un gap no es una traza de ceros.
 - Las muestras adquiridas son evidencia primaria. Índices, previews, raster, reducciones, gates y
   reconstrucciones son derivados con procedencia hacia identidades y revisión.
 
@@ -232,6 +234,34 @@ Permanecen abiertas: tamaño de chunk persistente; formato/contenedor o base de 
 mapeada; checksum concreto; política definitiva y capacidad de absorción ante disco lento; encoding
 rectificado; encoder/posición; layout y agrupación phased-array; política crudo/
 procesado; durabilidad/flush; taxonomía final de calidad; gates y criterios C-Scan.
+
+## Refinamiento aceptado de Fase 2
+
+Cada `AcquisitionRunId` se abre una sola vez y obtiene una capacidad `IInspectionRunWriter` ligada a
+esa run. La capacidad confirma una unidad indivisible formada por una traza y los `GapRecord`
+confirmados con ella. Un `GapRecord` también puede constituir un commit autoritativo propio cuando el
+frame que demuestra la discontinuidad todavía debe superar otras validaciones. La revisión se publica
+únicamente después de insertar toda la unidad;
+un fallo revierte la unidad completa. Un duplicado equivalente es idempotente y un mismo gap con
+evidencia distinta es conflicto, nunca sobrescritura.
+
+En adquisición convencional ordenada, una traza puede confirmar como máximo un intervalo contiguo de
+`Sequence` inmediatamente anterior. Por ello la unidad de Fase 2 admite cero o un `GapRecord`; más de
+uno se rechaza en el límite contractual. Flujos futuros capaces de demostrar varios intervalos por
+unidad requerirán un contrato explícito distinto, no una relajación implícita.
+
+`GapRecord` usa un intervalo inclusivo de `Sequence`, conserva la secuencia admitida anterior y la
+posterior observada, y no inventa `AcquisitionIndex`. La discontinuidad se confirma antes de avanzar el
+watermark observado y antes de validar índice o tiempo. Por ello un frame observador rechazado por otra
+dimensión conserva la evidencia legítima del gap sin publicar traza ni proyección visual.
+
+El sellado pasa `Open → Sealing → Sealed`, bloquea nuevas admisiones, espera operaciones ya admitidas y
+publica revisión final y watermarks disponibles. Es idempotente y sus llamadas concurrentes comparten
+resultado. `Stop` detiene la fuente, drena el lector, confirma la barrera de liberación de frames y
+después sella la run, que a su vez espera cualquier commit admitido. `CloseAsync` sella las runs
+abiertas y no fuerza writers ni leases.
+Cerrar admisión, liberar recursos y confirmar cleanup son hechos distintos: un fallo posterior no
+reabre admisión ni permite declarar falsamente una run como `Sealed`.
 
 ## Fases
 

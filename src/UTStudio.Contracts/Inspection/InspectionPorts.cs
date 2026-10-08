@@ -1,8 +1,21 @@
+using UTStudio.Domain.Acquisition;
+
 namespace UTStudio.Contracts.Inspection;
 
 public interface IInspectionDataWriter
 {
     ValueTask<InspectionAppendResult> AppendAsync(InspectionTraceInput trace, CancellationToken cancellationToken = default);
+}
+
+public interface IInspectionRunWriter : IAsyncDisposable
+{
+    AcquisitionRunId RunId { get; }
+    InspectionRunState State { get; }
+    ValueTask<InspectionAppendResult> CommitAsync(InspectionCommitInput commit,
+        CancellationToken cancellationToken = default);
+    ValueTask<InspectionAppendResult> CommitGapAsync(GapRecord gap,
+        CancellationToken cancellationToken = default);
+    ValueTask<InspectionRunSealResult> SealRunAsync(CancellationToken cancellationToken = default);
 }
 
 public interface IInspectionTraceLease : IDisposable
@@ -64,6 +77,10 @@ public interface IInspectionDataStore : IInspectionDataWriter, IUtTraceProvider,
 {
     InspectionRevision Revision { get; }
     StoreDiagnostics Diagnostics { get; }
+    ValueTask<IInspectionRunWriter> OpenRunAsync(AcquisitionRunId runId,
+        CancellationToken cancellationToken = default);
+    ValueTask<IReadOnlyList<GapRecord>> ReadGapsAsync(UtStreamIdentity stream, int maximumCount,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed class InspectionStoreCloseException : Exception

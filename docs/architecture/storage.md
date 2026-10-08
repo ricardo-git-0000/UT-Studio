@@ -28,6 +28,12 @@ Lecturas exactas/rangos usan lease estable con Dispose idempotente o snapshot in
 espera leases. Diagnósticos separan bytes lógicos, reservados, materializados y máximo materializado
 de muestras, además de límites/uso de entradas, writers, leases y chunks.
 
+En la integración de Fase 2, el runtime posee un store en memoria por inspección, con un
+`InspectionId` estable. Las ejecuciones sucesivas usan identidades de run distintas dentro del mismo
+store y comparten el mismo presupuesto, evitando multiplicar el límite por cada reinicio. La sesión
+espera el commit autoritativo antes de publicar las proyecciones visuales derivadas y el runtime cierra
+el store durante el cierre global, después de drenar la sesión.
+
 ## Persistencia futura
 
 Un futuro journal registrará preparación, commit, revisión y sellado. Checksums y versiones permitirán distinguir
@@ -44,3 +50,19 @@ La reproducción implementa el contrato de fuente, con cancelación y ritmo cont
 
 ## Informes
 Reporting produce un modelo neutral; Reporting.Pdf lo renderiza. El PDF forma parte de v1, no de la entrega documental actual. No seleccionar biblioteca ni plantilla hasta conocer PDF/A, firmas, imágenes, contenido y formato corporativo. Evitar que la generación requiera controles WPF vivos o la carga completa de la inspección.
+
+## Ciclo de vida de runs y gaps
+
+El store de inspección mantiene un presupuesto global y entrega una capacidad de escritura exclusiva
+por `AcquisitionRunId`. Una run transita `Open → Sealing → Sealed`; el sellado bloquea admisiones,
+espera commits admitidos y publica revisión final y watermarks. Una run sellada no se reabre, pero no
+impide abrir otra run en el mismo store.
+
+La unidad de commit en memoria contiene la traza y sus `GapRecord`, o un `GapRecord` independiente si
+el frame observador demuestra la pérdida pero no supera validaciones posteriores.
+Cada gap identifica el stream y un rango inclusivo de `Sequence`, sin deducir índices de adquisición.
+La publicación de payload, índices, gaps y revisión es atómica; A-Scan y B-Scan reciben el frame solo
+después del commit. Los gaps consumen el límite global `MaximumEntries` junto con las trazas.
+
+El cierre de admisión, la liberación de owners/chunks y la confirmación de cleanup se contabilizan por
+separado. Los errores principal y secundarios se conservan sin afirmar una transición falsa a `Sealed`.

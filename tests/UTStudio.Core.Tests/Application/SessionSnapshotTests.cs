@@ -15,7 +15,7 @@ public sealed class SessionSnapshotTests
     public async Task SlowObserverCoalescesSnapshotsWithoutBlockingStopOrDisposal()
     {
         await using var source = new ManualSessionSource();
-        await using var session = new ApplicationSession(source);
+        await using var session = TestInspectionAuthority.CreateSession(source);
         var entered = ManualSessionSource.Signal();
         var allowReturn = ManualSessionSource.Signal();
         var completed = ManualSessionSource.Signal();
@@ -55,7 +55,7 @@ public sealed class SessionSnapshotTests
     public async Task UnsubscribeDropsPendingNotificationsWithoutWaitingForAdmittedCallback()
     {
         await using var source = new ManualSessionSource();
-        await using var session = new ApplicationSession(source);
+        await using var session = TestInspectionAuthority.CreateSession(source);
         var entered = ManualSessionSource.Signal();
         var allowReturn = ManualSessionSource.Signal();
         var exited = ManualSessionSource.Signal();
@@ -85,7 +85,7 @@ public sealed class SessionSnapshotTests
     public async Task ThrowingObserverIsIsolatedAndLateSubscriberGetsTerminalSnapshot()
     {
         await using var source = new ManualSessionSource();
-        await using var session = new ApplicationSession(source);
+        await using var session = TestInspectionAuthority.CreateSession(source);
         var failed = ManualSessionSource.Signal();
         int invocations = 0;
         using var broken = session.Subscribe(new ApplicationSessionTests.CallbackObserver(_ =>
@@ -112,7 +112,7 @@ public sealed class SessionSnapshotTests
     {
         await using var source = new ManualSessionSource();
         source.Connect.Held = source.Configure.Held = source.Start.Held = true;
-        await using var session = new ApplicationSession(source);
+        await using var session = TestInspectionAuthority.CreateSession(source);
         var initial = session.Snapshot;
         var start = session.StartAsync(Configuration, new AcquisitionRunId(Guid.NewGuid()));
         try
