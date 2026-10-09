@@ -68,6 +68,15 @@ public interface IUtTraceProvider
     ValueTask<InspectionTraceReadResult> ReadAsync(TraceIdentity identity, CancellationToken cancellationToken = default);
 }
 
+/// <summary>Bounded visual notification of an already committed trace; never carries sample memory.</summary>
+public interface ICommittedTraceSink
+{
+    void OpenRun(AcquisitionRunId runId);
+    void NotifyCommitted(TraceIdentity identity, InspectionRevision revision);
+    void CloseRun(AcquisitionRunId runId);
+    ValueTask WaitForCloseAsync(AcquisitionRunId runId) => ValueTask.CompletedTask;
+}
+
 public interface IInspectionRangeProvider
 {
     ValueTask<InspectionRangeReadResult> ReadRangeAsync(InspectionRangeQuery query, CancellationToken cancellationToken = default);

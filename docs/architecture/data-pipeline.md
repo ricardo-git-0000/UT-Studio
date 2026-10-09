@@ -34,9 +34,9 @@ Hay un writer por run y lectores concurrentes. Commit de traza es todo-o-nada; i
 se sobrescribe. Duplicate, Conflict, CapacityExceeded, Cancelled y Faulted son resultados explícitos.
 Cancelación precommit revierte; después del commit no deshace datos.
 
-Flujo actual implementado: simulador -> Channel -> ApplicationSession (único lector) -> fan-out visual síncrono aislado. A conserva su proyección latest-only y B copia RF/metadata a un ring propio; índice, regiones y UI se ejecutan después, fuera del préstamo. Véase [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
+Flujo actual implementado: simulador → Channel → ApplicationSession (único lector) → commit autoritativo. Tras `Committed`, A recibe solo `TraceIdentity`+revisión, lee mediante `IUtTraceProvider`, proyecta bajo un lease y publica latest-only; B copia temporalmente RF/metadata confirmados a su ring derivado. Véase [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
 
-ApplicationSession presta `ReadOnlySpan<short>` únicamente durante Accept. El sink no puede retener el span ni aliases a las muestras. Con interés visual, AScanVisualDelivery realiza reducción síncrona por entrada y crea datos propios; la sesión libera siempre el frame original en finally, también ante excepciones. Sin interés evita proyección y acumulación. El mailbox en Visualization.Core retiene solamente un snapshot independiente pendiente y sustituye el anterior. No retiene ConventionalUtFrame ni transfiere owners a Presentation.
+ApplicationSession presta `ReadOnlySpan<short>` únicamente al adaptador B transitorio durante `Accept`; A-Scan no recibe ni conserva memoria de adquisición. `AScanVisualDelivery` retiene como máximo una solicitud de identidad, libera cada lease del provider tras formar el snapshot y antes de publicación. No expone leases ni `IDisposable` a Presentation o WPF.
 
 El presupuesto de reducción es configurable entre 4 y 1.024 puntos; conserva primero/último y extremos min/max de todos los grupos interiores en orden temporal. La publicación se limita a 30 Hz con TimeProvider monotónico, sin recuperar ticks. Ese límite no acota necesariamente el coste de proyección, que se paga por entrada interesada. Medir CPU, asignaciones, GC y backpressure y valorar una optimización previa al mailbox sigue pendiente.
 

@@ -263,6 +263,21 @@ abiertas y no fuerza writers ni leases.
 Cerrar admisión, liberar recursos y confirmar cleanup son hechos distintos: un fallo posterior no
 reabre admisión ni permite declarar falsamente una run como `Sealed`.
 
+## Refinamiento aceptado de Fase 3
+
+A-Scan recibe después de `Committed` únicamente `TraceIdentity` e `InspectionRevision` mediante una
+notificación latest-only acotada. `AScanVisualDelivery` resuelve esa identidad con `IUtTraceProvider`,
+valida identidad, revisión y run, forma el snapshot mientras mantiene el lease y lo libera siempre antes
+de publicar. Una sustitución o cambio de run cancela el candidato y la comprobación de generación impide
+publicaciones tardías. Los resultados `NotAvailable`, `Gap`, `OutOfRange`, `Cancelled` y `Faulted`
+permanecen distinguibles en el diagnóstico visual; un fallo visual no revierte el commit ni detiene la
+autoridad.
+
+B-Scan permanece temporalmente como proyección derivada alimentada con el frame ya confirmado y
+`BScanTraceStore` no se elimina. La selección B→A, en cambio, resuelve la `TraceIdentity` autoritativa
+por `AcquisitionIndex` mediante `IUtTraceProvider`; `Sequence` no sustituye al índice. La persistencia
+incremental continúa aplazada a Fase 5.
+
 ## Fases
 
 La ejecución se divide en Fase 0 documental y Fases 1–7 del

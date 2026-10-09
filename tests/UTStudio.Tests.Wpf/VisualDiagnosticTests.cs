@@ -31,8 +31,9 @@ public sealed class VisualDiagnosticTests
                 "first curve and simulator waiting on its manual timer");
             var first = vm.AScan!;
             clock.FailNextTimer = true;
-            // Source remains paused at its manual timer. This second input fails the publisher's timer.
-            delivery.Accept(first.Metadata, first.Sequence + 1, TimeSpan.FromTicks(1), new short[2048]);
+            // Source remains paused at its manual timer. Re-reading the already confirmed identity
+            // exercises the provider/lease path and fails the publisher's next timer.
+            delivery.NotifyCommitted(first.TraceIdentity!.Value, first.InspectionRevision);
             var text = (TextBlock)window.FindName("VisualErrorText");
             await DiagnosticWait.Until(() => text.Text.Contains("Synthetic clock failure", StringComparison.Ordinal),
                 "terminal visual error visible through WPF binding");

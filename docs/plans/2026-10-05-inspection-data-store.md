@@ -1,6 +1,6 @@
 # Plan por fases del almacén autoritativo de inspección
 
-Estado: Fases 0, 1 y 2 completadas y validadas.
+Estado: Fases 0, 1 y 2 completadas. Fase 3 en curso; validación y gates pendientes.
 Fuente normativa: [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
 
 ## Reglas transversales
@@ -79,6 +79,14 @@ Live consume la última traza confirmada mediante mailbox latest-only; Selected 
 identidad. Mantener navegación temporal, límites de publicación y cierre del ViewModel.
 
 Gate: coalescencia visual no afecta contadores del store; selección exacta sobre revisión estable.
+
+En curso: la sesión confirma primero y notifica solo identidad+revisión; A-Scan usa un mailbox
+latest-only, adquiere un lease de `IUtTraceProvider`, proyecta bajo el lease y publica solo si run y
+generación siguen vigentes. El cierre bloquea nuevas notificaciones, cancela candidatos no iniciados y
+espera lecturas/callbacks admitidos sin forzar leases. La selección B→A usa el provider autoritativo y
+`AcquisitionIndex`. B-Scan conserva temporalmente su proyección derivada; persistencia sigue aplazada.
+No se declara completada hasta retirar leases de Presentation, añadir la cobertura determinista exigida
+y dejar verdes Core, WPF y las repeticiones de cierre.
 
 ## Fase 4 — B-Scan sobre rangos
 

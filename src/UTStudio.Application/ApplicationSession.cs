@@ -21,6 +21,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private readonly InspectionId _inspectionId;
     private readonly Func<AcquisitionRunId, IInspectionRunWriter> _inspectionWriterFactory;
     private readonly IConventionalFrameSink? _visualSink;
+    private readonly ICommittedTraceSink? _aScanSink;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
     private Operation? _active;
@@ -31,7 +32,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
     public ApplicationSession(IUtFrameSource source, InspectionId inspectionId,
         Func<AcquisitionRunId, IInspectionRunWriter> inspectionWriterFactory,
-        IConventionalFrameSink? visualSink = null)
+        IConventionalFrameSink? visualSink = null, ICommittedTraceSink? aScanSink = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
@@ -42,6 +43,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _inspectionId = inspectionId;
         _inspectionWriterFactory = inspectionWriterFactory;
         _visualSink = visualSink;
+        _aScanSink = aScanSink;
         _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0, canStart: true);
         _publisher = new SessionSnapshotPublisher(_snapshot);
     }
@@ -129,6 +131,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                     try { _visualSink.OpenRun(run.Metadata); }
                     catch (Exception error) { RecordVisualError(operation, error); CloseVisual(operation); }
                 }
+                if (!operation.CleanupRequested && _aScanSink is not null)
+                {
+                    operation.AScanOpened = true;
+                    try { _aScanSink.OpenRun(operation.RunId); }
+                    catch (Exception error) { RecordVisualError(operation, error); CloseAScan(operation); }
+                }
                 operation.Consumer = Task.Run(() => ConsumeAsync(operation, run));
                 operation.Supervisor = Task.Run(() => SuperviseProducerAsync(operation, run));
                 if (run.Metadata.SourceId != _source.SourceId || run.Metadata.RunId != operation.RunId ||
@@ -210,8 +218,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                         {
                             if (await InspectFrameAsync(operation, run, frame).ConfigureAwait(false))
                             {
-                                if (await CommitInspectionAsync(operation, frame).ConfigureAwait(false))
-                                { DeliverVisual(operation, frame); }
+                                InspectionAppendResult commit = await CommitInspectionAsync(operation, frame).ConfigureAwait(false);
+                                if (commit.IsCommitted)
+                                {
+                                    DeliverCommittedAScan(operation, frame, commit.Revision);
+                                    DeliverVisual(operation, frame);
+                                }
                             }
                         }
                     }
@@ -376,7 +388,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         }
     }
 
-    private async ValueTask<bool> CommitInspectionAsync(Operation operation, ConventionalUtFrame frame)
+    private async ValueTask<InspectionAppendResult> CommitInspectionAsync(Operation operation, ConventionalUtFrame frame)
     {
         var configuration = frame.Metadata.Configuration;
         var stream = new UtStreamIdentity(_inspectionId, operation.RunId, frame.Metadata.SourceId,
@@ -389,13 +401,32 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             throw new InvalidOperationException("The inspection writer is unavailable.");
         InspectionAppendResult result = await writer.CommitAsync(
             new InspectionCommitInput(new InspectionTraceInput(descriptor, frame.Samples))).ConfigureAwait(false);
-        if (result.Status == InspectionAppendStatus.Duplicate) { return false; }
+        if (result.Status == InspectionAppendStatus.Duplicate) { return result; }
         if (!result.IsCommitted)
         {
             throw new InspectionAppendException(result.Status, result.ErrorCode);
         }
         ApplyCommittedFrame(operation, frame);
-        return true;
+        return result;
+    }
+
+    private void DeliverCommittedAScan(Operation operation, ConventionalUtFrame frame, InspectionRevision revision)
+    {
+        lock (_gate)
+        {
+            if (!operation.AScanOpened || operation.VisualError is not null || operation.CleanupRequested) { return; }
+        }
+        try
+        {
+            var configuration = frame.Metadata.Configuration;
+            var stream = new UtStreamIdentity(_inspectionId, operation.RunId, frame.Metadata.SourceId,
+                configuration.PhysicalChannelId);
+            _aScanSink!.NotifyCommitted(new TraceIdentity(stream, frame.AcquisitionIndex), revision);
+        }
+        catch (Exception error)
+        {
+            lock (_gate) { RecordVisualError(operation, error); CloseAScan(operation); Publish(operation, _snapshot.Phase); }
+        }
     }
 
     private void ApplyCommittedFrame(Operation operation, ConventionalUtFrame frame)
@@ -418,6 +449,14 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         catch (Exception error) { RecordVisualError(operation, error); }
     }
 
+    private void CloseAScan(Operation operation)
+    {
+        if (!operation.AScanOpened) { return; }
+        operation.AScanOpened = false;
+        try { _aScanSink!.CloseRun(operation.RunId); }
+        catch (Exception error) { RecordVisualError(operation, error); }
+    }
+
     private static void RecordVisualError(Operation operation, Exception error) =>
         operation.VisualError ??= Describe("session.visual", error);
 
@@ -425,6 +464,13 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     {
         if (_visualSink is null) { return; }
         try { await _visualSink.WaitForCloseAsync(operation.RunId).ConfigureAwait(false); }
+        catch (Exception error) { lock (_gate) { RecordVisualError(operation, error); } }
+    }
+
+    private async Task WaitForAScanCloseAsync(Operation operation)
+    {
+        if (_aScanSink is null) { return; }
+        try { await _aScanSink.WaitForCloseAsync(operation.RunId).ConfigureAwait(false); }
         catch (Exception error) { lock (_gate) { RecordVisualError(operation, error); } }
     }
 
@@ -468,6 +514,9 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 await ObserveAsync(operation,
                     () => operation.InspectionWriter.SealRunAsync().AsTask(), "session.seal").ConfigureAwait(false);
             }
+
+            lock (_gate) { CloseAScan(operation); }
+            await WaitForAScanCloseAsync(operation).ConfigureAwait(false);
 
             bool disconnect;
             lock (_gate) { disconnect = operation.DisconnectRequested || _disposing || operation.PrimaryException is not null; }
@@ -643,6 +692,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal TimeSpan LastElapsed;
         internal ConventionalUtFrameMetadata? LastMetadata;
         internal bool VisualOpened;
+        internal bool AScanOpened;
         internal UtSourceError? VisualError;
         internal IInspectionRunWriter? InspectionWriter;
         internal ulong AcquisitionMissingFrames;

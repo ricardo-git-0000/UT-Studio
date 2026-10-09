@@ -13,17 +13,19 @@ public sealed class AScanVisualDeliveryTests
     public async Task PendingSnapshotIsReplacedAndPublicationIsLimitedWithoutCatchUp()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        var projector = new CountingProjector();
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(projector, clock);
         var observer = new Observer();
         using var subscription = delivery.Subscribe(observer);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         var first = await observer.NextAsync();
         long firstAt = clock.GetTimestamp();
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         var timer = await clock.NextTimerAsync();
-        delivery.Accept(metadata, 2, TimeSpan.FromTicks(2), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 2, 2, TimeSpan.FromTicks(2), new short[8]);
+        await projector.WaitForCallsAsync(3);
         Assert.AreEqual(3L, delivery.Statistics.Received);
         Assert.AreEqual(1L, delivery.Statistics.Published);
         Assert.AreEqual(1L, delivery.Statistics.Replaced);
@@ -37,11 +39,11 @@ public sealed class AScanVisualDeliveryTests
         Assert.AreEqual(3UL, latest.Version);
         Assert.IsGreaterThan(first.Version, latest.Version);
         Assert.IsGreaterThanOrEqualTo(AScanVisualDelivery.MinimumPublicationInterval, clock.GetElapsedTime(firstAt));
-        delivery.Accept(metadata, 3, TimeSpan.FromTicks(3), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 3, 3, TimeSpan.FromTicks(3), new short[8]);
         (await clock.NextTimerAsync()).Fire(TimeSpan.FromSeconds(10));
         Assert.AreEqual(3UL, (await observer.NextAsync()).Sequence);
         long afterJump = clock.GetTimestamp();
-        delivery.Accept(metadata, 4, TimeSpan.FromTicks(4), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 4, 4, TimeSpan.FromTicks(4), new short[8]);
         var next = await clock.NextTimerAsync();
         Assert.AreEqual(3L, delivery.Statistics.Published); // A clock jump cannot authorize a burst.
         next.Fire();
@@ -53,7 +55,7 @@ public sealed class AScanVisualDeliveryTests
     public async Task SlowObserverDoesNotBlockInputAndDisposalWaitsOutsideGlobalLock()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         var entered = ManualSessionSource.Signal();
         var unblock = ManualSessionSource.Signal();
         var observer = new Observer(snapshot =>
@@ -70,11 +72,11 @@ public sealed class AScanVisualDeliveryTests
         Task? disposal = null;
         try
         {
-            delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+            delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
             await Watch(entered.Task);
             for (ulong sequence = 1; sequence <= 20; sequence++)
             {
-                delivery.Accept(metadata, sequence, TimeSpan.FromTicks((long)sequence), new short[8]);
+                delivery.ConfirmAndNotify(metadata, sequence, sequence, TimeSpan.FromTicks((long)sequence), new short[8]);
             }
             (await clock.NextTimerAsync()).Fire();
             await UntilAsync(() => delivery.Statistics.Published == 2);
@@ -94,12 +96,12 @@ public sealed class AScanVisualDeliveryTests
     {
         var projector = new BlockingProjector();
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(projector, clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(projector, clock);
         var observer = new Observer();
         using var subscription = delivery.Subscribe(observer);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        var accept = Task.Run(() => delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]));
+        var accept = Task.Run(() => delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]));
         try
         {
             await Watch(projector.Entered.Task);
@@ -107,16 +109,17 @@ public sealed class AScanVisualDeliveryTests
             delivery.CloseRun(metadata.RunId);
             projector.Continue.TrySetResult();
             await Watch(accept);
+            await Watch(projector.Exited.Task);
             Assert.IsNull(delivery.Current);
             Assert.IsFalse(delivery.Statistics.HasPending);
             Assert.AreEqual(1L, delivery.Statistics.Dropped);
             var second = Metadata(8);
             delivery.OpenRun(second.RunId);
-            delivery.Accept(second, 0, TimeSpan.Zero, new short[8]);
+            delivery.ConfirmAndNotify(second, 0, 0, TimeSpan.Zero, new short[8]);
             var snapshot = await observer.NextAsync();
             Assert.AreEqual(second.RunId, snapshot.Metadata.RunId);
             Assert.AreEqual(2UL, snapshot.Version);
-            delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+            delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
             Assert.AreEqual(2L, delivery.Statistics.Dropped);
         }
         finally { projector.Continue.TrySetResult(); await Watch(accept); }
@@ -127,16 +130,16 @@ public sealed class AScanVisualDeliveryTests
     {
         var projector = new CountingProjector();
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(projector, clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(projector, clock);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         Assert.AreEqual(0, projector.Calls);
         var observer = new Observer();
         using var subscription = delivery.Subscribe(observer);
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         await observer.NextAsync();
-        delivery.Accept(metadata, 2, TimeSpan.FromTicks(2), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 2, 2, TimeSpan.FromTicks(2), new short[8]);
         await clock.NextTimerAsync();
         subscription.Dispose();
         subscription.Dispose();
@@ -149,17 +152,17 @@ public sealed class AScanVisualDeliveryTests
     public async Task ThrowingObserverIsDetachedAndOtherObserverContinues()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         using var broken = delivery.Subscribe(new Observer(_ => throw new InvalidOperationException("observer failed")));
         var healthy = new Observer();
         using var subscription = delivery.Subscribe(healthy);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         await healthy.NextAsync();
         await UntilAsync(() => delivery.Statistics.ObserverErrors == 1);
         Assert.AreEqual("visual.observer", delivery.Statistics.LastError!.Code);
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         (await clock.NextTimerAsync()).Fire();
         Assert.AreEqual(1UL, (await healthy.NextAsync()).Sequence);
         Assert.AreEqual(1L, delivery.Statistics.ObserverErrors);
@@ -169,14 +172,14 @@ public sealed class AScanVisualDeliveryTests
     public async Task StopCancelsClockWaitAndRepeatedDisposalIsSafe()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         var observer = new Observer();
         using var subscription = delivery.Subscribe(observer);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         await observer.NextAsync();
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         var timer = await clock.NextTimerAsync();
         using var cancelled = new CancellationTokenSource();
         cancelled.Cancel();
@@ -187,7 +190,7 @@ public sealed class AScanVisualDeliveryTests
         Assert.IsTrue(timer.IsDisposed);
         Assert.IsNull(delivery.Current);
         Assert.IsFalse(delivery.Statistics.HasPending);
-        delivery.Accept(metadata, 2, TimeSpan.FromTicks(2), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 2, 2, TimeSpan.FromTicks(2), new short[8]);
         Assert.AreEqual(1L, delivery.Statistics.Published);
     }
 
@@ -195,20 +198,20 @@ public sealed class AScanVisualDeliveryTests
     public async Task TimerFailureIsObservableAndDisablesOnlyVisualDelivery()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         var observer = new Observer();
         using var subscription = delivery.Subscribe(observer);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         await observer.NextAsync();
         clock.FailTimerCreation = true;
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         await UntilAsync(() => delivery.Statistics.LastError is not null);
         Assert.AreEqual("visual.publication", delivery.Statistics.LastError!.Code);
         Assert.IsNull(delivery.Current);
         Assert.IsFalse(delivery.Statistics.HasPending);
-        delivery.Accept(metadata, 2, TimeSpan.FromTicks(2), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 2, 2, TimeSpan.FromTicks(2), new short[8]);
         Assert.AreEqual(1L, delivery.Statistics.Published);
     }
 
@@ -216,14 +219,14 @@ public sealed class AScanVisualDeliveryTests
     public async Task SubscriberTimerCleanupRunsOutsideLockAndItsFailureIsObserved()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         var initial = new Observer();
         using var firstSubscription = delivery.Subscribe(initial);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         await initial.NextAsync();
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         (await clock.NextTimerAsync()).FireEarly();
         var remainder = await clock.NextTimerAsync();
         var late = new Observer();
@@ -248,14 +251,14 @@ public sealed class AScanVisualDeliveryTests
     public async Task PublisherTimerCleanupFailureDoesNotSkipWorkerShutdown()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         var observer = new Observer();
         using var subscription = delivery.Subscribe(observer);
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         await observer.NextAsync();
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         var timer = await clock.NextTimerAsync();
         clock.OnTimerDispose = () =>
         {
@@ -274,23 +277,50 @@ public sealed class AScanVisualDeliveryTests
     {
         internal TaskCompletionSource Entered { get; } = ManualSessionSource.Signal();
         internal TaskCompletionSource Continue { get; } = ManualSessionSource.Signal();
+        internal TaskCompletionSource Exited { get; } = ManualSessionSource.Signal();
         public AScanSnapshot Project(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
             ReadOnlySpan<short> samples, ulong version)
         {
             Entered.TrySetResult();
             Watch(Continue.Task).GetAwaiter().GetResult();
-            return new AScanProjector().Project(metadata, sequence, elapsedSinceRunStart, samples, version);
+            var snapshot = new AScanProjector().Project(
+                metadata, sequence, elapsedSinceRunStart, samples, version);
+            Exited.TrySetResult();
+            return snapshot;
         }
     }
 
     private sealed class CountingProjector : IAScanProjector
     {
+        private readonly object _gate = new();
+        private readonly List<(int Count, TaskCompletionSource Completion)> _waiters = [];
         internal int Calls { get; private set; }
+
+        internal Task WaitForCallsAsync(int count)
+        {
+            lock (_gate)
+            {
+                if (Calls >= count) return Task.CompletedTask;
+                var completion = ManualSessionSource.Signal();
+                _waiters.Add((count, completion));
+                return completion.Task;
+            }
+        }
+
         public AScanSnapshot Project(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
             ReadOnlySpan<short> samples, ulong version)
         {
-            Calls++;
-            return new AScanProjector().Project(metadata, sequence, elapsedSinceRunStart, samples, version);
+            lock (_gate)
+            {
+                Calls++;
+                foreach (var waiter in _waiters.Where(waiter => Calls >= waiter.Count))
+                {
+                    waiter.Completion.TrySetResult();
+                }
+                _waiters.RemoveAll(waiter => Calls >= waiter.Count);
+            }
+            return new AScanProjector().Project(
+                metadata, sequence, elapsedSinceRunStart, samples, version);
         }
     }
 }

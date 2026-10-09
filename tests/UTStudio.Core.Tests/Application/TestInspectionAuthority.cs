@@ -4,6 +4,7 @@ using UTStudio.Contracts.Inspection;
 using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
+using UTStudio.Visualization.Core;
 
 namespace UTStudio.Core.Tests.Application;
 
@@ -12,8 +13,12 @@ internal static class TestInspectionAuthority
     private static readonly InspectionId InspectionId = new(Guid.Parse("5d943510-aacf-48db-82af-ebf56f278ca1"));
 
     internal static ApplicationSession CreateSession(IUtFrameSource source,
-        IConventionalFrameSink? visualSink = null) =>
-        new(source, InspectionId, runId => new Writer(runId), visualSink);
+        IConventionalFrameSink? visualSink = null, ICommittedTraceSink? aScanSink = null) =>
+        new(source, InspectionId, runId => new Writer(runId), visualSink, aScanSink);
+
+    internal static ApplicationSession CreateSession(IUtFrameSource source, AScanVisualDelivery delivery) =>
+        new(source, InspectionId, runId => AScanVisualDeliveryTestFactory.CreateRunWriter(delivery, runId),
+            aScanSink: delivery);
 
     private sealed class Writer(AcquisitionRunId runId) : IInspectionRunWriter
     {

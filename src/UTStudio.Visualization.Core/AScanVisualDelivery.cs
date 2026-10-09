@@ -1,24 +1,26 @@
 using UTStudio.Contracts.Presentation;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 
 namespace UTStudio.Visualization.Core;
 
 /// <summary>Independent-snapshot mailbox of capacity one, with publication limited by a monotonic clock.</summary>
 /// <remarks>
-/// Explicit adaptation of ADR 0008 for the borrowed-span port: projection happens synchronously per
-/// interested input, not at 30 Hz. Only independent data crosses the async boundary. This adds O(N)
-/// work/allocation per input. It does not implement Presentation coordination or the future UI refresh limit.
+/// Receives only confirmed trace identities. Its bounded latest-only reader acquires the authoritative
+/// trace lease, projects an independent snapshot while that lease is valid, and then releases the lease.
 /// Subscribers have one executing callback and one latest pending snapshot. Slow user code cannot
-/// block Accept, CloseRun or peers. External subscription disposal waits for its current callback;
+/// block identity notification, CloseRun or peers. External subscription disposal waits for its current callback;
 /// self-cancellation is reentrant. No new callback can begin after subscription disposal returns.
 /// </remarks>
-public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AScanSnapshot>, IAsyncDisposable
+public sealed class AScanVisualDelivery : ICommittedTraceSink, IObservable<AScanSnapshot>, IAsyncDisposable
 {
     public static readonly TimeSpan MinimumPublicationInterval = TimeSpan.FromTicks(333_334);
     private readonly object _gate = new();
     private readonly IAScanProjector _projector;
+    private readonly IUtTraceProvider _traceProvider;
     private readonly TimeProvider _timeProvider;
     private readonly SemaphoreSlim _wake = new(0, 1);
+    private readonly SemaphoreSlim _requestWake = new(0, 1);
     private readonly CancellationTokenSource _shutdown = new();
     private readonly List<Subscription> _subscriptions = [];
     private readonly DeliveryStatusStore _status = new();
@@ -28,6 +30,9 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     internal Action? AfterCallbackAttempt { get; set; }
     internal Action? BeforeSubscriptionWait { get; set; }
     private readonly Task _worker;
+    private readonly Task _readerWorker;
+    private TraceRequest? _pendingRequest;
+    private CancellationTokenSource? _activeRead;
     private Task? _disposal;
     private Task? _drain;
     private Subscription[]? _stoppedSubscriptions;
@@ -36,8 +41,6 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     private AcquisitionRunId? _runId;
     private long _generation;
     private ulong _version;
-    private ulong? _lastSequence;
-    private TimeSpan _lastElapsed;
     private long? _lastPublication;
     private AScanSnapshot? _pending;
     private AScanSnapshot? _current;
@@ -48,13 +51,18 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     private int _projectionsInFlight;
     private bool _diagnosticFullCleanupRequested;
     private TaskCompletionSource? _diagnosticProjectionDrain;
+    private TaskCompletionSource? _runReadDrain;
 
-    public AScanVisualDelivery(IAScanProjector? projector = null, TimeProvider? timeProvider = null)
+    public AScanVisualDelivery(IUtTraceProvider traceProvider, IAScanProjector? projector = null,
+        TimeProvider? timeProvider = null)
     {
+        _traceProvider = traceProvider ?? throw new ArgumentNullException(nameof(traceProvider));
         _projector = projector ?? new AScanProjector();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _worker = Task.Run(PublishLoopAsync);
+        _readerWorker = Task.Run(ReadLoopAsync);
     }
+
 
     public AScanSnapshot? Current { get { lock (_gate) { return _current; } } }
     public IObservable<AScanDeliveryStatus> StatusChanges => _status;
@@ -74,7 +82,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
     /// Diagnostic-only barrier for tests and benchmarks. It completes after the publisher has registered the
     /// requested asynchronous wait, the expected mailbox state is visible, and every subscriber pump/callback
     /// admitted before that observation has finished. The caller must serialize this diagnostic operation with
-    /// Accept; a returned Accept has already completed its synchronous projection. Cancellation abandons only this waiter.
+    /// identity notification. Cancellation abandons only this waiter.
     /// </summary>
     internal async Task WaitForDiagnosticStateAsync(VisualDiagnosticExpectation expectation, TimeSpan timeout,
         CancellationToken cancellationToken = default)
@@ -121,12 +129,6 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         return waiter.Completion.Task;
     }
 
-    public void OpenRun(ConventionalUtFrameMetadata metadata)
-    {
-        ArgumentNullException.ThrowIfNull(metadata);
-        OpenRun(metadata.RunId);
-    }
-
     public void OpenRun(AcquisitionRunId runId)
     {
         if (!runId.IsValid) { throw new ArgumentException("Invalid run identifier.", nameof(runId)); }
@@ -137,83 +139,176 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
             if (_failed) { throw new InvalidOperationException("The visual publisher has failed."); }
             Invalidate();
             _runId = runId;
-            _lastSequence = null;
-            _lastElapsed = TimeSpan.Zero;
         }
     }
 
-    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
-        TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
+    public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision)
     {
-        ArgumentNullException.ThrowIfNull(metadata);
-        long generation;
-        ulong version;
+        if (!identity.IsValid) { throw new ArgumentException("A valid trace identity is required.", nameof(identity)); }
+        if (revision == InspectionRevision.Initial) { throw new ArgumentException("A committed revision is required.", nameof(revision)); }
+        CancellationTokenSource? superseded;
         lock (_gate)
         {
             _received++;
-            if (_disposed || _failed || _runId != metadata.RunId || _subscriptions.Count == 0)
+            if (_disposed || _failed || _runId != identity.Stream.AcquisitionRunId || _subscriptions.Count == 0)
             {
                 _dropped++;
                 return;
             }
-
-            if ((_lastSequence is { } previous && sequence <= previous) || elapsedSinceRunStart < _lastElapsed)
-            {
-                _dropped++;
-                throw new ArgumentException("Visual input must be ordered within its execution.", nameof(sequence));
-            }
-            _lastSequence = sequence;
-            _lastElapsed = elapsedSinceRunStart;
-            generation = _generation;
-            version = ++_version;
-            _projectionsInFlight++;
+            if (_pendingRequest is not null) { _replaced++; }
+            _pendingRequest = new(identity, revision, _generation, ++_version);
+            superseded = _activeRead;
+            if (_requestWake.CurrentCount == 0) { _requestWake.Release(); }
         }
+        if (superseded is not null) { _ = superseded.CancelAsync(); }
+    }
 
-        AScanSnapshot snapshot;
-        try { snapshot = _projector.Project(metadata, sequence, elapsedSinceRunStart, samples, version); }
+    private async Task ReadLoopAsync()
+    {
+        try
+        {
+            while (true)
+            {
+                await _requestWake.WaitAsync(_shutdown.Token).ConfigureAwait(false);
+                TraceRequest? request;
+                CancellationTokenSource readCancellation;
+                lock (_gate)
+                {
+                    request = _pendingRequest;
+                    _pendingRequest = null;
+                    if (request is null || _disposed) { continue; }
+                    readCancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
+                    _activeRead = readCancellation;
+                    _projectionsInFlight++;
+                }
+                try { await ReadAndProjectAsync(request.Value, readCancellation.Token).ConfigureAwait(false); }
+                finally
+                {
+                    lock (_gate)
+                    {
+                        if (ReferenceEquals(_activeRead, readCancellation)) { _activeRead = null; }
+                        _projectionsInFlight--;
+                        if (_projectionsInFlight == 0)
+                        {
+                            _diagnosticProjectionDrain?.TrySetResult();
+                            _runReadDrain?.TrySetResult();
+                            _runReadDrain = null;
+                        }
+                        TryCompleteDiagnosticWaitersUnderLock();
+                    }
+                    readCancellation.Dispose();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
         catch (Exception error)
         {
-            lock (_gate)
-            {
-                _projectionsInFlight--;
-                if (_projectionsInFlight == 0) { _diagnosticProjectionDrain?.TrySetResult(); }
-                _dropped++;
-                _lastError = Describe("visual.projection", error);
-                if (_generation == generation) { Invalidate(); _runId = null; }
-                if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
-            }
-            throw;
+            lock (_gate) { _lastError = Describe("visual.reader", error); _failed = true; Invalidate(); }
         }
+    }
 
+    private async Task ReadAndProjectAsync(TraceRequest request, CancellationToken token)
+    {
+        InspectionTraceReadResult result;
+        try { result = await _traceProvider.ReadAsync(request.Identity, token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
+        catch (Exception error) { RecordReadFailure(request, "visual.provider", error); return; }
+        if (result.Status != InspectionReadStatus.Available || result.Lease is null)
+        {
+            if (result.Lease is not null) { result.Lease.Dispose(); }
+            if (result.Status is not InspectionReadStatus.Cancelled)
+            { RecordReadFailure(request, $"visual.provider.{result.Status.ToString().ToLowerInvariant()}", null); }
+            return;
+        }
+        AScanSnapshot snapshot;
+        using (result.Lease)
+        {
+            if (token.IsCancellationRequested || !IsCurrent(request)) { return; }
+            TraceDescriptor descriptor = result.Lease.Descriptor;
+            if (descriptor.Identity != request.Identity || result.Revision.Value < request.Revision.Value)
+            { RecordReadFailure(request, "visual.provider.identity", null); return; }
+            var samples = new short[descriptor.SampleCount];
+            result.Lease.Samples.CopyTo(samples);
+            if (token.IsCancellationRequested || !IsCurrent(request)) { return; }
+            var configuration = new ConventionalAcquisitionConfiguration(descriptor.Identity.Stream.PhysicalChannelId,
+                descriptor.SampleCount, descriptor.SampleRateHz, descriptor.FirstSampleOffsetSeconds,
+                descriptor.SignalMode);
+            DateTimeOffset started = descriptor.TimestampUtc is { } timestamp
+                ? timestamp - descriptor.ElapsedSinceRunStart : DateTimeOffset.UnixEpoch;
+            var metadata = new ConventionalUtFrameMetadata(descriptor.Identity.Stream.SourceId,
+                descriptor.Identity.Stream.AcquisitionRunId, configuration, started);
+            try
+            {
+                snapshot = _projector.Project(metadata, descriptor.Sequence, descriptor.ElapsedSinceRunStart,
+                samples, request.Version);
+            }
+            catch (Exception error) { RecordReadFailure(request, "visual.projection", error); return; }
+            snapshot.SetAuthority(request.Identity, request.Revision);
+        }
         lock (_gate)
         {
-            _projectionsInFlight--;
-            if (_projectionsInFlight == 0) { _diagnosticProjectionDrain?.TrySetResult(); }
-            if (_disposed || _generation != generation || _subscriptions.Count == 0)
+            if (_disposed || _generation != request.Generation || _version != request.Version ||
+                _runId != request.Identity.Stream.AcquisitionRunId ||
+                _subscriptions.Count == 0)
             {
                 _dropped++;
-                if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
                 return;
             }
             if (_pending is not null) { _replaced++; }
             _pending = snapshot;
             if (_wake.CurrentCount == 0) { _wake.Release(); }
-            if (_diagnosticWaiters is not null) { TryCompleteDiagnosticWaitersUnderLock(); }
         }
     }
 
-    /// <summary>Compatibility adapter for direct A-Scan consumers without spatial frame metadata.</summary>
-    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
-        ReadOnlySpan<short> samples) => Accept(metadata, sequence, sequence, elapsedSinceRunStart, null, samples);
-
-    public void CloseRun(AcquisitionRunId runId)
+    private bool IsCurrent(TraceRequest request)
     {
         lock (_gate)
         {
+            return !_disposed && _generation == request.Generation &&
+            _version == request.Version && _runId == request.Identity.Stream.AcquisitionRunId;
+        }
+    }
+
+    private void RecordReadFailure(TraceRequest request, string code, Exception? error)
+    {
+        lock (_gate)
+        {
+            if (_generation != request.Generation) { _dropped++; return; }
+            _dropped++;
+            _lastError = new(code, error is null || string.IsNullOrWhiteSpace(error.Message)
+                ? error?.GetType().Name ?? code : error.Message);
+            _status.Publish(new AScanDeliveryStatus(1, _lastError));
+        }
+    }
+
+    public void CloseRun(AcquisitionRunId runId)
+    {
+        CancellationTokenSource? activeRead;
+        lock (_gate)
+        {
             if (_runId != runId) { return; }
+            activeRead = _activeRead;
             Invalidate();
             _runId = null;
+            if (_projectionsInFlight != 0)
+            { _runReadDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously); }
         }
+        if (activeRead is not null) { _ = activeRead.CancelAsync(); }
+    }
+
+    public async ValueTask WaitForCloseAsync(AcquisitionRunId runId)
+    {
+        Task readDrain;
+        Subscription[] subscriptions;
+        lock (_gate)
+        {
+            readDrain = _projectionsInFlight == 0 ? Task.CompletedTask :
+                (_runReadDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            subscriptions = [.. _subscriptions];
+        }
+        await readDrain.ConfigureAwait(false);
+        await Task.WhenAll(subscriptions.Select(subscription => Task.Run(subscription.WaitForCallback)))
+            .ConfigureAwait(false);
     }
 
     public IDisposable Subscribe(IObserver<AScanSnapshot> observer)
@@ -274,6 +369,9 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
             try { await callback.ConfigureAwait(false); }
             catch (Exception error) { failures.Add(error); }
         }
+        try { await _readerWorker.ConfigureAwait(false); }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
+        catch (Exception error) { failures.Add(error); }
         try { await _worker.ConfigureAwait(false); }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
         catch (Exception error) { failures.Add(error); }
@@ -304,6 +402,7 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         _status.Dispose();
         _shutdown.Dispose();
         _wake.Dispose();
+        _requestWake.Dispose();
     }
 
     private async Task PublishLoopAsync()
@@ -437,7 +536,9 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         { FailDiagnosticWaitersUnderLock(new InvalidOperationException("Visual diagnostic generation was invalidated.")); }
         _generation++;
         if (_pending is not null) { _dropped++; }
+        if (_pendingRequest is not null) { _dropped++; }
         _pending = null;
+        _pendingRequest = null;
         _current = null;
         foreach (var subscription in _subscriptions) { subscription.ClearPending(); }
     }
@@ -626,6 +727,10 @@ public sealed class AScanVisualDelivery : IConventionalFrameSink, IObservable<AS
         }
     }
 }
+
+internal readonly record struct TraceRequest(TraceIdentity Identity, InspectionRevision Revision,
+    long Generation, ulong Version);
+
 
 internal enum VisualDiagnosticWorkerState { Starting, Processing, WaitingForSignal, WaitingForTimer, Stopped }
 

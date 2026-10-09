@@ -217,25 +217,26 @@ public sealed class DesktopRuntime
             }
             runtime._source = source;
             var interactionGate = runtime._interactionGate = new ShutdownInteractionGate(dispatcher);
-            var visual = runtime._visual = new AScanVisualDelivery(timeProvider: clock);
-            var bScanIngress = runtime._bScanIngress = tracePool is null
-                ? new BScanIngress(bScanOptions, clock)
-                : new BScanIngress(bScanOptions, clock, tracePool, SharedTraceCopyOwnerPool.Instance);
-            var bScanVisual = runtime._bScanVisual = rasterPool is null
-                ? new BScanVisualDelivery(bScanIngress, clock)
-                : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
-            var fanOut = new ConventionalFrameSinkFanOut(visual, bScanIngress);
             var inspectionOptions = new InMemoryInspectionStoreOptions(
                 builder.Configuration.GetValue<long?>("InspectionStore:SampleCapacityBudgetBytes") ?? 256L * 1024 * 1024,
                 builder.Configuration.GetValue<int?>("InspectionStore:MaximumEntries") ?? 100_000,
                 builder.Configuration.GetValue<int?>("InspectionStore:TargetChunkBytes") ?? 4 * 1024 * 1024);
             var inspectionStores = runtime._inspectionStores = new InspectionDataStoreRegistry(
                 new InspectionId(Guid.NewGuid()), inspectionOptions);
+            var visual = runtime._visual = new AScanVisualDelivery(inspectionStores.Store, timeProvider: clock);
+            var bScanIngress = runtime._bScanIngress = tracePool is null
+                ? new BScanIngress(bScanOptions, clock)
+                : new BScanIngress(bScanOptions, clock, tracePool, SharedTraceCopyOwnerPool.Instance);
+            var bScanVisual = runtime._bScanVisual = rasterPool is null
+                ? new BScanVisualDelivery(bScanIngress, clock)
+                : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
             checkpoint?.Invoke("visual");
             var session = runtime._session = new ApplicationSession(source, inspectionStores.InspectionId,
-                runId => inspectionStores.OpenRun(runId), fanOut);
+                runId => inspectionStores.OpenRun(runId), bScanIngress, visual);
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
-            var selection = runtime._selection = new BScanSelectionCoordinator(dispatcher, bScanIngress, new AScanProjector());
+            var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
+            var selection = runtime._selection = new BScanSelectionCoordinator(dispatcher, bScanIngress,
+                selectionResolver, inspectionStores.InspectionId);
             var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, configuration,
                 readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges, timeViewport: timeViewport,
                 selectionCoordinator: selection);
@@ -248,8 +249,7 @@ public sealed class DesktopRuntime
             if (simulator is not null) { builder.Services.AddSingleton(simulator); }
             builder.Services.AddSingleton<IUtFrameSource>(source);
             builder.Services.AddSingleton(visual);
-            builder.Services.AddSingleton(fanOut);
-            builder.Services.AddSingleton<IConventionalFrameSink>(fanOut);
+            builder.Services.AddSingleton<IConventionalFrameSink>(bScanIngress);
             builder.Services.AddSingleton<IObservable<AScanSnapshot>>(visual);
             builder.Services.AddSingleton(session);
             builder.Services.AddSingleton(inspectionStores);

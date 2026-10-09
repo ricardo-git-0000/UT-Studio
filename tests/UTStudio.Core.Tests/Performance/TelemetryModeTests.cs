@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using UTStudio.Core.Tests.Application;
 using UTStudio.Core.Tests.Simulator;
 using UTStudio.LoadTests;
 using UTStudio.Visualization.Core;
@@ -62,19 +63,22 @@ public sealed class TelemetryModeTests
     {
         var telemetry = new LoadTelemetry(mode: full ? TelemetryMode.Full : TelemetryMode.Minimal);
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(new InstrumentedProjector(new AScanProjector(4), telemetry), clock);
+        var projector = new SignalingProjector(
+            new InstrumentedProjector(new AScanProjector(4), telemetry));
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(projector, clock);
         var observer = new Observer(snapshot => telemetry.ObserveVisual(snapshot.Sequence));
         using var subscription = delivery.Subscribe(observer);
-        var sink = new InstrumentedFrameSink(delivery, telemetry);
         var metadata = Metadata(8);
         short[] samples = [0, 100, -200, 300, -400, 500, -600, 700];
-        sink.OpenRun(metadata);
+        delivery.OpenRun(metadata.RunId);
         telemetry.BeginWindow();
-        sink.Accept(metadata, 0, 0, TimeSpan.Zero, null, samples);
+        telemetry.PrepareFrame(0); delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, samples);
         var first = await observer.NextAsync();
-        sink.Accept(metadata, 1, 1, TimeSpan.FromTicks(1), null, samples);
+        telemetry.PrepareFrame(1); delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), samples);
         var timer = await clock.NextTimerAsync();
-        sink.Accept(metadata, 2, 2, TimeSpan.FromTicks(2), null, samples);
+        Task projected = projector.WaitForSequenceAsync(2);
+        telemetry.PrepareFrame(2); delivery.ConfirmAndNotify(metadata, 2, 2, TimeSpan.FromTicks(2), samples);
+        await projected;
         Assert.IsTrue(delivery.Statistics.HasPending);
         Assert.AreEqual(1L, delivery.Statistics.Replaced);
         timer.Fire();
@@ -88,7 +92,7 @@ public sealed class TelemetryModeTests
         Assert.AreEqual(2L, delivery.Statistics.Published);
         Assert.AreEqual(full ? 3L : 0L, telemetry.ProjectionMicroseconds.Count);
         Assert.AreEqual(full ? 2L : 0L, telemetry.AcceptToCallbackMicroseconds.Count);
-        sink.CloseRun(metadata.RunId);
+        delivery.CloseRun(metadata.RunId);
         Assert.IsFalse(delivery.Statistics.HasPending);
         Assert.IsNull(delivery.Current);
     }
@@ -221,5 +225,35 @@ public sealed class TelemetryModeTests
             Assert.AreEqual("catch-up-bounded", json.RootElement.GetProperty("result").GetProperty("effectivePacing").GetString());
         }
         finally { File.Delete(path); }
+    }
+
+    private sealed class SignalingProjector(IAScanProjector inner) : IAScanProjector
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<ulong, TaskCompletionSource> _waiters = [];
+
+        internal Task WaitForSequenceAsync(ulong sequence)
+        {
+            lock (_gate)
+            {
+                var completion = ManualSessionSource.Signal();
+                _waiters.Add(sequence, completion);
+                return completion.Task;
+            }
+        }
+
+        public AScanSnapshot Project(UTStudio.Domain.Acquisition.ConventionalUtFrameMetadata metadata,
+            ulong sequence, TimeSpan elapsedSinceRunStart, ReadOnlySpan<short> samples, ulong version)
+        {
+            AScanSnapshot snapshot = inner.Project(
+                metadata, sequence, elapsedSinceRunStart, samples, version);
+            TaskCompletionSource? completion;
+            lock (_gate)
+            {
+                _waiters.Remove(sequence, out completion);
+            }
+            completion?.TrySetResult();
+            return snapshot;
+        }
     }
 }

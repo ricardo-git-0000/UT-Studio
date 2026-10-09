@@ -1,4 +1,5 @@
 using System.Buffers;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
@@ -20,7 +21,7 @@ public sealed class BScanPresentationTests
         {
             IsOnUiThread = ui.CheckAccess
         };
-        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider(), new AScanProjector());
+        var coordinator = new BScanSelectionCoordinator(ui, new PendingTraceProvider());
         var vm = new BScanViewModel(source, shared, coordinator, ui);
         AcquisitionRunId run = new(Guid.NewGuid());
 
@@ -95,14 +96,14 @@ public sealed class BScanPresentationTests
     {
         var ui = new ManualUiDispatcher();
         var provider = new PendingTraceProvider();
-        var coordinator = new BScanSelectionCoordinator(ui, provider, new AScanProjector(16));
+        var coordinator = new BScanSelectionCoordinator(ui, provider);
         int healthyNotifications = 0;
         coordinator.PropertyChanged += (_, _) => throw new InvalidOperationException("observer failure");
         coordinator.PropertyChanged += (_, _) => healthyNotifications++;
         AcquisitionRunId run = new(Guid.NewGuid());
         await Drive(ui, coordinator.SetRunAsync(run));
         BScanTraceIdentity first = Identity(run, 1);
-        BScanTraceIdentity second = Identity(run, 2);
+        BScanTraceIdentity second = Identity(run, sequence: 2, acquisitionIndex: 7);
 
         Task old = coordinator.SelectAsync("b-1", first);
         await ui.DriveUntilAsync(() => provider.Requests.Count == 1);
@@ -118,7 +119,7 @@ public sealed class BScanPresentationTests
         Assert.AreEqual(7UL, coordinator.State.AcquisitionIndex);
         CollectionAssert.AreEqual(new[] { -100d, 0d, 100d * 32767 / 32768 },
             coordinator.State.Snapshot!.Points.Select(point => point.AmplitudePercent).ToArray());
-        Assert.AreEqual(1, provider.ReturnedOwners);
+        Assert.AreEqual(2, provider.ReturnedOwners);
         Assert.AreEqual(1, coordinator.ObserverErrorCount);
         Assert.IsGreaterThan(0, healthyNotifications);
         await Drive(ui, coordinator.DisposeAsync().AsTask());
@@ -130,7 +131,7 @@ public sealed class BScanPresentationTests
     {
         var ui = new ManualUiDispatcher();
         var provider = new PendingTraceProvider();
-        var coordinator = new BScanSelectionCoordinator(ui, provider, new AScanProjector());
+        var coordinator = new BScanSelectionCoordinator(ui, provider);
         AcquisitionRunId run = new(Guid.NewGuid());
         await Drive(ui, coordinator.SetRunAsync(run));
         BScanTraceIdentity identity = Identity(run, 1);
@@ -231,7 +232,7 @@ public sealed class BScanPresentationTests
         feed.Emit(live1);
         await ui.DriveUntilAsync(() => vm.DisplayMode == AScanDisplayMode.Live);
 
-        BScanTraceIdentity selectedIdentity = new(metadata.SourceId, run, configuration.PhysicalChannelId, 5);
+        BScanTraceIdentity selectedIdentity = new(metadata.SourceId, run, configuration.PhysicalChannelId, 5, 5);
         Task selection = coordinator.SelectAsync("b", selectedIdentity);
         await ui.DriveUntilAsync(() => provider.Requests.Count == 1);
         provider.Complete(0, Available(selectedIdentity, 5, [10, 20, 30]));
@@ -289,7 +290,7 @@ public sealed class BScanPresentationTests
         await ui.DriveUntilAsync(() => vm.Session.Phase == UTStudio.Contracts.Application.SessionPhase.Idle);
         Assert.AreSame(live, vm.AScan);
 
-        BScanTraceIdentity identity = new(metadata.SourceId, run, configuration.PhysicalChannelId, 8);
+        BScanTraceIdentity identity = new(metadata.SourceId, run, configuration.PhysicalChannelId, 8, 8);
         Task selection = coordinator.SelectAsync("b", identity);
         await ui.DriveUntilAsync(() => provider.Requests.Count == 1);
         provider.Complete(0, Available(identity, 8, [10, 20, 30]));
@@ -715,8 +716,9 @@ public sealed class BScanPresentationTests
     }
 
     private static async Task Drive(ManualUiDispatcher ui, Task task) => await ui.DriveAsync(task);
-    private static BScanTraceIdentity Identity(AcquisitionRunId run, ulong sequence) =>
-        new(new("selection-test"), run, new(0), sequence);
+    private static BScanTraceIdentity Identity(
+        AcquisitionRunId run, ulong sequence, ulong? acquisitionIndex = null) =>
+        new(new("selection-test"), run, new(0), sequence, acquisitionIndex ?? sequence);
 
     private static BScanTraceResult Available(BScanTraceIdentity identity, ulong index, short[] samples)
     {
@@ -761,16 +763,22 @@ public sealed class BScanPresentationTests
         public void Dispose() => Memory = Memory<byte>.Empty;
     }
 
-    private sealed class PendingTraceProvider : IBScanTraceProvider
+    private sealed class PendingTraceProvider : IAuthoritativeAScanSelector, IBScanTraceIdentityResolver
     {
-        internal List<TaskCompletionSource<BScanTraceResult>> Requests { get; } = [];
+        internal List<TaskCompletionSource<AScanSelectionResult>> Requests { get; } = [];
         internal int ReturnedOwners;
-        public ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity,
+        public ValueTask<AScanSelectionResult> ResolveAsync(TraceIdentity identity, ulong visualVersion,
             CancellationToken cancellationToken = default)
         {
-            var completion = new TaskCompletionSource<BScanTraceResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var completion = new TaskCompletionSource<AScanSelectionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             Requests.Add(completion);
             return new(completion.Task);
+        }
+        public bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex,
+            out BScanTraceIdentity identity)
+        {
+            identity = new(new("selection-test"), runId, new(0), acquisitionIndex + 1000, acquisitionIndex);
+            return acquisitionIndex != 999;
         }
         internal void Complete(int index, BScanTraceResult result)
         {
@@ -779,9 +787,14 @@ public sealed class BScanPresentationTests
                 var descriptor = trace.Descriptor;
                 short[] samples = trace.Samples.ToArray();
                 trace.Dispose();
-                result = BScanTraceResult.Available(new(descriptor, new CountingOwner(samples, this)));
+                using var owned = new BScanTraceSnapshot(descriptor, new CountingOwner(samples, this));
+                AScanSnapshot snapshot = new AScanProjector(16).Project(descriptor.Metadata,
+                    descriptor.Identity.Sequence, descriptor.ElapsedSinceRunStart, owned.Samples.Span,
+                    (ulong)(index + 1));
+                Requests[index].TrySetResult(new(BScanTraceResultKind.Available, snapshot));
+                return;
             }
-            Requests[index].TrySetResult(result);
+            Requests[index].TrySetResult(new(result.Kind, Error: result.Error));
         }
         private sealed class CountingOwner(short[] samples, PendingTraceProvider owner) : IMemoryOwner<short>
         {

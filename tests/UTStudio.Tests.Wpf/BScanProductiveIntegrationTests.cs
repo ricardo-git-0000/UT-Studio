@@ -419,7 +419,7 @@ public sealed class BScanProductiveIntegrationTests
         await fixture.WaitForRevisionAsync(4);
         await fixture.AddIndexedAsync(400);
         var identity = new BScanTraceIdentity(fixture.Metadata.SourceId, fixture.Metadata.RunId,
-            fixture.Metadata.Configuration.PhysicalChannelId, 4);
+            fixture.Metadata.Configuration.PhysicalChannelId, 4, 400);
 
         await fixture.ViewModel.SelectColumnAsync(identity);
 

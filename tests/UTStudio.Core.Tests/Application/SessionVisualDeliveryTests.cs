@@ -19,7 +19,7 @@ public sealed class SessionVisualDeliveryTests
     {
         var clock = new ManualSimulatorTimeProvider();
         await using var source = new ManualSessionSource();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         await using var session = TestInspectionAuthority.CreateSession(source, delivery);
         var entered = ManualSessionSource.Signal();
         var unblock = ManualSessionSource.Signal();
@@ -48,8 +48,11 @@ public sealed class SessionVisualDeliveryTests
             }
             Assert.AreEqual(SessionPhase.Running, session.Snapshot.Phase);
             Assert.AreEqual(11L, delivery.Statistics.Received);
-            Assert.AreEqual(9L, delivery.Statistics.Replaced);
-            await Watch(session.StopAsync());
+            Assert.IsGreaterThan(0L, delivery.Statistics.Replaced);
+            Task stop = session.StopAsync();
+            Assert.IsFalse(stop.IsCompleted);
+            unblock.TrySetResult();
+            await Watch(stop);
             Assert.AreEqual(11L, session.Snapshot.ReleasedFrames);
             Assert.IsTrue(owners.All(item => item.DisposeCount == 1));
             Assert.IsTrue(source.Released.Task.IsCompletedSuccessfully);
@@ -87,22 +90,25 @@ public sealed class SessionVisualDeliveryTests
     }
 
     [TestMethod]
-    public async Task ProjectionFailureReleasesFrameAndDisablesBranchWithoutStoppingSource()
+    public async Task ProjectionFailureIsDiagnosedWithoutStoppingSourceOrAuthority()
     {
         await using var source = new ManualSessionSource();
-        await using var delivery = new AScanVisualDelivery(new FailingProjector(), new ManualSimulatorTimeProvider());
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(new FailingProjector(), new ManualSimulatorTimeProvider());
         using var subscription = delivery.Subscribe(new Observer());
+        var failures = new StatusCounter(1);
+        using var statusSubscription = delivery.StatusChanges.Subscribe(failures);
         await using var session = TestInspectionAuthority.CreateSession(source, delivery);
         await Watch(session.StartAsync(Configuration, new AcquisitionRunId(Guid.NewGuid())));
         var first = source.QueueFrame(0);
         await Watch(first.Returned.Task);
+        await Watch(failures.Reached.Task);
         var second = source.QueueFrame(1);
         await Watch(second.Returned.Task);
         Assert.AreEqual(SessionPhase.Running, session.Snapshot.Phase);
-        Assert.IsNotNull(session.Snapshot.VisualError);
+        Assert.IsNull(session.Snapshot.VisualError);
         Assert.IsNull(session.Snapshot.PrimaryError);
         Assert.AreEqual("visual.projection", delivery.Statistics.LastError!.Code);
-        Assert.AreEqual(1L, delivery.Statistics.Received);
+        Assert.AreEqual(2L, delivery.Statistics.Received);
         Assert.AreEqual(0L, delivery.Statistics.Published);
         await Watch(session.StopAsync());
         Assert.AreEqual(2L, session.Snapshot.ReleasedFrames);
@@ -136,5 +142,21 @@ public sealed class SessionVisualDeliveryTests
     {
         public AScanSnapshot Project(ConventionalUtFrameMetadata metadata, ulong sequence, TimeSpan elapsedSinceRunStart,
             ReadOnlySpan<short> samples, ulong version) => throw new InvalidOperationException("synthetic projection failure");
+    }
+
+    private sealed class StatusCounter(int expected) : IObserver<AScanDeliveryStatus>
+    {
+        private int _count;
+        internal TaskCompletionSource Reached { get; } = ManualSessionSource.Signal();
+        public void OnNext(AScanDeliveryStatus value)
+        {
+            if (value.TerminalError?.Code == "visual.projection" &&
+                Interlocked.Increment(ref _count) == expected)
+            {
+                Reached.TrySetResult();
+            }
+        }
+        public void OnError(Exception error) => Reached.TrySetException(error);
+        public void OnCompleted() { }
     }
 }

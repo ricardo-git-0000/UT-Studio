@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.IO;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Data;
 using System.Windows.Media;
@@ -8,6 +9,7 @@ using System.Windows.Input;
 using System.Windows.Threading;
 using System.Xml.Linq;
 using UTStudio.App.Wpf;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Controls;
@@ -17,6 +19,67 @@ namespace UTStudio.Tests.Wpf;
 [TestClass]
 public sealed class VisualizationComponentTests
 {
+    [TestMethod]
+    public void WpfDoesNotReferenceAuthoritativeTraceOwnershipTypes()
+    {
+        Type[] forbidden =
+        [
+            typeof(IUtTraceProvider),
+            typeof(IInspectionTraceLease),
+            typeof(IReadOnlyUtSamples)
+        ];
+        var violations = new List<string>();
+
+        foreach (Assembly assembly in new[] { typeof(MainWindow).Assembly, typeof(AScanControl).Assembly })
+        {
+            foreach (Type type in assembly.GetTypes())
+            {
+                foreach (FieldInfo field in type.GetFields(ArchitectureMemberFlags))
+                {
+                    AddArchitectureViolation(field, field.FieldType, forbidden, violations);
+                }
+                foreach (PropertyInfo property in type.GetProperties(ArchitectureMemberFlags))
+                {
+                    AddArchitectureViolation(property, property.PropertyType, forbidden, violations);
+                }
+                foreach (MethodInfo method in type.GetMethods(ArchitectureMemberFlags))
+                {
+                    AddArchitectureViolation(method, method.ReturnType, forbidden, violations);
+                    foreach (ParameterInfo parameter in method.GetParameters())
+                    {
+                        AddArchitectureViolation(method, parameter.ParameterType, forbidden, violations);
+                    }
+                }
+            }
+        }
+
+        Assert.IsEmpty(violations, string.Join(Environment.NewLine, violations));
+    }
+
+    private const BindingFlags ArchitectureMemberFlags =
+        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance |
+        BindingFlags.Static | BindingFlags.DeclaredOnly;
+
+    private static void AddArchitectureViolation(MemberInfo member, Type candidate,
+        Type[] forbidden, List<string> violations)
+    {
+        if (ContainsArchitectureType(candidate, forbidden))
+        {
+            violations.Add($"{member.DeclaringType?.FullName}.{member.Name} -> {candidate}");
+        }
+    }
+
+    private static bool ContainsArchitectureType(Type candidate, Type[] forbidden)
+    {
+        if (candidate.IsByRef || candidate.IsPointer || candidate.IsArray)
+        {
+            return ContainsArchitectureType(candidate.GetElementType()!, forbidden);
+        }
+        return forbidden.Contains(candidate) ||
+            candidate.IsGenericType && candidate.GetGenericArguments()
+                .Any(argument => ContainsArchitectureType(argument, forbidden));
+    }
+
     [TestMethod]
     public Task ControlCanRenderOutsideMainWindow() => StaTest.Run(() =>
     {

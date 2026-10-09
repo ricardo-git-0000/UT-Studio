@@ -14,7 +14,7 @@ public sealed class VisualDiagnosticTests
     public async Task TerminalPublisherErrorReachesViewModelWithoutAnotherSnapshot()
     {
         var clock = new ManualSimulatorTimeProvider();
-        await using var delivery = new AScanVisualDelivery(timeProvider: clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: clock);
         var ui = new ManualUiDispatcher();
         var session = new ManualApplicationSession();
         var configuration = new ConventionalAcquisitionConfiguration(default, 8, 50_000_000);
@@ -27,10 +27,10 @@ public sealed class VisualDiagnosticTests
         {
             session.Set(ManualApplicationSession.Create(1, SessionPhase.Running, run, canStop: true));
             delivery.OpenRun(run);
-            delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+            delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
             await ui.DriveUntilAsync(() => vm.AScan is not null);
             clock.FailTimerCreation = true;
-            delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+            delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
             await ui.DriveUntilAsync(() => vm.VisualError is not null);
             Assert.AreEqual("visual.publication", vm.VisualError!.Code);
             Assert.AreEqual(1L, delivery.Statistics.Published);

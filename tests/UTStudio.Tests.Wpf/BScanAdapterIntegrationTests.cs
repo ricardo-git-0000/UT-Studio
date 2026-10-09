@@ -4,6 +4,8 @@ using System.Windows;
 using System.Windows.Threading;
 using UTStudio.App.Wpf.Adapters;
 using UTStudio.App.Wpf.Services;
+using UTStudio.Contracts.Inspection;
+using UTStudio.Domain.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
@@ -150,21 +152,36 @@ public sealed class BScanAdapterIntegrationTests
     }
     private sealed class Owner(byte[] data) : IMemoryOwner<byte>
     { public Memory<byte> Memory { get; private set; } = data; public void Dispose() => Memory = Memory<byte>.Empty; }
-    private sealed class NoTraceProvider : IBScanTraceProvider
-    { public ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity, CancellationToken cancellationToken = default) => throw new NotSupportedException(); }
-    private sealed class PendingTraceProvider : IBScanTraceProvider
+    private sealed class NoTraceProvider : IAuthoritativeAScanSelector, IBScanTraceIdentityResolver
     {
-        private readonly TaskCompletionSource<BScanTraceResult> _completion =
+        public bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex, out BScanTraceIdentity identity)
+        { identity = new(new("adapter"), runId, new(0), acquisitionIndex + 100, acquisitionIndex); return true; }
+        public ValueTask<AScanSelectionResult> ResolveAsync(TraceIdentity identity, ulong visualVersion,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(new AScanSelectionResult(BScanTraceResultKind.NotAvailable));
+    }
+    private sealed class PendingTraceProvider : IAuthoritativeAScanSelector, IBScanTraceIdentityResolver
+    {
+        private readonly TaskCompletionSource<AScanSelectionResult> _completion =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal List<TraceIdentity> RequestedIdentities { get; } = [];
+        internal int Callbacks;
         public bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex,
             out BScanTraceIdentity identity)
         {
-            identity = new(new UtSourceId("adapter"), runId, new PhysicalChannelId(0), acquisitionIndex);
+            identity = new(new UtSourceId("adapter"), runId, new PhysicalChannelId(0),
+                acquisitionIndex + 100, acquisitionIndex);
             return true;
         }
-        public ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity,
-            CancellationToken cancellationToken = default) => new(_completion.Task.WaitAsync(cancellationToken));
-        internal void Complete(BScanTraceResult result) => _completion.TrySetResult(result);
+        public ValueTask<AScanSelectionResult> ResolveAsync(TraceIdentity identity, ulong visualVersion,
+            CancellationToken cancellationToken = default)
+        {
+            RequestedIdentities.Add(identity);
+            Interlocked.Increment(ref Callbacks);
+            return new(_completion.Task.WaitAsync(cancellationToken));
+        }
+        internal void Complete(BScanTraceResult result) =>
+            _completion.TrySetResult(new(result.Kind, Error: result.Error));
     }
     private sealed class Source : IBScanVisualSource
     {

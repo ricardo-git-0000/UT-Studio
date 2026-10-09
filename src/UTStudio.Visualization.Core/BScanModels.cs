@@ -7,7 +7,8 @@ public readonly record struct BScanTraceIdentity(
     UtSourceId SourceId,
     AcquisitionRunId RunId,
     PhysicalChannelId PhysicalChannelId,
-    ulong Sequence)
+    ulong Sequence,
+    ulong AcquisitionIndex)
 {
     public bool IsValid => SourceId.IsValid && RunId.IsValid;
 }
@@ -30,6 +31,9 @@ public enum BScanTraceResultKind
 {
     Available,
     NotAvailable,
+    Gap,
+    OutOfRange,
+    Closed,
     Evicted,
     Cancelled,
     Faulted
@@ -83,9 +87,13 @@ public sealed class BScanTraceResult
         new(BScanTraceResultKind.Faulted, null, string.IsNullOrWhiteSpace(error.Message) ? error.GetType().Name : error.Message);
 }
 
-public interface IBScanTraceProvider
+public interface IBScanTraceIdentityResolver
 {
-    ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity, CancellationToken cancellationToken = default);
     bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex, out BScanTraceIdentity identity)
     { identity = default; return false; }
+}
+
+public interface IBScanTraceProvider : IBScanTraceIdentityResolver
+{
+    ValueTask<BScanTraceResult> GetTraceAsync(BScanTraceIdentity identity, CancellationToken cancellationToken = default);
 }

@@ -436,11 +436,11 @@ public sealed class BScanTraceStoreTests
         samples.CopyTo(reservation.Destination);
         var metadata = new ConventionalUtFrameMetadata(identity.SourceId, identity.RunId,
             new(identity.PhysicalChannelId, samples.Length, 10_000_000), DateTimeOffset.UnixEpoch);
-        var descriptor = new BScanTraceDescriptor(metadata, identity, identity.Sequence, TimeSpan.Zero,
+        var descriptor = new BScanTraceDescriptor(metadata, identity, identity.AcquisitionIndex, TimeSpan.Zero,
             samples.Length, 50_000_000, 0, null, 0, 0);
         Assert.AreEqual(StoreWriteKind.Accepted, reservation.Commit(descriptor).Kind);
     }
 
     private static BScanTraceIdentity Identity(ulong sequence) => new(new UtSourceId("bscan"),
-        new AcquisitionRunId(Guid.Parse("10000000-0000-0000-0000-000000000001")), default, sequence);
+        new AcquisitionRunId(Guid.Parse("10000000-0000-0000-0000-000000000001")), default, sequence, sequence);
 }

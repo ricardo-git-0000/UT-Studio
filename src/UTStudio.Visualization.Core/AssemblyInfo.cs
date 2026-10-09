@@ -4,3 +4,4 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("UTStudio.Benchmarks")]
 [assembly: InternalsVisibleTo("UTStudio.Tests.Wpf")]
 [assembly: InternalsVisibleTo("UTStudio.App.Wpf")]
+[assembly: InternalsVisibleTo("UTStudio.LoadTests")]

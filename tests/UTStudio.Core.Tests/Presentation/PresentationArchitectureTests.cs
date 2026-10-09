@@ -1,5 +1,7 @@
+using System.Reflection;
 using System.Xml.Linq;
 using UTStudio.Contracts.Application;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 
@@ -8,6 +10,63 @@ namespace UTStudio.Core.Tests.Presentation;
 [TestClass]
 public sealed class PresentationArchitectureTests
 {
+    [TestMethod]
+    public void PresentationDoesNotReferenceAuthoritativeTraceOwnershipTypes()
+    {
+        Type[] forbidden =
+        [
+            typeof(IUtTraceProvider),
+            typeof(IInspectionTraceLease),
+            typeof(IReadOnlyUtSamples)
+        ];
+        var violations = new List<string>();
+
+        foreach (Type type in typeof(AScanViewModel).Assembly.GetTypes())
+        {
+            foreach (FieldInfo field in type.GetFields(MemberFlags))
+            {
+                AddViolation(field, field.FieldType, forbidden, violations);
+            }
+            foreach (PropertyInfo property in type.GetProperties(MemberFlags))
+            {
+                AddViolation(property, property.PropertyType, forbidden, violations);
+            }
+            foreach (MethodInfo method in type.GetMethods(MemberFlags))
+            {
+                AddViolation(method, method.ReturnType, forbidden, violations);
+                foreach (ParameterInfo parameter in method.GetParameters())
+                {
+                    AddViolation(method, parameter.ParameterType, forbidden, violations);
+                }
+            }
+        }
+
+        Assert.IsEmpty(violations, string.Join(Environment.NewLine, violations));
+    }
+
+    private const BindingFlags MemberFlags = BindingFlags.Public | BindingFlags.NonPublic |
+        BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+
+    private static void AddViolation(MemberInfo member, Type candidate, Type[] forbidden,
+        List<string> violations)
+    {
+        if (ContainsAny(candidate, forbidden))
+        {
+            violations.Add($"{member.DeclaringType?.FullName}.{member.Name} -> {candidate}");
+        }
+    }
+
+    private static bool ContainsAny(Type candidate, Type[] forbidden)
+    {
+        if (candidate.IsByRef || candidate.IsPointer || candidate.IsArray)
+        {
+            return ContainsAny(candidate.GetElementType()!, forbidden);
+        }
+        return forbidden.Contains(candidate) ||
+            candidate.IsGenericType &&
+            candidate.GetGenericArguments().Any(argument => ContainsAny(argument, forbidden));
+    }
+
     [TestMethod]
     public void PresentationAssemblyHasNoApplicationOrPlatformDependency()
     {

@@ -3,6 +3,8 @@ using UTStudio.Acquisition.Simulator;
 using UTStudio.Application;
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
+using UTStudio.Contracts.Inspection;
+using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
@@ -37,14 +39,15 @@ internal sealed class LoadRunner
             : new SimulatorUtFrameSource(new UtSourceId("load-test-simulator"),
                 new SimulatorOptions(seed: 1, maxAScansPerSecond: options.Rate!.Value))
             { Metrics = telemetry.Counters });
-        var visual = new AScanVisualDelivery(new InstrumentedProjector(new AScanProjector(1024), telemetry));
-        IDisposable subscription = visual.Subscribe(new SnapshotObserver(telemetry));
         var observedSource = new RunCaptureSource(source);
         var inspectionId = new InspectionId(Guid.NewGuid());
         await using var stores = new InspectionDataStoreRegistry(inspectionId,
             new InMemoryInspectionStoreOptions(512L * 1024 * 1024, 1_000_000));
+        var visual = new AScanVisualDelivery(stores.Store,
+            new InstrumentedProjector(new AScanProjector(1024), telemetry));
+        IDisposable subscription = visual.Subscribe(new SnapshotObserver(telemetry));
         var session = new ApplicationSession(observedSource, inspectionId, stores.OpenRun,
-            new InstrumentedFrameSink(visual, telemetry));
+            new InstrumentedFrameSink(NoOpFrameSink.Instance, telemetry), visual);
         var configuration = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), options.SampleCount, 50_000_000);
         using var process = Process.GetCurrentProcess();
         TimeSpan cpuOrigin = process.TotalProcessorTime, cpuActiveStart = cpuOrigin, cpuActiveEnd = cpuOrigin;
@@ -258,6 +261,21 @@ internal sealed class LoadRunner
             catch (Exception error) { failures.Add(Describe("load.source_cleanup", error)); }
             try { subscription.Dispose(); await visual.DisposeAsync().ConfigureAwait(false); }
             catch (Exception error) { failures.Add(Describe("load.visual_cleanup", error)); }
+            try
+            {
+                await stores.DisposeAsync().ConfigureAwait(false);
+                StoreDiagnostics diagnostics = stores.Store.Diagnostics;
+                if (!diagnostics.IsClosed || diagnostics.ActiveLeases != 0 ||
+                    diagnostics.ActiveWriters != 0 || diagnostics.ActiveRunWriters != 0 ||
+                    diagnostics.PendingSealOperations != 0)
+                {
+                    failures.Add(new("load.store_balance",
+                        $"closed={diagnostics.IsClosed}, leases={diagnostics.ActiveLeases}, " +
+                        $"writers={diagnostics.ActiveWriters}, runWriters={diagnostics.ActiveRunWriters}, " +
+                        $"pendingSeals={diagnostics.PendingSealOperations}"));
+                }
+            }
+            catch (Exception error) { failures.Add(Describe("load.store_cleanup", error)); }
             failures.AddRange(session.Snapshot.CleanupErrors);
             return new(released, remaining, maximum, failures);
         }
@@ -269,4 +287,14 @@ internal sealed class LoadRunner
         public void OnError(Exception error) { }
         public void OnCompleted() { }
     }
+}
+
+internal sealed class NoOpFrameSink : IConventionalFrameSink
+{
+    internal static NoOpFrameSink Instance { get; } = new();
+    public void OpenRun(ConventionalUtFrameMetadata metadata) { }
+    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
+        TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
+    { }
+    public void CloseRun(AcquisitionRunId runId) { }
 }

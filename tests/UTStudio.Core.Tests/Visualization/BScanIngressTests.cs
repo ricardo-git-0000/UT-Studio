@@ -425,7 +425,7 @@ public sealed class BScanIngressTests
         new ConventionalAcquisitionConfiguration(default, samples, 50_000_000), DateTimeOffset.UnixEpoch);
 
     private static BScanTraceIdentity Identity(ConventionalUtFrameMetadata metadata, ulong sequence) =>
-        new(metadata.SourceId, metadata.RunId, metadata.Configuration.PhysicalChannelId, sequence);
+        new(metadata.SourceId, metadata.RunId, metadata.Configuration.PhysicalChannelId, sequence, sequence);
 
     private sealed class IncrementingTimeProvider(TimeSpan increment) : TimeProvider
     {

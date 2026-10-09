@@ -5,7 +5,10 @@ using System.Windows;
 using System.Windows.Threading;
 using UTStudio.App.Wpf.Adapters;
 using UTStudio.App.Wpf.Services;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
+using UTStudio.Inspection.Core;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
@@ -19,6 +22,8 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     private readonly TrackingTracePool _traces = new();
     private readonly TrackingBytePool _rasters = new();
     private readonly Window _host;
+    private readonly InspectionDataStoreRegistry _inspectionStores;
+    private IInspectionRunWriter _inspectionWriter;
     private ulong _sequence;
     private TaskCompletionSource? _bootstrapRequested;
     private AcquisitionRunId? _expectedBootstrapRun;
@@ -32,14 +37,19 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         Ingress = new(options, Clock, _blocks, _traces);
         Metadata = new(new("productive-bscan"), new(Guid.Parse("99000000-0000-0000-0000-000000000099")),
             new(new(3), 16, 1_000_000, 0, UtSignalMode.Rf), DateTimeOffset.UnixEpoch);
+        _inspectionStores = new(new InspectionId(Guid.Parse("98000000-0000-0000-0000-000000000098")),
+            new InMemoryInspectionStoreOptions(4 * 1024 * 1024, 4096));
+        _inspectionWriter = _inspectionStores.OpenRun(Metadata.RunId);
         Ingress.OpenRun(Metadata);
         for (int column = 0; column < preloadedColumns; column++)
         {
             using var indexed = new ManualResetEventSlim();
             ulong sequence = _sequence++;
             Ingress.AfterIndexCommit = identity => { if (identity.Sequence == sequence) { indexed.Set(); } };
-            Ingress.Accept(Metadata, sequence, (ulong)column, TimeSpan.FromTicks((long)sequence), null,
-                Enumerable.Range(0, Metadata.Configuration.SampleCount).Select(value => (short)(value + column)).ToArray());
+            short[] samples = Enumerable.Range(0, Metadata.Configuration.SampleCount)
+                .Select(value => (short)(value + column)).ToArray();
+            Commit(sequence, (ulong)column, samples);
+            Ingress.Accept(Metadata, sequence, (ulong)column, TimeSpan.FromTicks((long)sequence), null, samples);
             if (!indexed.Wait(TimeSpan.FromSeconds(10))) { throw new InvalidOperationException("B-Scan preload did not index."); }
         }
         Delivery = new(Ingress, useSystemDeliveryClock ? TimeProvider.System : Clock, _rasters);
@@ -56,7 +66,9 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         };
         Dispatcher = new(System.Windows.Threading.Dispatcher.CurrentDispatcher);
         SharedViewport = new(Dispatcher);
-        Selection = new(Dispatcher, Ingress, new AScanProjector());
+        Selection = new(Dispatcher, Ingress,
+            new UtTraceAScanSelector(_inspectionStores.Store, new AScanProjector()),
+            _inspectionStores.InspectionId);
         ViewModel = new(Delivery, SharedViewport, Selection, Dispatcher);
         Control = new();
         Adapter = new(ViewModel, Control);
@@ -108,6 +120,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         { if (identity.Sequence == sequence) { indexed.TrySetResult(); } };
         short[] samples = Enumerable.Range(0, Metadata.Configuration.SampleCount)
             .Select(value => (short)((ulong)value + acquisitionIndex)).ToArray();
+        Commit(sequence, acquisitionIndex, samples);
         Ingress.Accept(Metadata, sequence, acquisitionIndex, TimeSpan.FromTicks((long)sequence), null, samples);
         await indexed.Task;
     }
@@ -117,8 +130,11 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         AcquisitionRunId previous = Metadata.RunId;
         Ingress.CloseRun(previous);
         await Ingress.WaitForCloseAsync(previous);
+        await _inspectionWriter.SealRunAsync();
+        await _inspectionWriter.DisposeAsync();
         Metadata = new(Metadata.SourceId, new(runId), Metadata.Configuration,
             Metadata.RunStartedAtUtc.AddSeconds(1));
+        _inspectionWriter = _inspectionStores.OpenRun(Metadata.RunId);
         _expectedBootstrapRun = Metadata.RunId;
         _bootstrapRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _metadataCandidateReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -203,6 +219,19 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         Assert.AreEqual(Delivery.Diagnostics.ObserverCallbacksStarted, Delivery.Diagnostics.ObserverCallbacksCompleted);
     }
 
+    private void Commit(ulong sequence, ulong acquisitionIndex, short[] samples)
+    {
+        var stream = new UtStreamIdentity(_inspectionStores.InspectionId, Metadata.RunId,
+            Metadata.SourceId, Metadata.Configuration.PhysicalChannelId);
+        var descriptor = new TraceDescriptor(new TraceIdentity(stream, acquisitionIndex), sequence,
+            TimeSpan.FromTicks((long)sequence), Metadata.RunStartedAtUtc + TimeSpan.FromTicks((long)sequence),
+            null, samples.Length, Metadata.Configuration.SampleRateHz,
+            Metadata.Configuration.FirstSampleOffsetSeconds, Metadata.Configuration.SignalMode);
+        InspectionAppendResult result = _inspectionWriter.CommitAsync(
+            new InspectionCommitInput(new InspectionTraceInput(descriptor, samples))).AsTask().GetAwaiter().GetResult();
+        Assert.IsTrue(result.IsCommitted || result.Status == InspectionAppendStatus.Duplicate);
+    }
+
     public async ValueTask DisposeAsync()
     {
         Delivery.AfterBootstrapRequestQueued = null;
@@ -219,6 +248,9 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         await SharedViewport.DisposeAsync();
         await Delivery.DisposeAsync();
         await Ingress.DisposeAsync();
+        await _inspectionWriter.SealRunAsync();
+        await _inspectionWriter.DisposeAsync();
+        await _inspectionStores.DisposeAsync();
         _host.Close();
         Assert.AreEqual(0, TraceOwnersOutstanding);
         Assert.AreEqual(0, RasterOwnersOutstanding);

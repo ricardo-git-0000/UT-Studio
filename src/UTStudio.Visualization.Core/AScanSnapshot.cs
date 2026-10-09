@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Contracts.Inspection;
 
 namespace UTStudio.Visualization.Core;
 
@@ -24,6 +25,10 @@ public sealed class AScanSnapshot
     public TimeSpan ElapsedSinceRunStart { get; }
     /// <summary>Increasing visual input version; replacement can produce gaps between publications.</summary>
     public ulong Version { get; }
+    public TraceIdentity? TraceIdentity { get; private set; }
+    public InspectionRevision InspectionRevision { get; private set; }
+    internal void SetAuthority(TraceIdentity identity, InspectionRevision revision)
+    { TraceIdentity = identity; InspectionRevision = revision; }
     public int OriginalSampleCount => Metadata.Configuration.SampleCount;
     public ReadOnlyCollection<AScanPoint> Points { get; }
     public double MinimumTimeSeconds { get; }

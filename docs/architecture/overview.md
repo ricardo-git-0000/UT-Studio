@@ -100,11 +100,11 @@ SignalProcessing, Storage y Visualization.Core mantendrán dependencias neutrale
 
 ## Autoridad de datos de inspección
 
-El flujo objetivo es fuente común → `ApplicationSession` → `InspectionDataStore` → proveedores A/B y
+El flujo implementado para A es fuente común → `ApplicationSession` → `InspectionDataStore` → `IUtTraceProvider` → A-Scan. La sesión notifica solo identidad y revisión confirmadas; A no recibe memoria prestada. El flujo objetivo para B continúa como
 futuros C/S/D → backing persistente incremental. Store es la única autoridad; las vistas conservan
 solo presentación y caches acotadas. `BScanTraceStore` se mantendrá temporalmente como cache/proyección
 visual derivada y se retirará progresivamente, sin dual-write autoritativo. La selección B→A usa
-`TraceIdentity`.
+`TraceIdentity`. B-Scan sigue temporalmente como proyección derivada y la persistencia permanece aplazada.
 
 La autoridad publica únicamente trazas committed mediante `InspectionRevision`. Lecturas exactas y por
 rango son dispersas, acotadas y revisadas. En Fase 1 no hay expulsión autoritativa ni almacenamiento

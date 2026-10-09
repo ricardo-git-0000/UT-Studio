@@ -145,7 +145,7 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
             {
                 samples.CopyTo(reservation.Destination.Span);
                 var identity = new BScanTraceIdentity(metadata.SourceId, metadata.RunId,
-                    metadata.Configuration.PhysicalChannelId, sequence);
+                    metadata.Configuration.PhysicalChannelId, sequence, acquisitionIndex);
                 var descriptor = new BScanTraceDescriptor(metadata, identity, acquisitionIndex, elapsedSinceRunStart,
                     metadata.Configuration.SampleCount, metadata.Configuration.SampleRateHz,
                     metadata.Configuration.FirstSampleOffsetSeconds, spatialCoordinate, 0, 0);

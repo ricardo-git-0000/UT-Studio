@@ -14,18 +14,18 @@ public sealed class VisualDiagnosticBarrierTests
     [TestMethod]
     public async Task BarrierReachesRegisteredSignalWaitWithoutVisualInterest()
     {
-        await using var delivery = new AScanVisualDelivery(timeProvider: new ManualSimulatorTimeProvider());
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: new ManualSimulatorTimeProvider());
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
         await delivery.WaitForDiagnosticStateAsync(new(VisualDiagnosticWorkerState.WaitingForSignal, false), Limit);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         Assert.AreEqual(1L, delivery.Statistics.Dropped);
     }
 
     [TestMethod]
     public async Task InitialCallbackMustReturnBeforeSignalBarrierCompletes()
     {
-        await using var delivery = new AScanVisualDelivery(timeProvider: new ManualSimulatorTimeProvider());
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: new ManualSimulatorTimeProvider());
         var entered = ManualSessionSource.Signal();
         var release = ManualSessionSource.Signal();
         using var subscription = delivery.Subscribe(new Observer(_ =>
@@ -35,7 +35,7 @@ public sealed class VisualDiagnosticBarrierTests
         }));
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         try
         {
             await DiagnosticWait.For(entered.Task, "diagnostic callback entered");
@@ -51,11 +51,11 @@ public sealed class VisualDiagnosticBarrierTests
     public async Task ProjectionInProgressPreventsBarrierCompletion()
     {
         var projector = new BlockingProjector();
-        await using var delivery = new AScanVisualDelivery(projector, new ManualSimulatorTimeProvider());
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(projector, new ManualSimulatorTimeProvider());
         using var subscription = delivery.Subscribe(new Observer());
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        Task accept = Task.Run(() => delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]));
+        Task accept = Task.Run(() => delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]));
         try
         {
             await DiagnosticWait.For(projector.Entered.Task, "projection entered");
@@ -72,25 +72,26 @@ public sealed class VisualDiagnosticBarrierTests
     public async Task InvalidatedFailingProjectionReevaluatesNewGenerationBarrier()
     {
         var projector = new BlockingProjector(throwAfterRelease: true);
-        await using var delivery = new AScanVisualDelivery(projector, new ManualSimulatorTimeProvider());
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(projector, new ManualSimulatorTimeProvider());
         using var subscription = delivery.Subscribe(new Observer());
         var first = Metadata(8);
         delivery.OpenRun(first.RunId);
-        Task accept = Task.Run(() => delivery.Accept(first, 0, TimeSpan.Zero, new short[8]));
+        Task accept = Task.Run(() => delivery.ConfirmAndNotify(first, 0, 0, TimeSpan.Zero, new short[8]));
         await DiagnosticWait.For(projector.Entered.Task, "failing projection entered");
         delivery.CloseRun(first.RunId);
         var second = Metadata(8);
         delivery.OpenRun(second.RunId);
         Task barrier = delivery.WaitForDiagnosticStateAsync(new(VisualDiagnosticWorkerState.WaitingForSignal, false), Limit);
         projector.Release.TrySetResult();
-        await Assert.ThrowsAsync<InvalidOperationException>(() => accept);
+        await DiagnosticWait.For(accept, "identity notification returned");
+        await DiagnosticWait.For(projector.Exited.Task, "invalidated projection exited");
         await DiagnosticWait.For(barrier, "new generation after invalidated projection failure");
     }
 
     [TestMethod]
     public async Task CancellingOneOfMultipleWaitersDoesNotAffectTheOther()
     {
-        await using var delivery = new AScanVisualDelivery(timeProvider: new ManualSimulatorTimeProvider());
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: new ManualSimulatorTimeProvider());
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
         using var cancellation = new CancellationTokenSource();
@@ -104,7 +105,7 @@ public sealed class VisualDiagnosticBarrierTests
     [TestMethod]
     public async Task DiagnosticTimeoutIsReportedWithoutChangingDelivery()
     {
-        await using var delivery = new AScanVisualDelivery(timeProvider: new ManualSimulatorTimeProvider());
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: new ManualSimulatorTimeProvider());
         await Assert.ThrowsAsync<TimeoutException>(() => delivery.WaitForDiagnosticStateAsync(
             new(VisualDiagnosticWorkerState.WaitingForTimer, true), TimeSpan.FromMilliseconds(20)));
         await delivery.WaitForDiagnosticStateAsync(
@@ -114,7 +115,7 @@ public sealed class VisualDiagnosticBarrierTests
     [TestMethod]
     public async Task DiagnosticDisposalFaultsWaiterAndWaitsForBlockedCallbackPump()
     {
-        var delivery = new AScanVisualDelivery(timeProvider: new ManualSimulatorTimeProvider());
+        var delivery = AScanVisualDeliveryTestFactory.Create(timeProvider: new ManualSimulatorTimeProvider());
         var entered = ManualSessionSource.Signal();
         var release = ManualSessionSource.Signal();
         _ = delivery.Subscribe(new Observer(_ =>
@@ -124,7 +125,7 @@ public sealed class VisualDiagnosticBarrierTests
         }));
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
         await DiagnosticWait.For(entered.Task, "disposal callback entered");
         Task waiter = delivery.WaitForDiagnosticStateAsync(new(VisualDiagnosticWorkerState.WaitingForTimer, true), Limit);
         Task disposal = delivery.DisposeForDiagnosticsAsync(Limit);
@@ -141,19 +142,23 @@ public sealed class VisualDiagnosticBarrierTests
     {
         var clock = new ManualSimulatorTimeProvider();
         var projector = new CountingProjector();
-        await using var delivery = new AScanVisualDelivery(projector, clock);
+        await using var delivery = AScanVisualDeliveryTestFactory.Create(projector, clock);
         int callbacks = 0;
         using var subscription = delivery.Subscribe(new Observer(_ => Interlocked.Increment(ref callbacks)));
         var metadata = Metadata(8);
         delivery.OpenRun(metadata.RunId);
-        delivery.Accept(metadata, 0, TimeSpan.Zero, new short[8]);
+        delivery.ConfirmAndNotify(metadata, 0, 0, TimeSpan.Zero, new short[8]);
+        await DiagnosticWait.For(projector.WaitForCallsAsync(1),
+            "initial confirmed trace projected");
         await delivery.WaitForDiagnosticStateAsync(new(VisualDiagnosticWorkerState.WaitingForSignal, false), Limit);
         Assert.AreEqual(1, projector.Calls);
         Assert.AreEqual(1, callbacks);
-        delivery.Accept(metadata, 1, TimeSpan.FromTicks(1), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 1, 1, TimeSpan.FromTicks(1), new short[8]);
         await delivery.WaitForDiagnosticStateAsync(new(VisualDiagnosticWorkerState.WaitingForTimer, true), Limit);
         int preparedProjections = projector.Calls, preparedCallbacks = callbacks;
-        delivery.Accept(metadata, 2, TimeSpan.FromTicks(2), new short[8]);
+        delivery.ConfirmAndNotify(metadata, 2, 2, TimeSpan.FromTicks(2), new short[8]);
+        await DiagnosticWait.For(projector.WaitForCallsAsync(preparedProjections + 1),
+            "latest confirmed trace projected");
         Assert.AreEqual(preparedProjections + 1, projector.Calls);
         Assert.AreEqual(preparedCallbacks, callbacks);
         Assert.AreEqual(1L, delivery.Statistics.Replaced);
@@ -163,23 +168,50 @@ public sealed class VisualDiagnosticBarrierTests
     {
         internal TaskCompletionSource Entered { get; } = ManualSessionSource.Signal();
         internal TaskCompletionSource Release { get; } = ManualSessionSource.Signal();
+        internal TaskCompletionSource Exited { get; } = ManualSessionSource.Signal();
         public AScanSnapshot Project(UTStudio.Domain.Acquisition.ConventionalUtFrameMetadata metadata, ulong sequence,
             TimeSpan elapsedSinceRunStart, ReadOnlySpan<short> samples, ulong version)
         {
             Entered.TrySetResult();
             DiagnosticWait.For(Release.Task, "release blocked projection").GetAwaiter().GetResult();
-            if (throwAfterRelease) { throw new InvalidOperationException("synthetic invalidated projection failure"); }
-            return new AScanProjector().Project(metadata, sequence, elapsedSinceRunStart, samples, version);
+            try
+            {
+                if (throwAfterRelease) { throw new InvalidOperationException("synthetic invalidated projection failure"); }
+                return new AScanProjector().Project(metadata, sequence, elapsedSinceRunStart, samples, version);
+            }
+            finally { Exited.TrySetResult(); }
         }
     }
 
     private sealed class CountingProjector : IAScanProjector
     {
+        private readonly object _gate = new();
+        private readonly List<(int Count, TaskCompletionSource Completion)> _waiters = [];
         internal int Calls { get; private set; }
+
+        internal Task WaitForCallsAsync(int count)
+        {
+            lock (_gate)
+            {
+                if (Calls >= count) return Task.CompletedTask;
+                var completion = ManualSessionSource.Signal();
+                _waiters.Add((count, completion));
+                return completion.Task;
+            }
+        }
+
         public AScanSnapshot Project(UTStudio.Domain.Acquisition.ConventionalUtFrameMetadata metadata, ulong sequence,
             TimeSpan elapsedSinceRunStart, ReadOnlySpan<short> samples, ulong version)
         {
-            Calls++;
+            lock (_gate)
+            {
+                Calls++;
+                foreach (var waiter in _waiters.Where(waiter => Calls >= waiter.Count))
+                {
+                    waiter.Completion.TrySetResult();
+                }
+                _waiters.RemoveAll(waiter => Calls >= waiter.Count);
+            }
             return new AScanProjector().Project(metadata, sequence, elapsedSinceRunStart, samples, version);
         }
     }
