@@ -33,7 +33,9 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
     private readonly IInspectionTraceIndex _index;
     private IInspectionSealResultFactory _sealResultFactory = DefaultInspectionSealResultFactory.Instance;
     private readonly SemaphoreSlim _writer = new(1, 1);
+    private readonly SemaphoreSlim _streamStateAdmission = new(1, 1);
     private readonly Dictionary<GapKey, GapRecord> _gaps = [];
+    private readonly Dictionary<UtStreamIdentity, int> _gapCountsByStream = [];
     private readonly Dictionary<AcquisitionRunId, RunState> _runs = [];
     private readonly List<Chunk> _chunks = [];
     private Chunk? _activeChunk;
@@ -42,6 +44,8 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
     private long _logicalBytes, _reservedSampleBytes, _ownedSampleBytes, _maximumOwnedSampleBytes;
     private ulong _revision, _committedTraces, _cancelledAppends, _preAdmissionRejections, _duplicates, _conflicts,
         _capacityRejections;
+    private long _streamStateReadsCompleted, _streamStateReadFaults;
+    private string? _lastStreamStateReadFaultType;
     private TaskCompletionSource? _writersDrained, _leasesDrained;
     private Task? _disposeTask;
 
@@ -271,6 +275,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                                     throw new GapConflictException();
                                 }
                                 _gaps.Add(key, gap with { ConfirmedRevision = new(_revision + 1) });
+                                IncrementGapCountUnderLock(gap.Stream);
                                 addedGaps.Add(key);
                                 TestHooks?.AfterGapPrepared?.Invoke(gapIndex);
                             }
@@ -302,7 +307,11 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                                 if (streamCreated && rollbackStream!.Count == 0) { _index.RemoveStream(trace.Descriptor.Identity.Stream); }
                             }
                             if (primaryAdded) { _index.RemovePrimary(trace.Descriptor.Identity); }
-                            foreach (GapKey gap in addedGaps) { _gaps.Remove(gap); }
+                            foreach (GapKey gap in addedGaps)
+                            {
+                                _gaps.Remove(gap);
+                                DecrementGapCountUnderLock(gap.Stream);
+                            }
                             if (_chunks.Count > priorChunkCount && _activeChunk is { Entries.Count: 0 })
                             { _chunks.Remove(_activeChunk); _activeChunk = priorActive; if (priorActive is not null) { priorActive.Sealed = false; } }
                             try { _ownerReleaser.Release(owner); }
@@ -402,6 +411,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                     cancellationToken.ThrowIfCancellationRequested();
                     InspectionRevision revision = new(checked(_revision + 1));
                     _gaps.Add(key, gap with { ConfirmedRevision = revision });
+                    IncrementGapCountUnderLock(gap.Stream);
                     try
                     {
                         TestHooks?.BeforeRevisionPublished?.Invoke();
@@ -412,6 +422,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                     catch
                     {
                         _gaps.Remove(key);
+                        DecrementGapCountUnderLock(gap.Stream);
                         throw;
                     }
                     try { TestHooks?.AfterCommit?.Invoke(); }
@@ -442,7 +453,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
             if (!_leasesAllowed) { return ValueTask.FromResult(new InspectionTraceReadResult(InspectionReadStatus.Closed, new(_revision))); }
             if (!_index.TryGetPrimary(identity, out Entry? entry))
             {
-                InspectionReadStatus missing = MissingStatusUnderLock(identity.Stream.AcquisitionRunId,
+                InspectionReadStatus missing = MissingStatusUnderLock(identity.Stream,
                     identity.AcquisitionIndex);
                 return ValueTask.FromResult(new InspectionTraceReadResult(missing, new(_revision)));
             }
@@ -491,7 +502,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                     else
                     {
                         items.Add(new(new TraceIdentity(query.Stream, index),
-                            MissingStatusUnderLock(query.Stream.AcquisitionRunId, index)));
+                            MissingStatusUnderLock(query.Stream, index)));
                     }
                 }
                 return ValueTask.FromResult(new InspectionRangeReadResult(
@@ -513,6 +524,76 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                 throw new InspectionRangeAcquisitionException(error, cleanupErrors);
             }
         }
+    }
+
+    public async ValueTask<InspectionStreamStateReadResult> ReadStreamStateAsync(UtStreamIdentity stream,
+        CancellationToken cancellationToken = default)
+    {
+        if (!stream.IsValid) { throw new ArgumentException("A valid stream is required.", nameof(stream)); }
+        if (cancellationToken.IsCancellationRequested)
+        { return InspectionStreamStateReadResult.Cancelled(); }
+        bool admitted = false;
+        try
+        {
+            await _streamStateAdmission.WaitAsync(cancellationToken).ConfigureAwait(false);
+            admitted = true;
+            TestHooks?.AfterStreamStateAdmission?.Invoke();
+            await Task.Yield();
+            lock (_gate)
+            {
+                // Linearization point: cancellation before this check never captures state.
+                if (cancellationToken.IsCancellationRequested)
+                { return InspectionStreamStateReadResult.Cancelled(); }
+                var revision = new InspectionRevision(_revision);
+                if (!_leasesAllowed)
+                { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.Closed(revision)); }
+                if (stream.InspectionId != _inspectionId)
+                { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
+                    InspectionStreamStateErrorCode.InspectionNotFound)); }
+                if (!_runs.TryGetValue(stream.AcquisitionRunId, out RunState? run))
+                { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
+                    InspectionStreamStateErrorCode.RunNotFound)); }
+
+                _index.TryGetStream(stream, out SortedDictionary<ulong, Entry>? entries);
+                int gapCount = _gapCountsByStream.GetValueOrDefault(stream);
+                if (entries is null && gapCount == 0)
+                { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
+                    InspectionStreamStateErrorCode.StreamNotFound)); }
+                ulong? minimum = entries is { Count: > 0 } ? entries.First().Key : null;
+                ulong? maximum = entries is { Count: > 0 } ? entries.Last().Key : null;
+                bool final = run.State == InspectionRunState.Sealed && run.FinalRevision is not null;
+                var snapshot = new InspectionStreamStateSnapshot(stream.InspectionId,
+                    stream.AcquisitionRunId, stream, run.State, revision,
+                    final ? run.FinalRevision : null, minimum, maximum, entries?.Count ?? 0,
+                    gapCount, final, run.State == InspectionRunState.Faulted ? run.FaultCode : null);
+                return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.Available(snapshot));
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        { return InspectionStreamStateReadResult.Cancelled(); }
+        catch (Exception error)
+        {
+            lock (_gate)
+            {
+                _streamStateReadFaults++;
+                _lastStreamStateReadFaultType = error.GetType().Name;
+            }
+            return InspectionStreamStateReadResult.Faulted();
+        }
+        finally { if (admitted) { _streamStateAdmission.Release(); } }
+    }
+
+    internal (long Completed, long Faulted, string? LastFaultType) StreamStateReadDiagnostics
+    {
+        get { lock (_gate) { return (_streamStateReadsCompleted, _streamStateReadFaults,
+            _lastStreamStateReadFaultType); } }
+    }
+
+    private InspectionStreamStateReadResult CompleteStreamStateReadUnderLock(
+        InspectionStreamStateReadResult result)
+    {
+        _streamStateReadsCompleted++;
+        return result;
     }
 
     public ValueTask DisposeAsync()
@@ -590,7 +671,14 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
         }
         catch
         {
-            lock (_gate) { if (run.State != InspectionRunState.Sealed) { run.State = InspectionRunState.Faulted; } }
+            lock (_gate)
+            {
+                if (run.State != InspectionRunState.Sealed)
+                {
+                    run.State = InspectionRunState.Faulted;
+                    run.FaultCode = InspectionRunFaultCode.SealFailed;
+                }
+            }
             throw;
         }
     }
@@ -618,6 +706,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
         {
             SealActiveChunkUnderLock();
             _leasesAllowed = false;
+            TestHooks?.AfterLeasesClosed?.Invoke();
         }
         Task leases;
         lock (_gate) { leases = _activeLeases == 0 ? Task.CompletedTask : (_leasesDrained ??= NewSignal()).Task; }
@@ -637,7 +726,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                     catch (Exception fallbackError) { cleanupFailures.Add(fallbackError); }
                 }
             }
-            _index.Clear(); _gaps.Clear(); _chunks.Clear(); _activeChunk = null;
+            _index.Clear(); _gaps.Clear(); _gapCountsByStream.Clear(); _chunks.Clear(); _activeChunk = null;
             _logicalBytes = 0; _reservedSampleBytes = 0; _ownedSampleBytes = 0;
             _closing = false; _closed = true;
         }
@@ -663,13 +752,30 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
         }
     }
 
-    private InspectionReadStatus MissingStatusUnderLock(AcquisitionRunId runId, ulong acquisitionIndex)
+    private InspectionReadStatus MissingStatusUnderLock(UtStreamIdentity stream, ulong acquisitionIndex)
     {
-        if (!_runs.TryGetValue(runId, out RunState? run) || run.State != InspectionRunState.Sealed)
+        if (!_runs.TryGetValue(stream.AcquisitionRunId, out RunState? run) ||
+            run.State != InspectionRunState.Sealed)
         { return InspectionReadStatus.NotAvailable; }
-        if (run.MinimumIndex is null || acquisitionIndex < run.MinimumIndex || acquisitionIndex > run.MaximumIndex)
+        if (!_index.TryGetStream(stream, out SortedDictionary<ulong, Entry>? entries) ||
+            entries is not { Count: > 0 })
+        {
+            return _gapCountsByStream.ContainsKey(stream)
+                ? InspectionReadStatus.OutOfRange : InspectionReadStatus.NotAvailable;
+        }
+        if (acquisitionIndex < entries.First().Key || acquisitionIndex > entries.Last().Key)
         { return InspectionReadStatus.OutOfRange; }
         return InspectionReadStatus.NotAvailable;
+    }
+
+    private void IncrementGapCountUnderLock(UtStreamIdentity stream) =>
+        _gapCountsByStream[stream] = checked(_gapCountsByStream.GetValueOrDefault(stream) + 1);
+
+    private void DecrementGapCountUnderLock(UtStreamIdentity stream)
+    {
+        int remaining = _gapCountsByStream[stream] - 1;
+        if (remaining == 0) { _gapCountsByStream.Remove(stream); }
+        else { _gapCountsByStream[stream] = remaining; }
     }
 
     private void ReleaseWriterAdmission()
@@ -797,6 +903,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
         internal ulong Cancellations { get; set; }
         internal ulong Rejections { get; set; }
         internal InspectionRevision? FinalRevision;
+        internal InspectionRunFaultCode? FaultCode;
         internal ulong? MinimumIndex, MaximumIndex, MinimumSequence, MaximumSequence;
         internal TaskCompletionSource? OperationsDrained;
         internal Task<InspectionRunSealResult>? SealTask;
@@ -978,6 +1085,8 @@ internal sealed class InspectionStoreTestHooks
     internal Action? AfterPrimaryIndex { get; init; }
     internal Action? AfterStreamIndex { get; init; }
     internal Action? BeforeRevisionPublished { get; init; }
+    internal Action? AfterStreamStateAdmission { get; init; }
+    internal Action? AfterLeasesClosed { get; init; }
     internal Action? AfterCommit { get; init; }
     internal Action? BeforeSealing { get; init; }
     internal Action? BeforeSealWatermarksPublished { get; init; }

@@ -82,7 +82,14 @@ public interface IInspectionRangeProvider
     ValueTask<InspectionRangeReadResult> ReadRangeAsync(InspectionRangeQuery query, CancellationToken cancellationToken = default);
 }
 
-public interface IInspectionDataStore : IInspectionDataWriter, IUtTraceProvider, IInspectionRangeProvider, IAsyncDisposable
+public interface IInspectionStreamStateProvider
+{
+    ValueTask<InspectionStreamStateReadResult> ReadStreamStateAsync(UtStreamIdentity stream,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IInspectionDataStore : IInspectionDataWriter, IUtTraceProvider, IInspectionRangeProvider,
+    IInspectionStreamStateProvider, IAsyncDisposable
 {
     InspectionRevision Revision { get; }
     StoreDiagnostics Diagnostics { get; }

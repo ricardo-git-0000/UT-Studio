@@ -1,5 +1,6 @@
 using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
 
 namespace UTStudio.Core.Tests.Inspection;
@@ -277,6 +278,484 @@ public sealed class InMemoryInspectionDataStoreTests
         Assert.AreEqual(InspectionReadStatus.NotAvailable, range.Status);
         Assert.HasCount(4, range.Items);
         Assert.IsTrue(range.Items.All(x => x.Status == InspectionReadStatus.NotAvailable));
+    }
+
+    [TestMethod]
+    public async Task StreamStateUsesOnlyCommittedAcquisitionIndicesAndSequenceGapsAreDiagnostic()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        var runId = new AcquisitionRunId(Guid.NewGuid());
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(runId);
+        UtStreamIdentity stream = InputForRun(runId, 10, 100).Descriptor.Identity.Stream;
+        Assert.AreEqual(InspectionAppendStatus.Committed,
+            (await writer.CommitAsync(new(InputForRun(runId, 10, 100)))).Status);
+        var gap = new GapRecord(stream, 101, 104, 100, 105,
+            InspectionGapCause.SourceSequenceDiscontinuity);
+        Assert.AreEqual(InspectionAppendStatus.Committed,
+            (await writer.CommitAsync(new(InputForRun(runId, 30, 105), [gap]))).Status);
+
+        InspectionStreamStateReadResult open = await store.ReadStreamStateAsync(stream);
+        Assert.AreEqual(InspectionStreamStateReadStatus.Available, open.Status);
+        Assert.AreEqual(open.Revision, open.Snapshot!.Revision);
+        Assert.AreEqual(InspectionRunState.Open, open.Snapshot.RunState);
+        Assert.AreEqual<ulong>(10, open.Snapshot.MinimumCommittedAcquisitionIndex!.Value);
+        Assert.AreEqual<ulong>(30, open.Snapshot.MaximumCommittedAcquisitionIndex!.Value);
+        Assert.AreEqual(2, open.Snapshot.CommittedTraceCount);
+        Assert.AreEqual(1, open.Snapshot.SequenceGapCount);
+        Assert.IsFalse(open.Snapshot.AreWatermarksFinal);
+        Assert.IsNull(open.Snapshot.FinalRevision);
+
+        using InspectionRangeReadResult sparse = await store.ReadRangeAsync(new(stream, 10, 21));
+        Assert.AreEqual(InspectionReadStatus.Available, sparse.Items[0].Status);
+        Assert.IsTrue(sparse.Items.Skip(1).Take(19).All(item => item.Status == InspectionReadStatus.NotAvailable));
+        Assert.AreEqual(InspectionReadStatus.Available, sparse.Items[20].Status);
+
+        InspectionRunSealResult seal = await writer.SealRunAsync();
+        InspectionStreamStateReadResult sealedState = await store.ReadStreamStateAsync(stream);
+        Assert.AreEqual(InspectionRunState.Sealed, sealedState.Snapshot!.RunState);
+        Assert.AreEqual(seal.FinalRevision, sealedState.Snapshot.FinalRevision);
+        Assert.IsTrue(sealedState.Snapshot.AreWatermarksFinal);
+        using InspectionRangeReadResult sealedSparse = await store.ReadRangeAsync(new(stream, 9, 3));
+        CollectionAssert.AreEqual(
+            new[] { InspectionReadStatus.OutOfRange, InspectionReadStatus.Available, InspectionReadStatus.NotAvailable },
+            sealedSparse.Items.Select(item => item.Status).ToArray());
+        Assert.IsFalse(sealedSparse.Items.Any(item => item.Status == InspectionReadStatus.Gap));
+    }
+
+    [TestMethod]
+    public async Task StreamStateAndRangeEachExposeTheirCapturedRevisionForReconciliation()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        await writer.CommitAsync(new(Input(1, [1, 2], sequence: 99)));
+        InspectionStreamStateReadResult before = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        using InspectionRangeReadResult range = await store.ReadRangeAsync(
+            new(InspectionIdentityTests.Stream(), 1, 2));
+        await writer.CommitAsync(new(Input(2, [3, 4], sequence: 100)));
+        InspectionStreamStateReadResult after = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+
+        Assert.AreEqual(InspectionStreamStateReadStatus.Available, before.Status);
+        Assert.AreEqual(InspectionStreamStateReadStatus.Available, after.Status);
+        Assert.AreEqual<ulong>(1, before.Revision.Value);
+        Assert.AreEqual(before.Revision, range.Revision);
+        Assert.AreEqual<ulong>(2, after.Revision.Value);
+        Assert.AreEqual<ulong>(2, after.Snapshot!.MaximumCommittedAcquisitionIndex!.Value);
+        Assert.AreEqual((ulong)99, range.Items[0].Lease!.Descriptor.Sequence);
+        Assert.AreEqual((ulong)1, range.Items[0].Identity.AcquisitionIndex);
+    }
+
+    [TestMethod]
+    public void StreamStateResultDefaultAndFactoriesAreSafe()
+    {
+        InspectionStreamStateReadResult value = default;
+        Assert.AreEqual(InspectionStreamStateReadStatus.Unknown, value.Status);
+        Assert.IsFalse(value.IsAvailable);
+        Assert.IsNull(value.Snapshot);
+        Assert.IsNull(value.ErrorCode);
+        CollectionAssert.AreEqual(new[] { 0, 1, 2, 3, 4, 5 },
+            Enum.GetValues<InspectionStreamStateReadStatus>().Select(status => (int)status).ToArray());
+        Assert.IsFalse(Enum.IsDefined((InspectionStreamStateReadStatus)99));
+        Assert.ThrowsExactly<ArgumentNullException>(() =>
+            InspectionStreamStateReadResult.Available(null!));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            InspectionStreamStateReadResult.NotAvailable(new(1), InspectionStreamStateErrorCode.Unknown));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            InspectionStreamStateReadResult.NotAvailable(new(1), (InspectionStreamStateErrorCode)99));
+        Assert.AreEqual(InspectionStreamStateErrorCode.InternalFailure,
+            InspectionStreamStateReadResult.Faulted().ErrorCode);
+        Assert.AreEqual(InspectionRevision.Initial, InspectionStreamStateReadResult.Faulted().Revision);
+        Assert.IsTrue(typeof(InspectionStreamStateReadResult).GetConstructors().All(
+            constructor => constructor.GetParameters().Length == 0));
+    }
+
+    [TestMethod]
+    public void StreamStateSnapshotRejectsContradictoryValuesAndCannotBeMutated()
+    {
+        UtStreamIdentity stream = InspectionIdentityTests.Stream();
+        InspectionStreamStateSnapshot Valid(InspectionRunState state = InspectionRunState.Open,
+            InspectionRevision? final = null, bool finalWatermarks = false,
+            ulong? minimum = 1, ulong? maximum = 3, int count = 2,
+            InspectionRunFaultCode? fault = null) => new(InspectionIdentityTests.Inspection,
+                InspectionIdentityTests.Run, stream, state, new(4), final, minimum, maximum,
+                count, 0, finalWatermarks, fault);
+
+        Assert.ThrowsExactly<ArgumentException>(() => new InspectionStreamStateSnapshot(default,
+            InspectionIdentityTests.Run, stream, InspectionRunState.Open, new(1), null, 1, 1, 1, 0, false));
+        Assert.ThrowsExactly<ArgumentException>(() => new InspectionStreamStateSnapshot(
+            InspectionIdentityTests.Inspection, new(Guid.NewGuid()), stream, InspectionRunState.Open,
+            new(1), null, 1, 1, 1, 0, false));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => Valid(InspectionRunState.Unknown));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(minimum: 1, maximum: null));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(minimum: 4, maximum: 3));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(minimum: null, maximum: null, count: 1));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => Valid(count: -1));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new InspectionStreamStateSnapshot(
+            InspectionIdentityTests.Inspection, InspectionIdentityTests.Run, stream,
+            InspectionRunState.Open, new(1), null, null, null, 0, -1, false));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(final: new(4)));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(InspectionRunState.Sealing,
+            finalWatermarks: true));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(InspectionRunState.Sealed));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(InspectionRunState.Sealed,
+            final: new(4), finalWatermarks: false));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(InspectionRunState.Faulted));
+        Assert.ThrowsExactly<ArgumentException>(() => Valid(fault: InspectionRunFaultCode.SealFailed));
+
+        InspectionStreamStateSnapshot first = Valid();
+        InspectionStreamStateSnapshot same = Valid();
+        Assert.AreEqual(first, same);
+        Assert.IsTrue(typeof(InspectionStreamStateSnapshot).GetProperties().All(
+            property => property.SetMethod is null));
+    }
+
+    [TestMethod]
+    public void RangeProviderContractRemainsSourceCompatibleAndStateUsesSeparatePort()
+    {
+        CollectionAssert.AreEqual(new[] { nameof(IInspectionRangeProvider.ReadRangeAsync) },
+            typeof(IInspectionRangeProvider).GetMethods().Select(method => method.Name).ToArray());
+        CollectionAssert.AreEqual(new[] { nameof(IInspectionStreamStateProvider.ReadStreamStateAsync) },
+            typeof(IInspectionStreamStateProvider).GetMethods().Select(method => method.Name).ToArray());
+        Assert.IsTrue(typeof(IInspectionStreamStateProvider).IsAssignableFrom(typeof(IInspectionDataStore)));
+    }
+
+    [TestMethod]
+    public async Task StreamStateDistinguishesUnknownInspectionRunStreamAndEmptyRun()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        var runId = new AcquisitionRunId(Guid.NewGuid());
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(runId);
+        var stream = new UtStreamIdentity(InspectionIdentityTests.Inspection, runId,
+            new("state-source"), new(0));
+
+        InspectionStreamStateReadResult inspection = await store.ReadStreamStateAsync(new(
+            new InspectionId(Guid.NewGuid()), runId, stream.SourceId, stream.PhysicalChannelId));
+        InspectionStreamStateReadResult run = await store.ReadStreamStateAsync(new(
+            stream.InspectionId, new AcquisitionRunId(Guid.NewGuid()), stream.SourceId, stream.PhysicalChannelId));
+        InspectionStreamStateReadResult empty = await store.ReadStreamStateAsync(stream);
+
+        Assert.AreEqual(InspectionStreamStateErrorCode.InspectionNotFound, inspection.ErrorCode);
+        Assert.AreEqual(InspectionStreamStateErrorCode.RunNotFound, run.ErrorCode);
+        Assert.AreEqual(InspectionStreamStateErrorCode.StreamNotFound, empty.ErrorCode);
+        Assert.IsTrue(new[] { inspection, run, empty }.All(result =>
+            result.Status == InspectionStreamStateReadStatus.NotAvailable && result.Snapshot is null));
+    }
+
+    [TestMethod]
+    public async Task RejectedAndRolledBackCommitsDoNotMoveStreamStateWatermarks()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        Assert.IsTrue((await writer.CommitAsync(new(Input(10, [1, 2], 100)))).IsCommitted);
+        Assert.AreEqual(InspectionAppendStatus.Conflict,
+            (await writer.CommitAsync(new(Input(10, [9, 9], 100)))).Status);
+        store.TestHooks = new() { BeforeRevisionPublished = ThrowInjected };
+        var gap = new GapRecord(InspectionIdentityTests.Stream(), 101, 101, 100, 102,
+            InspectionGapCause.SourceSequenceDiscontinuity);
+        Assert.AreEqual(InspectionAppendStatus.Faulted,
+            (await writer.CommitAsync(new(Input(20, [3, 4], 102), [gap]))).Status);
+        store.TestHooks = null;
+
+        InspectionStreamStateReadResult result = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        Assert.AreEqual<ulong>(10, result.Snapshot!.MinimumCommittedAcquisitionIndex!.Value);
+        Assert.AreEqual<ulong>(10, result.Snapshot.MaximumCommittedAcquisitionIndex!.Value);
+        Assert.AreEqual(1, result.Snapshot.CommittedTraceCount);
+        Assert.AreEqual(0, result.Snapshot.SequenceGapCount);
+        Assert.AreEqual<ulong>(1, result.Revision.Value);
+    }
+
+    [TestMethod]
+    public async Task StreamStateCancellationWhileWaitingForGateCapturesNothingAndLaterReadWorks()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        await writer.CommitAsync(new(Input(0, [1, 2])));
+        using var gateEntered = new ManualResetEventSlim();
+        using var releaseGate = new ManualResetEventSlim();
+        var admission = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.TestHooks = new()
+        {
+            BeforeRangeLease = _ =>
+            {
+                gateEntered.Set();
+                if (!releaseGate.Wait(TimeSpan.FromSeconds(5))) { throw new TimeoutException("state gate release"); }
+            },
+            AfterStreamStateAdmission = () => admission.TrySetResult()
+        };
+        Task<InspectionRangeReadResult> blocking = Task.Run(async () =>
+            await store.ReadRangeAsync(new(InspectionIdentityTests.Stream(), 0, 1)));
+        Assert.IsTrue(gateEntered.Wait(TimeSpan.FromSeconds(5)));
+        using var cancellation = new CancellationTokenSource();
+        Task<InspectionStreamStateReadResult> read = store.ReadStreamStateAsync(
+            InspectionIdentityTests.Stream(), cancellation.Token).AsTask();
+        await admission.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        releaseGate.Set();
+        using InspectionRangeReadResult range = await blocking;
+
+        InspectionStreamStateReadResult cancelled = await read;
+        Assert.AreEqual(InspectionStreamStateReadStatus.Cancelled, cancelled.Status);
+        Assert.AreEqual(InspectionRevision.Initial, cancelled.Revision);
+        Assert.IsNull(cancelled.Snapshot);
+        Assert.AreEqual(0L, store.StreamStateReadDiagnostics.Completed);
+        store.TestHooks = null;
+        Assert.IsTrue((await store.ReadStreamStateAsync(InspectionIdentityTests.Stream())).IsAvailable);
+    }
+
+    [TestMethod]
+    public async Task StreamStateCancellationDuringAdmissionWaitDoesNotCompleteARead()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        await writer.CommitAsync(new(Input(0, [1, 2])));
+        using var firstAdmitted = new ManualResetEventSlim();
+        using var releaseFirst = new ManualResetEventSlim();
+        int admissions = 0;
+        store.TestHooks = new()
+        {
+            AfterStreamStateAdmission = () =>
+            {
+                if (Interlocked.Increment(ref admissions) == 1)
+                {
+                    firstAdmitted.Set();
+                    if (!releaseFirst.Wait(TimeSpan.FromSeconds(5))) { throw new TimeoutException("first state read release"); }
+                }
+            }
+        };
+        Task<InspectionStreamStateReadResult> first = Task.Run(async () =>
+            await store.ReadStreamStateAsync(InspectionIdentityTests.Stream()));
+        Assert.IsTrue(firstAdmitted.Wait(TimeSpan.FromSeconds(5)));
+        using var cancellation = new CancellationTokenSource();
+        Task<InspectionStreamStateReadResult> second = store.ReadStreamStateAsync(
+            InspectionIdentityTests.Stream(), cancellation.Token).AsTask();
+        cancellation.Cancel();
+        InspectionStreamStateReadResult cancelled = await second;
+        Assert.AreEqual(InspectionStreamStateReadStatus.Cancelled, cancelled.Status);
+        Assert.AreEqual(0L, store.StreamStateReadDiagnostics.Completed);
+        releaseFirst.Set();
+        Assert.IsTrue((await first).IsAvailable);
+        Assert.AreEqual(1L, store.StreamStateReadDiagnostics.Completed);
+        store.TestHooks = null;
+        Assert.IsTrue((await store.ReadStreamStateAsync(InspectionIdentityTests.Stream())).IsAvailable);
+    }
+
+    [TestMethod]
+    public async Task StreamStateLinearizesAfterConcurrentAppendAndSeal()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        Assert.IsTrue((await writer.CommitAsync(new(Input(0, [1, 2], 10)))).IsCommitted);
+        using var commitEntered = new ManualResetEventSlim();
+        using var releaseCommit = new ManualResetEventSlim();
+        store.TestHooks = new()
+        {
+            BeforeRevisionPublished = () =>
+            {
+                commitEntered.Set();
+                if (!releaseCommit.Wait(TimeSpan.FromSeconds(5))) { throw new TimeoutException("commit release"); }
+            }
+        };
+        Task<InspectionAppendResult> commit = Task.Run(async () =>
+            await writer.CommitAsync(new(Input(2, [3, 4], 11))));
+        Assert.IsTrue(commitEntered.Wait(TimeSpan.FromSeconds(5)));
+        Task<InspectionStreamStateReadResult> readAfterCommit = store.ReadStreamStateAsync(
+            InspectionIdentityTests.Stream()).AsTask();
+        releaseCommit.Set();
+        Assert.IsTrue((await commit).IsCommitted);
+        InspectionStreamStateReadResult appended = await readAfterCommit;
+        Assert.AreEqual(appended.Revision, appended.Snapshot!.Revision);
+        Assert.AreEqual<ulong>(2, appended.Snapshot.MaximumCommittedAcquisitionIndex!.Value);
+
+        store.TestHooks = null;
+        InspectionRunSealResult seal = await writer.SealRunAsync();
+        InspectionStreamStateReadResult sealedState = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        Assert.AreEqual(InspectionRunState.Sealed, sealedState.Snapshot!.RunState);
+        Assert.AreEqual(seal.FinalRevision, sealedState.Snapshot.FinalRevision);
+        Assert.IsTrue(sealedState.Snapshot.AreWatermarksFinal);
+    }
+
+    [TestMethod]
+    public async Task StreamStateExposesSealingAndRunFaultSeparatelyFromQueryFault()
+    {
+        var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        Assert.IsTrue((await writer.CommitAsync(new(Input(0, [1, 2], 10)))).IsCommitted);
+        using var commitEntered = new ManualResetEventSlim();
+        using var releaseCommit = new ManualResetEventSlim();
+        var sealingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.TestHooks = new()
+        {
+            BeforeCommit = () =>
+            {
+                commitEntered.Set();
+                if (!releaseCommit.Wait(TimeSpan.FromSeconds(5))) { throw new TimeoutException("sealing commit release"); }
+            },
+            BeforeSealing = () => sealingStarted.TrySetResult()
+        };
+        Task<InspectionAppendResult> pending = Task.Run(async () =>
+            await writer.CommitAsync(new(Input(1, [3, 4], 11))));
+        Assert.IsTrue(commitEntered.Wait(TimeSpan.FromSeconds(5)));
+        Task<InspectionRunSealResult> sealing = writer.SealRunAsync().AsTask();
+        await sealingStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        InspectionStreamStateReadResult duringSeal = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        Assert.AreEqual(InspectionRunState.Sealing, duringSeal.Snapshot!.RunState);
+        Assert.IsNull(duringSeal.Snapshot.FinalRevision);
+        Assert.IsFalse(duringSeal.Snapshot.AreWatermarksFinal);
+        releaseCommit.Set();
+        await pending;
+        await sealing;
+        await store.DisposeAsync();
+
+        var faultedStore = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter faultedWriter = await faultedStore.OpenRunAsync(InspectionIdentityTests.Run);
+        Assert.IsTrue((await faultedWriter.CommitAsync(new(Input(0, [1, 2], 10)))).IsCommitted);
+        faultedStore.SealResultFactory = new ThrowingSealResultFactory();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => faultedWriter.SealRunAsync().AsTask());
+        InspectionStreamStateReadResult runFault = await faultedStore.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        Assert.IsTrue(runFault.IsAvailable);
+        Assert.AreEqual(InspectionRunState.Faulted, runFault.Snapshot!.RunState);
+        Assert.AreEqual(InspectionRunFaultCode.SealFailed, runFault.Snapshot.RunFaultCode);
+        Assert.AreEqual(InspectionStreamStateReadStatus.Faulted,
+            InspectionStreamStateReadResult.Faulted().Status);
+        await Assert.ThrowsExactlyAsync<InspectionStoreCloseException>(() => faultedStore.DisposeAsync().AsTask());
+    }
+
+    [TestMethod]
+    public async Task StreamStateConcurrentWithFinalSealPublicationCannotObservePartialFinality()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        await writer.CommitAsync(new(Input(0, [1, 2])));
+        using var sealPublished = new ManualResetEventSlim();
+        using var releaseSeal = new ManualResetEventSlim();
+        store.TestHooks = new()
+        {
+            AfterSealPublished = () =>
+            {
+                sealPublished.Set();
+                if (!releaseSeal.Wait(TimeSpan.FromSeconds(5))) { throw new TimeoutException("seal publication release"); }
+            }
+        };
+        Task<InspectionRunSealResult> seal = Task.Run(async () => await writer.SealRunAsync());
+        Assert.IsTrue(sealPublished.Wait(TimeSpan.FromSeconds(5)));
+        Task<InspectionStreamStateReadResult> read = store.ReadStreamStateAsync(
+            InspectionIdentityTests.Stream()).AsTask();
+        releaseSeal.Set();
+        InspectionRunSealResult sealedRun = await seal;
+        InspectionStreamStateReadResult state = await read;
+        Assert.AreEqual(InspectionRunState.Sealed, state.Snapshot!.RunState);
+        Assert.AreEqual(sealedRun.FinalRevision, state.Snapshot.FinalRevision);
+        Assert.IsTrue(state.Snapshot.AreWatermarksFinal);
+        Assert.AreEqual(state.Revision, state.Snapshot.Revision);
+    }
+
+    [TestMethod]
+    public async Task StreamStateQueryFaultUsesBoundedCodeAndDoesNotPoisonLaterReads()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        await writer.CommitAsync(new(Input(0, [1, 2])));
+        store.TestHooks = new() { AfterStreamStateAdmission = ThrowInjected };
+
+        InspectionStreamStateReadResult faulted = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        Assert.AreEqual(InspectionStreamStateReadStatus.Faulted, faulted.Status);
+        Assert.AreEqual(InspectionStreamStateErrorCode.InternalFailure, faulted.ErrorCode);
+        Assert.AreEqual(InspectionRevision.Initial, faulted.Revision);
+        Assert.IsNull(faulted.Snapshot);
+        Assert.AreEqual(1L, store.StreamStateReadDiagnostics.Faulted);
+        Assert.AreEqual(nameof(InvalidOperationException), store.StreamStateReadDiagnostics.LastFaultType);
+
+        store.TestHooks = null;
+        Assert.IsTrue((await store.ReadStreamStateAsync(InspectionIdentityTests.Stream())).IsAvailable);
+    }
+
+    [TestMethod]
+    public async Task StreamStateReturnsClosedDuringCloseAndRepeatedSnapshotsAreEqual()
+    {
+        var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        await writer.CommitAsync(new(Input(0, [1, 2])));
+        InspectionStreamStateReadResult first = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        InspectionStreamStateReadResult second = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        Assert.AreEqual(first.Snapshot, second.Snapshot);
+        IInspectionTraceLease lease = (await store.ReadAsync(Identity(0))).Lease!;
+        var readsClosed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.TestHooks = new() { AfterLeasesClosed = () => readsClosed.TrySetResult() };
+        Task close = store.DisposeAsync().AsTask();
+        await readsClosed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        InspectionStreamStateReadResult closed = await store.ReadStreamStateAsync(InspectionIdentityTests.Stream());
+        Assert.AreEqual(InspectionStreamStateReadStatus.Closed, closed.Status);
+        Assert.AreEqual(InspectionStreamStateErrorCode.StoreClosed, closed.ErrorCode);
+        Assert.IsNull(closed.Snapshot);
+        lease.Dispose();
+        await close;
+        Assert.AreEqual(InspectionStreamStateReadStatus.Closed,
+            (await store.ReadStreamStateAsync(InspectionIdentityTests.Stream())).Status);
+    }
+
+    [TestMethod]
+    public async Task SealedMissingStatusUsesPerStreamWatermarks()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        UtStreamIdentity first = InspectionIdentityTests.Stream();
+        var second = new UtStreamIdentity(first.InspectionId, first.AcquisitionRunId,
+            first.SourceId, new PhysicalChannelId(1));
+        InspectionTraceInput Trace(UtStreamIdentity stream, ulong index, ulong sequence) => new(
+            InspectionIdentityTests.Descriptor(new TraceIdentity(stream, index), sequence, 2),
+            new short[] { 1, 2 });
+        Assert.IsTrue((await writer.CommitAsync(new(Trace(first, 10, 1)))).IsCommitted);
+        Assert.IsTrue((await writer.CommitAsync(new(Trace(first, 20, 2)))).IsCommitted);
+        Assert.IsTrue((await writer.CommitAsync(new(Trace(second, 0, 3)))).IsCommitted);
+        Assert.IsTrue((await writer.CommitAsync(new(Trace(second, 100, 4)))).IsCommitted);
+        await writer.SealRunAsync();
+
+        using InspectionRangeReadResult range = await store.ReadRangeAsync(new(first, 5, 16));
+        Assert.AreEqual(InspectionReadStatus.OutOfRange, range.Items[0].Status);
+        Assert.AreEqual(InspectionReadStatus.Available, range.Items[5].Status);
+        Assert.AreEqual(InspectionReadStatus.NotAvailable, range.Items[10].Status);
+        Assert.AreEqual(InspectionReadStatus.Available, range.Items[15].Status);
+        Assert.AreEqual(InspectionReadStatus.OutOfRange,
+            (await store.ReadAsync(new TraceIdentity(first, 50))).Status);
+        InspectionStreamStateReadResult state = await store.ReadStreamStateAsync(first);
+        Assert.AreEqual<ulong>(10, state.Snapshot!.MinimumCommittedAcquisitionIndex!.Value);
+        Assert.AreEqual<ulong>(20, state.Snapshot.MaximumCommittedAcquisitionIndex!.Value);
+    }
+
+    [TestMethod]
+    public async Task SealedGapOnlyStreamHasFinalEmptyRangeAndEveryIndexIsOutOfRange()
+    {
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(4096, 100));
+        await using IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        UtStreamIdentity stream = InspectionIdentityTests.Stream();
+        Assert.IsTrue((await writer.CommitGapAsync(new GapRecord(stream, 1, 2, 0, 3,
+            InspectionGapCause.SourceReportedLoss))).IsCommitted);
+        await writer.SealRunAsync();
+
+        InspectionStreamStateReadResult state = await store.ReadStreamStateAsync(stream);
+        Assert.IsTrue(state.IsAvailable);
+        Assert.AreEqual(0, state.Snapshot!.CommittedTraceCount);
+        Assert.AreEqual(1, state.Snapshot.SequenceGapCount);
+        Assert.IsNull(state.Snapshot.MinimumCommittedAcquisitionIndex);
+        Assert.IsNull(state.Snapshot.MaximumCommittedAcquisitionIndex);
+        Assert.IsTrue(state.Snapshot.AreWatermarksFinal);
+        Assert.AreEqual(InspectionReadStatus.OutOfRange,
+            (await store.ReadAsync(new TraceIdentity(stream, 0))).Status);
+        using InspectionRangeReadResult range = await store.ReadRangeAsync(new(stream, 0, 2));
+        Assert.IsTrue(range.Items.All(item => item.Status == InspectionReadStatus.OutOfRange));
     }
 
     [TestMethod]

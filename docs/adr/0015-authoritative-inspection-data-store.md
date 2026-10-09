@@ -278,6 +278,73 @@ B-Scan permanece temporalmente como proyección derivada alimentada con el frame
 por `AcquisitionIndex` mediante `IUtTraceProvider`; `Sequence` no sustituye al índice. La persistencia
 incremental continúa aplazada a Fase 5.
 
+## Refinamiento aceptado de Fase 4: estado neutral y rangos B-Scan
+
+`IInspectionStreamStateProvider` expone un snapshot neutral e inmutable del estado de un
+`UtStreamIdentity`; `IInspectionRangeProvider` conserva sin cambios su contrato anterior. El store
+completo implementa ambos puertos, y los consumidores que necesiten reconciliación reciben ambos de
+forma explícita. Añadir el puerto a `IInspectionDataStore` amplía deliberadamente ese contrato compuesto,
+pero no fuerza a los proveedores de rangos independientes a implementar estado.
+
+Compatibilidad: `IInspectionRangeProvider` mantiene compatibilidad fuente y binaria porque no añade
+miembros. La ampliación de `IInspectionDataStore` sí es una ruptura fuente para implementadores externos
+y puede ser binariamente incompatible con implementaciones precompiladas. Deben recompilarse y añadir
+`IInspectionStreamStateProvider`, o exponerse mediante un adaptador compuesto que mantenga separados los
+dos puertos. Los consumidores que solo leen rangos no necesitan cambios.
+
+El snapshot se captura bajo una única `InspectionRevision` y contiene inspección,
+run, stream, estado `Open`/`Sealing`/`Sealed`/`Faulted`, revisión vigente, revisión final solo tras un
+sellado confirmado, watermarks mínimo y máximo de `AcquisitionIndex` confirmado, conteos de trazas y
+gaps de `Sequence`, e indicador de watermarks finales. No contiene muestras, leases ni referencias
+mutables y no funciona como cola de eventos.
+
+El snapshot valida IDs coherentes, estado conocido, conteos no negativos, ambos watermarks presentes o
+ausentes y orden `Minimum <= Maximum`. Cero trazas exige ambos watermarks ausentes. Solo `Sealed` admite
+`FinalRevision` y watermarks finales; `Open`, `Sealing` y `Faulted` no. Una run `Faulted` expone un
+`InspectionRunFaultCode` tipado y acotado. El tipo solo ofrece propiedades `get`, no inicializadores ni
+`with`, por lo que no puede fabricarse una variante contradictoria después de construirlo.
+
+Los watermarks son límites dispersos derivados exclusivamente de trazas confirmadas. No aseguran
+densidad, no avanzan por rechazos, no usan `Sequence` y solo son finales tras sellar correctamente la
+run. `ResidentRange` usa estos límites autoritativos en la revisión capturada; `RepresentedRange`
+describe exclusivamente la proyección visual confirmada y la región dirty solo delimita trabajo de
+raster.
+
+Un `GapRecord` de `Sequence` permanece como evidencia y diagnóstico de adquisición, pero no se
+convierte en posición de `AcquisitionIndex`, columna B, gap espacial ni `TraceIdentity`. Una posición
+solicitada solo es `Gap` cuando exista evidencia autoritativa explícita por `AcquisitionIndex`.
+Mientras esa evidencia no exista, una ausencia dentro de los watermarks es `NotAvailable`, tanto en
+run abierta como sellada; fuera de watermarks finales es `OutOfRange`. `NotAvailable` y `Gap` conservan
+motivos distintos, se rasterizan como NoData, no se interpolan, no comprimen el eje y no permiten
+selección B→A.
+
+Un stream conocido solo por gaps de `Sequence` tiene cero trazas y watermarks nulos. Tras sellarlo, su
+rango final es vacío y cualquier `AcquisitionIndex` solicitado es `OutOfRange`; los gaps de `Sequence`
+siguen sin crear posiciones ni identidades.
+
+### Resultado de lectura de estado
+
+| Status | Snapshot | ErrorCode | Revisión | Significado |
+| --- | --- | --- | --- | --- |
+| `Unknown` | no | no | inicial | Valor `default`; nunca éxito |
+| `Available` | sí | no | la del snapshot | Consulta correcta; `RunState` distingue Open, Sealing, Sealed o Faulted |
+| `NotAvailable` | no | InspectionNotFound, RunNotFound o StreamNotFound | capturada | Identidad no conocida por esta autoridad |
+| `Closed` | no | StoreClosed | capturada | Store cerrado a nuevas lecturas |
+| `Cancelled` | no | no | inicial | Cancelación anterior al punto de captura |
+| `Faulted` | no | InternalFailure | inicial | Falló la propia consulta |
+
+`Status=Faulted` no equivale a `Snapshot.RunState=Faulted`: el primero indica que no pudo realizarse
+la consulta; el segundo es una consulta `Available` de una run cuyo lifecycle falló.
+
+`ReadStreamStateAsync` comprueba cancelación antes/durante la admisión y de nuevo dentro de la puerta
+del store. Esa segunda comprobación, inmediatamente antes de leer estado, es el punto de linealización.
+Una cancelación anterior devuelve `Cancelled` sin snapshot; una cancelación posterior no invalida un
+snapshot ya capturado.
+
+Los fallos internos de consulta incrementan un diagnóstico interno acotado y conservan únicamente el
+nombre del tipo de fallo; el contrato público devuelve `InternalFailure` sin excepción, mensaje ni datos
+sensibles. Las cancelaciones anteriores a captura no incrementan lecturas completadas.
+
 ## Fases
 
 La ejecución se divide en Fase 0 documental y Fases 1–7 del

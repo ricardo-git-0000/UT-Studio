@@ -97,6 +97,20 @@ gaps, resync, budgets, leases breves y cierre/reapertura de ventana.
 Gate: el store es la única autoridad; `BScanTraceStore` es solo cache/proyección derivada temporal;
 selección B→A usa `TraceIdentity`; cerrar B no pierde datos; ventanas 256/1.024 respetan budget.
 
+Decisión confirmada para esta fase: `IInspectionStreamStateProvider`, separado de
+`IInspectionRangeProvider`, ofrece un snapshot neutral de estado por stream,
+capturado bajo una revisión, con estado de run, revisión final opcional y watermarks dispersos de
+`AcquisitionIndex` confirmado. La notificación committed solo despierta/coalesce; el proyector consulta
+estado y revisión para reconciliar eventos omitidos. Los gaps de `Sequence` son solo diagnóstico y no
+crean columnas. Ausencias interiores continúan `NotAvailable`; `Gap` queda reservado para evidencia
+explícita futura por `AcquisitionIndex`; fuera de watermarks finales se devuelve `OutOfRange`.
+
+El resultado usa estados explícitos `Unknown`, `Available`, `NotAvailable`, `Closed`, `Cancelled` y
+`Faulted`, con factorías que impiden combinaciones inválidas de snapshot y código tipado. El valor
+`default` es `Unknown`. La cancelación se decide dentro de la puerta del store antes de capturar; una
+captura ya linealizada permanece válida. `Snapshot.RunState=Faulted` describe lifecycle y no debe
+confundirse con `Status=Faulted`, que describe un fallo de la consulta.
+
 ## Fase 5 — Persistencia incremental
 
 Implementar chunks, commits, journal, versiones, checksum e índice reconstruible tras aprobar las

@@ -203,6 +203,166 @@ public readonly record struct InspectionRunSealResult(AcquisitionRunId RunId, In
     ulong? MinimumAcquisitionIndex, ulong? MaximumAcquisitionIndex, ulong? MinimumSequence,
     ulong? MaximumSequence, int TraceCount, int GapCount);
 
+public enum InspectionStreamStateReadStatus
+{
+    Unknown = 0,
+    Available = 1,
+    NotAvailable = 2,
+    Closed = 3,
+    Cancelled = 4,
+    Faulted = 5
+}
+
+public enum InspectionStreamStateErrorCode
+{
+    Unknown = 0,
+    InspectionNotFound = 1,
+    RunNotFound = 2,
+    StreamNotFound = 3,
+    StoreClosed = 4,
+    InternalFailure = 5
+}
+
+public enum InspectionRunFaultCode
+{
+    Unknown = 0,
+    SealFailed = 1
+}
+
+/// <summary>
+/// Immutable, sample-free state of one inspection stream captured at a single store revision.
+/// Committed-index watermarks are sparse bounds: they neither assert density nor describe Sequence gaps.
+/// </summary>
+public sealed class InspectionStreamStateSnapshot : IEquatable<InspectionStreamStateSnapshot>
+{
+    public InspectionStreamStateSnapshot(InspectionId inspectionId, AcquisitionRunId acquisitionRunId,
+        UtStreamIdentity stream, InspectionRunState runState, InspectionRevision revision,
+        InspectionRevision? finalRevision, ulong? minimumCommittedAcquisitionIndex,
+        ulong? maximumCommittedAcquisitionIndex, int committedTraceCount, int sequenceGapCount,
+        bool areWatermarksFinal, InspectionRunFaultCode? runFaultCode = null)
+    {
+        if (!inspectionId.IsValid) { throw new ArgumentException("A valid inspection identifier is required.", nameof(inspectionId)); }
+        if (!acquisitionRunId.IsValid) { throw new ArgumentException("A valid run identifier is required.", nameof(acquisitionRunId)); }
+        if (!stream.IsValid) { throw new ArgumentException("A valid stream is required.", nameof(stream)); }
+        if (stream.InspectionId != inspectionId || stream.AcquisitionRunId != acquisitionRunId)
+        { throw new ArgumentException("The inspection, run and stream identifiers must agree.", nameof(stream)); }
+        if (!Enum.IsDefined(runState) || runState == InspectionRunState.Unknown)
+        { throw new ArgumentOutOfRangeException(nameof(runState)); }
+        if (revision == InspectionRevision.Initial)
+        { throw new ArgumentException("An available stream state requires a captured revision.", nameof(revision)); }
+        ArgumentOutOfRangeException.ThrowIfNegative(committedTraceCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(sequenceGapCount);
+        if (minimumCommittedAcquisitionIndex.HasValue != maximumCommittedAcquisitionIndex.HasValue)
+        { throw new ArgumentException("Committed acquisition-index watermarks must both be present or absent."); }
+        if (minimumCommittedAcquisitionIndex > maximumCommittedAcquisitionIndex)
+        { throw new ArgumentException("The minimum committed acquisition index cannot exceed the maximum."); }
+        if ((committedTraceCount == 0) != !minimumCommittedAcquisitionIndex.HasValue)
+        { throw new ArgumentException("Only a stream without committed traces can omit both watermarks.", nameof(committedTraceCount)); }
+
+        bool sealedRun = runState == InspectionRunState.Sealed;
+        if (sealedRun != finalRevision.HasValue || sealedRun != areWatermarksFinal)
+        { throw new ArgumentException("Only a confirmed sealed run has a final revision and final watermarks."); }
+        if (finalRevision is { } final &&
+            (final == InspectionRevision.Initial || final.Value > revision.Value))
+        { throw new ArgumentException("The final revision must be non-initial and no later than the captured revision.", nameof(finalRevision)); }
+        if (runState == InspectionRunState.Faulted)
+        {
+            if (runFaultCode is null || !Enum.IsDefined(runFaultCode.Value) ||
+                runFaultCode == InspectionRunFaultCode.Unknown)
+            { throw new ArgumentException("A faulted run requires a known bounded fault code.", nameof(runFaultCode)); }
+        }
+        else if (runFaultCode is not null)
+        { throw new ArgumentException("Only a faulted run can expose a run fault code.", nameof(runFaultCode)); }
+
+        InspectionId = inspectionId;
+        AcquisitionRunId = acquisitionRunId;
+        Stream = stream;
+        RunState = runState;
+        Revision = revision;
+        FinalRevision = finalRevision;
+        MinimumCommittedAcquisitionIndex = minimumCommittedAcquisitionIndex;
+        MaximumCommittedAcquisitionIndex = maximumCommittedAcquisitionIndex;
+        CommittedTraceCount = committedTraceCount;
+        SequenceGapCount = sequenceGapCount;
+        AreWatermarksFinal = areWatermarksFinal;
+        RunFaultCode = runFaultCode;
+    }
+
+    public InspectionId InspectionId { get; }
+    public AcquisitionRunId AcquisitionRunId { get; }
+    public UtStreamIdentity Stream { get; }
+    public InspectionRunState RunState { get; }
+    public InspectionRevision Revision { get; }
+    public InspectionRevision? FinalRevision { get; }
+    public ulong? MinimumCommittedAcquisitionIndex { get; }
+    public ulong? MaximumCommittedAcquisitionIndex { get; }
+    public int CommittedTraceCount { get; }
+    public int SequenceGapCount { get; }
+    public bool AreWatermarksFinal { get; }
+    public InspectionRunFaultCode? RunFaultCode { get; }
+
+    public bool Equals(InspectionStreamStateSnapshot? other) => other is not null &&
+        InspectionId == other.InspectionId && AcquisitionRunId == other.AcquisitionRunId &&
+        Stream == other.Stream && RunState == other.RunState && Revision == other.Revision &&
+        FinalRevision == other.FinalRevision &&
+        MinimumCommittedAcquisitionIndex == other.MinimumCommittedAcquisitionIndex &&
+        MaximumCommittedAcquisitionIndex == other.MaximumCommittedAcquisitionIndex &&
+        CommittedTraceCount == other.CommittedTraceCount && SequenceGapCount == other.SequenceGapCount &&
+        AreWatermarksFinal == other.AreWatermarksFinal && RunFaultCode == other.RunFaultCode;
+    public override bool Equals(object? obj) => Equals(obj as InspectionStreamStateSnapshot);
+    public override int GetHashCode() => HashCode.Combine(
+        HashCode.Combine(InspectionId, AcquisitionRunId, Stream, RunState, Revision, FinalRevision,
+            MinimumCommittedAcquisitionIndex, MaximumCommittedAcquisitionIndex),
+        CommittedTraceCount, SequenceGapCount, AreWatermarksFinal, RunFaultCode);
+}
+
+public readonly record struct InspectionStreamStateReadResult
+{
+    private InspectionStreamStateReadResult(InspectionStreamStateReadStatus status,
+        InspectionRevision revision, InspectionStreamStateSnapshot? snapshot,
+        InspectionStreamStateErrorCode? errorCode)
+    {
+        Status = status;
+        Revision = revision;
+        Snapshot = snapshot;
+        ErrorCode = errorCode;
+    }
+
+    public InspectionStreamStateReadStatus Status { get; }
+    public InspectionRevision Revision { get; }
+    public InspectionStreamStateSnapshot? Snapshot { get; }
+    public InspectionStreamStateErrorCode? ErrorCode { get; }
+    public bool IsAvailable => Status == InspectionStreamStateReadStatus.Available && Snapshot is not null;
+
+    public static InspectionStreamStateReadResult Available(InspectionStreamStateSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return new(InspectionStreamStateReadStatus.Available, snapshot.Revision, snapshot, null);
+    }
+
+    public static InspectionStreamStateReadResult NotAvailable(InspectionRevision revision,
+        InspectionStreamStateErrorCode errorCode)
+    {
+        if (errorCode is not (InspectionStreamStateErrorCode.InspectionNotFound or
+            InspectionStreamStateErrorCode.RunNotFound or InspectionStreamStateErrorCode.StreamNotFound))
+        { throw new ArgumentOutOfRangeException(nameof(errorCode)); }
+        return new(InspectionStreamStateReadStatus.NotAvailable, revision, null, errorCode);
+    }
+
+    public static InspectionStreamStateReadResult Closed(InspectionRevision revision)
+    {
+        return new(InspectionStreamStateReadStatus.Closed, revision, null,
+            InspectionStreamStateErrorCode.StoreClosed);
+    }
+
+    public static InspectionStreamStateReadResult Cancelled() =>
+        new(InspectionStreamStateReadStatus.Cancelled, InspectionRevision.Initial, null, null);
+
+    public static InspectionStreamStateReadResult Faulted() =>
+        new(InspectionStreamStateReadStatus.Faulted, InspectionRevision.Initial, null,
+            InspectionStreamStateErrorCode.InternalFailure);
+}
+
 public readonly record struct RunStoreDiagnostics(AcquisitionRunId RunId, InspectionRunState State,
     int ActiveWriters, int PendingOperations, int CommittedTraces, int ConfirmedGaps,
     ulong DuplicateCount, ulong ConflictCount, ulong CancellationCount, ulong RejectionCount,
