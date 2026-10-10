@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Numerics;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core.Scan2D;
 
@@ -151,7 +152,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             { throw new InvalidOperationException("The raster consumer is not registered."); }
             if (!_bootstrapConsumers.Add(consumerId)) { return; }
             _bootstrapStates[consumerId] = new(
-                _ingress.CurrentVisualState is { IsOpen: true } current ? current.Metadata.RunId : null,
+                _ingress.CurrentVisualState is { IsProjectable: true } current ? current.Metadata.RunId : null,
                 BScanBootstrapPhase.Requested, 0, null);
         }
         Audit(BScanVisualAuditEventKind.BootstrapRequested, consumerId,
@@ -162,19 +163,16 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private void QueueBootstrap(string consumerId)
     {
         BScanRenderRequest? previousRequest = null;
-        BScanVisualLeaseBatch? batch = null;
-        Exception? primary = null;
-        Exception? swallowed = null;
         try
         {
-            batch = _ingress.CaptureVisualLeases(_shutdown.Token,
-                out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
-            int count = batch?.Count ?? 0;
-            ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
-            if (metadata is null || count == 0 || state.ResidentRange is not { } resident) { return; }
+            BScanIngressVisualState? ingressState = _ingress.CurrentVisualState;
+            if (ingressState is null || ingressState.StoreState.CommittedTraceCount == 0 ||
+                ingressState.StoreState.ResidentRange is not { } resident) { return; }
+            ConventionalUtFrameMetadata metadata = ingressState.Metadata;
+            BScanStoreVisualState state = ingressState.StoreState;
             lock (_gate)
             {
-                if (!_consumers.Contains(consumerId) || ingressState is null ||
+                if (!_consumers.Contains(consumerId) ||
                     !ReferenceEquals(ingressState, _ingress.CurrentVisualState)) { return; }
                 if (_lastRequests.TryGetValue(consumerId, out BScanRenderRequest? current))
                 {
@@ -199,18 +197,11 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 ScanTimeViewportOperations.Create(minimum, maximum),
                 previousRequest?.PixelWidth ?? 1, previousRequest?.PixelHeight ?? 1,
                 previousRequest?.RenderConfigurationVersion ?? 0, ConsumerId: consumerId,
-                FollowLiveWindow: previousRequest?.FollowLiveWindow ?? false,
+                FollowLiveWindow: previousRequest?.FollowLiveWindow ?? true,
                 Resampling: previousRequest?.EffectiveResampling ?? Scan2DResamplingOptions.Default));
             AfterBootstrapRequestQueued?.Invoke(consumerId, metadata.RunId);
         }
-        catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException)
-        { swallowed = error; }
-        catch (Exception error) { primary = error; throw; }
-        finally
-        {
-            if (swallowed is not null) { batch?.DisposeAfterSwallowed(swallowed); }
-            else { batch?.Dispose(primary); }
-        }
+        catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException) { }
     }
 
     public void UnregisterConsumer(string consumerId)
@@ -271,7 +262,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_ingress.CurrentVisualState is { IsOpen: true } visualState &&
+            if (_ingress.CurrentVisualState is { IsProjectable: true } visualState &&
                 request.RunId != visualState.Metadata.RunId)
             { return; }
             if (request.ConsumerId == "default" && !_consumers.Contains("default"))
@@ -358,7 +349,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 BScanIngressVisualState? ingressState = _ingress.CurrentVisualState is { } current &&
                     current.Metadata.RunId == snapshot.RunId ? current : null;
                 subscription.Offer(new(snapshot), CaptureCallbackAuditContext(snapshot.ConsumerId,
-                    ingressState, _committedGenerations.GetValueOrDefault(snapshot.ConsumerId), request));
+                    ingressState, _committedGenerations.GetValueOrDefault(snapshot.ConsumerId), request), null);
             }
             return subscription;
         }
@@ -379,10 +370,14 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             consumerLifetime = _consumerLifetimes.GetValueOrDefault(request.ConsumerId);
         }
         long started = _clock.GetTimestamp();
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdown.Token);
+        BScanProjectionOperation? projection = null;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, _shutdown.Token, _ingress.RunCancellationToken);
         try
         {
             linked.Token.ThrowIfCancellationRequested();
+            if (!_ingress.TryBeginProjection(out BScanIngressVisualState? admittedState, out projection) ||
+                admittedState is null) { return BScanRasterResult.NotAvailable(); }
             lock (_gate)
             {
                 if (request.ConsumerId == "default" && !_consumers.Contains("default"))
@@ -397,8 +392,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     _ingress.Options.MaximumRasterOwnersPerConsumer)
                 { return BScanRasterResult.ResourceLimit("The consumer raster owner quota is exhausted."); }
             }
-            BScanRasterResult result = BuildRegion(request, requestGeneration,
-                consumerLifetime, linked.Token);
+            BScanRasterResult result = BuildRegionPaged(request, requestGeneration,
+                consumerLifetime, admittedState, linked.Token);
             return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -434,126 +429,212 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
         finally
         {
+            projection?.Dispose();
             RecordBuildDuration(_clock.GetElapsedTime(started, _clock.GetTimestamp()));
             EndRegionOperation();
         }
     }
 
-    private BScanRasterResult BuildRegion(BScanRenderRequest request, long requestGeneration,
-        long consumerLifetime, CancellationToken token)
+    private BScanRasterResult BuildRegionPaged(BScanRenderRequest request, long requestGeneration,
+        long consumerLifetime, BScanIngressVisualState admittedState, CancellationToken token)
     {
         BScanRenderRequest admittedRequest = request;
-        BScanVisualLeaseBatch? batch = null;
-        Exception? primary = null;
+        BScanStoreVisualState state = admittedState.StoreState;
+        ConventionalUtFrameMetadata metadata = admittedState.Metadata;
+        if (metadata.RunId != request.RunId || state.ResidentRange is not { } resident)
+        { return BScanRasterResult.NotAvailable(); }
+        request = ReconcileLiveWindow(request, resident);
+        BScanAcquisitionRange represented = RepresentedRange(request.SpatialViewport, resident);
+        if (represented.Last - represented.First >= (ulong)_ingress.Options.MaximumColumns)
+        {
+            return BScanRasterResult.ResourceLimit(
+                "The requested B-Scan viewport exceeds the configured visible-column capacity.");
+        }
+        var ticket = BScanProjectionTicket.Create(admittedState, request,
+            consumerLifetime, requestGeneration);
+        int horizontalPixelShift = GetHorizontalPixelShift(request);
+        BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state,
+            horizontalPixelShift);
+        bool full = reason != BScanFullRefreshReason.None;
+        BScanAcquisitionRange dirtyRange;
+        if (full) { dirtyRange = represented; }
+        else if (!_ingress.TryGetDirtyRange(ticket.Stream, represented,
+            request.DisplayedStoreRevision.GetValueOrDefault(), out dirtyRange))
+        { return BScanRasterResult.NotAvailable(); }
+        BScanAcquisitionRange traversalRange = represented;
+        if (!full && request.EffectiveResampling.Mode == Scan2DInterpolationMode.Bilinear)
+        {
+            dirtyRange = ExpandRange(dirtyRange, represented, 1);
+            traversalRange = ExpandRange(dirtyRange, represented, 1);
+        }
+        (int x, int width) = RasterColumns(request, dirtyRange.First, dirtyRange.Last, full);
+        bool compatibleHorizontalShift = request.EffectiveResampling.Mode ==
+            Scan2DInterpolationMode.Bilinear
+            ? x + width == request.PixelWidth && width >= horizontalPixelShift
+            : x == request.PixelWidth - horizontalPixelShift && width == horizontalPixelShift;
+        if (horizontalPixelShift > 0 && (full || !compatibleHorizontalShift))
+        {
+            horizontalPixelShift = 0;
+            reason |= BScanFullRefreshReason.Recovery;
+            full = true;
+            x = 0;
+            width = request.PixelWidth;
+            dirtyRange = represented;
+        }
+
+        int cells = checked(width * request.PixelHeight);
+        int length = checked(cells * 3);
+        int reservationLength = _pool.GetMaximumRentalLength(length);
+        if (reservationLength < length)
+        { throw new InvalidOperationException("Raster pool returned an invalid reservation quote."); }
+        if (!TryReserveRasterOwner(request.ConsumerId, reservationLength))
+        { return BScanRasterResult.ResourceLimit("The B-Scan visual memory quota is exhausted."); }
+        IMemoryOwner<byte> owner;
+        try { owner = _pool.Rent(length); }
+        catch { DiscardOwner(request.ConsumerId, reservationLength); throw; }
+        long actualBytes = owner.Memory.Length;
+        if (actualBytes < length || actualBytes > reservationLength ||
+            !TryAdjustRasterReservation(request.ConsumerId, reservationLength, actualBytes))
+        {
+            owner.Dispose();
+            DiscardOwner(request.ConsumerId, reservationLength);
+            return BScanRasterResult.ResourceLimit("The B-Scan visual memory quota is exhausted.");
+        }
+
+        IMemoryOwner<byte>? extremaOwner = null;
+        long extremaBytes = 0;
+        bool extremaAdmitted = false;
+        var available = new Dictionary<ulong, TraceIdentity>();
+        var selectable = new TraceIdentity?[request.PixelWidth];
+        if (!full)
+        {
+            SeedIncrementalIdentityMap(request.ConsumerId, represented, dirtyRange, x, width,
+                horizontalPixelShift, available, selectable);
+        }
+        ulong? previous = null;
+        bool discontinuities = state.CommittedGapCount != 0;
         try
         {
-            batch = _ingress.CaptureVisualLeases(token,
-                out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
-            BScanTraceStore.BScanTraceLease?[] leases = batch?.Items ?? [];
-            int count = batch?.Count ?? 0;
-            Audit(BScanVisualAuditEventKind.BuildStarted, request.ConsumerId, ingressState,
-                requestGeneration, request);
-            ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
-            if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null)
-            { return BScanRasterResult.NotAvailable(); }
-            Array.Sort(leases, 0, count, BScanLeaseComparer.Instance);
-            request = ReconcileLiveWindow(request, state.ResidentRange.Value);
-            token.ThrowIfCancellationRequested();
-
-            int horizontalPixelShift = GetHorizontalPixelShift(request);
-            BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state, leases, count,
-                horizontalPixelShift);
-            bool full = reason != BScanFullRefreshReason.None;
-            ulong dirtyFirst = ulong.MaxValue, dirtyLast = 0;
-            for (int i = 0; i < count; i++)
-            {
-                BScanTraceStore.BScanTraceLease lease = leases[i]!;
-                if (full || lease.VisualRevision > request.DisplayedStoreRevision.GetValueOrDefault())
-                {
-                    dirtyFirst = Math.Min(dirtyFirst, lease.Descriptor.AcquisitionIndex);
-                    dirtyLast = Math.Max(dirtyLast, lease.Descriptor.AcquisitionIndex);
-                }
-            }
-            if (dirtyFirst == ulong.MaxValue)
-            {
-                return BScanRasterResult.NotAvailable();
-            }
-
-            (int x, int width) = RasterColumns(request, dirtyFirst, dirtyLast, full);
-            if (horizontalPixelShift > 0 && (full || x != request.PixelWidth - horizontalPixelShift ||
-                width != horizontalPixelShift))
-            {
-                horizontalPixelShift = 0;
-                reason |= BScanFullRefreshReason.Recovery;
-                full = true;
-                x = 0;
-                width = request.PixelWidth;
-            }
-            int cells = checked(width * request.PixelHeight);
-            int length = checked(cells * 3);
-            int reservationLength = _pool.GetMaximumRentalLength(length);
-            if (reservationLength < length)
-            { throw new InvalidOperationException("Raster pool returned an invalid reservation quote."); }
-            if (!TryReserveRasterOwner(request.ConsumerId, reservationLength))
-            {
-                return BScanRasterResult.ResourceLimit("The B-Scan visual memory quota is exhausted.");
-            }
-            IMemoryOwner<byte> owner;
-            try { owner = _pool.Rent(length); }
-            catch { DiscardOwner(request.ConsumerId, reservationLength); throw; }
-            if (owner.Memory.Length < length || owner.Memory.Length > reservationLength)
-            {
-                owner.Dispose();
-                DiscardOwner(request.ConsumerId, reservationLength);
-                throw new InvalidOperationException("Raster pool violated its rental reservation quote.");
-            }
-            long actualBytes = owner.Memory.Length;
-            if (!TryAdjustRasterReservation(request.ConsumerId, reservationLength, actualBytes))
-            {
-                owner.Dispose();
-                DiscardOwner(request.ConsumerId, reservationLength);
-                return BScanRasterResult.ResourceLimit("The B-Scan visual memory quota is exhausted.");
-            }
             Memory<byte> storage = owner.Memory[..length];
             storage.Span.Clear();
-            Span<byte> pixels = storage.Span[..cells];
-            Span<byte> validity = storage.Span.Slice(cells, cells);
-            Span<byte> provenance = storage.Span.Slice(checked(cells * 2), cells);
-            try
+            Memory<byte> pixelsMemory = storage[..cells];
+            Memory<byte> validityMemory = storage.Slice(cells, cells);
+            Memory<byte> provenanceMemory = storage.Slice(checked(cells * 2), cells);
+            BScanPageTraversalResult traversal;
+            if (request.EffectiveResampling.Mode == Scan2DInterpolationMode.None)
             {
-                if (request.EffectiveResampling.Mode != Scan2DInterpolationMode.None)
+                extremaOwner = RentScratchOwner(request.ConsumerId, checked(cells * sizeof(short)),
+                    out extremaBytes);
+                extremaAdmitted = true;
+                Memory<byte> extremaMemory = extremaOwner.Memory[..checked(cells * sizeof(short))];
+                extremaMemory.Span.Clear();
+                double rate = metadata.Configuration.SampleRateHz;
+                double offset = metadata.Configuration.FirstSampleOffsetSeconds;
+                int[] sampleFirst = new int[request.PixelHeight];
+                int[] sampleLast = new int[request.PixelHeight];
+                for (int y = 0; y < request.PixelHeight; y++)
                 {
-                    RasterizeResampled(leases, count, metadata, state.IndexBucketSamples, request,
-                        storage, token);
+                    double t0 = request.TimeViewport.VisibleMinimumSeconds +
+                        request.TimeViewport.VisibleSpanSeconds * y / request.PixelHeight;
+                    double t1 = request.TimeViewport.VisibleMinimumSeconds +
+                        request.TimeViewport.VisibleSpanSeconds * (y + 1) / request.PixelHeight;
+                    sampleFirst[y] = Math.Clamp((int)Math.Floor((t0 - offset) * rate),
+                        0, metadata.Configuration.SampleCount);
+                    sampleLast[y] = Math.Clamp((int)Math.Ceiling((t1 - offset) * rate),
+                        0, metadata.Configuration.SampleCount);
                 }
-                else
+
+                traversal = _ingress.VisitVisualPages(ticket, represented, page =>
                 {
-                    Rasterize(leases, count, metadata, state.IndexBucketSamples, request, x, width,
-                        pixels, validity, provenance, token);
+                Span<byte> pixels = pixelsMemory.Span;
+                Span<byte> validity = validityMemory.Span;
+                Span<byte> provenance = provenanceMemory.Span;
+                Span<short> extrema = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, short>(
+                    extremaMemory.Span);
+                foreach (InspectionRangeItem item in page.Items)
+                {
+                    if (item.Status != InspectionReadStatus.Available || item.Lease is null) { continue; }
+                    if (item.Identity.Stream != ticket.Stream)
+                    { throw new InvalidOperationException("The range provider returned a trace from another stream."); }
+                    ulong index = item.Identity.AcquisitionIndex;
+                    available[index] = item.Identity;
+                    if (previous is { } prior && (prior == ulong.MaxValue || index != prior + 1))
+                    { discontinuities = true; }
+                    previous = index;
+                    decimal relative = BScanSpatialViewportOperations.RelativeOffset(index,
+                        request.SpatialViewport.OriginAcquisitionIndex);
+                    int firstPixel = Math.Clamp((int)decimal.Floor((relative -
+                        request.SpatialViewport.MinimumOffset) / request.SpatialViewport.Span *
+                        request.PixelWidth), 0, request.PixelWidth - 1);
+                    int lastPixel = Math.Clamp((int)decimal.Ceiling((relative + 1 -
+                        request.SpatialViewport.MinimumOffset) / request.SpatialViewport.Span *
+                        request.PixelWidth), firstPixel + 1, request.PixelWidth);
+                    if (selectable[firstPixel] is null) { selectable[firstPixel] = item.Identity; }
+                    int localFirst = Math.Max(firstPixel, x);
+                    int localLast = Math.Min(lastPixel, x + width);
+                    IReadOnlyUtSamples samples = item.Lease.Samples;
+                    for (int pixelX = localFirst; pixelX < localLast; pixelX++)
+                    {
+                        int localX = pixelX - x;
+                        for (int y = 0; y < request.PixelHeight; y++)
+                        {
+                            int destination = checked(y * width + localX);
+                            short selected = extrema[destination];
+                            int magnitude = validity[destination] == 0 ? -1 : Math.Abs((int)selected);
+                            for (int sample = sampleFirst[y]; sample < sampleLast[y]; sample++)
+                            {
+                                short candidate = samples[sample];
+                                int candidateMagnitude = Math.Abs((int)candidate);
+                                if (candidateMagnitude <= magnitude) { continue; }
+                                selected = candidate;
+                                magnitude = candidateMagnitude;
+                            }
+                            if (magnitude < 0) { continue; }
+                            extrema[destination] = selected;
+                            pixels[destination] = BScanBipolarIntensity8.Map(selected);
+                            validity[destination] = 1;
+                            provenance[destination] = (byte)Scan2DSampleProvenance.AcquiredSupport;
+                        }
+                    }
                 }
-                BeforeRasterCandidateValidation?.Invoke();
-                token.ThrowIfCancellationRequested();
-                BeforeRasterCandidateCommit?.Invoke();
+                }, token);
             }
-            catch
+            else
             {
-                owner.Dispose();
-                DiscardOwner(request.ConsumerId, actualBytes);
-                throw;
+                traversal = RasterizeResampledPages(ticket, traversalRange, represented,
+                    metadata, request, x, width, storage, available, selectable,
+                    ref previous, ref discontinuities, token);
             }
-            var dirty = new BScanDirtyRange(dirtyFirst, dirtyLast,
+            if (traversal.Stale)
+            { owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes); return BScanRasterResult.Stale(); }
+            if (traversal.TerminalStatus is { } terminal)
+            {
+                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes);
+                return terminal switch
+                {
+                    InspectionReadStatus.Cancelled => BScanRasterResult.Cancelled(),
+                    InspectionReadStatus.Closed => BScanRasterResult.Closed(),
+                    InspectionReadStatus.OutOfRange => BScanRasterResult.OutOfRange(),
+                    _ => BScanRasterResult.Faulted(
+                        new InvalidOperationException("The authoritative range query faulted."))
+                };
+            }
+            discontinuities |= traversal.AvailableCount == 0 ||
+                !available.ContainsKey(represented.First) || !available.ContainsKey(represented.Last) ||
+                traversal.Statuses.Any(static status => status is InspectionReadStatus.NotAvailable or
+                    InspectionReadStatus.Gap);
+            token.ThrowIfCancellationRequested();
+            BeforeRasterCandidateCommit?.Invoke();
+            var dirty = new BScanDirtyRange(dirtyRange.First, dirtyRange.Last,
                 request.DisplayedStoreRevision.GetValueOrDefault(), state.StoreRevision);
-            var candidate = CreateSnapshot(metadata, request, state, 0, dirty,
-                new(x, 0, width, request.PixelHeight), full, reason, leases, count) with
+            BScanVisualSnapshot candidate = CreateSnapshotProjected(admittedState, metadata, request,
+                state, dirty, new(x, 0, width, request.PixelHeight), full, reason, represented,
+                discontinuities, available, selectable, traversal.Statuses) with
             { HorizontalPixelShift = horizontalPixelShift };
-            Audit(BScanVisualAuditEventKind.BuildCompleted, request.ConsumerId, ingressState,
-                requestGeneration, request, BScanVisualAuditResult.Accepted);
-            Audit(BScanVisualAuditEventKind.CommitAttempted, request.ConsumerId, ingressState,
-                requestGeneration, request);
+            BeforeRasterCandidateValidation?.Invoke();
             BScanVisualSnapshot? snapshot = null;
             bool stale;
             bool active;
-            BScanVisualAuditRejection staleRejection = BScanVisualAuditRejection.None;
             lock (_gate)
             {
                 active = !_disposed && _consumers.Contains(request.ConsumerId) &&
@@ -563,13 +644,18 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     _pendingGenerations.GetValueOrDefault(request.ConsumerId) == requestGeneration;
                 bool signatureCurrent = !_lastRequests.TryGetValue(request.ConsumerId,
                     out BScanRenderRequest? latest) || HasSameRenderSignature(admittedRequest, latest);
-                stale = active && (!generationCurrent || !signatureCurrent);
+                bool authorityCurrent = _ingress.IsTicketCurrent(ticket);
+                bool monotonic = ticket.FollowLiveWindow
+                    ? candidate.StoreRevision >= request.DisplayedStoreRevision.GetValueOrDefault()
+                    : !_currentByConsumer.TryGetValue(request.ConsumerId,
+                        out BScanVisualSnapshot? current) || current.RunId != candidate.RunId ||
+                        current.StoreRevision <= candidate.StoreRevision;
+                stale = active && (!generationCurrent || !signatureCurrent || !authorityCurrent || !monotonic);
                 if (stale)
                 {
-                    staleRejection = !generationCurrent ? BScanVisualAuditRejection.Generation :
-                        BScanVisualAuditRejection.Signature;
                     _staleCandidates++;
-                    RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request);
+                    if (!generationCurrent || !signatureCurrent || !monotonic)
+                    { RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request); }
                 }
                 else if (active)
                 {
@@ -578,27 +664,189 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     _recoveryConsumers.Remove(request.ConsumerId);
                 }
             }
-            if (stale)
+            if (stale || !active)
             {
-                Audit(BScanVisualAuditEventKind.CandidateRejectedStale, request.ConsumerId,
-                    ingressState, requestGeneration, request, BScanVisualAuditResult.Stale,
-                    staleRejection);
-                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes); return BScanRasterResult.Stale();
+                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes);
+                return stale ? BScanRasterResult.Stale() : BScanRasterResult.NotAvailable();
             }
-            if (!active)
-            {
-                Audit(BScanVisualAuditEventKind.CandidateRejectedClosed, request.ConsumerId,
-                    ingressState, requestGeneration, request, BScanVisualAuditResult.Closed,
-                    BScanVisualAuditRejection.Consumer);
-                owner.Dispose(); DiscardOwner(request.ConsumerId, actualBytes); return BScanRasterResult.NotAvailable();
-            }
-            Audit(BScanVisualAuditEventKind.CandidateCommitted, request.ConsumerId, ingressState,
-                requestGeneration, request, BScanVisualAuditResult.Committed);
             return BScanRasterResult.Available(new(snapshot!, x, 0, width, request.PixelHeight,
                 owner, () => ReleaseOwner(request.ConsumerId, actualBytes)));
         }
-        catch (Exception error) { primary = error; throw; }
-        finally { batch?.Dispose(primary); }
+        catch
+        {
+            owner.Dispose();
+            DiscardOwner(request.ConsumerId, actualBytes);
+            throw;
+        }
+        finally
+        {
+            extremaOwner?.Dispose();
+            if (extremaAdmitted) { ReleaseScratchBytes(request.ConsumerId, extremaBytes); }
+        }
+    }
+
+    private BScanPageTraversalResult RasterizeResampledPages(BScanProjectionTicket ticket,
+        BScanAcquisitionRange traversalRange, BScanAcquisitionRange represented,
+        ConventionalUtFrameMetadata metadata, BScanRenderRequest request, int destinationX,
+        int destinationWidth, Memory<byte> destinationStorage,
+        Dictionary<ulong, TraceIdentity> available, TraceIdentity?[] selectable,
+        ref ulong? previous, ref bool discontinuities, CancellationToken token)
+    {
+        decimal firstValue = RelativeOffset(request.SpatialViewport.OriginAcquisitionIndex,
+            traversalRange.First);
+        decimal lastExclusive = checked(RelativeOffset(
+            request.SpatialViewport.OriginAcquisitionIndex, traversalRange.Last) + 1);
+        int firstOffset = checked((int)firstValue);
+        int sourceWidth = checked((int)(lastExclusive - firstOffset));
+        ArgumentOutOfRangeException.ThrowIfLessThan(sourceWidth, 1);
+        double rate = metadata.Configuration.SampleRateHz;
+        double offset = metadata.Configuration.FirstSampleOffsetSeconds;
+        double visibleSampleMinimum = Math.Clamp(
+            (request.TimeViewport.VisibleMinimumSeconds - offset) * rate,
+            0, metadata.Configuration.SampleCount);
+        double visibleSampleMaximum = Math.Clamp(
+            (request.TimeViewport.VisibleMaximumSeconds - offset) * rate,
+            0, metadata.Configuration.SampleCount);
+        int visibleSampleFirst = Math.Clamp((int)Math.Floor(visibleSampleMinimum),
+            0, metadata.Configuration.SampleCount);
+        int visibleSampleLastExclusive = Math.Clamp((int)Math.Ceiling(visibleSampleMaximum),
+            0, metadata.Configuration.SampleCount);
+        int visibleSamples = Math.Max(1, visibleSampleLastExclusive - visibleSampleFirst);
+        int sourceHeight = Math.Min(request.PixelHeight, visibleSamples);
+        bool upsamplingTime = visibleSamples <= request.PixelHeight;
+
+        int sourceCells = checked(sourceWidth * sourceHeight);
+        IMemoryOwner<byte>? intensityOwner = null, maskOwner = null, segmentOwner = null;
+        long intensityBytes = 0, maskBytes = 0, segmentBytes = 0;
+        bool intensityAdmitted = false, maskAdmitted = false, segmentAdmitted = false;
+        ulong? pagePrevious = previous;
+        bool pageDiscontinuities = discontinuities;
+        try
+        {
+            intensityOwner = RentScratchOwner(request.ConsumerId, sourceCells, out intensityBytes);
+            intensityAdmitted = true;
+            maskOwner = RentScratchOwner(request.ConsumerId, sourceCells, out maskBytes);
+            maskAdmitted = true;
+            segmentOwner = RentScratchOwner(request.ConsumerId, sourceCells, out segmentBytes);
+            segmentAdmitted = true;
+            Memory<byte> intensity = intensityOwner.Memory[..sourceCells];
+            Memory<byte> mask = maskOwner.Memory[..sourceCells];
+            Memory<byte> segments = segmentOwner.Memory[..sourceCells];
+            intensity.Span.Clear(); mask.Span.Clear(); segments.Span.Clear();
+            BScanPageTraversalResult traversal = _ingress.VisitVisualPages(ticket, traversalRange, page =>
+            {
+                Span<byte> intensitySpan = intensity.Span;
+                Span<byte> maskSpan = mask.Span;
+                foreach (InspectionRangeItem item in page.Items)
+                {
+                    if (item.Status != InspectionReadStatus.Available || item.Lease is null) { continue; }
+                    if (item.Identity.Stream != ticket.Stream)
+                    { throw new InvalidOperationException("The range provider returned a trace from another stream."); }
+                    ulong index = item.Identity.AcquisitionIndex;
+                    available[index] = item.Identity;
+                    if (pagePrevious is { } prior && (prior == ulong.MaxValue || index != prior + 1))
+                    { pageDiscontinuities = true; }
+                    pagePrevious = index;
+                    decimal relative = RelativeOffset(request.SpatialViewport.OriginAcquisitionIndex, index);
+                    int sourceX = checked((int)(relative - firstOffset));
+                    int selectionPixel = (int)decimal.Floor((relative -
+                        request.SpatialViewport.MinimumOffset) / request.SpatialViewport.Span *
+                        request.PixelWidth);
+                    if ((uint)selectionPixel < (uint)selectable.Length && selectable[selectionPixel] is null)
+                    { selectable[selectionPixel] = item.Identity; }
+                    if ((uint)sourceX >= (uint)sourceWidth) { continue; }
+                    IReadOnlyUtSamples samples = item.Lease.Samples;
+                    for (int y = 0; y < sourceHeight; y++)
+                    {
+                        int sampleFirst;
+                        int sampleLast;
+                        if (upsamplingTime)
+                        {
+                            sampleFirst = Math.Min(visibleSampleFirst + y,
+                                metadata.Configuration.SampleCount - 1);
+                            sampleLast = sampleFirst + 1;
+                        }
+                        else
+                        {
+                            double u0 = visibleSampleMinimum +
+                                (visibleSampleMaximum - visibleSampleMinimum) * y / sourceHeight;
+                            double u1 = visibleSampleMinimum +
+                                (visibleSampleMaximum - visibleSampleMinimum) * (y + 1) / sourceHeight;
+                            sampleFirst = Math.Clamp((int)Math.Floor(u0), 0,
+                                metadata.Configuration.SampleCount);
+                            sampleLast = Math.Clamp((int)Math.Ceiling(u1), 0,
+                                metadata.Configuration.SampleCount);
+                        }
+                        bool found = false;
+                        short selected = 0;
+                        int magnitude = -1;
+                        for (int sample = sampleFirst; sample < sampleLast; sample++)
+                        {
+                            short candidate = samples[sample];
+                            int candidateMagnitude = Math.Abs((int)candidate);
+                            if (candidateMagnitude <= magnitude) { continue; }
+                            selected = candidate; magnitude = candidateMagnitude; found = true;
+                        }
+                        if (!found) { continue; }
+                        int sourceIndex = checked(y * sourceWidth + sourceX);
+                        intensitySpan[sourceIndex] = BScanBipolarIntensity8.Map(selected);
+                        maskSpan[sourceIndex] = 1;
+                    }
+                }
+            }, token);
+            previous = pagePrevious;
+            discontinuities = pageDiscontinuities;
+            if (traversal.Stale || traversal.TerminalStatus is not null) { return traversal; }
+
+            Span<byte> maskValues = mask.Span;
+            Span<byte> segmentValues = segments.Span;
+            byte segment = 1;
+            bool inGap = false;
+            for (int sourceX = 0; sourceX < sourceWidth; sourceX++)
+            {
+                bool columnAvailable = false;
+                for (int y = 0; y < sourceHeight && !columnAvailable; y++)
+                { columnAvailable = maskValues[y * sourceWidth + sourceX] != 0; }
+                if (!columnAvailable) { inGap = true; continue; }
+                if (inGap)
+                { segment = segment == byte.MaxValue ? (byte)1 : checked((byte)(segment + 1)); inGap = false; }
+                for (int y = 0; y < sourceHeight; y++)
+                {
+                    int sourceIndex = y * sourceWidth + sourceX;
+                    if (maskValues[sourceIndex] != 0) { segmentValues[sourceIndex] = segment; }
+                }
+            }
+            double destinationStepY =
+                (visibleSampleMaximum - visibleSampleMinimum) / request.PixelHeight;
+            double sourceFirstY = upsamplingTime ? visibleSampleFirst + .5 :
+                visibleSampleMinimum + destinationStepY / 2;
+            double sourceStepY = upsamplingTime ? 1 : destinationStepY;
+            var sourceGeometry = new Scan2DGridGeometry(firstOffset + .5, sourceFirstY, 1, sourceStepY);
+            var destinationGeometry = new Scan2DGridGeometry(
+                (double)(request.SpatialViewport.MinimumOffset + request.SpatialViewport.Span *
+                    (2m * destinationX + 1) / (2m * request.PixelWidth)),
+                visibleSampleMinimum + destinationStepY / 2,
+                (double)(request.SpatialViewport.Span / request.PixelWidth), destinationStepY);
+            var source = new Scan2DSourceGrid(sourceWidth, sourceHeight, sourceWidth, sourceGeometry,
+                intensity, mask, segments, mask);
+            var renderRequest = new Scan2DRenderRequest(sourceGeometry, sourceWidth, sourceHeight,
+                destinationGeometry, destinationWidth, request.PixelHeight,
+                new(0, 0, destinationWidth, request.PixelHeight), request.EffectiveResampling);
+            using Scan2DRenderResult ignored = _resampler.Render(source, renderRequest,
+                new BorrowedByteOwner(destinationStorage), token);
+            ClearOutsideRepresentedRange(destinationStorage.Span, request, represented,
+                destinationX, destinationWidth);
+            return traversal;
+        }
+        finally
+        {
+            segmentOwner?.Dispose();
+            if (segmentAdmitted) { ReleaseScratchBytes(request.ConsumerId, segmentBytes); }
+            maskOwner?.Dispose();
+            if (maskAdmitted) { ReleaseScratchBytes(request.ConsumerId, maskBytes); }
+            intensityOwner?.Dispose();
+            if (intensityAdmitted) { ReleaseScratchBytes(request.ConsumerId, intensityBytes); }
+        }
     }
 
     private static BScanRenderRequest ReconcileLiveWindow(BScanRenderRequest request,
@@ -640,197 +888,6 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             DisplayedWrapGeneration = displayed.Revision.WrapGeneration,
             Displayed = displayed
         };
-    }
-
-    private void Rasterize(BScanTraceStore.BScanTraceLease?[] leases, int count,
-        ConventionalUtFrameMetadata metadata, int bucketSamples, BScanRenderRequest request, int rasterX, int width,
-        Span<byte> pixels, Span<byte> validity, Span<byte> provenance, CancellationToken token)
-    {
-        double rate = metadata.Configuration.SampleRateHz;
-        double offset = metadata.Configuration.FirstSampleOffsetSeconds;
-        Span<int> sampleFirstByRow = stackalloc int[request.PixelHeight];
-        Span<int> sampleLastByRow = stackalloc int[request.PixelHeight];
-        for (int y = 0; y < request.PixelHeight; y++)
-        {
-            double t0 = request.TimeViewport.VisibleMinimumSeconds +
-                request.TimeViewport.VisibleSpanSeconds * y / request.PixelHeight;
-            double t1 = request.TimeViewport.VisibleMinimumSeconds +
-                request.TimeViewport.VisibleSpanSeconds * (y + 1) / request.PixelHeight;
-            sampleFirstByRow[y] = Math.Clamp((int)Math.Floor((t0 - offset) * rate),
-                0, metadata.Configuration.SampleCount);
-            sampleLastByRow[y] = Math.Clamp((int)Math.Ceiling((t1 - offset) * rate),
-                0, metadata.Configuration.SampleCount);
-        }
-        int columnStart = 0;
-        for (int localX = 0; localX < width; localX++)
-        {
-            token.ThrowIfCancellationRequested();
-            int pixelX = rasterX + localX;
-            decimal left = request.SpatialViewport.MinimumOffset +
-                request.SpatialViewport.Span * pixelX / request.PixelWidth;
-            decimal right = request.SpatialViewport.MinimumOffset +
-                request.SpatialViewport.Span * (pixelX + 1) / request.PixelWidth;
-            while (columnStart < count && BScanSpatialViewportOperations.RelativeOffset(
-                leases[columnStart]!.Descriptor.AcquisitionIndex,
-                request.SpatialViewport.OriginAcquisitionIndex) + 1 <= left)
-            {
-                leases[columnStart]!.Dispose();
-                columnStart++;
-            }
-            int columnEnd = columnStart;
-            while (columnEnd < count && BScanSpatialViewportOperations.RelativeOffset(
-                leases[columnEnd]!.Descriptor.AcquisitionIndex,
-                request.SpatialViewport.OriginAcquisitionIndex) < right)
-            { columnEnd++; }
-            for (int y = 0; y < request.PixelHeight; y++)
-            {
-                int sampleFirst = sampleFirstByRow[y];
-                int sampleLastExclusive = sampleLastByRow[y];
-                bool found = false;
-                short selected = 0;
-                int selectedMagnitude = -1;
-                for (int column = columnStart; column < columnEnd; column++)
-                {
-                    BScanTraceStore.BScanTraceLease lease = leases[column]!;
-                    SelectRange(lease, bucketSamples, sampleFirst, sampleLastExclusive,
-                        ref selected, ref selectedMagnitude, ref found);
-                }
-                if (found)
-                {
-                    int destination = y * width + localX;
-                    pixels[destination] = BScanBipolarIntensity8.Map(selected);
-                    validity[destination] = 1;
-                    provenance[destination] = (byte)Scan2DSampleProvenance.AcquiredSupport;
-                }
-            }
-            AfterRasterColumnReleased?.Invoke(pixelX, count - columnStart);
-        }
-    }
-
-    private void RasterizeResampled(BScanTraceStore.BScanTraceLease?[] leases, int count,
-        ConventionalUtFrameMetadata metadata, int bucketSamples, BScanRenderRequest request,
-        Memory<byte> destinationStorage, CancellationToken token)
-    {
-        bool lanczos = request.EffectiveResampling.Mode == Scan2DInterpolationMode.Lanczos;
-        decimal requestedFirst = decimal.Floor(request.SpatialViewport.MinimumOffset);
-        decimal requestedLastExclusive = decimal.Ceiling(request.SpatialViewport.MaximumOffset);
-        decimal residentFirstOffset = lanczos ? RelativeOffset(request.SpatialViewport.OriginAcquisitionIndex,
-            leases[0]!.Descriptor.AcquisitionIndex) : requestedFirst;
-        decimal residentLastExclusive = lanczos ? checked(RelativeOffset(
-            request.SpatialViewport.OriginAcquisitionIndex, leases[count - 1]!.Descriptor.AcquisitionIndex) + 1)
-            : requestedLastExclusive;
-        int firstOffset = checked((int)Math.Max(requestedFirst - (lanczos ? 3 : 0), residentFirstOffset));
-        decimal lastExclusive = Math.Min(requestedLastExclusive + (lanczos ? 3 : 0), residentLastExclusive);
-        int sourceWidth = checked((int)(lastExclusive - firstOffset));
-        ArgumentOutOfRangeException.ThrowIfLessThan(sourceWidth, 1);
-        double rate = metadata.Configuration.SampleRateHz;
-        double offset = metadata.Configuration.FirstSampleOffsetSeconds;
-        double visibleSampleMinimum = Math.Clamp(
-            (request.TimeViewport.VisibleMinimumSeconds - offset) * rate, 0, metadata.Configuration.SampleCount);
-        double visibleSampleMaximum = Math.Clamp(
-            (request.TimeViewport.VisibleMaximumSeconds - offset) * rate, 0, metadata.Configuration.SampleCount);
-        int visibleSampleFirst = Math.Clamp((int)Math.Floor(visibleSampleMinimum), 0, metadata.Configuration.SampleCount);
-        int visibleSampleLastExclusive = Math.Clamp((int)Math.Ceiling(visibleSampleMaximum),
-            0, metadata.Configuration.SampleCount);
-        int visibleSamples = Math.Max(1, visibleSampleLastExclusive - visibleSampleFirst);
-        int sourceHeight = Math.Min(request.PixelHeight, visibleSamples);
-        bool upsamplingTime = visibleSamples <= request.PixelHeight;
-        Span<int> sampleFirstByRow = stackalloc int[sourceHeight];
-        Span<int> sampleLastByRow = stackalloc int[sourceHeight];
-        for (int y = 0; y < sourceHeight; y++)
-        {
-            if (upsamplingTime)
-            {
-                sampleFirstByRow[y] = Math.Min(visibleSampleFirst + y, metadata.Configuration.SampleCount - 1);
-                sampleLastByRow[y] = sampleFirstByRow[y] + 1;
-            }
-            else
-            {
-                double u0 = visibleSampleMinimum + (visibleSampleMaximum - visibleSampleMinimum) * y / sourceHeight;
-                double u1 = visibleSampleMinimum + (visibleSampleMaximum - visibleSampleMinimum) * (y + 1) / sourceHeight;
-                sampleFirstByRow[y] = Math.Clamp((int)Math.Floor(u0), 0, metadata.Configuration.SampleCount);
-                sampleLastByRow[y] = Math.Clamp((int)Math.Ceiling(u1), 0, metadata.Configuration.SampleCount);
-            }
-        }
-
-        int sourceCells = checked(sourceWidth * sourceHeight);
-        IMemoryOwner<byte>? sourceIntensityOwner = null, sourceMaskOwner = null, sourceSegmentsOwner = null;
-        long sourceIntensityBytes = 0, sourceMaskBytes = 0, sourceSegmentsBytes = 0;
-        bool sourceIntensityAdmitted = false, sourceMaskAdmitted = false, sourceSegmentsAdmitted = false;
-        try
-        {
-            sourceIntensityOwner = RentScratchOwner(request.ConsumerId, sourceCells, out sourceIntensityBytes);
-            sourceIntensityAdmitted = true;
-            sourceMaskOwner = RentScratchOwner(request.ConsumerId, sourceCells, out sourceMaskBytes);
-            sourceMaskAdmitted = true;
-            sourceSegmentsOwner = RentScratchOwner(request.ConsumerId, sourceCells, out sourceSegmentsBytes);
-            sourceSegmentsAdmitted = true;
-            Memory<byte> sourceIntensity = sourceIntensityOwner.Memory[..sourceCells];
-            Memory<byte> sourceMask = sourceMaskOwner.Memory[..sourceCells];
-            Memory<byte> sourceSegments = sourceSegmentsOwner.Memory[..sourceCells];
-            // Valid source cells are always acquired support, so mask values 0/1 are also the exact
-            // NoData/AcquiredSupport provenance values. Sharing avoids another full-raster owner.
-            Memory<byte> sourceProvenance = sourceMask;
-            sourceIntensity.Span.Clear();
-            sourceMask.Span.Clear();
-            sourceSegments.Span.Clear();
-            byte segment = 1;
-            bool gap = false;
-            int leaseCursor = 0;
-            for (int sourceX = 0; sourceX < sourceWidth; sourceX++)
-            {
-                token.ThrowIfCancellationRequested();
-                ulong? acquisitionIndex = TryAddOffset(request.SpatialViewport.OriginAcquisitionIndex,
-                    checked(firstOffset + sourceX));
-                int leaseIndex = -1;
-                if (acquisitionIndex is { } index)
-                {
-                    while (leaseCursor < count && leases[leaseCursor]!.Descriptor.AcquisitionIndex < index)
-                    { leaseCursor++; }
-                    if (leaseCursor < count && leases[leaseCursor]!.Descriptor.AcquisitionIndex == index)
-                    { leaseIndex = leaseCursor; }
-                }
-                if (leaseIndex < 0) { gap = true; continue; }
-                if (gap) { segment = segment == byte.MaxValue ? (byte)1 : checked((byte)(segment + 1)); gap = false; }
-                for (int y = 0; y < sourceHeight; y++)
-                {
-                    bool found = false; short selected = 0; int magnitude = -1;
-                    SelectRange(leases[leaseIndex]!, bucketSamples, sampleFirstByRow[y], sampleLastByRow[y],
-                        ref selected, ref magnitude, ref found);
-                    if (!found) { continue; }
-                    int sourceIndex = checked(y * sourceWidth + sourceX);
-                    sourceIntensity.Span[sourceIndex] = BScanBipolarIntensity8.Map(selected);
-                    sourceMask.Span[sourceIndex] = 1; sourceSegments.Span[sourceIndex] = segment;
-                    sourceProvenance.Span[sourceIndex] = (byte)Scan2DSampleProvenance.AcquiredSupport;
-                }
-            }
-            for (int index = 0; index < count; index++) { leases[index]!.Dispose(); }
-
-            double destinationStepY = (visibleSampleMaximum - visibleSampleMinimum) / request.PixelHeight;
-            double sourceFirstY = upsamplingTime ? visibleSampleFirst + .5 : visibleSampleMinimum + destinationStepY / 2;
-            double sourceStepY = upsamplingTime ? 1 : destinationStepY;
-            var sourceGeometry = new Scan2DGridGeometry(firstOffset + .5, sourceFirstY, 1, sourceStepY);
-            var destinationGeometry = new Scan2DGridGeometry(
-                (double)(request.SpatialViewport.MinimumOffset + request.SpatialViewport.Span /
-                    (2m * request.PixelWidth)), visibleSampleMinimum + destinationStepY / 2,
-                (double)(request.SpatialViewport.Span / request.PixelWidth), destinationStepY);
-            var source = new Scan2DSourceGrid(sourceWidth, sourceHeight, sourceWidth, sourceGeometry,
-                sourceIntensity, sourceMask, sourceSegments, sourceProvenance);
-            var renderRequest = new Scan2DRenderRequest(sourceGeometry, sourceWidth, sourceHeight,
-                destinationGeometry, request.PixelWidth, request.PixelHeight,
-                new(0, 0, request.PixelWidth, request.PixelHeight), request.EffectiveResampling);
-            using Scan2DRenderResult result = _resampler.Render(source, renderRequest,
-                new BorrowedByteOwner(destinationStorage), token);
-        }
-        finally
-        {
-            if (sourceSegmentsOwner is not null) sourceSegmentsOwner.Dispose();
-            if (sourceSegmentsAdmitted) ReleaseScratchBytes(request.ConsumerId, sourceSegmentsBytes);
-            if (sourceMaskOwner is not null) sourceMaskOwner.Dispose();
-            if (sourceMaskAdmitted) ReleaseScratchBytes(request.ConsumerId, sourceMaskBytes);
-            if (sourceIntensityOwner is not null) sourceIntensityOwner.Dispose();
-            if (sourceIntensityAdmitted) ReleaseScratchBytes(request.ConsumerId, sourceIntensityBytes);
-        }
     }
 
     private IMemoryOwner<byte> RentScratchOwner(string consumerId, int requestedBytes, out long actualBytes)
@@ -932,6 +989,61 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private static decimal RelativeOffset(ulong origin, ulong acquisitionIndex) =>
         acquisitionIndex >= origin ? acquisitionIndex - origin : -(decimal)(origin - acquisitionIndex);
 
+    private static void ClearOutsideRepresentedRange(Span<byte> storage,
+        BScanRenderRequest request, BScanAcquisitionRange represented,
+        int destinationX, int destinationWidth)
+    {
+        int cells = checked(destinationWidth * request.PixelHeight);
+        decimal first = RelativeOffset(request.SpatialViewport.OriginAcquisitionIndex,
+            represented.First);
+        decimal lastExclusive = checked(RelativeOffset(
+            request.SpatialViewport.OriginAcquisitionIndex, represented.Last) + 1);
+        for (int localX = 0; localX < destinationWidth; localX++)
+        {
+            int x = checked(destinationX + localX);
+            decimal center = request.SpatialViewport.MinimumOffset +
+                request.SpatialViewport.Span * (2m * x + 1) / (2m * request.PixelWidth);
+            if (center >= first && center < lastExclusive) { continue; }
+            for (int y = 0; y < request.PixelHeight; y++)
+            {
+                int index = checked(y * destinationWidth + localX);
+                storage[index] = 0;
+                storage[cells + index] = 0;
+                storage[checked(cells * 2) + index] = (byte)Scan2DSampleProvenance.NoData;
+            }
+        }
+    }
+
+    private static BScanAcquisitionRange ExpandRange(BScanAcquisitionRange range,
+        BScanAcquisitionRange bounds, ulong radius)
+    {
+        ulong first = range.First - Math.Min(radius, range.First - bounds.First);
+        ulong last = range.Last + Math.Min(radius, bounds.Last - range.Last);
+        return new(first, last);
+    }
+
+    private void SeedIncrementalIdentityMap(string consumerId,
+        BScanAcquisitionRange representedRange, BScanAcquisitionRange dirtyRange,
+        int dirtyX, int dirtyWidth, int horizontalPixelShift,
+        Dictionary<ulong, TraceIdentity> available, TraceIdentity?[] selectable)
+    {
+        lock (_gate)
+        {
+            if (!_currentByConsumer.TryGetValue(consumerId, out BScanVisualSnapshot? prior)) { return; }
+            foreach ((ulong index, TraceIdentity identity) in prior.AvailableTraceIdentities)
+            {
+                if (index >= representedRange.First && index <= representedRange.Last &&
+                    (index < dirtyRange.First || index > dirtyRange.Last))
+                { available[index] = identity; }
+            }
+            int copy = Math.Min(selectable.Length, Math.Max(0,
+                prior.SelectableTraceIdentities.Count - horizontalPixelShift));
+            for (int index = 0; index < copy; index++)
+            { selectable[index] = prior.SelectableTraceIdentities[index + horizontalPixelShift]; }
+        }
+        Array.Clear(selectable, dirtyX, dirtyWidth);
+    }
+
     private static ulong? TryAddOffset(ulong origin, decimal offset)
     {
         decimal integral = decimal.Truncate(offset);
@@ -951,45 +1063,6 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         public void Dispose() { }
     }
 
-    private static void SelectRange(BScanTraceStore.BScanTraceLease lease, int bucketSamples,
-        int first, int lastExclusive, ref short selected, ref int selectedMagnitude, ref bool found)
-    {
-        if (first >= lastExclusive) { return; }
-        int firstFullBucket = checked((first + bucketSamples - 1) / bucketSamples);
-        int lastFullBucketExclusive = lastExclusive / bucketSamples;
-        ReadOnlySpan<short> samples = lease.Samples.Span;
-        int prefixEnd = Math.Min(lastExclusive, firstFullBucket * bucketSamples);
-        for (int sample = first; sample < prefixEnd; sample++)
-        { Consider(samples[sample], ref selected, ref selectedMagnitude, ref found); }
-        ReadOnlySpan<BScanIndexedMinMax> index = lease.Index.Span;
-        for (int bucket = firstFullBucket; bucket < lastFullBucketExclusive; bucket++)
-        {
-            BScanIndexedMinMax extrema = index[bucket];
-            if (extrema.MinimumOffset <= extrema.MaximumOffset)
-            {
-                Consider(extrema.Minimum, ref selected, ref selectedMagnitude, ref found);
-                Consider(extrema.Maximum, ref selected, ref selectedMagnitude, ref found);
-            }
-            else
-            {
-                Consider(extrema.Maximum, ref selected, ref selectedMagnitude, ref found);
-                Consider(extrema.Minimum, ref selected, ref selectedMagnitude, ref found);
-            }
-        }
-        int suffixStart = Math.Max(prefixEnd, lastFullBucketExclusive * bucketSamples);
-        for (int sample = suffixStart; sample < lastExclusive; sample++)
-        { Consider(samples[sample], ref selected, ref selectedMagnitude, ref found); }
-    }
-
-    private static void Consider(short value, ref short selected, ref int selectedMagnitude, ref bool found)
-    {
-        int magnitude = Math.Abs((int)value);
-        if (magnitude <= selectedMagnitude) { return; }
-        selectedMagnitude = magnitude;
-        selected = value;
-        found = true;
-    }
-
     private static (int X, int Width) RasterColumns(BScanRenderRequest request, ulong first, ulong last, bool full)
     {
         if (full) { return (0, request.PixelWidth); }
@@ -1003,8 +1076,7 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     }
 
     private BScanFullRefreshReason GetFullRefreshReason(BScanRenderRequest request,
-        ConventionalUtFrameMetadata metadata, BScanStoreVisualState state,
-        BScanTraceStore.BScanTraceLease?[] leases, int count, int horizontalPixelShift = 0)
+        ConventionalUtFrameMetadata metadata, BScanStoreVisualState state, int horizontalPixelShift = 0)
     {
         bool coalesced;
         bool recovery;
@@ -1022,7 +1094,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             return initial;
         }
         BScanFullRefreshReason reason = BScanFullRefreshReason.None;
-        if (request.EffectiveResampling.Mode != Scan2DInterpolationMode.None)
+        if (request.EffectiveResampling.Mode is not (
+            Scan2DInterpolationMode.None or Scan2DInterpolationMode.Bilinear))
         { reason |= BScanFullRefreshReason.RenderConfigurationChanged; }
         if (request.Displayed is null && prior is not null)
         {
@@ -1060,25 +1133,14 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
         ulong baseRevision = request.DisplayedStoreRevision.GetValueOrDefault();
         if (baseRevision > state.StoreRevision) { reason |= BScanFullRefreshReason.BaseRevisionMismatch; }
-        if (reason == BScanFullRefreshReason.None && baseRevision < state.StoreRevision)
-        {
-            ulong expected = baseRevision + 1;
-            for (int index = 0; index < count && expected <= state.StoreRevision; index++)
-            {
-                ulong revision = leases[index]!.VisualRevision;
-                if (revision < expected) { continue; }
-                if (revision != expected) { reason |= BScanFullRefreshReason.DirtyRangeEvicted; break; }
-                expected++;
-            }
-            if (expected <= state.StoreRevision) { reason |= BScanFullRefreshReason.DirtyRangeEvicted; }
-        }
         if (recovery) { reason |= BScanFullRefreshReason.Recovery; }
         return reason;
     }
 
     private static int GetHorizontalPixelShift(BScanRenderRequest request)
     {
-        if (request.EffectiveResampling.Mode != Scan2DInterpolationMode.None ||
+        if (request.EffectiveResampling.Mode is not (
+                Scan2DInterpolationMode.None or Scan2DInterpolationMode.Bilinear) ||
             !request.FollowLiveWindow || request.Displayed is not { } displayed ||
             displayed.Render.PixelWidth != request.PixelWidth ||
             displayed.Render.PixelHeight != request.PixelHeight ||
@@ -1140,78 +1202,127 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private void PublishMetadata(BScanRenderRequest request, long requestGeneration)
     {
-        BScanVisualLeaseBatch? batch = null;
+        BScanRenderRequest admittedRequest = request;
+        BScanProjectionOperation? projection = null;
         Exception? primary = null;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            _shutdown.Token, _ingress.RunCancellationToken);
         try
         {
-            batch = _ingress.CaptureVisualLeases(_shutdown.Token,
-                out BScanIngressVisualState? ingressState, out BScanStoreVisualState state);
-            BScanTraceStore.BScanTraceLease?[] leases = batch?.Items ?? [];
-            int count = batch?.Count ?? 0;
-            ConventionalUtFrameMetadata? metadata = ingressState?.Metadata;
-            if (metadata is null || metadata.RunId != request.RunId || count == 0 || state.ResidentRange is null) { return; }
-            Array.Sort(leases, 0, count, BScanLeaseComparer.Instance);
+            if (!_ingress.TryBeginProjection(out BScanIngressVisualState? admittedState, out projection) ||
+                admittedState is null) { return; }
+            BScanStoreVisualState state = admittedState.StoreState;
+            ConventionalUtFrameMetadata metadata = admittedState.Metadata;
+            if (metadata.RunId != request.RunId || state.ResidentRange is not { } resident) { return; }
+            request = ReconcileLiveWindow(request, resident);
+            BScanAcquisitionRange represented = RepresentedRange(request.SpatialViewport, resident);
+            if (represented.Last - represented.First >= (ulong)_ingress.Options.MaximumColumns) { return; }
             request = WithAcknowledgedDisplay(request);
-            request = ReconcileLiveWindow(request, state.ResidentRange.Value);
+            request = ReconcileLiveWindow(request, resident);
+            long consumerLifetime;
+            lock (_gate) { consumerLifetime = _consumerLifetimes.GetValueOrDefault(request.ConsumerId); }
+            var ticket = BScanProjectionTicket.Create(admittedState, request,
+                consumerLifetime, requestGeneration);
             int horizontalPixelShift = GetHorizontalPixelShift(request);
-            BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state, leases, count,
+            BScanFullRefreshReason reason = GetFullRefreshReason(request, metadata, state,
                 horizontalPixelShift);
             bool full = reason != BScanFullRefreshReason.None;
-            ulong first = ulong.MaxValue, last = 0;
-            for (int i = 0; i < count; i++)
+            BScanAcquisitionRange dirtyRange;
+            if (full) { dirtyRange = represented; }
+            else if (!_ingress.TryGetDirtyRange(ticket.Stream, represented,
+                request.DisplayedStoreRevision.GetValueOrDefault(), out dirtyRange))
+            { return; }
+            var available = new Dictionary<ulong, TraceIdentity>();
+            var selectable = new TraceIdentity?[request.PixelWidth];
+            if (!full)
             {
-                var lease = leases[i]!;
-                if (full || lease.VisualRevision > request.DisplayedStoreRevision.GetValueOrDefault())
-                { first = Math.Min(first, lease.Descriptor.AcquisitionIndex); last = Math.Max(last, lease.Descriptor.AcquisitionIndex); }
+                (int dirtyX, int dirtyWidth) = RasterColumns(request,
+                    dirtyRange.First, dirtyRange.Last, false);
+                SeedIncrementalIdentityMap(request.ConsumerId, represented, dirtyRange,
+                    dirtyX, dirtyWidth, horizontalPixelShift, available, selectable);
             }
-            if (first == ulong.MaxValue) { return; }
-            ulong version;
-            lock (_gate) { version = ++_snapshotVersion; }
-            var dirty = new BScanDirtyRange(first, last, request.DisplayedStoreRevision.GetValueOrDefault(), state.StoreRevision);
-            var snapshot = CreateSnapshot(metadata, request, state, version, dirty,
-                new(0, 0, request.PixelWidth, request.PixelHeight), full, reason, leases, count) with
+            ulong? previous = null;
+            bool discontinuities = state.CommittedGapCount != 0;
+            BScanPageTraversalResult traversal = _ingress.VisitVisualPages(ticket, dirtyRange, page =>
+            {
+                foreach (InspectionRangeItem item in page.Items)
+                {
+                    if (item.Status != InspectionReadStatus.Available || item.Lease is null) { continue; }
+                    if (item.Identity.Stream != ticket.Stream)
+                    { throw new InvalidOperationException("The range provider returned a trace from another stream."); }
+                    ulong index = item.Identity.AcquisitionIndex;
+                    available[index] = item.Identity;
+                    if (previous is { } prior && (prior == ulong.MaxValue || index != prior + 1))
+                    { discontinuities = true; }
+                    previous = index;
+                    decimal offset = BScanSpatialViewportOperations.RelativeOffset(index,
+                        request.SpatialViewport.OriginAcquisitionIndex);
+                    int pixel = (int)decimal.Floor((offset - request.SpatialViewport.MinimumOffset) /
+                        request.SpatialViewport.Span * request.PixelWidth);
+                    if ((uint)pixel < (uint)selectable.Length && selectable[pixel] is null)
+                    { selectable[pixel] = item.Identity; }
+                }
+            }, linked.Token);
+            if (traversal.Stale || traversal.TerminalStatus is not null) { return; }
+            discontinuities |= traversal.AvailableCount == 0 ||
+                !available.ContainsKey(represented.First) || !available.ContainsKey(represented.Last) ||
+                traversal.Statuses.Any(static status => status is InspectionReadStatus.NotAvailable or InspectionReadStatus.Gap);
+            var dirty = new BScanDirtyRange(dirtyRange.First, dirtyRange.Last,
+                request.DisplayedStoreRevision.GetValueOrDefault(), state.StoreRevision);
+            var candidate = CreateSnapshotProjected(admittedState, metadata, request, state, dirty,
+                new(0, 0, request.PixelWidth, request.PixelHeight), full, reason, represented,
+                discontinuities, available, selectable, traversal.Statuses) with
             { HorizontalPixelShift = horizontalPixelShift };
-            BeforeMetadataCandidateCommit?.Invoke(snapshot);
+            BeforeMetadataCandidateCommit?.Invoke(candidate);
             BeforeMetadataCandidateValidation?.Invoke();
-            Audit(BScanVisualAuditEventKind.CommitAttempted, request.ConsumerId, ingressState,
+            Audit(BScanVisualAuditEventKind.CommitAttempted, request.ConsumerId, admittedState,
                 requestGeneration, request);
             Subscription[] observers;
+            BScanVisualSnapshot snapshot;
             BScanVisualCallbackAuditContext? callbackAudit = null;
             lock (_gate)
             {
                 if (_disposed)
                 {
                     Audit(BScanVisualAuditEventKind.CandidateRejectedClosed, request.ConsumerId,
-                        ingressState, requestGeneration, request, BScanVisualAuditResult.Closed,
+                        admittedState, requestGeneration, request, BScanVisualAuditResult.Closed,
                         BScanVisualAuditRejection.Closed);
                     return;
                 }
-                bool ingressCurrent = ingressState is not null &&
-                    ReferenceEquals(ingressState, _ingress.CurrentVisualState);
-                bool storeCurrent = ingressState is not null &&
-                    ReferenceEquals(ingressState.StoreState, ingressState.Store.CurrentVisualState);
+                bool ingressCurrent = _ingress.IsTicketCurrent(ticket);
+                bool storeCurrent = ingressCurrent;
                 long currentGeneration = _pendingGenerations.GetValueOrDefault(request.ConsumerId);
-                if (currentGeneration != requestGeneration)
+                bool active = _consumers.Contains(request.ConsumerId) &&
+                    !_retiringConsumers.Contains(request.ConsumerId) &&
+                    _consumerLifetimes.GetValueOrDefault(request.ConsumerId) == consumerLifetime;
+                bool signatureCurrent = !_lastRequests.TryGetValue(request.ConsumerId,
+                    out BScanRenderRequest? latestRequest) || HasSameRenderSignature(admittedRequest, latestRequest);
+                if (!active || currentGeneration != requestGeneration || !signatureCurrent || !ingressCurrent)
                 {
                     _lastMetadataCandidateAudit = new(request.RunId, requestGeneration,
                         currentGeneration, ingressCurrent, storeCurrent, false,
                         _lastGenerationReason, request);
                     Audit(BScanVisualAuditEventKind.CandidateRejectedStale, request.ConsumerId,
-                        ingressState, requestGeneration, request, BScanVisualAuditResult.Stale,
-                        BScanVisualAuditRejection.Generation);
+                        admittedState, requestGeneration, request, BScanVisualAuditResult.Stale,
+                        !active ? BScanVisualAuditRejection.Consumer :
+                        currentGeneration != requestGeneration ? BScanVisualAuditRejection.Generation :
+                        !signatureCurrent ? BScanVisualAuditRejection.Signature :
+                        BScanVisualAuditRejection.StoreState);
                     _staleCandidates++;
-                    RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request);
+                    if (currentGeneration != requestGeneration || !signatureCurrent)
+                    { RequestRecoveryUnderLock(request.ConsumerId, requestGeneration, request); }
                     long latestGeneration = _pendingGenerations.GetValueOrDefault(request.ConsumerId);
                     if (_committedGenerations.GetValueOrDefault(request.ConsumerId) != latestGeneration &&
                         !_pending.ContainsKey(request.ConsumerId) &&
                         _lastRequests.TryGetValue(request.ConsumerId, out BScanRenderRequest? latest) &&
-                        _ingress.CurrentVisualState is { IsOpen: true } current &&
+                        _ingress.CurrentVisualState is { IsProjectable: true } current &&
                         latest.RunId == current.Metadata.RunId)
                     { _pending[request.ConsumerId] = latest; }
                     if (_pending.ContainsKey(request.ConsumerId) && _wake.CurrentCount == 0)
                     { _wake.Release(); }
                     return;
                 }
+                snapshot = candidate with { SnapshotVersion = ++_snapshotVersion };
                 _lastPublication = _clock.GetTimestamp();
                 _lastMetadataCandidateAudit = new(request.RunId, requestGeneration,
                     requestGeneration, true, true, true, _lastGenerationReason, request);
@@ -1228,43 +1339,72 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                 _coalesced = false;
                 _recoveryConsumers.Remove(request.ConsumerId);
                 observers = [.. _subscriptions];
-                callbackAudit = CaptureCallbackAuditContext(request.ConsumerId, ingressState,
+                callbackAudit = CaptureCallbackAuditContext(request.ConsumerId, admittedState,
                     requestGeneration, request);
                 Audit(BScanVisualAuditEventKind.CandidateCommitted, request.ConsumerId,
-                    ingressState, requestGeneration, request, BScanVisualAuditResult.Committed);
+                    admittedState, requestGeneration, request, BScanVisualAuditResult.Committed);
             }
             var update = new BScanVisualUpdate(snapshot);
+            BScanProjectionCallbackGroup? callbackGroup = observers.Length == 0
+                ? null : new(projection!, observers.Length);
+            if (callbackGroup is not null) { projection = null; }
             foreach (Subscription subscription in observers)
-            { subscription.Offer(update, callbackAudit); }
+            { subscription.Offer(update, callbackAudit, callbackGroup); }
         }
+        catch (OperationCanceledException error) when (linked.IsCancellationRequested)
+        { primary = error; }
         catch (Exception error) { primary = error; throw; }
-        finally { batch?.Dispose(primary); }
+        finally { projection?.Dispose(); }
     }
 
-    private static BScanVisualSnapshot CreateSnapshot(ConventionalUtFrameMetadata metadata, BScanRenderRequest request,
-        BScanStoreVisualState state, ulong version, BScanDirtyRange dirty, BScanRasterRectangle region,
-        bool full, BScanFullRefreshReason reason, BScanTraceStore.BScanTraceLease?[] leases, int count)
+    private static BScanVisualSnapshot CreateSnapshotProjected(BScanIngressVisualState ingressState,
+        ConventionalUtFrameMetadata metadata, BScanRenderRequest request,
+        BScanStoreVisualState state, BScanDirtyRange dirty, BScanRasterRectangle region,
+        bool full, BScanFullRefreshReason reason, BScanAcquisitionRange represented,
+        bool discontinuities, IReadOnlyDictionary<ulong, TraceIdentity> available,
+        TraceIdentity?[] selectable, IReadOnlySet<InspectionReadStatus> statuses)
     {
         double domainMinimum = metadata.Configuration.FirstSampleOffsetSeconds;
-        double domainMaximum = domainMinimum + metadata.Configuration.SampleCount / metadata.Configuration.SampleRateHz;
-        bool discontinuities = false;
-        for (int i = 1; i < count; i++)
-        { if (leases[i]!.Descriptor.AcquisitionIndex != leases[i - 1]!.Descriptor.AcquisitionIndex + 1) { discontinuities = true; break; } }
-        return new(metadata.RunId, version, dirty.BaseStoreRevision, state.StoreRevision, state.WrapGeneration,
-            new(dirty.FirstAcquisitionIndex, dirty.LastAcquisitionIndex), state.ResidentRange!.Value,
+        double domainMaximum = domainMinimum +
+            metadata.Configuration.SampleCount / metadata.Configuration.SampleRateHz;
+        return new(metadata.RunId, 0, dirty.BaseStoreRevision, state.StoreRevision,
+            state.WrapGeneration, represented, state.ResidentRange!.Value,
             ScanTimeViewportOperations.Create(domainMinimum, domainMaximum), request.SpatialViewport,
-            request.TimeViewport, request.PixelWidth, request.PixelHeight, request.RenderConfigurationVersion,
-            dirty, region, discontinuities, full, reason)
+            request.TimeViewport, request.PixelWidth, request.PixelHeight,
+            request.RenderConfigurationVersion, dirty, region, discontinuities, full, reason)
         {
             ConsumerId = request.ConsumerId,
-            Stream = new(metadata.SourceId, metadata.RunId, metadata.Configuration.PhysicalChannelId),
+            Stream = new(metadata.SourceId, metadata.RunId,
+                metadata.Configuration.PhysicalChannelId),
+            TraceStream = ingressState.StreamIdentity,
+            AvailableTraceIdentities = new Dictionary<ulong, TraceIdentity>(available),
+            SelectableTraceIdentities = Array.AsReadOnly(selectable),
+            NoDataStatuses = new HashSet<InspectionReadStatus>(statuses.Where(
+                static status => status != InspectionReadStatus.Available)),
+            RunState = state.RunState,
+            FinalRevision = state.FinalRevision,
+            AreWatermarksFinal = state.AreWatermarksFinal,
+            CommittedTraceCount = state.CommittedTraceCount,
+            CommittedGapCount = state.CommittedGapCount,
             Resampling = request.EffectiveResampling
         };
     }
 
+    private static BScanAcquisitionRange RepresentedRange(BScanSpatialViewport viewport,
+        BScanAcquisitionRange resident)
+    {
+        decimal firstValue = decimal.Floor(viewport.OriginAcquisitionIndex + viewport.MinimumOffset);
+        decimal lastValue = decimal.Ceiling(viewport.OriginAcquisitionIndex + viewport.MaximumOffset) - 1;
+        ulong first = firstValue <= 0 ? 0 : firstValue >= ulong.MaxValue ? ulong.MaxValue : (ulong)firstValue;
+        ulong last = lastValue <= 0 ? 0 : lastValue >= ulong.MaxValue ? ulong.MaxValue : (ulong)lastValue;
+        first = Math.Clamp(first, resident.First, resident.Last);
+        last = Math.Clamp(last, first, resident.Last);
+        return new(first, last);
+    }
+
     private void OnVisualStateChanged()
     {
-        AcquisitionRunId? currentRun = _ingress.CurrentVisualState is { IsOpen: true } state
+        AcquisitionRunId? currentRun = _ingress.CurrentVisualState is { IsProjectable: true } state
             ? state.Metadata.RunId : null;
         string[] bootstrap;
         lock (_gate)
@@ -1520,25 +1660,20 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
             _ingress.CurrentVisualState, requestGeneration, request, BScanVisualAuditResult.Accepted);
     }
 
-    private sealed class BScanLeaseComparer : IComparer<BScanTraceStore.BScanTraceLease?>
-    {
-        internal static BScanLeaseComparer Instance { get; } = new();
-        public int Compare(BScanTraceStore.BScanTraceLease? x, BScanTraceStore.BScanTraceLease? y) =>
-            x!.Descriptor.AcquisitionIndex.CompareTo(y!.Descriptor.AcquisitionIndex);
-    }
-
     private sealed class Subscription(BScanVisualDelivery owner, IObserver<BScanVisualUpdate> observer) : IDisposable
     {
         private readonly object _gate = new();
         private BScanPendingCallback? _pending;
         private Task _pump = Task.CompletedTask;
         private bool _detached;
-        internal void Offer(BScanVisualUpdate update, BScanVisualCallbackAuditContext? audit)
+        internal void Offer(BScanVisualUpdate update, BScanVisualCallbackAuditContext? audit,
+            BScanProjectionCallbackGroup? projection)
         {
             lock (_gate)
             {
-                if (_detached) { return; }
-                _pending = new(update, audit);
+                if (_detached) { projection?.Release(); return; }
+                _pending?.Projection?.Release();
+                _pending = new(update, audit, projection);
                 owner.Audit(BScanVisualAuditEventKind.CallbackQueued,
                     update.Snapshot.ConsumerId, audit);
                 if (_pump.IsCompleted) { _pump = Task.Run(Pump); }
@@ -1578,11 +1713,18 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
                     }
                     return;
                 }
+                finally { pending.Projection?.Release(); }
             }
         }
         internal Task Detach()
         {
-            lock (_gate) { _detached = true; _pending = null; return _pump; }
+            lock (_gate)
+            {
+                _detached = true;
+                _pending?.Projection?.Release();
+                _pending = null;
+                return _pump;
+            }
         }
         public void Dispose()
         {
@@ -1594,7 +1736,19 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
 
     private readonly record struct BScanPendingCallback(
         BScanVisualUpdate Update,
-        BScanVisualCallbackAuditContext? Audit);
+        BScanVisualCallbackAuditContext? Audit,
+        BScanProjectionCallbackGroup? Projection);
+
+    private sealed class BScanProjectionCallbackGroup(BScanProjectionOperation projection, int count)
+    {
+        private BScanProjectionOperation? _projection = projection;
+        private int _remaining = count;
+        internal void Release()
+        {
+            if (Interlocked.Decrement(ref _remaining) == 0)
+            { Interlocked.Exchange(ref _projection, null)?.Dispose(); }
+        }
+    }
 }
 
 internal readonly record struct BScanVisualCallbackAuditContext(

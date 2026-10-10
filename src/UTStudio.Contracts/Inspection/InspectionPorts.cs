@@ -77,6 +77,18 @@ public interface ICommittedTraceSink
     ValueTask WaitForCloseAsync(AcquisitionRunId runId) => ValueTask.CompletedTask;
 }
 
+/// <summary>
+/// Optional monotonic lifecycle for a committed-trace projection that must reconcile a sealed
+/// authoritative revision before it becomes a frozen, read-only view.
+/// </summary>
+public interface ICommittedTraceLifecycleSink : ICommittedTraceSink
+{
+    void RequestFinalReconciliation(AcquisitionRunId runId, InspectionRevision finalRevision);
+    void StopAdmission(AcquisitionRunId runId);
+    ValueTask WaitForDrainAsync(AcquisitionRunId runId);
+    void FreezeRun(AcquisitionRunId runId);
+}
+
 public interface IInspectionRangeProvider
 {
     ValueTask<InspectionRangeReadResult> ReadRangeAsync(InspectionRangeQuery query, CancellationToken cancellationToken = default);

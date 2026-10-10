@@ -65,7 +65,7 @@ Dependencias prohibidas: Domain hacia cualquier otro proyecto; Contracts hacia i
 Los casos de uso operan mediante interfaces inyectadas. Los ViewModels no acceden al hardware ni se referencian entre sí; reciben servicios y snapshots de stores mediante IObservable<T> o equivalente. Messenger sirve solo para notificaciones ocasionales de presentación. Frames circulan por ChannelReader<T> de canales acotados.
 La sesión pertenece a Application. Cerrar MainWindow solicita salir: cancelar productor mientras el único lector drena, esperar buffers devueltos, desconectar y detener/liberar Host antes del cierre definitivo. MainWindow permanece abierta durante limpieza y diagnóstico tras cinco segundos. Sin bandeja, OnExplicitShutdown ni ejecución sin ventanas. La secundaria B-Scan puede cerrarse sin detener la sesión. Véase [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 
-El [ADR 0007](../adr/0007-frame-source-ownership.md) concreta frame RF `ReadOnlyMemory<short>` y ownership exclusivo; el [ADR 0008](../adr/0008-latest-only-visual-delivery.md) concreta la entrega A-Scan latest-only. El [ADR 0010](../adr/0010-ascan-manual-cursor-measurements.md) añade medidas manuales aproximadas. Los [ADR 0011](../adr/0011-shared-physical-time-viewport.md) y [ADR 0012](../adr/0012-shared-scan-time-navigation.md) definen el viewport temporal neutral. El [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md) concreta el fan-out visual aislado, ring B-Scan con leases, selección exacta, regiones revisionadas y ventana secundaria ya implementados. Cada ViewModel expone binding local; A y B comparten intervalo, no versión visual. No se comparte un ChannelReader entre consumidores. Procesamiento y almacenamiento futuros conservan ramas lossless distintas.
+El [ADR 0007](../adr/0007-frame-source-ownership.md) concreta frame RF `ReadOnlyMemory<short>` y ownership exclusivo; el [ADR 0008](../adr/0008-latest-only-visual-delivery.md) concreta la entrega A-Scan latest-only. El [ADR 0010](../adr/0010-ascan-manual-cursor-measurements.md) añade medidas manuales aproximadas. Los [ADR 0011](../adr/0011-shared-physical-time-viewport.md) y [ADR 0012](../adr/0012-shared-scan-time-navigation.md) definen el viewport temporal neutral. El [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md), refinado por el [ADR 0015](../adr/0015-authoritative-inspection-data-store.md), concreta la proyección B sample-free desde rangos autoritativos, selección exacta emparejada con el raster y ventana secundaria. Cada ViewModel expone binding local; A y B comparten intervalo, no versión visual. No se comparte un ChannelReader entre consumidores. Procesamiento y almacenamiento futuros conservan ramas lossless distintas.
 
 ## Frontera WPF/Avalonia
 Presentation no importa WPF ni Avalonia. Los servicios UI abstractos permanecen en App.Wpf, separados por carpetas de composición, vistas y servicios. El renderizador A-Scan se extrae a Visualization.Wpf conforme al ADR 0009; no contiene servicios de aplicación ni se inyecta en hardware.
@@ -100,11 +100,13 @@ SignalProcessing, Storage y Visualization.Core mantendrán dependencias neutrale
 
 ## Autoridad de datos de inspección
 
-El flujo implementado para A es fuente común → `ApplicationSession` → `InspectionDataStore` → `IUtTraceProvider` → A-Scan. La sesión notifica solo identidad y revisión confirmadas; A no recibe memoria prestada. El flujo objetivo para B continúa como
-futuros C/S/D → backing persistente incremental. Store es la única autoridad; las vistas conservan
-solo presentación y caches acotadas. `BScanTraceStore` se mantendrá temporalmente como cache/proyección
-visual derivada y se retirará progresivamente, sin dual-write autoritativo. La selección B→A usa
-`TraceIdentity`. B-Scan sigue temporalmente como proyección derivada y la persistencia permanece aplazada.
+El flujo implementado para A y B es fuente común → `ApplicationSession` → `InspectionDataStore` →
+providers autoritativos → proyección visual. La sesión notifica solo identidad y revisión confirmadas;
+ningún scan recibe memoria prestada desde Application. B-Scan reconcilia mediante
+`IInspectionStreamStateProvider`, lee rangos acotados con `IInspectionRangeProvider` y mantiene los
+leases solo durante el raster en Visualization.Core. Store es la única autoridad; las vistas conservan
+solo presentación y derivados acotados, sin copia RF autoritativa ni `BScanTraceStore`. La selección
+B→A usa la `TraceIdentity` exacta publicada. C/S/D y la persistencia incremental permanecen aplazados.
 
 La autoridad publica únicamente trazas committed mediante `InspectionRevision`. Lecturas exactas y por
 rango son dispersas, acotadas y revisadas. En Fase 1 no hay expulsión autoritativa ni almacenamiento
@@ -114,6 +116,9 @@ libera su consumidor, no los datos; cierre global drena admisión, commits y lea
 
 ## Decisiones abiertas y siguiente incremento
 
-Q12: propiedad de la primera secundaria B-Scan resuelta por ADR 0013; concurrencia de otras inspecciones sigue abierta. Q13: fan-out visual por copia propia resuelto para A/B; procesamiento, persistencia y su ownership continúan abiertos. Q06 conserva datos crudos/procesados y durabilidad.
+Q12: propiedad de la primera secundaria B-Scan resuelta por ADR 0013 y refinada por ADR 0015;
+concurrencia de otras inspecciones sigue abierta. Q13: A/B notifican identidad y revisión tras el commit
+y consultan la autoridad sin fan-out RF; procesamiento, persistencia y su ownership continúan abiertos.
+Q06 conserva datos crudos/procesados y durabilidad.
 
 Pendientes mocking/CI y paquetes adicionales (Q10), renderizadores de otros scans, gates de rendimiento sobre hardware acordado (Q09/Q14) y futuras integraciones. Los modos `None`, `NearestNeighbor`, `Bilinear`, `Bicubic` y `Lanczos`, el selector y la preferencia versionada están implementados conforme al ADR 0014; `None` es predeterminado y Lanczos es alta calidad con cadencia reducida. GP/Kriging permanece como reconstrucción futura separada. ChannelCapacity=4 y BufferCount=8 son internos configurables del simulador sujetos a benchmarks, no del contrato general. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).

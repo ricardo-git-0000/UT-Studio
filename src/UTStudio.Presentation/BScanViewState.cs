@@ -1,4 +1,5 @@
 using UTStudio.Domain.Acquisition;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
 
@@ -34,7 +35,7 @@ public sealed record BScanViewState(
     BScanPresentedRegion? Region,
     BScanVisualRevision? DisplayedRevision,
     bool RequiresFullRefresh,
-    BScanTraceIdentity? SelectedColumn,
+    TraceIdentity? SelectedColumn,
     BScanSelectionState Selection,
     string? AcquisitionError,
     string? BScanIngressError,

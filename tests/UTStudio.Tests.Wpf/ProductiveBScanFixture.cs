@@ -18,8 +18,6 @@ namespace UTStudio.Tests.Wpf;
 
 internal sealed class ProductiveBScanFixture : IAsyncDisposable
 {
-    private readonly TrackingShortPool _blocks = new();
-    private readonly TrackingTracePool _traces = new();
     private readonly TrackingBytePool _rasters = new();
     private readonly Window _host;
     private readonly InspectionDataStoreRegistry _inspectionStores;
@@ -33,24 +31,22 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     private ProductiveBScanFixture(int preloadedColumns, bool useSystemDeliveryClock)
     {
         Clock = new();
-        var options = new BScanOptions(4 * 1024 * 1024, 16 * 1024 * 1024, 512, 8, 2);
-        Ingress = new(options, Clock, _blocks, _traces);
+        var options = new BScanOptions(16 * 1024 * 1024, 512, 8, 2);
         Metadata = new(new("productive-bscan"), new(Guid.Parse("99000000-0000-0000-0000-000000000099")),
             new(new(3), 16, 1_000_000, 0, UtSignalMode.Rf), DateTimeOffset.UnixEpoch);
         _inspectionStores = new(new InspectionId(Guid.Parse("98000000-0000-0000-0000-000000000098")),
             new InMemoryInspectionStoreOptions(4 * 1024 * 1024, 4096));
         _inspectionWriter = _inspectionStores.OpenRun(Metadata.RunId);
-        Ingress.OpenRun(Metadata);
+        Ingress = new(_inspectionStores.Store, _inspectionStores.Store, options, Clock);
+        Ingress.OpenRun(Metadata.RunId);
         for (int column = 0; column < preloadedColumns; column++)
         {
-            using var indexed = new ManualResetEventSlim();
             ulong sequence = _sequence++;
-            Ingress.AfterIndexCommit = identity => { if (identity.Sequence == sequence) { indexed.Set(); } };
             short[] samples = Enumerable.Range(0, Metadata.Configuration.SampleCount)
                 .Select(value => (short)(value + column)).ToArray();
-            Commit(sequence, (ulong)column, samples);
-            Ingress.Accept(Metadata, sequence, (ulong)column, TimeSpan.FromTicks((long)sequence), null, samples);
-            if (!indexed.Wait(TimeSpan.FromSeconds(10))) { throw new InvalidOperationException("B-Scan preload did not index."); }
+            InspectionAppendResult commit = Commit(sequence, (ulong)column, samples);
+            Ingress.NotifyCommitted(new TraceIdentity(new(_inspectionStores.InspectionId, Metadata.RunId,
+                Metadata.SourceId, Metadata.Configuration.PhysicalChannelId), (ulong)column), commit.Revision);
         }
         Delivery = new(Ingress, useSystemDeliveryClock ? TimeProvider.System : Clock, _rasters);
         Delivery.AfterBootstrapRequestQueued = (_, runId) =>
@@ -66,9 +62,8 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         };
         Dispatcher = new(System.Windows.Threading.Dispatcher.CurrentDispatcher);
         SharedViewport = new(Dispatcher);
-        Selection = new(Dispatcher, Ingress,
-            new UtTraceAScanSelector(_inspectionStores.Store, new AScanProjector()),
-            _inspectionStores.InspectionId);
+        Selection = new(Dispatcher,
+            new UtTraceAScanSelector(_inspectionStores.Store, new AScanProjector()));
         ViewModel = new(Delivery, SharedViewport, Selection, Dispatcher);
         Control = new();
         Adapter = new(ViewModel, Control);
@@ -88,8 +83,8 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     internal BScanViewModel ViewModel { get; }
     internal BScanControl Control { get; }
     internal BScanControlAdapter Adapter { get; }
-    internal int BlocksOutstanding => _blocks.Outstanding;
-    internal int TraceOwnersOutstanding => _traces.Outstanding;
+    internal int BlocksOutstanding => 0;
+    internal int TraceOwnersOutstanding => 0;
     internal int RasterOwnersOutstanding => _rasters.Outstanding;
 
     internal static Task<ProductiveBScanFixture> CreateAsync(int preloadedColumns = 0,
@@ -115,22 +110,24 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     internal async Task AddIndexedAsync(ulong acquisitionIndex)
     {
         ulong sequence = _sequence++;
-        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        Ingress.AfterIndexCommit = identity =>
-        { if (identity.Sequence == sequence) { indexed.TrySetResult(); } };
         short[] samples = Enumerable.Range(0, Metadata.Configuration.SampleCount)
             .Select(value => (short)((ulong)value + acquisitionIndex)).ToArray();
-        Commit(sequence, acquisitionIndex, samples);
-        Ingress.Accept(Metadata, sequence, acquisitionIndex, TimeSpan.FromTicks((long)sequence), null, samples);
-        await indexed.Task;
+        InspectionAppendResult commit = Commit(sequence, acquisitionIndex, samples);
+        Ingress.NotifyCommitted(new TraceIdentity(new(_inspectionStores.InspectionId, Metadata.RunId,
+            Metadata.SourceId, Metadata.Configuration.PhysicalChannelId), acquisitionIndex), commit.Revision);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (Ingress.CurrentVisualState?.StoreState.StoreRevision != commit.Revision.Value)
+        { await Task.Delay(10, timeout.Token); }
     }
 
     internal async Task StartNewRunAsync(Guid runId)
     {
         AcquisitionRunId previous = Metadata.RunId;
-        Ingress.CloseRun(previous);
-        await Ingress.WaitForCloseAsync(previous);
-        await _inspectionWriter.SealRunAsync();
+        InspectionRunSealResult final = await _inspectionWriter.SealRunAsync();
+        Ingress.RequestFinalReconciliation(previous, final.FinalRevision);
+        Ingress.StopAdmission(previous);
+        await Ingress.WaitForDrainAsync(previous);
+        Ingress.FreezeRun(previous);
         await _inspectionWriter.DisposeAsync();
         Metadata = new(Metadata.SourceId, new(runId), Metadata.Configuration,
             Metadata.RunStartedAtUtc.AddSeconds(1));
@@ -139,7 +136,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         _bootstrapRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _metadataCandidateReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _releaseMetadataCandidate = new();
-        Ingress.OpenRun(Metadata);
+        Ingress.OpenRun(Metadata.RunId);
     }
 
     internal Task WaitForBootstrapRequestAsync() =>
@@ -172,7 +169,28 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
 
     internal async Task WaitForRevisionAsync(ulong revision)
     {
-        await WaitForStateAsync(() => ViewModel.State.DisplayedRevision?.StoreRevision >= revision);
+        try
+        { await WaitForStateAsync(() => ViewModel.State.DisplayedRevision?.StoreRevision >= revision); }
+        catch (TimeoutException error)
+        {
+            BScanMetadataCandidateAudit? audit = Delivery.LastMetadataCandidateAudit;
+            throw new TimeoutException($"Expected revision {revision}; displayed=" +
+                $"{ViewModel.State.DisplayedRevision?.StoreRevision}; metadata={ViewModel.State.StoreRevision}; " +
+                $"visual={Ingress.CurrentVisualState?.StoreState.StoreRevision}; " +
+                $"ingressError={Ingress.Diagnostics.WorkerError}; visualError={ViewModel.State.BScanVisualError}; " +
+                $"updates={Delivery.Diagnostics.VisualUpdatesPublished}; " +
+                $"superseded={Delivery.Diagnostics.VisualBuildsSuperseded}; " +
+                $"audit=current:{audit?.CurrentGeneration},candidate:{audit?.CandidateGeneration}," +
+                $"ingress:{audit?.IngressCurrent},store:{audit?.StoreCurrent}," +
+                $"committed:{audit?.Committed},reason:{audit?.LastGenerationReason}.", error);
+        }
+    }
+
+    internal async Task WaitForBootstrapDrainAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (Delivery.PendingBootstrapCount != 0)
+        { await Task.Delay(10, timeout.Token); }
     }
 
     internal async Task WaitForRunAsync(AcquisitionRunId runId, ulong revision)
@@ -219,7 +237,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         Assert.AreEqual(Delivery.Diagnostics.ObserverCallbacksStarted, Delivery.Diagnostics.ObserverCallbacksCompleted);
     }
 
-    private void Commit(ulong sequence, ulong acquisitionIndex, short[] samples)
+    private InspectionAppendResult Commit(ulong sequence, ulong acquisitionIndex, short[] samples)
     {
         var stream = new UtStreamIdentity(_inspectionStores.InspectionId, Metadata.RunId,
             Metadata.SourceId, Metadata.Configuration.PhysicalChannelId);
@@ -230,6 +248,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         InspectionAppendResult result = _inspectionWriter.CommitAsync(
             new InspectionCommitInput(new InspectionTraceInput(descriptor, samples))).AsTask().GetAwaiter().GetResult();
         Assert.IsTrue(result.IsCommitted || result.Status == InspectionAppendStatus.Duplicate);
+        return result;
     }
 
     public async ValueTask DisposeAsync()
@@ -259,22 +278,6 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         Assert.AreEqual(0, Control.ActiveCandidateBitmaps);
         Assert.AreEqual(0, Clock.RegisteredTimers);
         Assert.AreEqual(Delivery.Diagnostics.ObserverCallbacksStarted, Delivery.Diagnostics.ObserverCallbacksCompleted);
-    }
-
-    private sealed class TrackingShortPool : IShortArrayPool
-    {
-        private int _outstanding;
-        internal int Outstanding => Volatile.Read(ref _outstanding);
-        public short[] Rent(int minimumLength) { Interlocked.Increment(ref _outstanding); return new short[minimumLength]; }
-        public void Return(short[] array) => Interlocked.Decrement(ref _outstanding);
-    }
-
-    private sealed class TrackingTracePool : ITraceCopyOwnerPool
-    {
-        private int _outstanding;
-        internal int Outstanding => Volatile.Read(ref _outstanding);
-        public IMemoryOwner<short> Rent(int minimumLength)
-        { Interlocked.Increment(ref _outstanding); return new Owner<short>(new short[minimumLength], () => Interlocked.Decrement(ref _outstanding)); }
     }
 
     private sealed class TrackingBytePool : IByteOwnerPool

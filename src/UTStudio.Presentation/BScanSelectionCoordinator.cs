@@ -12,7 +12,7 @@ public enum BScanSelectionResidency { Resident, Evicted }
 public sealed record BScanSelectionState(
     AcquisitionRunId? RunId,
     AScanSnapshot? Snapshot,
-    BScanTraceIdentity? Identity,
+    TraceIdentity? Identity,
     ulong? AcquisitionIndex,
     BScanSelectionResidency? Residency,
     BScanTraceResultKind? LastResult,
@@ -28,9 +28,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
 {
     private readonly object _gate = new();
     private readonly IUiDispatcher _dispatcher;
-    private readonly IBScanTraceIdentityResolver _identityResolver;
     private readonly IAuthoritativeAScanSelector _selector;
-    private readonly InspectionId _inspectionId;
     private CancellationTokenSource? _activeCancellation;
     private BScanSelectionState _state = BScanSelectionState.Empty;
     private AcquisitionRunId? _activeRun;
@@ -47,20 +45,11 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
     private Task? _disposal;
     private long _observerErrors;
 
-    public BScanSelectionCoordinator(IUiDispatcher dispatcher, IBScanTraceIdentityResolver identityResolver,
-        IAuthoritativeAScanSelector selector, InspectionId inspectionId)
+    public BScanSelectionCoordinator(IUiDispatcher dispatcher, IAuthoritativeAScanSelector selector)
     {
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
-        _identityResolver = identityResolver ?? throw new ArgumentNullException(nameof(identityResolver));
         _selector = selector ?? throw new ArgumentNullException(nameof(selector));
-        if (!inspectionId.IsValid) { throw new ArgumentException("A valid inspection id is required.", nameof(inspectionId)); }
-        _inspectionId = inspectionId;
     }
-
-    internal BScanSelectionCoordinator(IUiDispatcher dispatcher, IAuthoritativeAScanSelector selector)
-        : this(dispatcher, selector as IBScanTraceIdentityResolver ??
-            throw new ArgumentException("The test selector must also resolve B-Scan identities.", nameof(selector)),
-            selector, new InspectionId(Guid.Parse("64080ec8-175d-4cc2-b831-b7f286f93a8e"))) { }
 
     internal BScanSelectionCoordinator(IUiDispatcher dispatcher, IAuthoritativeAScanSelector selector,
         IAScanProjector unusedProjector) : this(dispatcher, selector)
@@ -100,7 +89,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         });
     }
 
-    public Task SelectAsync(string ownerId, BScanTraceIdentity identity)
+    public Task SelectAsync(string ownerId, TraceIdentity identity)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         if (!identity.IsValid) { throw new ArgumentException("A valid trace identity is required.", nameof(identity)); }
@@ -111,7 +100,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         Task previous;
         lock (_gate)
         {
-            if (IsClosed || _activeRun != identity.RunId) { return Task.CompletedTask; }
+            if (IsClosed || _activeRun != identity.Stream.AcquisitionRunId) { return Task.CompletedTask; }
             previousCancellation = _activeCancellation;
             cancellation = new();
             _activeCancellation = cancellation;
@@ -127,30 +116,6 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         _ = CompleteResolutionAsync(previous, ownerId, identity, generation, cancellation, completion);
         return completion.Task;
     }
-
-    public Task SelectAsync(string ownerId, AcquisitionRunId runId, ulong acquisitionIndex)
-    {
-        if (_identityResolver.TryResolveIdentity(runId, acquisitionIndex, out BScanTraceIdentity identity))
-        { return SelectAsync(ownerId, identity); }
-        CancellationTokenSource? cancellation;
-        long generation;
-        lock (_gate)
-        {
-            if (IsClosed || _activeRun != runId) { return Task.CompletedTask; }
-            generation = ++_generation;
-            cancellation = _activeCancellation;
-            _activeCancellation = null;
-            _activeOwnerId = null;
-        }
-        try { cancellation?.Cancel(); } catch { Interlocked.Increment(ref _observerErrors); }
-        return _dispatcher.InvokeAsync(() =>
-        {
-            if (!IsCurrent(generation, runId)) { return; }
-            ReplaceState(_state with { LastResult = BScanTraceResultKind.NotAvailable,
-                SelectionError = null, IsPending = false, RequestOwnerId = ownerId });
-        });
-    }
-
 
     public void Cancel(string ownerId)
     {
@@ -195,14 +160,14 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         });
     });
 
-    private async Task CompleteResolutionAsync(Task previous, string ownerId, BScanTraceIdentity identity, long generation,
+    private async Task CompleteResolutionAsync(Task previous, string ownerId, TraceIdentity identity, long generation,
         CancellationTokenSource cancellation, TaskCompletionSource completion)
     {
         Exception? failure = null;
         try
         {
             try { await previous.ConfigureAwait(false); } catch { }
-            if (IsCurrent(generation, identity.RunId))
+            if (IsCurrent(generation, identity.Stream.AcquisitionRunId))
             { await ResolveAsync(ownerId, identity, generation, cancellation).ConfigureAwait(false); }
         }
         catch (Exception error) { failure = error; }
@@ -233,43 +198,42 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         });
     }
 
-    private async Task ResolveAsync(string ownerId, BScanTraceIdentity identity, long generation,
+    private async Task ResolveAsync(string ownerId, TraceIdentity identity, long generation,
         CancellationTokenSource cancellation)
     {
         await _dispatcher.InvokeAsync(() =>
         {
-            if (IsCurrent(generation, identity.RunId))
+            if (IsCurrent(generation, identity.Stream.AcquisitionRunId))
             { ReplaceState(_state with { IsPending = true, LastResult = null, SelectionError = null, RequestOwnerId = ownerId }); }
         }).ConfigureAwait(false);
 
-        var stream = new UtStreamIdentity(_inspectionId, identity.RunId, identity.SourceId, identity.PhysicalChannelId);
-        if (identity.AcquisitionIndex == ulong.MaxValue)
-        { throw new ArgumentException("B-Scan identity must carry AcquisitionIndex.", nameof(identity)); }
-        var traceIdentity = new TraceIdentity(stream, identity.AcquisitionIndex);
         AScanSelectionResult result;
-        try { result = await _selector.ResolveAsync(traceIdentity, checked((ulong)generation), cancellation.Token)
-            .ConfigureAwait(false); }
+        try
+        {
+            result = await _selector.ResolveAsync(identity, checked((ulong)generation), cancellation.Token)
+            .ConfigureAwait(false);
+        }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         { result = new(BScanTraceResultKind.Cancelled); }
         catch (Exception error)
         { result = new(BScanTraceResultKind.Faulted, Error: error.Message); }
 
-        if (!IsCurrent(generation, identity.RunId)) { return; }
+        if (!IsCurrent(generation, identity.Stream.AcquisitionRunId)) { return; }
         if (result.Kind == BScanTraceResultKind.Available && result.Snapshot is not null)
         {
             bool published = false;
             await _dispatcher.InvokeAsync(() =>
             {
-                if (!IsCurrent(generation, identity.RunId)) { return; }
+                if (!IsCurrent(generation, identity.Stream.AcquisitionRunId)) { return; }
                 lock (_gate)
                 {
-                    if (!IsCurrent(generation, identity.RunId)) { return; }
+                    if (!IsCurrent(generation, identity.Stream.AcquisitionRunId)) { return; }
                     _selectedOwnerId = ownerId;
                     _activeCancellation = null;
                     _activeOwnerId = null;
                     published = true;
                 }
-                ReplaceState(new(identity.RunId, result.Snapshot, identity, identity.AcquisitionIndex,
+                ReplaceState(new(identity.Stream.AcquisitionRunId, result.Snapshot, identity, identity.AcquisitionIndex,
                     BScanSelectionResidency.Resident, BScanTraceResultKind.Available, null, false, null));
             }).ConfigureAwait(false);
             if (!published) { return; }
@@ -280,7 +244,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         BScanTraceResultKind kind = result.Kind;
         await _dispatcher.InvokeAsync(() =>
         {
-            if (!IsCurrent(generation, identity.RunId)) { return; }
+            if (!IsCurrent(generation, identity.Stream.AcquisitionRunId)) { return; }
             ReplaceState(_state with
             {
                 LastResult = kind,

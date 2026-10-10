@@ -1,7 +1,6 @@
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Inspection;
-using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 
@@ -20,7 +19,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private readonly IUtFrameSource _source;
     private readonly InspectionId _inspectionId;
     private readonly Func<AcquisitionRunId, IInspectionRunWriter> _inspectionWriterFactory;
-    private readonly IConventionalFrameSink? _visualSink;
+    private readonly ICommittedTraceSink? _bScanSink;
     private readonly ICommittedTraceSink? _aScanSink;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
@@ -32,7 +31,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
     public ApplicationSession(IUtFrameSource source, InspectionId inspectionId,
         Func<AcquisitionRunId, IInspectionRunWriter> inspectionWriterFactory,
-        IConventionalFrameSink? visualSink = null, ICommittedTraceSink? aScanSink = null)
+        ICommittedTraceSink? bScanSink = null, ICommittedTraceSink? aScanSink = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
@@ -42,7 +41,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         ArgumentNullException.ThrowIfNull(inspectionWriterFactory);
         _inspectionId = inspectionId;
         _inspectionWriterFactory = inspectionWriterFactory;
-        _visualSink = visualSink;
+        _bScanSink = bScanSink;
         _aScanSink = aScanSink;
         _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0, canStart: true);
         _publisher = new SessionSnapshotPublisher(_snapshot);
@@ -125,17 +124,18 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             {
                 // Receiving a descriptor transfers its reader even if the token is already cancelled.
                 operation.Run = run;
-                if (!operation.CleanupRequested && _visualSink is not null)
+                if (!operation.CleanupRequested && _bScanSink is not null)
                 {
                     operation.VisualOpened = true;
-                    try { _visualSink.OpenRun(run.Metadata); }
-                    catch (Exception error) { RecordVisualError(operation, error); CloseVisual(operation); }
+                    operation.VisualRunRequiresDrain = true;
+                    try { _bScanSink.OpenRun(operation.RunId); }
+                    catch (Exception error) { RecordBScanError(operation, error); CloseVisual(operation); }
                 }
                 if (!operation.CleanupRequested && _aScanSink is not null)
                 {
                     operation.AScanOpened = true;
                     try { _aScanSink.OpenRun(operation.RunId); }
-                    catch (Exception error) { RecordVisualError(operation, error); CloseAScan(operation); }
+                    catch (Exception error) { RecordAScanError(operation, error); CloseAScan(operation); }
                 }
                 operation.Consumer = Task.Run(() => ConsumeAsync(operation, run));
                 operation.Supervisor = Task.Run(() => SuperviseProducerAsync(operation, run));
@@ -193,7 +193,6 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         operation.DisconnectRequested |= disconnect;
         if (operation.CleanupRequested) { return operation.Cleanup.Task; }
         operation.CleanupRequested = true;
-        CloseVisual(operation);
         Publish(operation, SessionPhase.Stopping);
         // Marks cancellation before waiting for lifecycle exclusion; callbacks execute outside _gate.
         operation.CancellationCallbacks = operation.StartCancellation.CancelAsync();
@@ -222,7 +221,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                                 if (commit.IsCommitted)
                                 {
                                     DeliverCommittedAScan(operation, frame, commit.Revision);
-                                    DeliverVisual(operation, frame);
+                                    DeliverCommittedBScan(operation, frame, commit.Revision);
                                 }
                             }
                         }
@@ -363,25 +362,26 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         actual.SampleCount == expected.SampleCount && actual.SampleRateHz == expected.SampleRateHz &&
         actual.FirstSampleOffsetSeconds == expected.FirstSampleOffsetSeconds;
 
-    private void DeliverVisual(Operation operation, ConventionalUtFrame frame)
+    private void DeliverCommittedBScan(Operation operation, ConventionalUtFrame frame,
+        InspectionRevision revision)
     {
         lock (_gate)
         {
-            if (!operation.VisualOpened || operation.VisualError is not null || operation.CleanupRequested) { return; }
+            if (!operation.VisualOpened || operation.BScanError is not null) { return; }
         }
 
-        // Borrow only during this call. CloseRun may invalidate the projection concurrently.
-        // The frame is always released by ConsumeAsync's finally, including when Accept throws.
         try
         {
-            _visualSink!.Accept(frame.Metadata, frame.Sequence, frame.AcquisitionIndex,
-                frame.ElapsedSinceRunStart, frame.SpatialCoordinate, frame.Samples.Span);
+            var configuration = frame.Metadata.Configuration;
+            var stream = new UtStreamIdentity(_inspectionId, operation.RunId, frame.Metadata.SourceId,
+                configuration.PhysicalChannelId);
+            _bScanSink!.NotifyCommitted(new TraceIdentity(stream, frame.AcquisitionIndex), revision);
         }
         catch (Exception error)
         {
             lock (_gate)
             {
-                RecordVisualError(operation, error);
+                RecordBScanError(operation, error);
                 CloseVisual(operation);
                 Publish(operation, _snapshot.Phase);
             }
@@ -414,7 +414,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     {
         lock (_gate)
         {
-            if (!operation.AScanOpened || operation.VisualError is not null || operation.CleanupRequested) { return; }
+            if (!operation.AScanOpened || operation.AScanError is not null) { return; }
         }
         try
         {
@@ -425,7 +425,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         }
         catch (Exception error)
         {
-            lock (_gate) { RecordVisualError(operation, error); CloseAScan(operation); Publish(operation, _snapshot.Phase); }
+            lock (_gate) { RecordAScanError(operation, error); CloseAScan(operation); Publish(operation, _snapshot.Phase); }
         }
     }
 
@@ -445,8 +445,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     {
         if (!operation.VisualOpened) { return; }
         operation.VisualOpened = false;
-        try { _visualSink!.CloseRun(operation.RunId); }
-        catch (Exception error) { RecordVisualError(operation, error); }
+        try { _bScanSink!.CloseRun(operation.RunId); }
+        catch (Exception error) { RecordBScanError(operation, error); }
     }
 
     private void CloseAScan(Operation operation)
@@ -454,24 +454,42 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         if (!operation.AScanOpened) { return; }
         operation.AScanOpened = false;
         try { _aScanSink!.CloseRun(operation.RunId); }
-        catch (Exception error) { RecordVisualError(operation, error); }
+        catch (Exception error) { RecordAScanError(operation, error); }
     }
 
-    private static void RecordVisualError(Operation operation, Exception error) =>
-        operation.VisualError ??= Describe("session.visual", error);
+    private static void RecordBScanError(Operation operation, Exception error)
+    {
+        operation.BScanError ??= Describe("session.visual.bscan", error);
+        operation.VisualError ??= operation.BScanError;
+        AddVisualBranchError(operation, operation.BScanError);
+    }
+
+    private static void RecordAScanError(Operation operation, Exception error)
+    {
+        operation.AScanError ??= Describe("session.visual.ascan", error);
+        operation.VisualError ??= operation.AScanError;
+        AddVisualBranchError(operation, operation.AScanError);
+    }
+
+    private static void AddVisualBranchError(Operation operation, UtSourceError error)
+    {
+        if (operation.CleanupErrors.Any(existing => existing.Code == error.Code)) { return; }
+        if (operation.CleanupErrors.Count < 8) { operation.CleanupErrors.Add(error); }
+        else { operation.AdditionalErrorCount++; }
+    }
 
     private async Task WaitForVisualCloseAsync(Operation operation)
     {
-        if (_visualSink is null) { return; }
-        try { await _visualSink.WaitForCloseAsync(operation.RunId).ConfigureAwait(false); }
-        catch (Exception error) { lock (_gate) { RecordVisualError(operation, error); } }
+        if (_bScanSink is null) { return; }
+        try { await _bScanSink.WaitForCloseAsync(operation.RunId).ConfigureAwait(false); }
+        catch (Exception error) { lock (_gate) { RecordBScanError(operation, error); } }
     }
 
     private async Task WaitForAScanCloseAsync(Operation operation)
     {
         if (_aScanSink is null) { return; }
         try { await _aScanSink.WaitForCloseAsync(operation.RunId).ConfigureAwait(false); }
-        catch (Exception error) { lock (_gate) { RecordVisualError(operation, error); } }
+        catch (Exception error) { lock (_gate) { RecordAScanError(operation, error); } }
     }
 
     private async Task SuperviseProducerAsync(Operation operation, UtAcquisitionRun run)
@@ -499,7 +517,6 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 await ObserveAsync(operation, () => run.ProducerCompletion, "session.producer").ConfigureAwait(false);
                 await operation.Supervisor.ConfigureAwait(false);
                 await ObserveAsync(operation, () => operation.Consumer, "session.reader").ConfigureAwait(false);
-                await WaitForVisualCloseAsync(operation).ConfigureAwait(false);
                 lock (_gate) { Publish(operation, SessionPhase.AwaitingFramesReleased); }
                 operation.ResourcesReleased = await ObserveAsync(operation, () => run.AllFramesReleased, "session.barrier").ConfigureAwait(false);
             }
@@ -509,11 +526,20 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 operation.ResourcesReleased = true;
             }
 
+            InspectionRunSealResult? sealedRun = null;
             if (operation.InspectionWriter is not null)
             {
-                await ObserveAsync(operation,
-                    () => operation.InspectionWriter.SealRunAsync().AsTask(), "session.seal").ConfigureAwait(false);
+                try
+                {
+                    sealedRun = await operation.InspectionWriter.SealRunAsync().ConfigureAwait(false);
+                }
+                catch (Exception error)
+                {
+                    lock (_gate) { RecordError(operation, error, "session.seal"); }
+                }
             }
+
+            await FinalizeBScanAsync(operation, sealedRun).ConfigureAwait(false);
 
             lock (_gate) { CloseAScan(operation); }
             await WaitForAScanCloseAsync(operation).ConfigureAwait(false);
@@ -548,6 +574,32 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 Complete(operation.Cleanup, operation.PrimaryException);
             }
         }
+    }
+
+    private async Task FinalizeBScanAsync(Operation operation, InspectionRunSealResult? sealedRun)
+    {
+        if (_bScanSink is null || !operation.VisualRunRequiresDrain) { return; }
+        if (_bScanSink is ICommittedTraceLifecycleSink lifecycle && sealedRun is { } final)
+        {
+            try
+            {
+                lifecycle.RequestFinalReconciliation(operation.RunId, final.FinalRevision);
+                lifecycle.StopAdmission(operation.RunId);
+                await lifecycle.WaitForDrainAsync(operation.RunId).ConfigureAwait(false);
+                lifecycle.FreezeRun(operation.RunId);
+                operation.VisualOpened = false;
+                operation.VisualRunRequiresDrain = false;
+                return;
+            }
+            catch (Exception error)
+            {
+                lock (_gate) { RecordBScanError(operation, error); }
+            }
+        }
+
+        lock (_gate) { CloseVisual(operation); }
+        await WaitForVisualCloseAsync(operation).ConfigureAwait(false);
+        operation.VisualRunRequiresDrain = false;
     }
 
     private async Task DisposeCoreAsync(Operation? operation, Task cleanup)
@@ -692,7 +744,10 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal TimeSpan LastElapsed;
         internal ConventionalUtFrameMetadata? LastMetadata;
         internal bool VisualOpened;
+        internal bool VisualRunRequiresDrain;
         internal bool AScanOpened;
+        internal UtSourceError? BScanError;
+        internal UtSourceError? AScanError;
         internal UtSourceError? VisualError;
         internal IInspectionRunWriter? InspectionWriter;
         internal ulong AcquisitionMissingFrames;

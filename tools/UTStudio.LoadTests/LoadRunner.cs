@@ -4,7 +4,6 @@ using UTStudio.Application;
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Inspection;
-using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
@@ -45,9 +44,11 @@ internal sealed class LoadRunner
             new InMemoryInspectionStoreOptions(512L * 1024 * 1024, 1_000_000));
         var visual = new AScanVisualDelivery(stores.Store,
             new InstrumentedProjector(new AScanProjector(1024), telemetry));
+        var bScanIngress = new BScanIngress(stores.Store, stores.Store,
+            new BScanOptions(maximumColumns: 1024));
         IDisposable subscription = visual.Subscribe(new SnapshotObserver(telemetry));
         var session = new ApplicationSession(observedSource, inspectionId, stores.OpenRun,
-            new InstrumentedFrameSink(NoOpFrameSink.Instance, telemetry), visual);
+            new InstrumentedCommittedSink(telemetry, bScanIngress), visual);
         var configuration = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), options.SampleCount, 50_000_000);
         using var process = Process.GetCurrentProcess();
         TimeSpan cpuOrigin = process.TotalProcessorTime, cpuActiveStart = cpuOrigin, cpuActiveEnd = cpuOrigin;
@@ -261,6 +262,8 @@ internal sealed class LoadRunner
             catch (Exception error) { failures.Add(Describe("load.source_cleanup", error)); }
             try { subscription.Dispose(); await visual.DisposeAsync().ConfigureAwait(false); }
             catch (Exception error) { failures.Add(Describe("load.visual_cleanup", error)); }
+            try { await bScanIngress.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) { failures.Add(Describe("load.bscan_cleanup", error)); }
             try
             {
                 await stores.DisposeAsync().ConfigureAwait(false);
@@ -287,14 +290,4 @@ internal sealed class LoadRunner
         public void OnError(Exception error) { }
         public void OnCompleted() { }
     }
-}
-
-internal sealed class NoOpFrameSink : IConventionalFrameSink
-{
-    internal static NoOpFrameSink Instance { get; } = new();
-    public void OpenRun(ConventionalUtFrameMetadata metadata) { }
-    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
-        TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
-    { }
-    public void CloseRun(AcquisitionRunId runId) { }
 }

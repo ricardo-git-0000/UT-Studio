@@ -85,6 +85,19 @@ Las firmas exactas pertenecen a Fase 1; la semántica aceptada es:
   de forma idempotente; no expone mmap ni archivo. `TraceSnapshot` es una copia independiente opcional.
 - `ChunkIdentity`: identidad opaca de bloque; nunca sustituye a `TraceIdentity`.
 - `InspectionRevision`: watermark monótono de commits confirmados, distinto de revisiones visuales.
+
+La reconciliación B-Scan captura primero un snapshot de estado y lee su rango en páginas acotadas.
+Como los commits publicados son inmutables, una página puede observar una revisión posterior sin
+invalidar el prefijo delimitado por ese snapshot: se confirma la revisión intermedia capturada y otra
+iteración consume la cola más reciente. Una revisión de página inferior al snapshot sí invalida el
+intento. Exigir igualdad entre todas las páginas provocaría inanición determinista bajo adquisición
+continua cuando el rango requiere más de una lectura.
+
+La proyección raster conserva la barrera exacta para vistas históricas, zoom, pan, cambios de firma,
+run y cierre. Únicamente una petición `FollowLiveWindow` puede confirmar una revisión intermedia si la
+run, fase, contrato final y rango leído siguen residentes y la autoridad solo avanzó monótonamente.
+Así la superficie progresa sin declarar como mostradas revisiones posteriores ni quedar atrapada
+persiguiendo el último commit durante adquisición continua.
 - `StoreDiagnostics`: contadores y estados acumulativos de admisión, commit, durabilidad, colas,
   leases, caché, I/O, gaps, integridad, recuperación y cierre.
 
@@ -208,8 +221,9 @@ no configuraciones prometidas. Los budgets implementables incluirán todas las c
 3. A-Scan Live observa `IUtTraceProvider` mediante una entrega latest-only; Selected obtiene snapshot
    estable por identidad.
 4. B-Scan consulta `IInspectionRangeProvider`; la selección B→A resuelve `TraceIdentity` en el store.
-5. `BScanTraceStore` se mantiene temporalmente solo como cache/proyección visual derivada alimentada
-   desde el provider. No recibe dual-write autoritativo; después se reduce o retira.
+5. La migración de Fase 4 retiró `BScanTraceStore`: B-Scan conserva únicamente derivados acotados y
+   obtiene cada payload RF mediante leases acotados a la capacidad visual y retenidos únicamente
+   durante la indexación y el raster dentro de Visualization.Core.
 
 Durante la transición se declara en cada fase una única autoridad. Cerrar/reabrir B no altera datos.
 El rango residente del provider sigue siendo autoritativo para identidad/selección; dirty solo delimita
@@ -273,8 +287,8 @@ publicaciones tardías. Los resultados `NotAvailable`, `Gap`, `OutOfRange`, `Can
 permanecen distinguibles en el diagnóstico visual; un fallo visual no revierte el commit ni detiene la
 autoridad.
 
-B-Scan permanece temporalmente como proyección derivada alimentada con el frame ya confirmado y
-`BScanTraceStore` no se elimina. La selección B→A, en cambio, resuelve la `TraceIdentity` autoritativa
+Durante Fase 3 B-Scan permaneció temporalmente como proyección derivada alimentada con el frame ya confirmado y
+`BScanTraceStore` no se eliminó. La selección B→A, en cambio, resolvía la `TraceIdentity` autoritativa
 por `AcquisitionIndex` mediante `IUtTraceProvider`; `Sequence` no sustituye al índice. La persistencia
 incremental continúa aplazada a Fase 5.
 
@@ -344,6 +358,21 @@ snapshot ya capturado.
 Los fallos internos de consulta incrementan un diagnóstico interno acotado y conservan únicamente el
 nombre del tipo de fallo; el contrato público devuelve `InternalFailure` sin excepción, mensaje ni datos
 sensibles. Las cancelaciones anteriores a captura no incrementan lecturas completadas.
+
+### Proyección B confirmada y cierre
+
+La proyección B captura un ticket inmutable con identidad completa, revisión y lifecycle autoritativos,
+rangos residente/representado, consumidor, generación y firma de render. El candidato no consulta
+estado mutable para reconstruir esa firma. Inmediatamente antes del commit se revalidan, bajo la misma
+puerta, consumidor, generación, inspection/run/stream, revisión, lifecycle y firma; un desacuerdo
+libera el candidato fuera de la puerta y solicita recovery latest-only.
+
+El cierre sigue `Open → AdmissionClosed → Draining → Frozen → Disposed`. `ApplicationSession` drena
+frames y commits admitidos, sella la run, entrega su `FinalRevision`, solicita la reconciliación B,
+espera la barrera y sólo entonces congela. La barrera incluye reconciliador, páginas, leases,
+reducciones, renders, candidatos y callbacks admitidos; no fuerza owners ni sustituye un CTS cancelado.
+El raster congelado conserva selección y navegación sobre el mapa de `TraceIdentity` que se confirmó
+con él.
 
 ## Fases
 

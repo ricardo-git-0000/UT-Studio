@@ -2,8 +2,9 @@
 
 Trazabilidad: R03–R07, R10, R13; ADR 0002, [ADR 0005](../adr/0005-initial-solution-structure.md),
 [ADR 0006](../adr/0006-session-window-lifecycle.md) y [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
-La canalización A/B actual sigue implementada; el store autoritativo RAM de Fase 1 está implementado
-pero todavía no integrado con ApplicationSession ni con los consumidores visuales.
+El store autoritativo RAM de Fase 1 está integrado con `ApplicationSession` y con A/B. B-Scan no
+recibe ni conserva muestras desde adquisición: recibe identidad y revisión confirmadas y vuelve a
+leer la autoridad mediante providers.
 
 Fuentes GigE, PCIe, simulador y reproducción entregarán datos bajo el mismo contrato propio. El adaptador PCIe encierra el SDK y sus reglas de memoria. Separar canal físico, elemento, beam y ley focal; no inferir leyes del número de elementos.
 
@@ -34,13 +35,23 @@ Hay un writer por run y lectores concurrentes. Commit de traza es todo-o-nada; i
 se sobrescribe. Duplicate, Conflict, CapacityExceeded, Cancelled y Faulted son resultados explícitos.
 Cancelación precommit revierte; después del commit no deshace datos.
 
-Flujo actual implementado: simulador → Channel → ApplicationSession (único lector) → commit autoritativo. Tras `Committed`, A recibe solo `TraceIdentity`+revisión, lee mediante `IUtTraceProvider`, proyecta bajo un lease y publica latest-only; B copia temporalmente RF/metadata confirmados a su ring derivado. Véase [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md).
+Flujo actual implementado: simulador → Channel → ApplicationSession (único lector) → commit autoritativo.
+Tras `Committed`, A y B reciben solo `TraceIdentity`+revisión. A lee mediante `IUtTraceProvider`; B
+reconcilia estado mediante `IInspectionStreamStateProvider` y lee páginas de hasta 256 posiciones con
+`IInspectionRangeProvider`. Ambos proyectan bajo leases retenidos solo en Visualization.Core. Véanse
+[ADR 0013](../adr/0013-bscan-bounded-live-visualization.md) y su refinamiento en
+[ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
 
-ApplicationSession presta `ReadOnlySpan<short>` únicamente al adaptador B transitorio durante `Accept`; A-Scan no recibe ni conserva memoria de adquisición. `AScanVisualDelivery` retiene como máximo una solicitud de identidad, libera cada lease del provider tras formar el snapshot y antes de publicación. No expone leases ni `IDisposable` a Presentation o WPF.
+ApplicationSession no presta muestras a las ramas visuales. `AScanVisualDelivery` retiene como máximo
+una solicitud de identidad. B-Scan lee lotes de 256 posiciones como máximo, reduce cada lease a
+extremos derivados y libera la página antes de continuar. Los owners raster pertenecen a
+Visualization.Core; Presentation y WPF no reciben leases RF.
 
 El presupuesto de reducción es configurable entre 4 y 1.024 puntos; conserva primero/último y extremos min/max de todos los grupos interiores en orden temporal. La publicación se limita a 30 Hz con TimeProvider monotónico, sin recuperar ticks. Ese límite no acota necesariamente el coste de proyección, que se paga por entrada interesada. Medir CPU, asignaciones, GC y backpressure y valorar una optimización previa al mailbox sigue pendiente.
 
-SessionSnapshot.VisualError informa del fallo de la rama visual sin convertirlo automáticamente en fallo de adquisición. La adquisición continúa drenando/liberando; los errores propios de adquisición y devolución de buffers mantienen su tratamiento independiente.
+`SessionSnapshot.VisualError` mantiene compatibilidad como primer error visual, pero A y B tienen
+admisión, error y continuidad independientes. Un fallo de A no impide intentar B, ni a la inversa;
+ambos se agregan con códigos estructurados sin alterar el commit autoritativo.
 
 La futura distribución tendrá ramas separadas:
 
@@ -53,10 +64,22 @@ La futura distribución tendrá ramas separadas:
 
 Este cuadro fija políticas, no decide si almacenamiento recibe datos crudos, procesados o ambos, ni el orden entre procesamiento y persistencia (Q06/Q13). Sin pérdida silenciosa no significa garantía de cero pérdida ante saturación o fallo.
 
-Los enlaces asíncronos de frames usan canales acotados con presupuesto tanto de elementos como de bytes; la entrada visual actual es síncrona y su mailbox de snapshots tiene capacidad uno. Incluir colas, ensamblados parciales, buffers en procesamiento, leases y cachés en el límite total. Presupuestar el tiempo de absorción como bytes disponibles / exceso de bytes por segundo.
-Un ChannelReader no se comparte entre consumidores competidores: dividirían frames. Para A/B, Application conserva el único lector y presta el frame a ramas visuales síncronas; B adquiere ownership propio mediante copia. Sus leases protegen exclusivamente esa copia. Procesamiento y persistencia futuros requerirán ramas separadas sin pérdida silenciosa y mantienen abierta su estrategia de ownership.
+Los enlaces asíncronos de frames usan canales acotados con presupuesto tanto de elementos como de bytes;
+la notificación visual actual es sample-free y sus mailboxes coalescen identidad/revisión. Incluir colas,
+ensamblados parciales, buffers en procesamiento, leases y caches en el límite total. Presupuestar el
+tiempo de absorción como bytes disponibles / exceso de bytes por segundo.
+Un ChannelReader no se comparte entre consumidores competidores: dividirían frames. Application conserva
+el único lector, confirma en el store y notifica A/B después del commit. Los leases de A/B protegen la
+lectura autoritativa durante la proyección; no existe copia RF propietaria de B. Procesamiento y
+persistencia futuros requerirán ramas separadas sin pérdida silenciosa y mantienen abierta su estrategia
+de ownership.
 
-La retención B se acota por bytes y columnas. Si el próximo slot está fijado, B rechaza únicamente esa columna con diagnóstico y A continúa. Una señal de capacidad uno coalesce trabajo del worker. Adquisición completa el ring y desplaza su ventana lógica con cada A-Scan; representación lee snapshots coherentes a una cadencia independiente. La publicación neutral y la aplicación de datos nuevos al bitmap se limitan a 30 Hz hasta 512 trazas y a 10 Hz por encima, mientras la ingestión puede continuar. Una publicación puede incorporar varias trazas nuevas. Versiones saltadas, wrap o cambio de región obligan a resincronizar desde una región coherente.
+La retención RF pertenece exclusivamente al store autoritativo. B mantiene sólo reducciones e
+índices derivados bajo el presupuesto visual y coalesce notificaciones como estado latest-only:
+última revisión objetivo, un worker y como máximo una solicitud pendiente. La publicación neutral y
+la aplicación al bitmap se limitan a 30 Hz hasta 512 trazas y a 10 Hz por encima. Versiones saltadas,
+cambio de revisión entre páginas o cambio de firma invalidan el candidato y solicitan una
+resincronización full coalescida.
 
 Cuando la ventana live está llena, Core produce una columna neutral por traza visible para cualquier tamaño admitido hasta 1.024. Las revisiones compatibles rasterizan solo las columnas entrantes y publican un desplazamiento horizontal entero; WPF desplaza el bitmap y escribe la franja derecha. El escalado nearest-neighbor ocupa el ancho físico sin introducir columnas negras. Cambiar la capacidad visible en live actualiza de forma coherente capacidad, viewport y petición antes de notificar layout, cancela trabajo geométricamente obsoleto y permite una sola recuperación full; después vuelve al desplazamiento incremental. Esta prioridad impide que el raster prive de atención a Stop, cierre o entrada del usuario.
 
@@ -64,9 +87,10 @@ El intervalo representado por un snapshot incremental describe únicamente su tr
 Memoria UT contigua reutilizable; evitar asignaciones innecesarias en adquisición. La implementación visual actual sí asigna puntos propios por entrada interesada; su coste está pendiente de benchmark. El contenido publicado es inmutable. Un propietario devuelve el buffer exactamente una vez; no reutilizarlo mientras un consumidor lo conserva. `Span<T>` no atraviesa esperas asíncronas; `Memory<T>` exige vida útil documentada.
 ADR 0007 define ownership del frame y adquisición; la revisión de ADR 0008 sustituye para esta rama visual su antigua transferencia a mailbox/coordinador por préstamo síncrono y liberación en Application. Frame `ReadOnlyMemory<short>` RF bipolar; representación binaria de rectificadas reales abierta. ChannelCapacity=4 y BufferCount=8 son configurables internos del simulador sujetos a benchmarks, no propiedades del contrato general. Cancelar, fallar, descartar o drenar libera todos los buffers implicados. Los observadores lentos no retienen muestras UT. El snapshot A-Scan sí sobrevive a devolver y sobrescribir el buffer UT porque posee datos independientes. Presupuestar pendiente, actual, proyección en curso y estado por suscriptor; no afirmar 30 asignaciones/s ni cuatro snapshots como límite demostrado.
 
-En live convencional, ApplicationSession entrega a un fan-out aislado: AScanVisualDelivery recibe A y
-BScanIngress recibe B. BScanVisualDelivery publica regiones latest-only; BScanViewModel conserva el
-owner y App.Wpf copia por filas al WriteableBitmap. Cerrar B retira solo su consumidor.
+En live convencional, `ApplicationSession` confirma primero el store y luego notifica de forma
+sample-free a A y B, aislando sus fallos. `BScanVisualDelivery` publica regiones latest-only;
+`BScanViewModel` conserva el owner y App.Wpf copia por filas al `WriteableBitmap`. Cerrar una ventana B
+retira sólo su consumidor.
 
 El remuestreo B-Scan propuesto no altera ese flujo ni el store. Tras la formación B específica se
 separarán intensidad neutral, máscara `NoData` autoritativa y procedencia; un servicio 2D neutral podrá
@@ -84,11 +108,20 @@ raster remuestreado o reconstruido.
 ## Saturación e integridad
 Visualización sustituye snapshots independientes pendientes mediante latest-only y cuenta esas sustituciones; no descarta frames del Channel de adquisición. Las futuras ramas de procesamiento y almacenamiento no descartan silenciosamente. Si el dispositivo permite pausar de forma segura, la coordinación puede usarlo; si se desconoce, no usar bloqueo del receptor como política de backpressure; emitir fallo observable y coordinar parada conforme a capacidades. Saturación/disco lleno produce estado de fallo observable, discontinuidad registrada y parada conforme a capacidades reales.
 Acotar ventana y plazo de reordenación/ensamblado. Detectar pérdidas, duplicados, overrun, paquetes fuera de orden e imágenes incompletas. Decidir si estas últimas se rechazan o conservan marcadas; nunca tratarlas como completas.
-Cerrar solo BScanWindow cancelará su ViewModel/solicitudes y retirará su consumidor temporal sin detener sesión. Cerrar MainWindow cerrará antes secundarias y ViewModels, luego sesión, workers/deliveries y coordinadores. El worker B deja de admitir, cancela trabajo propio y espera leases antes de devolver bloques. El único consumidor Application continúa drenando/liberando adquisición. Cinco segundos siguen siendo solo diagnóstico, sin devolución forzada.
+Cerrar sólo BScanWindow cancela su ViewModel/solicitudes y retira su consumidor temporal sin detener
+sesión. El cierre de run B es monotónico: `Open → AdmissionClosed → Draining → Frozen → Disposed`.
+`StopAdmission` no fuerza leases ni callbacks admitidos; `WaitForDrainAsync` espera reconciliación,
+páginas, reducción, raster, candidatos y callbacks; `FreezeRun` conserva navegación sobre la revisión
+sellada. Cinco segundos siguen siendo sólo diagnóstico.
 
-Métricas: bytes/frames recibidos y, cuando exista almacenamiento, persistidos; pérdidas y descartes por causa, ocupación en bytes, buffers vivos, latencia y velocidad de escritura. Los contadores de integridad se actualizan por evento; el muestreo afecta a su publicación/observación, no elimina eventos del recuento ni añade un lector competidor de frames. AScanDeliveryStatistics es actualmente una consulta bajo demanda con contadores visuales acumulados: Received cuenta llamadas a Accept; Published, confirmaciones del mailbox al store; Replaced, pendientes sustituidos. Dropped agrupa descartes y ObserverCoalesced/ObserverErrors separan coalescencia y fallos de observadores. No son contadores de persistencia ni número de callbacks. La publicación de métricas a 5 Hz y el refresco UI efectivo siguen pendientes. Los 30 Hz actuales acotan publicación y admisión de notificaciones, no necesariamente el inicio efectivo de OnNext. La saturación sostenida no se resuelve aumentando indefinidamente memoria.
+Métricas: bytes/frames recibidos y confirmados; pérdidas y descartes por causa; leases RF activos y
+máximos; bytes visuales; y tiempos separados de lectura, reducción, raster, interpolación y commit.
+Los contadores de integridad se actualizan por evento. La publicación de métricas a 5 Hz sigue
+pendiente; la saturación sostenida no se resuelve aumentando indefinidamente memoria.
 
-Requisito confirmado de suscripciones: un callback que ya comenzó puede terminar después del cierre; no deben comenzar nuevos callbacks tras cancelar la suscripción o completar la entrega. Las entregas A/B y sus ViewModels aplican barreras de cierre antes de liberar owners. Cerrar MainWindow bloquea nuevas ventanas B, cierra adaptadores/ViewModels, drena sesión y fan-out y después libera deliveries, store, coordinadores y Host.
+Un callback admitido puede terminar durante `Draining`, pero ninguno comienza tras completar esa
+barrera. Cerrar MainWindow bloquea nuevas ventanas B, drena sesión y entregas, y después libera store,
+coordinadores y Host.
 
 Las referencias históricas de ADR 0007 sobre owners en el mailbox visual quedan sustituidas por ADR 0008 para esta rama. ADR 0006 y la arquitectura general ya reflejan el ciclo de vida y la composición A/B actuales.
 

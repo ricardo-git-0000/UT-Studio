@@ -1,345 +1,532 @@
-using UTStudio.Contracts.Presentation;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 
 namespace UTStudio.Visualization.Core;
 
-/// <summary>Bounded live B-Scan ingress, index worker and exact-trace provider.</summary>
-public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, IAsyncDisposable
+/// <summary>
+/// Sample-free B-Scan range projector. Commit notifications only coalesce work; authoritative
+/// state and samples are always reacquired from the inspection providers.
+/// </summary>
+public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposable
 {
-    private const int DurationWindow = 1024;
     private readonly object _gate = new();
+    private readonly IInspectionRangeProvider _ranges;
+    private readonly IInspectionStreamStateProvider _states;
     private readonly BScanOptions _options;
-    private readonly IShortArrayPool _arrayPool;
-    private readonly ITraceCopyOwnerPool _copyPool;
     private readonly BoundedBScanVisualBufferPool _visualBuffers;
-    private readonly TimeProvider _timeProvider;
-    private readonly SemaphoreSlim _copyQuota = new(2, 2);
-    private readonly long[] _durations = new long[DurationWindow];
-    private readonly List<string> _cleanupErrors = [];
-    private BScanTraceStore? _store;
-    private ConventionalUtFrameMetadata? _metadata;
-    private SemaphoreSlim? _wake;
+    private readonly CancellationTokenSource _lifetime = new();
+    private Task _reconcile = Task.CompletedTask;
     private CancellationTokenSource? _runCancellation;
-    private CancellationTokenSource _lifetimeCancellation = new();
-    private Task? _worker;
-    private Task? _closeTask;
-    private Task? _drainTask;
+    private long _runEpoch;
+    private bool _reconcilePending;
+    private int _activeOperations;
+    private TaskCompletionSource _drained = CompletedDrain();
+    private readonly TaskCompletionSource _disposeDrained =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private BScanRunProjectionPhase _phase = BScanRunProjectionPhase.Closed;
+    private InspectionRevision? _requiredFinalRevision;
     private Task? _disposeTask;
-    private bool _open;
+    private AcquisitionRunId? _runId;
+    private UtStreamIdentity? _stream;
+    private InspectionRevision _targetRevision;
+    private readonly Dictionary<TraceIdentity, ulong> _identityRevisions = [];
     private bool _disposed;
-    private ulong _rejectedConfiguration, _rejectedClosed, _budgetExceeded;
-    private long _durationCount, _durationMaximum;
+    private long _epoch;
+    private int _activeLeases;
+    private int _maximumLeases;
+    private ulong _rangeReads;
     private string? _workerError;
-    private int _providerOperations;
-    private TaskCompletionSource? _providerDrain;
-    private long _visualEpoch;
     private BScanIngressVisualState? _visualState;
 
-    internal Action? BeforeIndexBatch { get; set; }
-    internal Action<BScanTraceIdentity>? AfterIndexCommit { get; set; }
-    internal Func<Exception?>? WorkerFailure { get; set; }
-    internal Action? AfterWorkerFailure { get; set; }
-    internal Action? BeforeProviderCopy { get; set; }
-    internal Action? AfterProviderCopy { get; set; }
     internal event Action? VisualStateChanged;
+    internal Action? BeforeReconcileWorkerExit { get; set; }
+    internal Action? BeforeVisualStateCommit { get; set; }
 
-    public BScanIngress(BScanOptions? options = null, TimeProvider? timeProvider = null)
-        : this(options, timeProvider, SharedShortArrayPool.Instance, null, null) { }
+    public BScanIngress(IInspectionRangeProvider ranges, IInspectionStreamStateProvider states,
+        BScanOptions? options = null, TimeProvider? timeProvider = null)
+        : this(ranges, states, options,
+            new BoundedBScanVisualBufferPool((options ?? new BScanOptions()).VisualMemoryBudgetBytes))
+    { }
 
-    internal BScanIngress(BScanOptions? options, TimeProvider? timeProvider,
-        IShortArrayPool arrayPool, ITraceCopyOwnerPool? copyPool,
-        BoundedBScanVisualBufferPool? visualBuffers = null)
+    internal BScanIngress(IInspectionRangeProvider ranges, IInspectionStreamStateProvider states,
+        BScanOptions? options, BoundedBScanVisualBufferPool visualBuffers)
     {
+        _ranges = ranges ?? throw new ArgumentNullException(nameof(ranges));
+        _states = states ?? throw new ArgumentNullException(nameof(states));
         _options = options ?? new();
-        _timeProvider = timeProvider ?? TimeProvider.System;
-        _arrayPool = arrayPool ?? throw new ArgumentNullException(nameof(arrayPool));
-        _visualBuffers = visualBuffers ?? new(_options.VisualMemoryBudgetBytes);
-        _copyPool = copyPool ?? new BoundedTraceCopyOwnerPool(_visualBuffers);
+        _visualBuffers = visualBuffers ?? throw new ArgumentNullException(nameof(visualBuffers));
     }
 
-    internal BoundedBScanVisualBufferPool VisualBuffers => _visualBuffers;
-
-    public void OpenRun(ConventionalUtFrameMetadata metadata)
+    public void OpenRun(AcquisitionRunId runId)
     {
-        ArgumentNullException.ThrowIfNull(metadata);
-        BScanTraceStore? previousStore;
-        Task? previousClose;
+        if (!runId.IsValid) { throw new ArgumentException("A valid run is required.", nameof(runId)); }
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_open || _closeTask is { IsCompleted: false })
-            {
-                throw new InvalidOperationException("The previous B-Scan run is still active or closing.");
-            }
-            previousStore = _store;
-            previousClose = _closeTask;
-        }
-        previousClose?.GetAwaiter().GetResult();
-        previousStore?.CloseAsync().GetAwaiter().GetResult();
-        lock (_gate)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var store = new BScanTraceStore(metadata.Configuration.SampleCount, _options, _arrayPool,
-                _visualBuffers);
-            var wake = new SemaphoreSlim(0, 1);
-            var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
-            _metadata = metadata;
-            _store = store;
-            _wake = wake;
-            _runCancellation = cancellation;
-            _open = true;
-            _closeTask = null;
+            if (_phase is not (BScanRunProjectionPhase.Closed or BScanRunProjectionPhase.Frozen))
+            { throw new InvalidOperationException("A B-Scan run is already open or draining."); }
+            if (_activeOperations != 0)
+            { throw new InvalidOperationException("The previous B-Scan run is still closing."); }
+            // The stable drain completes in the worker's finally block. Task.Run may mark its
+            // wrapper completed a few instructions later, after no admitted operation remains.
+            _reconcile = Task.CompletedTask;
+            _runId = runId;
+            _runCancellation?.Dispose();
+            _runCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            _runEpoch++;
+            _stream = null;
+            _targetRevision = InspectionRevision.Initial;
+            _requiredFinalRevision = null;
+            _identityRevisions.Clear();
+            _visualState = null;
             _workerError = null;
-            _cleanupErrors.Clear();
-            _rejectedConfiguration = 0;
-            _rejectedClosed = 0;
-            _budgetExceeded = 0;
-            _durationCount = 0;
-            _durationMaximum = 0;
-            Array.Clear(_durations);
-            _worker = Task.Run(() => RunIndexWorkerAsync(store, wake, cancellation.Token));
-            Volatile.Write(ref _visualState, new(checked(++_visualEpoch), metadata, store,
-                store.CurrentVisualState, true));
+            _reconcilePending = false;
+            _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _phase = BScanRunProjectionPhase.Open;
         }
         NotifyVisualStateChanged();
     }
 
-    public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
-        TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
+    public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision)
     {
-        ArgumentNullException.ThrowIfNull(metadata);
-        long started = _timeProvider.GetTimestamp();
-        try
+        if (!identity.IsValid) { throw new ArgumentException("A valid identity is required.", nameof(identity)); }
+        if (revision == InspectionRevision.Initial)
+        { throw new ArgumentException("A committed revision is required.", nameof(revision)); }
+        lock (_gate)
         {
-            BScanTraceStore? store;
-            SemaphoreSlim? wake;
-            lock (_gate)
-            {
-                store = _open ? _store : null;
-                wake = _wake;
-                if (store is null)
-                {
-                    _rejectedClosed++;
-                    return;
-                }
-                if (!IsCompatible(_metadata!, metadata) || samples.Length != metadata.Configuration.SampleCount ||
-                    spatialCoordinate is { IsValid: false })
-                {
-                    _rejectedConfiguration++;
-                    return;
-                }
-            }
-
-            var reservation = store.BeginWrite(samples.Length);
-            if (reservation.Kind != StoreWriteKind.Accepted)
-            {
-                lock (_gate)
-                {
-                    if (reservation.Kind == StoreWriteKind.Configuration) { _rejectedConfiguration++; }
-                    else if (reservation.Kind == StoreWriteKind.Closed) { _rejectedClosed++; }
-                }
-                return;
-            }
-
-            try
-            {
-                samples.CopyTo(reservation.Destination.Span);
-                var identity = new BScanTraceIdentity(metadata.SourceId, metadata.RunId,
-                    metadata.Configuration.PhysicalChannelId, sequence, acquisitionIndex);
-                var descriptor = new BScanTraceDescriptor(metadata, identity, acquisitionIndex, elapsedSinceRunStart,
-                    metadata.Configuration.SampleCount, metadata.Configuration.SampleRateHz,
-                    metadata.Configuration.FirstSampleOffsetSeconds, spatialCoordinate, 0, 0);
-                StoreWriteResult result = reservation.Commit(descriptor);
-                if (result.Kind == StoreWriteKind.Accepted)
-                {
-                    try { wake!.Release(); }
-                    catch (SemaphoreFullException) { }
-                }
-                else if (result.Kind == StoreWriteKind.Closed)
-                {
-                    lock (_gate) { _rejectedClosed++; }
-                }
-            }
-            catch
-            {
-                reservation.Abort();
-                throw;
-            }
-        }
-        finally
-        {
-            RecordDuration(_timeProvider.GetElapsedTime(started, _timeProvider.GetTimestamp()));
+            if (_phase != BScanRunProjectionPhase.Open || _disposed ||
+                _runId != identity.Stream.AcquisitionRunId) { return; }
+            if (_stream is { } existing && existing != identity.Stream)
+            { throw new InvalidOperationException("One B-Scan projection cannot combine inspection streams."); }
+            _stream = identity.Stream;
+            if (revision.Value > _targetRevision.Value) { _targetRevision = revision; }
+            _reconcilePending = true;
+            ScheduleReconcileUnderLock();
         }
     }
 
     public void CloseRun(AcquisitionRunId runId)
     {
-        bool changed = false;
-        if (!runId.IsValid) { throw new ArgumentException("Invalid run identifier.", nameof(runId)); }
-        lock (_gate)
-        {
-            if (!_open || _metadata?.RunId != runId) { return; }
-            _open = false;
-            _store!.StopAccepting();
-            _closeTask ??= FreezeCoreAsync(_store, _worker!, _wake!, _runCancellation!);
-            Volatile.Write(ref _visualState, new(checked(++_visualEpoch), _metadata, _store,
-                _store.CurrentVisualState, true));
-            changed = true;
-        }
-        if (changed) { NotifyVisualStateChanged(); }
+        StopAdmission(runId);
     }
 
     public ValueTask WaitForCloseAsync(AcquisitionRunId runId)
     {
+        return WaitForDrainAsync(runId);
+    }
+
+    public void RequestFinalReconciliation(AcquisitionRunId runId, InspectionRevision finalRevision)
+    {
         lock (_gate)
         {
-            if (_metadata?.RunId != runId) { return ValueTask.CompletedTask; }
-            return new(_closeTask ?? Task.CompletedTask);
+            if (_runId != runId || _phase != BScanRunProjectionPhase.Open) { return; }
+            _requiredFinalRevision = finalRevision;
+            if (finalRevision.Value > _targetRevision.Value) { _targetRevision = finalRevision; }
+            if (_stream is null)
+            {
+                _reconcilePending = false;
+                return;
+            }
+            _reconcilePending = true;
+            ScheduleReconcileUnderLock();
         }
     }
 
-    public async ValueTask<BScanTraceResult> GetTraceAsync(
-        BScanTraceIdentity identity, CancellationToken cancellationToken = default)
+    public void StopAdmission(AcquisitionRunId runId)
     {
-        if (!identity.IsValid) { return BScanTraceResult.NotAvailable(); }
-        CancellationToken lifetime;
-        BScanTraceStore? store;
+        bool changed = false;
         lock (_gate)
         {
-            if (_disposed || _store is null) { return BScanTraceResult.NotAvailable(); }
-            _providerOperations++;
-            lifetime = _open ? _runCancellation!.Token : _lifetimeCancellation.Token;
-            store = _store;
+            if (_runId != runId || _phase != BScanRunProjectionPhase.Open) { return; }
+            _phase = BScanRunProjectionPhase.AdmissionClosed;
+            if (_visualState is { } current)
+            { _visualState = current with { Phase = _phase }; changed = true; }
+            TryCompleteDrainUnderLock();
         }
+        if (changed) { NotifyVisualStateChanged(); }
+    }
 
-        bool quota = false;
+    public ValueTask WaitForDrainAsync(AcquisitionRunId runId)
+    {
+        bool changed = false;
+        lock (_gate)
+        {
+            if (_runId != runId) { return ValueTask.CompletedTask; }
+            if (_phase == BScanRunProjectionPhase.Open)
+            { throw new InvalidOperationException("B-Scan admission must be stopped before draining."); }
+            if (_phase == BScanRunProjectionPhase.AdmissionClosed)
+            {
+                _phase = BScanRunProjectionPhase.Draining;
+                if (_visualState is { } current)
+                { _visualState = current with { Phase = _phase }; changed = true; }
+            }
+            TryCompleteDrainUnderLock();
+            ValueTask drain = new(_drained.Task);
+            if (changed)
+            {
+                ThreadPool.QueueUserWorkItem(static owner =>
+                ((BScanIngress)owner!).NotifyVisualStateChanged(), this);
+            }
+            return drain;
+        }
+    }
+
+    public void FreezeRun(AcquisitionRunId runId)
+    {
+        bool changed = false;
+        lock (_gate)
+        {
+            if (_runId != runId) { return; }
+            if (_phase != BScanRunProjectionPhase.Draining)
+            { throw new InvalidOperationException("B-Scan can only freeze after entering the draining phase."); }
+            if (!_drained.Task.IsCompletedSuccessfully)
+            { throw new InvalidOperationException("B-Scan cannot freeze before the drain barrier completes."); }
+            _phase = BScanRunProjectionPhase.Frozen;
+            if (_visualState is { } current)
+            { _visualState = current with { Phase = _phase }; changed = true; }
+        }
+        if (changed) { NotifyVisualStateChanged(); }
+    }
+
+    private void ScheduleReconcileUnderLock()
+    {
+        if (_disposed || _stream is null || !_reconcilePending || !_reconcile.IsCompleted ||
+            _runCancellation is null || _phase is not (BScanRunProjectionPhase.Open or
+                BScanRunProjectionPhase.AdmissionClosed or BScanRunProjectionPhase.Draining)) { return; }
+        long epoch = _runEpoch;
+        CancellationToken token = _runCancellation.Token;
+        _activeOperations++;
+        _reconcile = Task.Run(() => ReconcileWorkerAsync(epoch, token));
+    }
+
+    private async Task ReconcileWorkerAsync(long epoch, CancellationToken token)
+    {
         try
         {
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime);
-            CancellationToken token = linked.Token;
-            await _copyQuota.WaitAsync(token).ConfigureAwait(false);
-            quota = true;
-            token.ThrowIfCancellationRequested();
-            using BScanTraceStore.BScanTraceLease? lease = store.TryAcquire(identity);
-            if (lease is null)
+            while (true)
             {
-                _copyQuota.Release();
-                quota = false;
-                return store.GetResidence(identity) == BScanResidence.Evicted
-                    ? BScanTraceResult.Evicted() : BScanTraceResult.NotAvailable();
-            }
-
-            token.ThrowIfCancellationRequested();
-            var owner = _copyPool.Rent(lease.Descriptor.SampleCount);
-            try
-            {
-                BeforeProviderCopy?.Invoke();
-                Memory<short> destination = owner.Memory[..lease.Descriptor.SampleCount];
-                const int chunkSize = 4096;
-                for (int offset = 0; offset < destination.Length; offset += chunkSize)
+                lock (_gate)
                 {
-                    token.ThrowIfCancellationRequested();
-                    int count = Math.Min(chunkSize, destination.Length - offset);
-                    lease.Samples.Span.Slice(offset, count).CopyTo(destination.Span.Slice(offset, count));
+                    if (_disposed || epoch != _runEpoch || !_reconcilePending) { return; }
+                    _reconcilePending = false;
                 }
-                AfterProviderCopy?.Invoke();
-                token.ThrowIfCancellationRequested();
-                var snapshot = new BScanTraceSnapshot(lease.Descriptor, owner, () => _copyQuota.Release());
-                quota = false;
-                return BScanTraceResult.Available(snapshot);
+                await ReconcileAsync(token).ConfigureAwait(false);
+                lock (_gate)
+                {
+                    if (!_reconcilePending || epoch != _runEpoch) { return; }
+                }
             }
-            catch
-            {
-                owner.Dispose();
-                throw;
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || lifetime.IsCancellationRequested)
-        {
-            return BScanTraceResult.Cancelled();
-        }
-        catch (Exception error)
-        {
-            return BScanTraceResult.Faulted(error);
         }
         finally
         {
-            if (quota) { _copyQuota.Release(); }
-            EndProviderOperation();
-        }
-    }
-
-    public bool TryResolveIdentity(AcquisitionRunId runId, ulong acquisitionIndex,
-        out BScanTraceIdentity identity)
-    {
-        lock (_gate)
-        {
-            if (_disposed || _metadata?.RunId != runId || _store is null)
-            { identity = default; return false; }
-            return _store.TryResolveIdentity(acquisitionIndex, out identity);
-        }
-    }
-
-    public BScanDiagnostics Diagnostics
-    {
-        get
-        {
+            BeforeReconcileWorkerExit?.Invoke();
             lock (_gate)
             {
-                StoreStatistics statistics = _store?.Statistics ?? default;
-                return new(statistics.Accepted, statistics.RejectedPinned, _rejectedConfiguration,
-                    _rejectedClosed, statistics.Evicted, statistics.Superseded, statistics.ActiveLeases,
-                    statistics.MaximumLeases, _budgetExceeded, GetDurations(), statistics.BlocksRented,
-                    statistics.BlocksReturned, statistics.LogicalBytes, statistics.RentedBytes,
-                    statistics.VisualLogicalBytes, statistics.Capacity, _workerError,
-                    [.. _cleanupErrors], statistics.Closed);
+                _activeOperations--;
+                _reconcile = Task.CompletedTask;
+                ScheduleReconcileUnderLock();
+                TryCompleteDrainUnderLock();
             }
         }
     }
 
-    public ValueTask DisposeAsync()
+    private async Task ReconcileAsync(CancellationToken token)
     {
-        lock (_gate)
+        try
         {
-            return new(_disposeTask ??= DisposeCoreAsync());
+            while (true)
+            {
+                UtStreamIdentity stream;
+                InspectionRevision target;
+                lock (_gate)
+                {
+                    if (_disposed || _stream is not { } current ||
+                        _phase is not (BScanRunProjectionPhase.Open or
+                            BScanRunProjectionPhase.AdmissionClosed or BScanRunProjectionPhase.Draining))
+                    { return; }
+                    stream = current;
+                    target = _targetRevision;
+                }
+                InspectionStreamStateReadResult state = await _states.ReadStreamStateAsync(stream, token)
+                    .ConfigureAwait(false);
+                if (!state.IsAvailable || state.Snapshot is not { } snapshot) { return; }
+                if (snapshot.CommittedTraceCount == 0 || snapshot.MinimumCommittedAcquisitionIndex is null ||
+                    snapshot.MaximumCommittedAcquisitionIndex is null) { return; }
+
+                ulong last = snapshot.MaximumCommittedAcquisitionIndex.Value;
+                ulong distance = last - snapshot.MinimumCommittedAcquisitionIndex.Value;
+                ulong span = distance >= (ulong)_options.MaximumColumns - 1
+                    ? (ulong)_options.MaximumColumns : distance + 1;
+                ulong first = last - span + 1;
+                ConventionalUtFrameMetadata? metadata = null;
+                var identities = new List<TraceIdentity>((int)span);
+                ulong cursor = first;
+                ulong remaining = span;
+                bool revisionRegressed = false;
+                while (remaining != 0)
+                {
+                    int count = (int)Math.Min(remaining, (ulong)InspectionRangeBatchSize);
+                    using InspectionRangeReadResult range = await _ranges.ReadRangeAsync(
+                        new(stream, cursor, count), token).ConfigureAwait(false);
+                    // The store is append-only for committed identities. A later revision may be
+                    // observed between bounded pages without invalidating the prefix described by
+                    // the stream-state snapshot. Publish that coherent intermediate snapshot and
+                    // let the next reconciliation consume the newer tail. Requiring equality here
+                    // starves forever once a scan takes longer than one acquisition interval.
+                    if (range.Revision.Value < snapshot.Revision.Value)
+                    { revisionRegressed = true; break; }
+                    foreach (InspectionRangeItem available in range.Items.Where(static item =>
+                        item.Status == InspectionReadStatus.Available && item.Lease is not null))
+                    {
+                        metadata ??= CreateMetadata(available.Lease!.Descriptor);
+                        identities.Add(available.Identity);
+                    }
+                    remaining -= (ulong)count;
+                    if (remaining != 0) { cursor = checked(cursor + (ulong)count); }
+                }
+                if (revisionRegressed) { continue; }
+                if (metadata is null) { return; }
+                var storeState = new BScanStoreVisualState(snapshot.Revision.Value, 0,
+                    new(snapshot.MinimumCommittedAcquisitionIndex.Value, last), snapshot.RunState,
+                    snapshot.FinalRevision?.Value, snapshot.AreWatermarksFinal,
+                    snapshot.CommittedTraceCount, snapshot.SequenceGapCount);
+                BeforeVisualStateCommit?.Invoke();
+                bool reconcileAgain;
+                lock (_gate)
+                {
+                    if (_disposed || _stream != stream) { return; }
+                    var residentIdentities = identities.ToHashSet();
+                    foreach (TraceIdentity retired in _identityRevisions.Keys
+                        .Where(identity => !residentIdentities.Contains(identity)).ToArray())
+                    { _identityRevisions.Remove(retired); }
+                    foreach (TraceIdentity identity in identities)
+                    { _identityRevisions.TryAdd(identity, snapshot.Revision.Value); }
+                    _visualState = new(checked(++_epoch), _runEpoch, metadata, stream, storeState, _phase);
+                    reconcileAgain = _targetRevision.Value > snapshot.Revision.Value ||
+                        target.Value > snapshot.Revision.Value;
+                }
+                NotifyVisualStateChanged();
+                if (!reconcileAgain) { return; }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            lock (_gate) { _workerError ??= Message(error); }
+            NotifyVisualStateChanged();
         }
     }
 
+    private const int InspectionRangeBatchSize = 256;
+
+    internal BScanPageTraversalResult VisitVisualPages(BScanProjectionTicket ticket,
+        BScanAcquisitionRange range,
+        Action<InspectionRangeReadResult> visit, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(visit);
+        var statuses = new HashSet<InspectionReadStatus>();
+        ulong distance = range.Last - range.First;
+        ulong span = distance >= (ulong)_options.MaximumColumns - 1
+            ? (ulong)_options.MaximumColumns : distance + 1;
+        ulong cursor = range.First;
+        ulong remaining = span;
+        int pages = 0;
+        int availableTotal = 0;
+        while (remaining != 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int count = (int)Math.Min(remaining, (ulong)InspectionRangeBatchSize);
+            InspectionRangeReadResult? result = null;
+            int pageLeases = 0;
+            try
+            {
+                result = _ranges.ReadRangeAsync(new(ticket.Stream, cursor, count), cancellationToken)
+                    .AsTask().GetAwaiter().GetResult();
+                Interlocked.Increment(ref _rangeReads);
+                pages++;
+                statuses.Add(result.Status);
+                foreach (InspectionRangeItem item in result.Items) { statuses.Add(item.Status); }
+                if (result.Revision.Value != ticket.AuthoritativeRevision &&
+                    (!ticket.FollowLiveWindow || result.Revision.Value < ticket.AuthoritativeRevision))
+                { return new(statuses, null, true, pages, availableTotal); }
+                if (result.Status is InspectionReadStatus.Closed or InspectionReadStatus.Cancelled or
+                    InspectionReadStatus.Faulted or InspectionReadStatus.OutOfRange)
+                { return new(statuses, result.Status, false, pages, availableTotal); }
+                pageLeases = result.Items.Count(static item =>
+                    item.Status == InspectionReadStatus.Available && item.Lease is not null);
+                int active = Interlocked.Add(ref _activeLeases, pageLeases);
+                UpdateMaximum(ref _maximumLeases, active);
+                availableTotal = checked(availableTotal + pageLeases);
+                visit(result);
+            }
+            finally
+            {
+                try { result?.Dispose(); }
+                finally
+                {
+                    if (pageLeases != 0) { Interlocked.Add(ref _activeLeases, -pageLeases); }
+                }
+            }
+            remaining -= (ulong)count;
+            if (remaining != 0) { cursor = checked(cursor + (ulong)count); }
+        }
+        return new(statuses, null, false, pages, availableTotal);
+    }
+
+    internal ulong GetVisualRevision(TraceIdentity identity)
+    { lock (_gate) { return _identityRevisions.GetValueOrDefault(identity); } }
+
+    internal bool TryGetDirtyRange(UtStreamIdentity stream, BScanAcquisitionRange represented,
+        ulong displayedRevision, out BScanAcquisitionRange dirty)
+    {
+        ulong first = ulong.MaxValue;
+        ulong last = 0;
+        lock (_gate)
+        {
+            foreach ((TraceIdentity identity, ulong revision) in _identityRevisions)
+            {
+                ulong index = identity.AcquisitionIndex;
+                if (identity.Stream != stream || revision <= displayedRevision ||
+                    index < represented.First || index > represented.Last) { continue; }
+                first = Math.Min(first, index);
+                last = Math.Max(last, index);
+            }
+        }
+        if (first == ulong.MaxValue) { dirty = default; return false; }
+        dirty = new(first, last);
+        return true;
+    }
+
+    private static ConventionalUtFrameMetadata CreateMetadata(TraceDescriptor descriptor)
+    {
+        var configuration = new ConventionalAcquisitionConfiguration(descriptor.Identity.Stream.PhysicalChannelId,
+            descriptor.SampleCount, descriptor.SampleRateHz, descriptor.FirstSampleOffsetSeconds,
+            descriptor.SignalMode);
+        DateTimeOffset started = (descriptor.TimestampUtc ?? DateTimeOffset.UnixEpoch + descriptor.ElapsedSinceRunStart) -
+            descriptor.ElapsedSinceRunStart;
+        return new(descriptor.Identity.Stream.SourceId, descriptor.Identity.Stream.AcquisitionRunId,
+            configuration, started);
+    }
+
+    internal BoundedBScanVisualBufferPool VisualBuffers => _visualBuffers;
+    internal BScanOptions Options => _options;
+    internal CancellationToken RunCancellationToken
+    { get { lock (_gate) { return _runCancellation?.Token ?? _lifetime.Token; } } }
+    internal BScanIngressVisualState? CurrentVisualState => Volatile.Read(ref _visualState);
+    internal bool TryBeginProjection(out BScanIngressVisualState? state,
+        out BScanProjectionOperation? operation)
+    {
+        lock (_gate)
+        {
+            state = _visualState;
+            if (_disposed || state is null || _phase is not (BScanRunProjectionPhase.Open or
+                BScanRunProjectionPhase.Frozen))
+            { operation = null; return false; }
+            _activeOperations++;
+            operation = new(this, state.RunGeneration);
+            return true;
+        }
+    }
+
+    internal bool IsTicketCurrent(BScanProjectionTicket ticket)
+    {
+        lock (_gate)
+        {
+            if (_disposed || _phase is not (BScanRunProjectionPhase.Open or BScanRunProjectionPhase.Frozen) ||
+                _runEpoch != ticket.RunGeneration || _visualState is not { } current ||
+                _phase != ticket.Phase || current.StreamIdentity != ticket.Stream ||
+                current.StoreState.RunState != ticket.RunState ||
+                current.StoreState.FinalRevision != ticket.FinalRevision ||
+                current.StoreState.AreWatermarksFinal != ticket.AreWatermarksFinal)
+            { return false; }
+            if (current.Epoch == ticket.StateEpoch &&
+                _targetRevision.Value == ticket.AuthoritativeRevision &&
+                current.StoreState.StoreRevision == ticket.AuthoritativeRevision &&
+                current.StoreState.ResidentRange == ticket.ResidentRange)
+            { return true; }
+            if (!ticket.FollowLiveWindow || current.StoreState.StoreRevision < ticket.AuthoritativeRevision ||
+                current.StoreState.ResidentRange is not { } resident)
+            { return false; }
+            decimal firstValue = decimal.Floor(ticket.SpatialViewport.OriginAcquisitionIndex +
+                ticket.SpatialViewport.MinimumOffset);
+            decimal lastValue = decimal.Ceiling(ticket.SpatialViewport.OriginAcquisitionIndex +
+                ticket.SpatialViewport.MaximumOffset) - 1;
+            ulong first = firstValue <= 0 ? 0 : firstValue >= ulong.MaxValue
+                ? ulong.MaxValue : (ulong)firstValue;
+            ulong last = lastValue <= 0 ? 0 : lastValue >= ulong.MaxValue
+                ? ulong.MaxValue : (ulong)lastValue;
+            ulong representedFirst = Math.Max(first, ticket.ResidentRange.First);
+            ulong representedLast = Math.Min(last, ticket.ResidentRange.Last);
+            return representedFirst <= representedLast && representedFirst >= resident.First &&
+                representedLast <= resident.Last;
+        }
+    }
+
+    internal void EndProjection(long runGeneration)
+    {
+        lock (_gate)
+        {
+            if (_runEpoch != runGeneration)
+            { throw new InvalidOperationException("B-Scan projection completed against a different run generation."); }
+            if (_activeOperations <= 0) { throw new InvalidOperationException("B-Scan operation ledger underflow."); }
+            _activeOperations--;
+            if (_disposed && _activeOperations == 0) { _disposeDrained.TrySetResult(); }
+            TryCompleteDrainUnderLock();
+        }
+    }
+
+    private void TryCompleteDrainUnderLock()
+    {
+        if (_phase is not (BScanRunProjectionPhase.AdmissionClosed or BScanRunProjectionPhase.Draining) ||
+            _activeOperations != 0 ||
+            _reconcilePending) { return; }
+        if (_stream is not null && _requiredFinalRevision is { } required &&
+            (_visualState?.StoreState.StoreRevision ?? 0) != required.Value)
+        {
+            _drained.TrySetException(new InvalidOperationException(
+                $"B-Scan did not reconcile final revision {required.Value}."));
+            return;
+        }
+        if (_workerError is { } error)
+        { _drained.TrySetException(new InvalidOperationException(error)); return; }
+        _drained.TrySetResult();
+    }
+
+    private static TaskCompletionSource CompletedDrain()
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        completion.SetResult();
+        return completion;
+    }
+    internal long VisualBytesReserved => 0;
+    public BScanDiagnostics Diagnostics => new(_rangeReads, 0, 0, 0, 0, 0,
+        Volatile.Read(ref _activeLeases), Volatile.Read(ref _maximumLeases), 0,
+        new(0, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero), 0, 0, 0, 0,
+        0, _options.MaximumColumns, _workerError, [], _disposed);
+
     internal void Stop()
     {
-        bool notify = false;
         lock (_gate)
         {
             if (_disposed) { return; }
             _disposed = true;
-            _lifetimeCancellation.Cancel();
-            if (_open)
-            {
-                _open = false;
-                _store!.StopAccepting();
-                _closeTask ??= FreezeCoreAsync(_store, _worker!, _wake!, _runCancellation!);
-            }
-            if (_store is not null && _metadata is not null)
-            {
-                Volatile.Write(ref _visualState, new(checked(++_visualEpoch), _metadata, _store,
-                    _store.CurrentVisualState, false));
-                notify = true;
-            }
-            Task closeAndReturn = CloseAndReturnStoreAsync(_closeTask ?? Task.CompletedTask, _store);
-            _drainTask ??= DrainCoreAsync(
-                closeAndReturn,
-                _providerOperations == 0 ? Task.CompletedTask :
-                    (_providerDrain ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task);
+            _phase = BScanRunProjectionPhase.Disposed;
+            _lifetime.Cancel();
+            if (_activeOperations == 0) { _disposeDrained.TrySetResult(); }
         }
-        if (notify) { NotifyVisualStateChanged(); }
     }
 
     internal Task WaitForDrainAsync(CancellationToken cancellationToken = default)
     {
         Stop();
         Task drain;
-        lock (_gate) { drain = _drainTask!; }
+        lock (_gate) { drain = Task.WhenAll(_reconcile, _disposeDrained.Task); }
         return cancellationToken.CanBeCanceled ? drain.WaitAsync(cancellationToken) : drain;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        lock (_gate) { return new(_disposeTask ??= DisposeCoreAsync()); }
     }
 
     private async Task DisposeCoreAsync()
@@ -347,247 +534,22 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
         Stop();
         await WaitForDrainAsync().ConfigureAwait(false);
         await _visualBuffers.DisposeAsync().ConfigureAwait(false);
-        _lifetimeCancellation.Dispose();
-    }
-
-    private static async Task DrainCoreAsync(Task close, Task providers)
-    {
-        List<Exception> failures = [];
-        try { await close.ConfigureAwait(false); }
-        catch (Exception error) { AddFailures(failures, error); }
-        try { await providers.ConfigureAwait(false); }
-        catch (Exception error) { AddFailures(failures, error); }
-        if (failures.Count != 0) { throw new AggregateException("B-Scan ingress drain failed.", failures); }
-    }
-
-    private async Task FreezeCoreAsync(BScanTraceStore store, Task worker, SemaphoreSlim wake,
-        CancellationTokenSource cancellation)
-    {
-        List<Exception> failures = [];
-        try
-        {
-            await store.WaitForWritersAsync().ConfigureAwait(false);
-            try { wake.Release(); } catch (SemaphoreFullException) { }
-        }
-        catch (Exception error) { failures.Add(error); }
-        try { await worker.ConfigureAwait(false); }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested ||
-            _lifetimeCancellation.IsCancellationRequested)
-        { }
-        catch (Exception error)
-        {
-            lock (_gate) { _workerError ??= Message(error); }
-            failures.Add(error);
-        }
-        try
-        {
-            wake.Dispose();
-            cancellation.Dispose();
-        }
-        catch (Exception error) { failures.Add(error); }
-        if (failures.Count != 0) { throw new AggregateException("B-Scan run cleanup failed.", failures); }
-    }
-
-    private async Task CloseAndReturnStoreAsync(Task frozen, BScanTraceStore? store)
-    {
-        List<Exception> failures = [];
-        try { await frozen.ConfigureAwait(false); }
-        catch (Exception error) { AddFailures(failures, error); }
-        if (store is not null)
-        {
-            try { await store.CloseAsync().ConfigureAwait(false); }
-            catch (Exception error)
-            {
-                AddFailures(failures, error);
-                lock (_gate)
-                {
-                    IEnumerable<Exception> errors = error is AggregateException aggregate
-                        ? aggregate.Flatten().InnerExceptions : [error];
-                    foreach (Exception cleanupError in errors)
-                    {
-                        if (_cleanupErrors.Count == 8) { break; }
-                        _cleanupErrors.Add(Message(cleanupError));
-                    }
-                }
-            }
-        }
-        if (failures.Count != 0) { throw new AggregateException("B-Scan store cleanup failed.", failures); }
-    }
-
-    private static void AddFailures(List<Exception> failures, Exception error)
-    {
-        if (error is AggregateException aggregate) { failures.AddRange(aggregate.Flatten().InnerExceptions); }
-        else { failures.Add(error); }
-    }
-
-    private async Task IndexLoopAsync(BScanTraceStore store, SemaphoreSlim wake, CancellationToken token)
-    {
-        using IBScanVisualBufferOwner<BScanIndexedMinMax> bucketsOwner =
-            _visualBuffers.Rent<BScanIndexedMinMax>(store.BucketCount,
-                BScanVisualBufferKind.DetachedIndex);
-        BScanIndexedMinMax[] buckets = bucketsOwner.Array;
-        var candidates = new BScanIndexCandidate[store.Capacity];
-        while (true)
-        {
-            await wake.WaitAsync(token).ConfigureAwait(false);
-            token.ThrowIfCancellationRequested();
-            BeforeIndexBatch?.Invoke();
-            if (WorkerFailure?.Invoke() is { } failure) { throw failure; }
-            int candidateCount = store.CaptureIndexCandidates(candidates);
-            for (int candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++)
-            {
-                (BScanTraceIdentity identity, ulong generation) = candidates[candidateIndex];
-                token.ThrowIfCancellationRequested();
-                using BScanTraceStore.BScanTraceLease? lease = store.TryAcquire(identity, generation);
-                if (lease is null)
-                {
-                    if (!token.IsCancellationRequested) { store.RecordSuperseded(); }
-                    continue;
-                }
-                BuildIndexedIndex(lease.Samples.Span, _options.IndexBucketSamples, buckets);
-                if (store.CommitIndex(identity, generation, buckets))
-                {
-                    PublishVisualState(store);
-                    AfterIndexCommit?.Invoke(identity);
-                    NotifyVisualStateChanged();
-                }
-            }
-            if (!store.IsAccepting) { return; }
-        }
-    }
-
-    private async Task RunIndexWorkerAsync(BScanTraceStore store, SemaphoreSlim wake, CancellationToken token)
-    {
-        try { await IndexLoopAsync(store, wake, token).ConfigureAwait(false); }
-        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-        catch (Exception error)
-        {
-            lock (_gate) { _workerError ??= Message(error); }
-            AfterWorkerFailure?.Invoke();
-            throw;
-        }
-    }
-
-    internal static void BuildIndex(ReadOnlySpan<short> samples, int bucketSamples, Span<BScanMinMax> destination)
-    {
-        int required = checked((samples.Length + bucketSamples - 1) / bucketSamples);
-        if (destination.Length < required) { throw new ArgumentException("Index destination is too short.", nameof(destination)); }
-        for (int bucket = 0; bucket < required; bucket++)
-        {
-            int start = checked(bucket * bucketSamples);
-            ReadOnlySpan<short> source = samples.Slice(start, Math.Min(bucketSamples, samples.Length - start));
-            short minimum = source[0], maximum = source[0];
-            for (int index = 1; index < source.Length; index++)
-            {
-                if (source[index] < minimum) { minimum = source[index]; }
-                if (source[index] > maximum) { maximum = source[index]; }
-            }
-            destination[bucket] = new(minimum, maximum);
-        }
-    }
-
-    private static void BuildIndexedIndex(ReadOnlySpan<short> samples, int bucketSamples,
-        Span<BScanIndexedMinMax> destination)
-    {
-        int required = checked((samples.Length + bucketSamples - 1) / bucketSamples);
-        if (destination.Length < required) { throw new ArgumentException("Index destination is too short.", nameof(destination)); }
-        for (int bucket = 0; bucket < required; bucket++)
-        {
-            int start = checked(bucket * bucketSamples);
-            ReadOnlySpan<short> source = samples.Slice(start, Math.Min(bucketSamples, samples.Length - start));
-            short minimum = source[0], maximum = source[0];
-            int minimumOffset = start, maximumOffset = start;
-            for (int index = 1; index < source.Length; index++)
-            {
-                if (source[index] < minimum) { minimum = source[index]; minimumOffset = start + index; }
-                if (source[index] > maximum) { maximum = source[index]; maximumOffset = start + index; }
-            }
-            destination[bucket] = new(minimum, checked((ushort)minimumOffset),
-                maximum, checked((ushort)maximumOffset));
-        }
+        _runCancellation?.Dispose();
+        _lifetime.Dispose();
     }
 
     private void NotifyVisualStateChanged()
     {
-        Delegate[] observers = VisualStateChanged?.GetInvocationList() ?? [];
-        foreach (Action observer in observers)
-        {
-            try { observer(); }
-            catch { /* Visual observers cannot terminate the indexing worker. */ }
-        }
+        foreach (Action observer in VisualStateChanged?.GetInvocationList() ?? [])
+        { try { observer(); } catch { } }
     }
 
-    internal BScanMinMax[]? CopyIndexForDiagnostics(BScanTraceIdentity identity) => _store?.CopyIndex(identity);
-    internal int PendingWorkerSignals => _wake?.CurrentCount ?? 0;
-    internal int VisualCapacity { get { lock (_gate) { return _store?.Capacity ?? 0; } } }
-    internal long VisualBytesReserved { get { lock (_gate) { return _store?.VisualLogicalBytes ?? 0; } } }
-    internal BScanOptions Options => _options;
-    internal ConventionalUtFrameMetadata? CurrentMetadata { get { lock (_gate) { return _disposed ? null : _metadata; } } }
-    internal BScanIngressVisualState? CurrentVisualState => Volatile.Read(ref _visualState);
-    internal BScanVisualLeaseBatch? CaptureVisualLeases(CancellationToken cancellationToken,
-        out BScanIngressVisualState? visualState, out BScanStoreVisualState state)
+    private static void UpdateMaximum(ref int target, int value)
     {
-        visualState = Volatile.Read(ref _visualState);
-        if (visualState is not { IsOpen: true } current)
-        { state = null!; return null; }
-        return current.Store.CaptureVisualLeases(current.StoreState, cancellationToken, out state);
+        int observed;
+        while (value > (observed = Volatile.Read(ref target)) &&
+            Interlocked.CompareExchange(ref target, value, observed) != observed) { }
     }
-
-    private void PublishVisualState(BScanTraceStore store)
-    {
-        lock (_gate)
-        {
-            if (_disposed || !ReferenceEquals(_store, store) || _metadata is null) { return; }
-            Volatile.Write(ref _visualState, new(checked(++_visualEpoch), _metadata, store,
-                store.CurrentVisualState, _open));
-        }
-    }
-
-    private static bool IsCompatible(ConventionalUtFrameMetadata expected, ConventionalUtFrameMetadata actual) =>
-        expected.SourceId == actual.SourceId && expected.RunId == actual.RunId &&
-        expected.Configuration.PhysicalChannelId == actual.Configuration.PhysicalChannelId &&
-        expected.Configuration.SampleCount == actual.Configuration.SampleCount &&
-        expected.Configuration.SampleRateHz.Equals(actual.Configuration.SampleRateHz) &&
-        expected.Configuration.FirstSampleOffsetSeconds.Equals(actual.Configuration.FirstSampleOffsetSeconds) &&
-        expected.Configuration.SignalMode == actual.Configuration.SignalMode &&
-        expected.RunStartedAtUtc == actual.RunStartedAtUtc;
-
-    private void EndProviderOperation()
-    {
-        TaskCompletionSource? drain = null;
-        lock (_gate)
-        {
-            _providerOperations--;
-            if (_providerOperations == 0) { drain = _providerDrain; }
-        }
-        drain?.TrySetResult();
-    }
-
-    private void RecordDuration(TimeSpan elapsed)
-    {
-        long ticks = Math.Max(0, elapsed.Ticks);
-        lock (_gate)
-        {
-            long index = _durationCount++;
-            _durations[index % DurationWindow] = ticks;
-            _durationMaximum = Math.Max(_durationMaximum, ticks);
-            if (elapsed > _options.AcceptDiagnosticBudget) { _budgetExceeded++; }
-        }
-    }
-
-    private BScanAcceptDurationStatistics GetDurations()
-    {
-        int count = (int)Math.Min(_durationCount, DurationWindow);
-        if (count == 0) { return new(0, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero); }
-        long[] values = _durations[..count].ToArray();
-        Array.Sort(values);
-        return new(_durationCount, TimeSpan.FromTicks(Percentile(values, 50)),
-            TimeSpan.FromTicks(Percentile(values, 95)), TimeSpan.FromTicks(Percentile(values, 99)),
-            TimeSpan.FromTicks(_durationMaximum));
-    }
-
-    private static long Percentile(long[] values, int percentile) =>
-        values[Math.Max(0, (int)Math.Ceiling(values.Length * percentile / 100d) - 1)];
 
     private static string Message(Exception error) =>
         string.IsNullOrWhiteSpace(error.Message) ? error.GetType().Name : error.Message;
@@ -595,11 +557,22 @@ public sealed class BScanIngress : IConventionalFrameSink, IBScanTraceProvider, 
 
 internal sealed record BScanIngressVisualState(
     long Epoch,
+    long RunGeneration,
     ConventionalUtFrameMetadata Metadata,
-    BScanTraceStore Store,
+    UtStreamIdentity StreamIdentity,
     BScanStoreVisualState StoreState,
-    bool IsOpen)
+    BScanRunProjectionPhase Phase)
 {
+    internal bool IsOpen => Phase == BScanRunProjectionPhase.Open;
+    internal bool IsProjectable => Phase is BScanRunProjectionPhase.Open or BScanRunProjectionPhase.Frozen;
     internal BScanStreamIdentity Stream => new(Metadata.SourceId, Metadata.RunId,
         Metadata.Configuration.PhysicalChannelId);
+}
+
+internal enum BScanRunProjectionPhase { Closed, Open, AdmissionClosed, Draining, Frozen, Disposed }
+
+internal sealed class BScanProjectionOperation(BScanIngress owner, long runGeneration) : IDisposable
+{
+    private BScanIngress? _owner = owner;
+    public void Dispose() => Interlocked.Exchange(ref _owner, null)?.EndProjection(runGeneration);
 }

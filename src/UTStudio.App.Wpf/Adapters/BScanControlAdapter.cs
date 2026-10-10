@@ -76,8 +76,26 @@ internal sealed class BScanControlAdapter : IDisposable
     private void OnTimeZoom(object? s, BScanTimeZoomRequestedEventArgs e) => _viewModel.ZoomTimeAt(e.AnchorSeconds, e.Factor);
     private void OnSpatialZoom(object? s, BScanSpatialZoomRequestedEventArgs e) => _viewModel.ZoomSpatialAt(e.AnchorRatio, e.Factor);
     private void OnPan(object? s, BScanPanRequestedEventArgs e) { _viewModel.PanTimeBy(e.TimeDeltaSeconds); _viewModel.PanSpatialBy(e.SpatialDelta); }
-    private async void OnColumn(object? s, BScanColumnRequestedEventArgs e) =>
-        await SelectColumnAsync(e.AcquisitionIndex);
+    private async void OnColumn(object? s, BScanColumnRequestedEventArgs e)
+    {
+        if (e.RasterPixelX is { } pixel)
+        { await SelectPixelAsync(pixel, e.AcquisitionIndex); }
+        else { await SelectColumnAsync(e.AcquisitionIndex); }
+    }
+
+    private async Task SelectPixelAsync(int pixel, ulong requestedIndex)
+    {
+        if (_disposed) { return; }
+        _requestedColumn = requestedIndex;
+        _control.SelectedAcquisitionIndex = requestedIndex;
+        try { await _viewModel.SelectPixelAsync(pixel); }
+        catch (Exception error) { _viewModel.ReportUiInteractionError(error.Message); }
+        finally
+        {
+            if (_requestedColumn == requestedIndex) { _requestedColumn = null; }
+            if (!_disposed) { PublishState(); }
+        }
+    }
 
     internal async Task SelectColumnAsync(ulong acquisitionIndex)
     {

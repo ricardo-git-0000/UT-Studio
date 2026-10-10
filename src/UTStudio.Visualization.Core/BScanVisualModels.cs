@@ -1,5 +1,7 @@
 using System.Buffers;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
 using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Visualization.Core;
@@ -166,6 +168,40 @@ public sealed record BScanRenderRequest(
     }
 }
 
+internal sealed record BScanProjectionTicket(
+    InspectionId InspectionId,
+    AcquisitionRunId RunId,
+    UtStreamIdentity Stream,
+    ulong AuthoritativeRevision,
+    InspectionRunState RunState,
+    ulong? FinalRevision,
+    bool AreWatermarksFinal,
+    BScanRunProjectionPhase Phase,
+    BScanAcquisitionRange ResidentRange,
+    string ConsumerId,
+    long ConsumerLifetime,
+    long RequestGeneration,
+    long RunGeneration,
+    long StateEpoch,
+    BScanSpatialViewport SpatialViewport,
+    ScanTimeViewport TimeViewport,
+    int PixelWidth,
+    int PixelHeight,
+    ulong RenderConfigurationVersion,
+    Scan2DResamplingOptions Resampling,
+    bool FollowLiveWindow)
+{
+    internal static BScanProjectionTicket Create(BScanIngressVisualState state,
+        BScanRenderRequest request, long consumerLifetime, long requestGeneration) =>
+        new(state.StreamIdentity.InspectionId, state.Metadata.RunId, state.StreamIdentity,
+            state.StoreState.StoreRevision, state.StoreState.RunState, state.StoreState.FinalRevision,
+            state.StoreState.AreWatermarksFinal, state.Phase,
+            state.StoreState.ResidentRange ?? throw new InvalidOperationException("Resident range is unavailable."),
+            request.ConsumerId, consumerLifetime, requestGeneration, state.RunGeneration, state.Epoch,
+            request.SpatialViewport, request.TimeViewport, request.PixelWidth, request.PixelHeight,
+            request.RenderConfigurationVersion, request.EffectiveResampling, request.FollowLiveWindow);
+}
+
 public readonly record struct BScanRenderSignature(BScanSpatialViewport SpatialViewport,
     ScanTimeViewport TimeViewport, int PixelWidth, int PixelHeight, ulong RenderConfigurationVersion,
     Scan2DResamplingOptions Resampling = default);
@@ -195,13 +231,26 @@ public sealed record BScanVisualSnapshot(
 {
     public string ConsumerId { get; init; } = "default";
     public BScanStreamIdentity Stream { get; init; }
+    public UtStreamIdentity TraceStream { get; init; }
+    public IReadOnlyDictionary<ulong, TraceIdentity> AvailableTraceIdentities { get; init; } =
+        new Dictionary<ulong, TraceIdentity>();
+    public IReadOnlyList<TraceIdentity?> SelectableTraceIdentities { get; init; } =
+        Array.AsReadOnly(Array.Empty<TraceIdentity?>());
+    public IReadOnlySet<InspectionReadStatus> NoDataStatuses { get; init; } =
+        new HashSet<InspectionReadStatus>();
+    public InspectionRunState RunState { get; init; }
+    public ulong? FinalRevision { get; init; }
+    public bool AreWatermarksFinal { get; init; }
+    public int CommittedTraceCount { get; init; }
+    public int CommittedGapCount { get; init; }
     public int HorizontalPixelShift { get; init; }
     public Scan2DResamplingOptions Resampling { get; init; }
 }
 
 public sealed record BScanVisualUpdate(BScanVisualSnapshot Snapshot);
 
-public enum BScanRasterResultKind { Available, NotAvailable, Stale, ResourceLimit, Cancelled, Faulted }
+public enum BScanRasterResultKind
+{ Available, NotAvailable, Closed, OutOfRange, Stale, ResourceLimit, Cancelled, Faulted }
 
 public interface IBScanRasterRegionProvider
 {
@@ -229,6 +278,8 @@ public sealed class BScanRasterResult
     public string? Error { get; }
     internal static BScanRasterResult Available(BScanRasterRegion region) => new(BScanRasterResultKind.Available, region, null);
     internal static BScanRasterResult NotAvailable() => new(BScanRasterResultKind.NotAvailable, null, null);
+    internal static BScanRasterResult Closed() => new(BScanRasterResultKind.Closed, null, null);
+    internal static BScanRasterResult OutOfRange() => new(BScanRasterResultKind.OutOfRange, null, null);
     internal static BScanRasterResult Stale() => new(BScanRasterResultKind.Stale, null, null);
     internal static BScanRasterResult ResourceLimit(string error) => new(BScanRasterResultKind.ResourceLimit, null, error);
     internal static BScanRasterResult Cancelled() => new(BScanRasterResultKind.Cancelled, null, null);

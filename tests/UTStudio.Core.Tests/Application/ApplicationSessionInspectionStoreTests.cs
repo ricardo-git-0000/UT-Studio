@@ -1,6 +1,5 @@
 using UTStudio.Application;
 using UTStudio.Contracts.Inspection;
-using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
@@ -225,32 +224,122 @@ public sealed class ApplicationSessionInspectionStoreTests
         Assert.AreEqual(0, stores.Store.Diagnostics.Runs![0].PendingOperations);
     }
 
+    [TestMethod]
+    public async Task AScanNotifyFailureDoesNotPreventBScanNotification()
+    {
+        await using var source = new ManualSessionSource();
+        var inspectionId = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspectionId,
+            new InMemoryInspectionStoreOptions(1024, 10));
+        var bScan = new CountingSink();
+        var aScan = new FailingNotifySink();
+        await using var session = new ApplicationSession(source, inspectionId, stores.OpenRun,
+            bScan, aScan);
+        await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
+
+        var owner = source.QueueFrame(0);
+        await owner.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(1, bScan.AcceptCount);
+        Assert.AreEqual(1, aScan.NotifyAttempts);
+        Assert.AreEqual(1, session.Snapshot.CleanupErrors.Count(
+            static error => error.Code == "session.visual.ascan"));
+    }
+
+    [TestMethod]
+    public async Task BScanNotifyFailureDoesNotPreventAScanNotification()
+    {
+        await using var source = new ManualSessionSource();
+        var inspectionId = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspectionId,
+            new InMemoryInspectionStoreOptions(1024, 10));
+        var bScan = new FailingNotifySink();
+        var aScan = new CountingSink();
+        await using var session = new ApplicationSession(source, inspectionId, stores.OpenRun,
+            bScan, aScan);
+        await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
+
+        var owner = source.QueueFrame(0);
+        await owner.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(1, aScan.AcceptCount);
+        Assert.AreEqual(1, bScan.NotifyAttempts);
+        Assert.AreEqual(1, session.Snapshot.CleanupErrors.Count(
+            static error => error.Code == "session.visual.bscan"));
+    }
+
+    [TestMethod]
+    public async Task StopPublishesFinalRevisionThenDrainsAndFreezesBScan()
+    {
+        await using var source = new ManualSessionSource();
+        var inspectionId = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspectionId,
+            new InMemoryInspectionStoreOptions(1024, 10));
+        var sink = new RecordingLifecycleSink(stores.Store);
+        await using var session = new ApplicationSession(source, inspectionId, stores.OpenRun, sink);
+        await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
+        var owner = source.QueueFrame(0);
+        await owner.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
+
+        CollectionAssert.AreEqual(new[] { "final:1", "stop", "drain", "freeze" }, sink.Events);
+        Assert.AreEqual(1, stores.Store.Diagnostics.SealedRuns);
+    }
+
     private sealed class StoreCheckingSink(IInspectionDataStore store, InspectionId inspectionId,
-        AcquisitionRunId runId, UtSourceId sourceId) : IConventionalFrameSink
+        AcquisitionRunId runId, UtSourceId sourceId) : ICommittedTraceSink
     {
         public int AcceptCount { get; private set; }
-        public void OpenRun(ConventionalUtFrameMetadata metadata) { }
-        public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
-            TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples)
+        public void OpenRun(AcquisitionRunId runId) { }
+        public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision)
         {
-            var identity = new TraceIdentity(new UtStreamIdentity(inspectionId, runId, sourceId,
-                metadata.Configuration.PhysicalChannelId), acquisitionIndex);
             InspectionTraceReadResult read = store.ReadAsync(identity).AsTask().GetAwaiter().GetResult();
             using IInspectionTraceLease lease = read.Lease!;
             Assert.AreEqual(InspectionReadStatus.Available, read.Status);
-            Assert.AreEqual(samples[0], lease.Samples[0]);
+            Assert.AreEqual(identity.Stream.InspectionId, inspectionId);
+            Assert.AreEqual(identity.Stream.AcquisitionRunId, runId);
+            Assert.AreEqual(identity.Stream.SourceId, sourceId);
             AcceptCount++;
         }
         public void CloseRun(AcquisitionRunId runId) { }
     }
 
-    private sealed class CountingSink : IConventionalFrameSink
+    private sealed class CountingSink : ICommittedTraceSink
     {
         public int AcceptCount { get; private set; }
-        public void OpenRun(ConventionalUtFrameMetadata metadata) { }
-        public void Accept(ConventionalUtFrameMetadata metadata, ulong sequence, ulong acquisitionIndex,
-            TimeSpan elapsedSinceRunStart, ScanSpatialCoordinate? spatialCoordinate, ReadOnlySpan<short> samples) =>
-            AcceptCount++;
+        public void OpenRun(AcquisitionRunId runId) { }
+        public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision) => AcceptCount++;
         public void CloseRun(AcquisitionRunId runId) { }
+    }
+
+    private sealed class FailingNotifySink : ICommittedTraceSink
+    {
+        internal int NotifyAttempts { get; private set; }
+        public void OpenRun(AcquisitionRunId runId) { }
+        public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision)
+        { NotifyAttempts++; throw new InvalidOperationException("synthetic A failure"); }
+        public void CloseRun(AcquisitionRunId runId) { }
+    }
+
+    private sealed class RecordingLifecycleSink(IInspectionDataStore store) : ICommittedTraceLifecycleSink
+    {
+        internal List<string> Events { get; } = [];
+        public void OpenRun(AcquisitionRunId runId) { }
+        public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision) { }
+        public void CloseRun(AcquisitionRunId runId) => StopAdmission(runId);
+        public ValueTask WaitForCloseAsync(AcquisitionRunId runId) => WaitForDrainAsync(runId);
+        public void RequestFinalReconciliation(AcquisitionRunId runId, InspectionRevision finalRevision)
+        {
+            Assert.AreEqual(finalRevision, store.Revision);
+            Assert.AreEqual(1, store.Diagnostics.SealedRuns);
+            Events.Add($"final:{finalRevision.Value}");
+        }
+        public void StopAdmission(AcquisitionRunId runId) => Events.Add("stop");
+        public ValueTask WaitForDrainAsync(AcquisitionRunId runId)
+        { Events.Add("drain"); return ValueTask.CompletedTask; }
+        public void FreezeRun(AcquisitionRunId runId) => Events.Add("freeze");
     }
 }

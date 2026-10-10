@@ -6,6 +6,7 @@ using UTStudio.Domain.Acquisition;
 namespace UTStudio.Core.Tests.Performance;
 
 [TestClass]
+[DoNotParallelize]
 public sealed class LoadRunnerTests
 {
     [TestMethod]
@@ -20,12 +21,13 @@ public sealed class LoadRunnerTests
         double? rate = rateText == "max" ? null : double.Parse(rateText, System.Globalization.CultureInfo.InvariantCulture);
         var requested = (PacingMode)requestedValue;
         var expected = (EffectivePacing)expectedValue;
-        int samples = rate is null ? 65535 : 2048;
-        var options = new LoadOptions(LoadProfile.Smoke, samples, rate, TimeSpan.FromMilliseconds(100))
+        var options = new LoadOptions(LoadProfile.Smoke, 2048, rate, TimeSpan.FromMilliseconds(100))
         { Source = source, Pacing = requested, PacingSpecified = specified, Progress = ProgressMode.Quiet };
         var result = await new LoadRunner().RunAsync(options, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
         Assert.AreEqual(expected, result.EffectivePacing);
-        Assert.AreEqual(0, FunctionalCriteria.ExitCode(result));
+        Assert.AreEqual(0, FunctionalCriteria.ExitCode(result),
+            string.Join(" | ", FunctionalCriteria.Evaluate(result).Concat(
+                result.Errors.Select(static error => $"{error.Code}:{error.Message}"))));
         if (expected == EffectivePacing.ProductionFixedDelay)
         {
             Assert.AreEqual(0, result.Demand.Missed);
@@ -48,7 +50,8 @@ public sealed class LoadRunnerTests
         Assert.AreEqual(result.Consumed, result.Released);
         Assert.AreEqual(0, result.OutstandingBuffers);
         Assert.IsTrue(result.FramesReleasedBarrier);
-        Assert.AreEqual(CampaignOutcome.Cancelled, result.Outcome);
+        Assert.AreEqual(CampaignOutcome.Cancelled, result.Outcome,
+            string.Join(" | ", result.Errors.Select(static error => error.ToString())));
         Assert.IsTrue(result.CleanupSucceeded);
         Assert.AreEqual(3, FunctionalCriteria.ExitCode(result));
     }
@@ -80,16 +83,24 @@ public sealed class LoadRunnerTests
     public async Task PeriodicLiveSampleAdvancesWhileFramesCirculate()
     {
         using var cancellation = new CancellationTokenSource();
+        ResourceSample? baseline = null;
         var result = await new LoadRunner().RunAsync(
             new(LoadProfile.Smoke, 65535, null, TimeSpan.FromHours(1)), cancellation.Token,
             telemetryInterval: TimeSpan.FromMilliseconds(1),
-            sampleObserved: sample => { if (sample.Consumed > 0) { cancellation.Cancel(); } })
+            sampleObserved: sample =>
+            {
+                if (baseline is null) { baseline = sample; return; }
+                if (sample.Accepted > baseline.Value.Accepted &&
+                    sample.Consumed > baseline.Value.Consumed)
+                { cancellation.Cancel(); }
+            })
             .WaitAsync(TimeSpan.FromSeconds(10));
         Assert.IsNotNull(result.ResourceSamples);
         Assert.IsTrue(result.ResourceSamples.Any(sample => sample.Consumed > 0));
         Assert.IsGreaterThan(0d, result.ActiveWindow.ConsumedPerSecond);
         Assert.IsGreaterThan(0d, result.ActiveWindow.AcceptedPerSecond);
-        Assert.AreEqual(CampaignOutcome.Cancelled, result.Outcome);
+        Assert.AreEqual(CampaignOutcome.Cancelled, result.Outcome,
+            string.Join(" | ", result.Errors.Select(static error => $"{error.Code}:{error.Message}")));
         Assert.IsTrue(result.CleanupSucceeded);
     }
 

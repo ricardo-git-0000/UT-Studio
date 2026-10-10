@@ -8,7 +8,6 @@ using UTStudio.Application;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
-using UTStudio.Contracts.Presentation;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
@@ -92,6 +91,7 @@ public sealed class DesktopRuntime
     private async Task WaitForPipelineDrainAsync()
     {
         List<Exception> failures = [];
+        ObserveLifecycle("phase6.wait");
         Task[] drains =
         [
             CaptureDrain(() => _bScanVisual?.WaitForDrainAsync() ?? Task.CompletedTask, failures),
@@ -184,12 +184,12 @@ public sealed class DesktopRuntime
 
     // Deterministic partial-construction fault injection, without changing neutral APIs.
     internal static Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, string[]? args, TimeProvider clock,
-        Action<string>? checkpoint) => CreateAsync(dispatcher, args, clock, checkpoint, null, null, null, null, null, null);
+        Action<string>? checkpoint) => CreateAsync(dispatcher, args, clock, checkpoint, null, null, null, null, null);
 
     internal static async Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, string[]? args, TimeProvider clock,
         Action<string>? checkpoint, IUtFrameSource? controlledSource,
         ConventionalAcquisitionConfiguration? controlledConfiguration, BScanOptions? bScanOptions,
-        IShortArrayPool? tracePool, IByteOwnerPool? rasterPool, Action<string>? lifecycleObserver)
+        IByteOwnerPool? rasterPool, Action<string>? lifecycleObserver)
     {
         var runtime = new DesktopRuntime(clock, lifecycleObserver);
         try
@@ -224,9 +224,8 @@ public sealed class DesktopRuntime
             var inspectionStores = runtime._inspectionStores = new InspectionDataStoreRegistry(
                 new InspectionId(Guid.NewGuid()), inspectionOptions);
             var visual = runtime._visual = new AScanVisualDelivery(inspectionStores.Store, timeProvider: clock);
-            var bScanIngress = runtime._bScanIngress = tracePool is null
-                ? new BScanIngress(bScanOptions, clock)
-                : new BScanIngress(bScanOptions, clock, tracePool, SharedTraceCopyOwnerPool.Instance);
+            var bScanIngress = runtime._bScanIngress = new BScanIngress(
+                inspectionStores.Store, inspectionStores.Store, bScanOptions, clock);
             var bScanVisual = runtime._bScanVisual = rasterPool is null
                 ? new BScanVisualDelivery(bScanIngress, clock)
                 : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
@@ -235,8 +234,7 @@ public sealed class DesktopRuntime
                 runId => inspectionStores.OpenRun(runId), bScanIngress, visual);
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
-            var selection = runtime._selection = new BScanSelectionCoordinator(dispatcher, bScanIngress,
-                selectionResolver, inspectionStores.InspectionId);
+            var selection = runtime._selection = new BScanSelectionCoordinator(dispatcher, selectionResolver);
             var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, configuration,
                 readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges, timeViewport: timeViewport,
                 selectionCoordinator: selection);
@@ -249,7 +247,6 @@ public sealed class DesktopRuntime
             if (simulator is not null) { builder.Services.AddSingleton(simulator); }
             builder.Services.AddSingleton<IUtFrameSource>(source);
             builder.Services.AddSingleton(visual);
-            builder.Services.AddSingleton<IConventionalFrameSink>(bScanIngress);
             builder.Services.AddSingleton<IObservable<AScanSnapshot>>(visual);
             builder.Services.AddSingleton(session);
             builder.Services.AddSingleton(inspectionStores);

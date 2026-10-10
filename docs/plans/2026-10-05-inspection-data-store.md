@@ -1,6 +1,6 @@
 # Plan por fases del almacén autoritativo de inspección
 
-Estado: Fases 0, 1 y 2 completadas. Fase 3 en curso; validación y gates pendientes.
+Estado: Fases 0 a 4 completadas. Persistencia (Fase 5) no iniciada.
 Fuente normativa: [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
 
 ## Reglas transversales
@@ -80,21 +80,20 @@ identidad. Mantener navegación temporal, límites de publicación y cierre del 
 
 Gate: coalescencia visual no afecta contadores del store; selección exacta sobre revisión estable.
 
-En curso: la sesión confirma primero y notifica solo identidad+revisión; A-Scan usa un mailbox
+Implementado: la sesión confirma primero y notifica solo identidad+revisión; A-Scan usa un mailbox
 latest-only, adquiere un lease de `IUtTraceProvider`, proyecta bajo el lease y publica solo si run y
 generación siguen vigentes. El cierre bloquea nuevas notificaciones, cancela candidatos no iniciados y
 espera lecturas/callbacks admitidos sin forzar leases. La selección B→A usa el provider autoritativo y
 `AcquisitionIndex`. B-Scan conserva temporalmente su proyección derivada; persistencia sigue aplazada.
-No se declara completada hasta retirar leases de Presentation, añadir la cobertura determinista exigida
-y dejar verdes Core, WPF y las repeticiones de cierre.
+Los leases permanecen dentro de Visualization.Core y la cobertura determinista de cierre está verde.
 
 ## Fase 4 — B-Scan sobre rangos
 
-Consumir páginas/rangos del provider; mantener temporalmente `BScanTraceStore` solo como caché derivada
-o adaptador, migrar selección B→A y retirarlo progresivamente. Conservar rango residente vs dirty,
+Consumir páginas/rangos del provider, migrar selección B→A y retirar completamente el ingreso y store
+RF visual legacy. Conservar rango residente vs dirty,
 gaps, resync, budgets, leases breves y cierre/reapertura de ventana.
 
-Gate: el store es la única autoridad; `BScanTraceStore` es solo cache/proyección derivada temporal;
+Gate: el store es la única autoridad; no existe copia RF en un store B-Scan;
 selección B→A usa `TraceIdentity`; cerrar B no pierde datos; ventanas 256/1.024 respetan budget.
 
 Decisión confirmada para esta fase: `IInspectionStreamStateProvider`, separado de
@@ -110,6 +109,16 @@ El resultado usa estados explícitos `Unknown`, `Available`, `NotAvailable`, `Cl
 `default` es `Unknown`. La cancelación se decide dentro de la puerta del store antes de capturar; una
 captura ya linealizada permanece válida. `Snapshot.RunState=Faulted` describe lifecycle y no debe
 confundirse con `Status=Faulted`, que describe un fallo de la consulta.
+
+Implementado: `BScanIngress` es un proyector sample-free que implementa el lifecycle extendido de
+`ICommittedTraceSink`. Las
+notificaciones coalescen trabajo y la reconciliación consulta estado y rangos autoritativos en páginas
+de 256 posiciones. Cada página reduce y devuelve todos sus leases antes de leer la siguiente; sólo
+se conservan extremos min/max y owners de raster derivados. El ticket inmutable se revalida bajo el
+gate de publicación y el lifecycle drena antes de congelar. `ResidentRange` procede de watermarks y
+`RepresentedRange` de la publicación; `NotAvailable` ocupa NoData, los gaps de `Sequence` no crean
+columnas y selección usa la `TraceIdentity` exacta disponible. Se retiraron `IConventionalFrameSink`,
+el fan-out RF, `BScanTraceStore` y sus identidades paralelas.
 
 ## Fase 5 — Persistencia incremental
 

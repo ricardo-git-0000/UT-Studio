@@ -6,7 +6,7 @@ namespace UTStudio.Tests.Wpf;
 
 internal static class StaTest
 {
-    internal static Task Run(Func<Task> test)
+    internal static Task Run(Func<Task> test, TimeSpan? timeout = null)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
@@ -28,6 +28,6 @@ internal static class StaTest
         { IsBackground = true };
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
-        return completion.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        return completion.Task.WaitAsync(timeout ?? TimeSpan.FromSeconds(15));
     }
 }

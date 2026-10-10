@@ -10,8 +10,8 @@ internal static class DesktopRuntimeFactory
 {
     internal static Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, IUtFrameSource source,
         ConventionalAcquisitionConfiguration configuration, BScanOptions bScanOptions, TimeProvider clock,
-        IShortArrayPool? tracePool = null, IByteOwnerPool? rasterPool = null,
+        IByteOwnerPool? rasterPool = null,
         Action<string>? lifecycleObserver = null) =>
-        DesktopRuntime.CreateAsync(dispatcher, [], clock, null, source, configuration, bScanOptions, tracePool, rasterPool,
+        DesktopRuntime.CreateAsync(dispatcher, [], clock, null, source, configuration, bScanOptions, rasterPool,
             lifecycleObserver);
 }

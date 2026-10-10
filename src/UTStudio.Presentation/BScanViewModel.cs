@@ -2,6 +2,7 @@ using System.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Presentation;
@@ -241,12 +242,16 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         RequestRefresh();
     });
 
-    public async Task SelectColumnAsync(BScanTraceIdentity identity)
+    public async Task SelectColumnAsync(TraceIdentity identity)
     {
         Task selection = Task.CompletedTask;
         await _lifetime.InvokeAsync(() =>
         {
-            if (IsClosing || _state.RunId != identity.RunId) { return; }
+            BScanRasterRegion? visible;
+            lock (_gate) { visible = _visibleRegion; }
+            if (IsClosing || _state.RunId != identity.Stream.AcquisitionRunId || visible is null ||
+                visible.Snapshot.TraceStream != identity.Stream ||
+                !visible.Snapshot.AvailableTraceIdentities.Values.Contains(identity)) { return; }
             ReplaceState(_state with { SelectedColumn = identity });
             selection = _selection.SelectAsync(_consumerId, identity);
         }).ConfigureAwait(false);
@@ -259,9 +264,29 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         Task selection = Task.CompletedTask;
         await _lifetime.InvokeAsync(() =>
         {
-            if (IsClosing || _state.RunId is not { } run || _state.ResidentRange is not { } resident ||
-                acquisitionIndex < resident.First || acquisitionIndex > resident.Last) { return; }
-            selection = _selection.SelectAsync(_consumerId, run, acquisitionIndex);
+            BScanRasterRegion? visible;
+            lock (_gate) { visible = _visibleRegion; }
+            if (IsClosing || visible is null) { return; }
+            if (!visible.Snapshot.AvailableTraceIdentities.TryGetValue(acquisitionIndex,
+                out TraceIdentity identity)) { return; }
+            selection = _selection.SelectAsync(_consumerId, identity);
+        }).ConfigureAwait(false);
+        await selection.ConfigureAwait(false);
+        await _lifetime.InvokeAsync(ApplySelection).ConfigureAwait(false);
+    }
+
+    public async Task SelectPixelAsync(int rasterPixelX)
+    {
+        Task selection = Task.CompletedTask;
+        await _lifetime.InvokeAsync(() =>
+        {
+            BScanRasterRegion? visible;
+            lock (_gate) { visible = _visibleRegion; }
+            if (IsClosing || visible is null || (uint)rasterPixelX >=
+                (uint)visible.Snapshot.SelectableTraceIdentities.Count ||
+                visible.Snapshot.SelectableTraceIdentities[rasterPixelX] is not { } identity) { return; }
+            ReplaceState(_state with { SelectedColumn = identity });
+            selection = _selection.SelectAsync(_consumerId, identity);
         }).ConfigureAwait(false);
         await selection.ConfigureAwait(false);
         await _lifetime.InvokeAsync(ApplySelection).ConfigureAwait(false);
@@ -732,11 +757,9 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     {
         BScanSelectionState selection = _selection.State;
         bool compatible = selection.RunId is null || selection.RunId == _state.RunId;
-        if (compatible && selection.Identity is { } identity && _latestMetadata?.Stream is { } stream &&
-            stream.RunId.IsValid)
+        if (compatible && selection.Identity is { } identity && _latestMetadata is { } metadata)
         {
-            compatible = identity.SourceId == stream.SourceId && identity.RunId == stream.RunId &&
-                identity.PhysicalChannelId == stream.PhysicalChannelId;
+            compatible = identity.Stream == metadata.TraceStream;
         }
         if (!compatible) { return; }
         ReplaceState(_state with

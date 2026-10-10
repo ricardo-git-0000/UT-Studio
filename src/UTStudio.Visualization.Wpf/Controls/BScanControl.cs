@@ -17,8 +17,11 @@ public sealed class BScanSpatialZoomRequestedEventArgs(decimal anchorRatio, deci
 { public decimal AnchorRatio { get; } = anchorRatio; public decimal Factor { get; } = factor; }
 public sealed class BScanPanRequestedEventArgs(double timeDeltaSeconds, decimal spatialDelta) : EventArgs
 { public double TimeDeltaSeconds { get; } = timeDeltaSeconds; public decimal SpatialDelta { get; } = spatialDelta; }
-public sealed class BScanColumnRequestedEventArgs(ulong acquisitionIndex) : EventArgs
-{ public ulong AcquisitionIndex { get; } = acquisitionIndex; }
+public sealed class BScanColumnRequestedEventArgs(ulong acquisitionIndex, int? rasterPixelX = null) : EventArgs
+{
+    public ulong AcquisitionIndex { get; } = acquisitionIndex;
+    public int? RasterPixelX { get; } = rasterPixelX;
+}
 public sealed class BScanRasterSizeRequestedEventArgs(int pixelWidth, int pixelHeight, ulong configurationVersion) : EventArgs
 { public int PixelWidth { get; } = pixelWidth; public int PixelHeight { get; } = pixelHeight; public ulong ConfigurationVersion { get; } = configurationVersion; }
 
@@ -53,6 +56,7 @@ public sealed class BScanControl : FrameworkElement
     private MouseButton? _panButton;
     private Point _lastPosition;
     private ulong _renderConfigurationVersion;
+    private int _requestedRasterWidth, _requestedRasterHeight;
     private long _rasterGeneration;
     private readonly Func<ModifierKeys> _modifiers;
     private readonly Func<IInputElement, Point> _position;
@@ -104,6 +108,7 @@ public sealed class BScanControl : FrameworkElement
     internal int ActivePooledRasterBytes => _activePooledRasterBytes;
     internal int PeakPooledRasterBytes => _peakPooledRasterBytes;
     internal int ActiveCandidateBitmaps => Volatile.Read(ref _activeCandidateBitmaps);
+    internal string? LastIncrementalRejection { get; private set; }
     internal bool HasSelectionVisual => _hasSelectionVisual;
     internal int? FailFullCommitAtRow { get; set; }
     internal int? FailIncrementalCommitAtRow { get; set; }
@@ -139,9 +144,9 @@ public sealed class BScanControl : FrameworkElement
         { throw new ArgumentException("A full refresh must cover the complete raster.", nameof(descriptor)); }
         if (descriptor.HorizontalPixelShift < 0 || descriptor.HorizontalPixelShift >= descriptor.RasterWidth ||
             descriptor.HorizontalPixelShift > 0 &&
-            (descriptor.RequiresFullRefresh || descriptor.AffectedRegion.X !=
-                descriptor.RasterWidth - descriptor.HorizontalPixelShift ||
-             descriptor.AffectedRegion.Width != descriptor.HorizontalPixelShift))
+            (descriptor.RequiresFullRefresh ||
+             descriptor.AffectedRegion.X + descriptor.AffectedRegion.Width != descriptor.RasterWidth ||
+             descriptor.AffectedRegion.Width < descriptor.HorizontalPixelShift))
         { throw new ArgumentException("Invalid B-Scan horizontal shift descriptor.", nameof(descriptor)); }
         bool recreate = _bitmap is null || _bitmap.PixelWidth != descriptor.RasterWidth ||
             _bitmap.PixelHeight != descriptor.RasterHeight || _bitmap.DpiX != dpiX || _bitmap.DpiY != dpiY;
@@ -153,7 +158,15 @@ public sealed class BScanControl : FrameworkElement
             _applied.Resampling != descriptor.Resampling ||
             (_applied.SpatialViewport != descriptor.SpatialViewport && descriptor.HorizontalPixelShift == 0) ||
             _applied.TimeViewport != descriptor.TimeViewport))
-        { FullRefreshRequired?.Invoke(this, EventArgs.Empty); return false; }
+        {
+            LastIncrementalRejection = $"recreate={recreate}; applied={_applied is not null}; " +
+                $"appliedRevision={_applied?.StoreRevision}; base={descriptor.BaseStoreRevision}; " +
+                $"appliedConfig={_applied?.RenderConfigurationVersion}; config={descriptor.RenderConfigurationVersion}; " +
+                $"appliedViewport={_applied?.SpatialViewport}; viewport={descriptor.SpatialViewport}; " +
+                $"shift={descriptor.HorizontalPixelShift}; appliedMode={_applied?.Resampling.Mode}; mode={descriptor.Resampling.Mode}";
+            FullRefreshRequired?.Invoke(this, EventArgs.Empty); return false;
+        }
+        LastIncrementalRejection = null;
         int stagedStride = checked(descriptor.AffectedRegion.Width * 4);
         int stagedBytes = checked(stagedStride * descriptor.AffectedRegion.Height);
         byte[] staging = RentRasterBuffer(stagedBytes);
@@ -386,6 +399,9 @@ public sealed class BScanControl : FrameworkElement
         {
             int width = Math.Clamp(checked((int)Math.Ceiling(plot.Width * dpi.DpiScaleX)), 1, 1024);
             int height = Math.Clamp(checked((int)Math.Ceiling(plot.Height * dpi.DpiScaleY)), 1, 1024);
+            if (width == _requestedRasterWidth && height == _requestedRasterHeight) { return; }
+            _requestedRasterWidth = width;
+            _requestedRasterHeight = height;
             RasterSizeRequested?.Invoke(this, new(width, height, ++_renderConfigurationVersion));
         }
     }
@@ -458,13 +474,14 @@ public sealed class BScanControl : FrameworkElement
         Point position = _position(this);
         bool onSelection = HitSelection(position);
         bool hasColumn = TryAcquisitionIndex(position, out ulong index);
+        _ = TryRasterPixelX(position, out int rasterPixelX);
         if (_clickCount(args) == 2 && PlotBounds().Contains(position) && !onSelection)
         { ResetAllRequested?.Invoke(this, EventArgs.Empty); args.Handled = true; return; }
         if ((_modifiers() & ModifierKeys.Shift) != 0 && !onSelection)
         { BeginPan(position, args); return; }
         if (hasColumn)
         {
-            ColumnRequested?.Invoke(this, new(index));
+            ColumnRequested?.Invoke(this, new(index, rasterPixelX));
             if (onSelection && CaptureMouse()) { _selectingColumn = true; _panButton = args.ChangedButton; }
             args.Handled = true;
         }
@@ -484,8 +501,10 @@ public sealed class BScanControl : FrameworkElement
         if (!_interactionEnabled) { return; }
         if (_selectingColumn)
         {
-            if (TryAcquisitionIndex(_position(this), out ulong index) && index != SelectedAcquisitionIndex)
-            { ColumnRequested?.Invoke(this, new(index)); }
+            Point position = _position(this);
+            if (TryAcquisitionIndex(position, out ulong index) && index != SelectedAcquisitionIndex &&
+                TryRasterPixelX(position, out int rasterPixelX))
+            { ColumnRequested?.Invoke(this, new(index, rasterPixelX)); }
             args.Handled = true;
             return;
         }
@@ -524,6 +543,16 @@ public sealed class BScanControl : FrameworkElement
         if (absolute < 0 || absolute > ulong.MaxValue) { return false; }
         index = (ulong)Math.Floor(absolute);
         index = Math.Clamp(index, resident.First, resident.Last);
+        return true;
+    }
+
+    private bool TryRasterPixelX(Point point, out int pixel)
+    {
+        Rect plot = PlotBounds();
+        if (Snapshot is not { RasterWidth: > 0 } snapshot || plot.Width <= 0 ||
+            !plot.Contains(point)) { pixel = 0; return false; }
+        pixel = Math.Clamp((int)((point.X - plot.Left) / plot.Width * snapshot.RasterWidth),
+            0, snapshot.RasterWidth - 1);
         return true;
     }
 

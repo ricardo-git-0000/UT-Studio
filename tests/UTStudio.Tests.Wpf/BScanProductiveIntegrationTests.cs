@@ -2,7 +2,9 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using UTStudio.App.Wpf;
 using UTStudio.App.Wpf.Services;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
@@ -202,6 +204,7 @@ public sealed class BScanProductiveIntegrationTests
     {
         await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
         await fixture.WaitForRevisionAsync(4);
+        await fixture.WaitForBootstrapDrainAsync();
         Assert.IsTrue(fixture.Delivery.RegisterConsumer("second"));
         long before = fixture.Delivery.RenderRequestCount;
 
@@ -237,7 +240,7 @@ public sealed class BScanProductiveIntegrationTests
         BScanRenderRequest bootstrapB = fixture.Delivery.GetLastRequest(fixture.ViewModel.ConsumerId)!;
         Assert.AreEqual(nextRunId, bootstrapB.RunId);
         long requestsAfterBootstrapB = fixture.Delivery.RenderRequestCount;
-        BScanVisualAuditEntry admittedB = fixture.Delivery.AuditSnapshot.Entries.Single(entry =>
+        BScanVisualAuditEntry admittedB = fixture.Delivery.AuditSnapshot.Entries.Last(entry =>
             entry.Kind == BScanVisualAuditEventKind.BuildAdmitted && entry.RunId == nextRunId);
 
         fixture.Delivery.RequestRender(lateRunA);
@@ -282,7 +285,7 @@ public sealed class BScanProductiveIntegrationTests
     });
 
     [TestMethod]
-    public Task Real_delivery_viewmodel_adapter_control_commits_full_and_incrementals() => StaTest.Run(async () =>
+    public Task Frozen_viewport_ignores_commits_outside_its_represented_range() => StaTest.Run(async () =>
     {
         await using var fixture = await ProductiveBScanFixture.CreateAsync(128);
         await fixture.WaitForRevisionAsync(128);
@@ -299,10 +302,10 @@ public sealed class BScanProductiveIntegrationTests
             expectedRevision += (ulong)accumulated;
             fixture.Delivery.RequestRender(fixture.Request());
             fixture.Clock.Advance(BScanVisualDelivery.MinimumPublicationInterval);
-            await fixture.WaitForRevisionAsync(expectedRevision);
+            await Task.Delay(50);
             Assert.AreSame(bitmap, fixture.Control.RasterSource);
-            Assert.AreEqual(expectedRevision, fixture.Control.AppliedSnapshot!.StoreRevision);
-            Assert.IsFalse(fixture.Control.AppliedSnapshot.RequiresFullRefresh);
+            Assert.AreEqual(128UL, fixture.Control.AppliedSnapshot!.StoreRevision);
+            Assert.AreEqual(128UL, fixture.ViewModel.State.DisplayedRevision?.StoreRevision);
             fixture.AssertOpenBalances();
         }
     });
@@ -418,8 +421,10 @@ public sealed class BScanProductiveIntegrationTests
         await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
         await fixture.WaitForRevisionAsync(4);
         await fixture.AddIndexedAsync(400);
-        var identity = new BScanTraceIdentity(fixture.Metadata.SourceId, fixture.Metadata.RunId,
-            fixture.Metadata.Configuration.PhysicalChannelId, 4, 400);
+        var identity = new TraceIdentity(new UtStreamIdentity(
+            new InspectionId(Guid.Parse("98000000-0000-0000-0000-000000000098")),
+            fixture.Metadata.RunId, fixture.Metadata.SourceId,
+            fixture.Metadata.Configuration.PhysicalChannelId), 400);
 
         await fixture.ViewModel.SelectColumnAsync(identity);
 
@@ -440,6 +445,7 @@ public sealed class BScanProductiveIntegrationTests
         await fixture.WaitForRevisionAsync(4);
         fixture.Ingress.CloseRun(fixture.Metadata.RunId);
         await fixture.Ingress.WaitForCloseAsync(fixture.Metadata.RunId);
+        fixture.Ingress.FreezeRun(fixture.Metadata.RunId);
 
         await fixture.Adapter.SelectColumnAsync(2);
 
@@ -471,6 +477,7 @@ public sealed class BScanProductiveIntegrationTests
         await fixture.WaitForRevisionAsync(128);
         fixture.Ingress.CloseRun(fixture.Metadata.RunId);
         await fixture.Ingress.WaitForCloseAsync(fixture.Metadata.RunId);
+        fixture.Ingress.FreezeRun(fixture.Metadata.RunId);
         BScanPresentedRegionToken previous = fixture.ViewModel.State.Region!.Token;
 
         fixture.ViewModel.ChangeResamplingModeCommand.Execute(Scan2DInterpolationMode.Bicubic);

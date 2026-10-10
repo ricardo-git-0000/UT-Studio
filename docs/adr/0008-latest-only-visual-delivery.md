@@ -15,7 +15,8 @@ Esta revisión prevalece para la rama visual sobre las referencias anteriores a 
 `Simulador -> Channel -> ApplicationSession -> IConventionalFrameSink.Accept -> AScanProjector -> AScanSnapshot -> mailbox latest-only -> publicación observable`.
 
 - ApplicationSession conserva el único lector de UtAcquisitionRun.Frames. El B-Scan aprobado añadirá un fan-out visual síncrono, ordenado y aislado por rama; no añadirá otro lector.
-- La sesión recibe opcionalmente [IConventionalFrameSink](../../src/UTStudio.Contracts/Presentation/IConventionalFrameSink.cs); un puerto nulo conserva el comportamiento sin entrega visual. Application no referencia Visualization.Core.
+- Histórico sustituido por ADR 0013: la sesión recibía opcionalmente el contrato retirado
+  `IConventionalFrameSink`; un puerto nulo conservaba el comportamiento sin entrega visual.
 - OpenRun recibe la metadata completa para reservar antes del primer préstamo. Accept recibe datos per-frame, incluido `AcquisitionIndex` y posición opcional, además del `ReadOnlySpan<short>` prestado. Ninguna rama puede retener span, aliases ni owner. A conserva su proyección latest-only; B copia al ring propio dentro de Accept y difiere índice, tiles y publicación. Un fallo B no cierra A y viceversa. `WaitForCloseAsync` constituye la barrera de cleanup previa a otra run. Véase [ADR 0013](0013-bscan-bounded-live-visualization.md).
 - ApplicationSession conserva el frame y lo libera en finally, también si falla la transformación o entrega. Ninguna espera de observadores conserva muestras UT.
 - [AScanVisualDelivery](../../src/UTStudio.Visualization.Core/AScanVisualDelivery.cs) implementa el puerto y proyecta fuera del bloqueo del mailbox. Confirma el resultado solo si la ejecución y generación siguen vigentes. Sin suscriptores evita proyección y acumulación.

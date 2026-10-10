@@ -1,6 +1,8 @@
 using BenchmarkDotNet.Attributes;
 using System.Buffers;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
 
@@ -160,7 +162,7 @@ public class BScanBipolarMappingBenchmarks
 [MemoryDiagnoser]
 public class BScanIncrementalRasterBenchmarks
 {
-    [Params(1, 8)] public int DirtyColumns { get; set; }
+    [Params(1, 8, 33, 100)] public int DirtyColumns { get; set; }
     private BScanVisualBenchmarkFixture _fixture = null!;
     [IterationSetup] public void Setup() => _fixture = BScanVisualBenchmarkFixture.CreateIncremental(DirtyColumns, wrap: false);
     [IterationCleanup] public void Cleanup() => _fixture.Dispose();
@@ -216,9 +218,24 @@ public class BScanPublicationAdmissionBenchmarks
     public void SupersedeCandidate() => _withObserver.RequestSupersession();
 }
 
+[MemoryDiagnoser]
+public class BScanReconciliationLifecycleBenchmarks
+{
+    private BScanVisualBenchmarkFixture _fixture = null!;
+    [IterationSetup] public void Setup() => _fixture = BScanVisualBenchmarkFixture.Create(256, 2048, 256);
+    [IterationCleanup] public void Cleanup() => _fixture.Dispose();
+
+    [Benchmark(Description = "B-Scan recovers a deliberately omitted committed notification")]
+    public ulong LostNotificationRecovery() => _fixture.ReconcileAfterLostNotification();
+
+    [Benchmark(Description = "B-Scan closes admission, drains and freezes")]
+    public void CloseDrainFreeze() => _fixture.CloseDrainFreeze();
+}
+
 internal sealed class BScanVisualBenchmarkFixture : IDisposable
 {
     private readonly BScanIngress _ingress;
+    private readonly BenchmarkInspectionProvider _provider;
     private readonly BScanVisualDelivery _delivery;
     private readonly BScanRenderRequest _request;
     private BScanRenderRequest _preparedRequest;
@@ -237,43 +254,44 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
         }
     }
 
-    private BScanVisualBenchmarkFixture(BScanIngress ingress, BScanVisualDelivery delivery,
+    private BScanVisualBenchmarkFixture(BScanIngress ingress, BenchmarkInspectionProvider provider,
+        BScanVisualDelivery delivery,
         BScanRenderRequest request)
-    { _ingress = ingress; _delivery = delivery; _request = request; _preparedRequest = request; }
+    { _ingress = ingress; _provider = provider; _delivery = delivery; _request = request; _preparedRequest = request; }
 
     internal static BScanVisualBenchmarkFixture Create(int columns, int samples, int rasterSize,
         bool subscribe = false, int? initialColumns = null,
         Scan2DInterpolationMode mode = Scan2DInterpolationMode.None)
     {
         int initial = initialColumns ?? columns;
-        var options = new BScanOptions(32L * 1024 * 1024, 16L * 1024 * 1024,
+        var options = new BScanOptions(16L * 1024 * 1024,
             columns, columns, 64);
-        var ingress = new BScanIngress(options);
         var metadata = BenchmarkData.Metadata(samples);
-        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        int remaining = initial;
-        ingress.AfterIndexCommit = _ => { if (Interlocked.Decrement(ref remaining) == 0) { indexed.TrySetResult(); } };
-        ingress.OpenRun(metadata);
+        var provider = new BenchmarkInspectionProvider(metadata);
+        var ingress = new BScanIngress(provider, provider, options);
+        ingress.OpenRun(metadata.RunId);
         short[] data = BenchmarkData.Samples(samples);
+        TraceIdentity latest = default;
         for (int column = 0; column < initial; column++)
         {
-            ingress.Accept(metadata, (ulong)column, (ulong)column, TimeSpan.FromTicks(column), null, data);
+            latest = provider.Append((ulong)column, data);
         }
-        indexed.Task.WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult();
+        ingress.NotifyCommitted(latest, provider.Revision);
+        SpinWait.SpinUntil(() => ingress.CurrentVisualState is not null, TimeSpan.FromSeconds(30));
         var delivery = new BScanVisualDelivery(ingress);
         var range = new BScanAcquisitionRange(0, (ulong)columns - 1);
         var time = ScanTimeViewportOperations.Create(metadata.Configuration.FirstSampleOffsetSeconds,
             metadata.Configuration.FirstSampleOffsetSeconds + samples / metadata.Configuration.SampleRateHz);
         var request = new BScanRenderRequest(metadata.RunId, BScanSpatialViewportOperations.Reset(range),
             time, rasterSize, rasterSize, 1, Resampling: new(mode));
-        var fixture = new BScanVisualBenchmarkFixture(ingress, delivery, request) { _sequence = (ulong)initial };
+        var fixture = new BScanVisualBenchmarkFixture(ingress, provider, delivery, request) { _sequence = (ulong)initial };
         if (subscribe) { fixture._subscription = delivery.Subscribe(new Observer()); }
         return fixture;
     }
 
     internal static BScanVisualBenchmarkFixture CreateIncremental(int dirtyColumns, bool wrap)
     {
-        const int capacity = 16;
+        int capacity = Math.Max(128, dirtyColumns + 4);
         BScanVisualBenchmarkFixture fixture = Create(capacity, 2048, 256,
             initialColumns: wrap ? capacity : 4);
         using BScanRasterRegion baseline = fixture.GetRegion(fixture._request);
@@ -314,6 +332,26 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
         _delivery.RequestRender(_request with { PixelWidth = 256 });
     }
 
+    internal ulong ReconcileAfterLostNotification()
+    {
+        short[] data = BenchmarkData.Samples(2048);
+        _ = _provider.Append(_sequence++, data);
+        TraceIdentity latest = _provider.Append(_sequence++, data);
+        _ingress.NotifyCommitted(latest, _provider.Revision);
+        if (!SpinWait.SpinUntil(() => _ingress.CurrentVisualState?.StoreState.StoreRevision ==
+            _provider.Revision.Value, TimeSpan.FromSeconds(30)))
+        { throw new TimeoutException("Lost-notification reconciliation did not complete."); }
+        return _ingress.CurrentVisualState!.StoreState.StoreRevision;
+    }
+
+    internal void CloseDrainFreeze()
+    {
+        AcquisitionRunId run = _request.RunId;
+        _ingress.StopAdmission(run);
+        _ingress.WaitForDrainAsync(run).AsTask().GetAwaiter().GetResult();
+        _ingress.FreezeRun(run);
+    }
+
     private BScanRasterRegion GetRegion(BScanRenderRequest request)
     {
         BScanRasterResult result = _delivery.GetRegionAsync(request).AsTask().GetAwaiter().GetResult();
@@ -327,11 +365,11 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
         short[] data = BenchmarkData.Samples(2048);
         for (int index = 0; index < count; index++)
         {
-            var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            _ingress.AfterIndexCommit = _ => indexed.TrySetResult();
             ulong sequence = _sequence++;
-            _ingress.Accept(BenchmarkData.Metadata(2048), sequence, sequence, TimeSpan.FromTicks((long)sequence), null, data);
-            indexed.Task.WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult();
+            TraceIdentity identity = _provider.Append(sequence, data);
+            _ingress.NotifyCommitted(identity, _provider.Revision);
+            SpinWait.SpinUntil(() => _ingress.CurrentVisualState?.StoreState.StoreRevision == _provider.Revision.Value,
+                TimeSpan.FromSeconds(30));
         }
     }
 
@@ -352,5 +390,61 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
         public void OnNext(BScanVisualUpdate value) { }
         public void OnError(Exception error) { }
         public void OnCompleted() { }
+    }
+
+    private sealed class BenchmarkInspectionProvider(ConventionalUtFrameMetadata metadata) :
+        IInspectionRangeProvider, IInspectionStreamStateProvider
+    {
+        private readonly InspectionId _inspectionId = new(Guid.NewGuid());
+        private readonly SortedDictionary<ulong, short[]> _samples = [];
+        private ulong _revision;
+        internal InspectionRevision Revision => new(_revision);
+        private UtStreamIdentity Stream => new(_inspectionId, metadata.RunId, metadata.SourceId,
+            metadata.Configuration.PhysicalChannelId);
+
+        internal TraceIdentity Append(ulong index, short[] samples)
+        { _samples[index] = samples; _revision++; return new(Stream, index); }
+
+        public ValueTask<InspectionRangeReadResult> ReadRangeAsync(InspectionRangeQuery query,
+            CancellationToken cancellationToken = default)
+        {
+            var items = new List<InspectionRangeItem>(query.MaximumCount);
+            for (int offset = 0; offset < query.MaximumCount; offset++)
+            {
+                ulong index = query.StartAcquisitionIndex + (ulong)offset;
+                if (_samples.TryGetValue(index, out short[]? samples))
+                {
+                    items.Add(new(new TraceIdentity(Stream, index), InspectionReadStatus.Available,
+                    new Lease(Descriptor(index), samples)));
+                }
+                else { items.Add(new(new TraceIdentity(Stream, index), InspectionReadStatus.NotAvailable)); }
+            }
+            return ValueTask.FromResult(new InspectionRangeReadResult(InspectionReadStatus.Available,
+                Revision, items));
+        }
+
+        public ValueTask<InspectionStreamStateReadResult> ReadStreamStateAsync(UtStreamIdentity stream,
+            CancellationToken cancellationToken = default) => ValueTask.FromResult(
+                InspectionStreamStateReadResult.Available(new(_inspectionId, metadata.RunId, Stream,
+                    InspectionRunState.Open, Revision, null, _samples.Keys.First(), _samples.Keys.Last(),
+                    _samples.Count, 0, false)));
+
+        private TraceDescriptor Descriptor(ulong index) => new(new(Stream, index), index,
+            TimeSpan.FromTicks((long)index), metadata.RunStartedAtUtc + TimeSpan.FromTicks((long)index),
+            null, metadata.Configuration.SampleCount, metadata.Configuration.SampleRateHz,
+            metadata.Configuration.FirstSampleOffsetSeconds, metadata.Configuration.SignalMode);
+
+        private sealed class Lease(TraceDescriptor descriptor, short[] samples) : IInspectionTraceLease
+        {
+            public TraceDescriptor Descriptor { get; } = descriptor;
+            public IReadOnlyUtSamples Samples { get; } = new SamplesView(samples);
+            public void Dispose() { }
+        }
+        private sealed class SamplesView(short[] samples) : IReadOnlyUtSamples
+        {
+            public int Count => samples.Length;
+            public short this[int index] => samples[index];
+            public void CopyTo(Span<short> destination) => samples.CopyTo(destination);
+        }
     }
 }

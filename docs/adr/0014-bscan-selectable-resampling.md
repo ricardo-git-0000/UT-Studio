@@ -131,8 +131,12 @@ La Fase 2 acumula Bilinear y Bicubic en `double`, en orden estable de filas y ta
 derecha, y redondea el valor final con `MidpointRounding.AwayFromZero`. El clamp geométrico se aplica a
 cada índice antes de validar máscara y segmento; el clamp de amplitud bicúbico se aplica después de la
 suma completa. El rango es `[0,255]` porque intensidad cero válida se distingue de NoData mediante la
-máscara. Los 4/16 taps se validan incluso si su peso matemático es cero. Ambos modos son full-only en
-esta fase; los bloques B incorporan halo vertical 1/2 y no convierten sus fronteras internas en bordes.
+máscara. Los 4/16 taps se validan incluso si su peso matemático es cero. Bicubic permanece full-only.
+Bilinear admite incrementales live compatibles: amplía el dirty un radio horizontal, lee otro radio
+de soporte y publica únicamente la región afectada. Los bloques B incorporan halo vertical 1/2 y no
+convierten sus fronteras internas en bordes. Esta ruta acotada evita que una adquisición continua
+invalide indefinidamente candidatos full Bilinear; cambios de firma, run, viewport, resolución o base
+incompatible continúan forzando una única recuperación full.
 En 1024×1024, resultado vigente y candidato consumen 6 MiB lógicos; el bloque máximo añade
 aproximadamente 193 KiB lógicos. Con los buckets observados de `MemoryPool`, la coexistencia máxima
 rentada es 8.650.752 bytes. El techo por consumidor contempla sus dos owners permitidos y el presupuesto

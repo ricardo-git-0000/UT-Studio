@@ -1,4 +1,3 @@
-using UTStudio.Contracts.Presentation;
 using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 

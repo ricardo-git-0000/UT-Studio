@@ -7,14 +7,10 @@ namespace UTStudio.Visualization.Core;
 
 internal enum BScanVisualBufferKind
 {
-    StoreIndex,
-    DetachedSamples,
-    DetachedIndex,
     Raster,
     Scratch,
     KernelIndices,
-    KernelWeights,
-    TraceCopy
+    KernelWeights
 }
 
 internal readonly record struct BScanVisualMemorySnapshot(
@@ -202,7 +198,6 @@ internal sealed class BoundedBScanVisualBufferPool : IAsyncDisposable
         short[] => sizeof(short),
         int[] => sizeof(int),
         double[] => sizeof(double),
-        BScanIndexedMinMax[] => Unsafe.SizeOf<BScanIndexedMinMax>(),
         _ => throw new InvalidOperationException("Unsupported B-Scan visual buffer type.")
     };
 
@@ -239,9 +234,6 @@ internal sealed class BoundedBScanVisualBufferPool : IAsyncDisposable
                 retain = retain && bucket!.Count < MaximumRetainedPerBucket;
                 if (retain)
                 {
-                    if (key.Kind is BScanVisualBufferKind.DetachedSamples or
-                        BScanVisualBufferKind.DetachedIndex or BScanVisualBufferKind.TraceCopy)
-                    { Array.Clear(array); }
                     bucket!.Push(array);
                     _retainedBytes = checked(_retainedBytes + capacityBytes);
                     _retainedBuffers++;
@@ -348,12 +340,6 @@ internal sealed class BoundedByteOwnerPool(BoundedBScanVisualBufferPool buffers)
 
     public IMemoryOwner<byte> Rent(int minimumLength, BScanVisualBufferKind kind) =>
         buffers.Rent<byte>(minimumLength, kind);
-}
-
-internal sealed class BoundedTraceCopyOwnerPool(BoundedBScanVisualBufferPool buffers) : ITraceCopyOwnerPool
-{
-    public IMemoryOwner<short> Rent(int minimumLength) =>
-        buffers.Rent<short>(minimumLength, BScanVisualBufferKind.TraceCopy);
 }
 
 internal sealed class BoundedLanczosTablePool(BoundedBScanVisualBufferPool buffers) : ILanczosTablePool

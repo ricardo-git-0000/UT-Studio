@@ -61,8 +61,10 @@ impide abrir otra run en el mismo store.
 La unidad de commit en memoria contiene la traza y sus `GapRecord`, o un `GapRecord` independiente si
 el frame observador demuestra la pérdida pero no supera validaciones posteriores.
 Cada gap identifica el stream y un rango inclusivo de `Sequence`, sin deducir índices de adquisición.
-La publicación de payload, índices, gaps y revisión es atómica; A-Scan y B-Scan reciben el frame solo
-después del commit. Los gaps consumen el límite global `MaximumEntries` junto con las trazas.
+La publicación de payload, índices, gaps y revisión es atómica. A-Scan y B-Scan reciben únicamente una
+notificación sample-free de identidad y revisión después del commit; B-Scan reconcilia estado y lee
+rangos autoritativos en lotes acotados, sin store RF paralelo. Los gaps consumen el límite global
+`MaximumEntries` junto con las trazas.
 
 El cierre de admisión, la liberación de owners/chunks y la confirmación de cleanup se contabilizan por
 separado. Los errores principal y secundarios se conservan sin afirmar una transición falsa a `Sealed`.

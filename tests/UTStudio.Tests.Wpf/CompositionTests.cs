@@ -11,10 +11,11 @@ using UTStudio.App.Wpf.Composition;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
-using UTStudio.Contracts.Presentation;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
+using UTStudio.Visualization.Core.Scan2D;
 using UTStudio.Visualization.Wpf.Controls;
 using UTStudio.Visualization.Wpf.Rendering;
 
@@ -86,8 +87,7 @@ public sealed class CompositionTests
             Assert.AreSame(services.GetRequiredService<SimulatorUtFrameSource>(), services.GetRequiredService<IUtFrameSource>());
             Assert.AreSame(services.GetRequiredService<ApplicationSession>(), services.GetRequiredService<IApplicationSession>());
             Assert.IsNotNull(services.GetRequiredService<InspectionDataStoreRegistry>());
-            Assert.AreSame(services.GetRequiredService<BScanIngress>(),
-                services.GetRequiredService<IConventionalFrameSink>());
+            Assert.IsNotNull(services.GetRequiredService<BScanIngress>());
             Assert.AreSame(services.GetRequiredService<AScanVisualDelivery>(), services.GetRequiredService<IObservable<AScanSnapshot>>());
             var vm = services.GetRequiredService<AScanViewModel>();
             var session = services.GetRequiredService<IApplicationSession>();
@@ -149,6 +149,60 @@ public sealed class CompositionTests
         finally { await runtime.Shutdown.ShutdownAsync(); }
     });
 
+    [TestMethod]
+    [Timeout(30_000, CooperativeCancellation = true)]
+    public Task Open_bilinear_bscan_keeps_advancing_during_continuous_productive_simulation() => StaTest.Run(async () =>
+    {
+        var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
+            ["--Simulator:AScansPerSecond=100"]);
+        var services = runtime.Host.Services;
+        var aScan = services.GetRequiredService<AScanViewModel>();
+        var windows = services.GetRequiredService<BScanWindowManager>();
+        try
+        {
+            await runtime.Host.StartAsync();
+            await windows.OpenAsync();
+            BScanWindow window = windows.ActiveWindow!;
+            var bScan = (BScanViewModel)window.DataContext;
+            var control = (BScanControl)window.FindName("Scan");
+            bScan.SetResamplingMode(Scan2DInterpolationMode.Bilinear);
+            await aScan.StartCommand.ExecuteAsync(null);
+            try
+            {
+                await DiagnosticWait.Until(() => control.AppliedSnapshot?.StoreRevision >= 450,
+                    "open Bilinear B-Scan reaches revision 450");
+            }
+            catch (TimeoutException error)
+            {
+                throw new AssertFailedException($"sequence={aScan.AScan?.Sequence}; " +
+                    $"ingress={services.GetRequiredService<BScanIngress>().CurrentVisualState?.StoreState.StoreRevision}; " +
+                    $"view={bScan.State.StoreRevision}; displayed={bScan.State.DisplayedRevision?.StoreRevision}; " +
+                    $"region={bScan.State.Region?.Snapshot.StoreRevision}; control={control.AppliedSnapshot?.StoreRevision}; " +
+                    $"regionSize={bScan.State.Region?.Snapshot.RasterWidth}x{bScan.State.Region?.Snapshot.RasterHeight}; " +
+                    $"regionConfig={bScan.State.Region?.Snapshot.RenderConfigurationVersion}; " +
+                    $"full={bScan.State.Region?.Snapshot.RequiresFullRefresh}; reason={bScan.State.Region?.Snapshot.FullRefreshReason}; " +
+                    $"request={services.GetRequiredService<BScanVisualDelivery>().GetLastRequest(bScan.ConsumerId)}; " +
+                    $"pending={bScan.State.IsRenderPending}; visual={bScan.State.BScanVisualError}; " +
+                    $"ui={bScan.State.UiInteractionError}; reject={control.LastIncrementalRejection}; " +
+                    $"delivery={services.GetRequiredService<BScanVisualDelivery>().Diagnostics}", error);
+            }
+            ulong first = control.AppliedSnapshot!.StoreRevision;
+            ulong configuration = control.AppliedSnapshot.RenderConfigurationVersion;
+            await DiagnosticWait.Until(() => aScan.AScan?.Sequence >= first + 100,
+                "productive simulator advances 100 further traces");
+            await DiagnosticWait.Until(() => control.AppliedSnapshot?.StoreRevision >= first + 75,
+                $"B-Scan catches up after revision {first}; ingress=" +
+                $"{services.GetRequiredService<BScanIngress>().CurrentVisualState?.StoreState.StoreRevision}; " +
+                $"view={bScan.State.StoreRevision}; displayed={bScan.State.DisplayedRevision?.StoreRevision}; " +
+                $"region={bScan.State.Region?.Snapshot.StoreRevision}; pending={bScan.State.IsRenderPending}; " +
+                $"error={bScan.State.BScanVisualError}; ui={bScan.State.UiInteractionError}");
+            Assert.AreEqual(configuration, control.AppliedSnapshot!.RenderConfigurationVersion);
+            Assert.IsGreaterThan(0UL,
+                services.GetRequiredService<BScanVisualDelivery>().Diagnostics.IncrementalUpdatesBuilt);
+        }
+        finally { await runtime.Shutdown.ShutdownAsync(); }
+    }, TimeSpan.FromSeconds(30));
+
     private static void AssertRasterContainsSignal(BScanControl control)
     {
         var bitmap = (WriteableBitmap)control.RasterSource!;
@@ -171,7 +225,7 @@ public sealed class CompositionTests
         var source = new ControlledSource();
         var clock = new ManualClock();
         var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
-        var options = new BScanOptions(1_000_000, 1_000_000, 8, 2, 2);
+        var options = new BScanOptions(1_000_000, 8, 2, 2);
         var runtime = await DesktopRuntimeFactory.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
             source, configuration, options, clock);
         try
@@ -191,14 +245,14 @@ public sealed class CompositionTests
         var events = new List<string>();
         var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
         var runtime = await DesktopRuntimeFactory.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
-            source, configuration, new BScanOptions(1_000_000, 4_000_000, 8, 2, 2), new ManualClock(),
+            source, configuration, new BScanOptions(4_000_000, 8, 2, 2), new ManualClock(),
             lifecycleObserver: events.Add);
 
         await runtime.Shutdown.ShutdownAsync();
 
         CollectionAssert.AreEqual(new[]
         {
-            "phase5.stop", "phase6.drain", "phase7.dispose", "host.stop", "host.dispose"
+            "phase5.stop", "phase6.wait", "phase6.drain", "phase7.dispose", "host.stop", "host.dispose"
         }, events);
         Assert.IsTrue(runtime.Shutdown.Status.Completed);
         Assert.AreEqual(1, source.DisposeCount);
@@ -208,68 +262,58 @@ public sealed class CompositionTests
     public Task Productive_shutdown_waits_for_raster_owner_before_disposal_and_host() => StaTest.Run(async () =>
     {
         var source = new ControlledSource();
+        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var drainEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disposed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
         var runtime = await DesktopRuntimeFactory.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
-            source, configuration, new BScanOptions(1_000_000, 4_000_000, 8, 2, 2), new ManualClock());
+            source, configuration, new BScanOptions(4_000_000, 8, 2, 2), new ManualClock(),
+            lifecycleObserver: phase =>
+            {
+                if (phase == "phase5.stop") { stopped.TrySetResult(); }
+                else if (phase == "phase6.wait") { drainEntered.TrySetResult(); }
+                else if (phase == "phase6.drain") { drained.TrySetResult(); }
+                else if (phase == "phase7.dispose") { disposed.TrySetResult(); }
+            });
         var services = runtime.Host.Services;
         var ingress = services.GetRequiredService<BScanIngress>();
         var delivery = services.GetRequiredService<BScanVisualDelivery>();
-        var window = services.GetRequiredService<MainWindow>();
         var run = new AcquisitionRunId(Guid.NewGuid());
-        var metadata = new ConventionalUtFrameMetadata(source.SourceId, run, configuration, DateTimeOffset.UnixEpoch);
-        var indexed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        ingress.AfterIndexCommit = _ => indexed.TrySetResult();
-        ingress.OpenRun(metadata);
-        ingress.Accept(metadata, 0, 0, TimeSpan.Zero, null, new short[16]);
-        await indexed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var stores = services.GetRequiredService<InspectionDataStoreRegistry>();
+        await using IInspectionRunWriter writer = stores.OpenRun(run);
+        ingress.OpenRun(run);
+        var stream = new UtStreamIdentity(stores.InspectionId, run, source.SourceId,
+            configuration.PhysicalChannelId);
+        var identity = new TraceIdentity(stream, 0);
+        var descriptor = new TraceDescriptor(identity, 0, TimeSpan.Zero, DateTimeOffset.UnixEpoch,
+            null, 16, 1_000_000, 0, UtSignalMode.Rf);
+        InspectionAppendResult commit = await writer.CommitAsync(new InspectionCommitInput(
+            new InspectionTraceInput(descriptor, new short[16])));
+        ingress.NotifyCommitted(identity, commit.Revision);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (ingress.CurrentVisualState?.StoreState.StoreRevision != commit.Revision.Value)
+        { await Task.Delay(10, timeout.Token); }
         BScanRasterRegion owner = (await delivery.GetRegionAsync(new(run,
             BScanSpatialViewportOperations.Reset(new(0, 0)),
             ScanTimeViewportOperations.Create(0, .000016), 1, 1, 1))).Region!;
-        window.Show();
-
         Task shutdown = runtime.Shutdown.ShutdownAsync();
-        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        await stopped.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await drainEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.IsFalse(shutdown.IsCompleted);
+        Assert.IsFalse(drained.Task.IsCompleted);
         Assert.IsFalse(runtime.Shutdown.Status.Completed);
-        Assert.IsTrue(window.IsVisible);
         Assert.AreEqual(0, source.DisposeCount);
         Assert.AreEqual(1, delivery.Diagnostics.ActiveRasterOwners);
 
         owner.Dispose();
+        await drained.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await disposed.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await shutdown.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.IsTrue(runtime.Shutdown.Status.Completed);
         Assert.AreEqual(0, delivery.Diagnostics.ActiveRasterOwners);
         Assert.AreEqual(BScanVisualCloseState.Closed, delivery.Diagnostics.CloseState);
         Assert.AreEqual(1, source.DisposeCount);
-        window.Close();
-    });
-
-    [TestMethod]
-    public Task Failed_block_return_keeps_productive_cleanup_unconfirmed_and_shell_visible() => StaTest.Run(async () =>
-    {
-        var source = new ControlledSource();
-        var pool = new FailingTracePool();
-        var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
-        var runtime = await DesktopRuntimeFactory.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
-            source, configuration, new BScanOptions(1_000_000, 4_000_000, 8, 2, 2), new ManualClock(), pool);
-        var services = runtime.Host.Services;
-        var ingress = services.GetRequiredService<BScanIngress>();
-        var window = services.GetRequiredService<MainWindow>();
-        var run = new AcquisitionRunId(Guid.NewGuid());
-        ingress.OpenRun(new(source.SourceId, run, configuration, DateTimeOffset.UnixEpoch));
-        window.Show();
-
-        InvalidOperationException error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
-            () => runtime.Shutdown.ShutdownAsync());
-
-        StringAssert.Contains(error.Message, "synthetic trace return failure");
-        Assert.IsFalse(runtime.Shutdown.Status.Completed);
-        Assert.IsNotNull(runtime.Shutdown.Status.PrimaryFailure);
-        Assert.IsTrue(window.IsVisible);
-        Assert.AreEqual(0, source.DisposeCount);
-        Assert.AreEqual(pool.RentCount, pool.ReturnAttempts);
-        Assert.IsFalse(ingress.Diagnostics.IsClosed);
-        window.Hide();
     });
 
     [TestMethod]
@@ -513,19 +557,4 @@ public sealed class CompositionTests
         public ValueTask DisposeAsync() { DisposeCount++; return ValueTask.CompletedTask; }
     }
 
-    private sealed class FailingTracePool : IShortArrayPool
-    {
-        internal int RentCount { get; private set; }
-        internal int ReturnAttempts { get; private set; }
-        public short[] Rent(int minimumLength)
-        {
-            RentCount++;
-            return new short[minimumLength];
-        }
-        public void Return(short[] array)
-        {
-            ReturnAttempts++;
-            if (ReturnAttempts == 1) { throw new InvalidOperationException("synthetic trace return failure"); }
-        }
-    }
 }

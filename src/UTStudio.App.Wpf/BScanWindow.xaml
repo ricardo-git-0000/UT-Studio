@@ -44,7 +44,9 @@
     <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0" AutomationProperties.Name="Estado B-Scan">
       <TextBlock x:Name="PaletteStatus" Text="Paleta: predeterminada" />
       <TextBlock><Run Text="Solicitado: "/><Run Text="{Binding State.RequestedResamplingMode, Converter={StaticResource BScanResamplingModeConverter}, Mode=OneWay}" /></TextBlock>
-      <TextBlock Text="Actualizando…" Visibility="{Binding State.IsRenderPending, Converter={StaticResource BooleanToVisibilityConverter}}" />
+      <Grid Height="16">
+        <TextBlock Text="Actualizando…" Visibility="{Binding State.IsRenderPending, Converter={StaticResource BooleanToVisibilityConverter}}" />
+      </Grid>
       <TextBlock><Run Text="Presentado: "/><Run Text="{Binding State.PresentedResamplingMode, Converter={StaticResource BScanResamplingModeConverter}, Mode=OneWay}" /></TextBlock>
       <TextBlock x:Name="LanczosWarning" Text="Alta calidad; la actualización puede ser más lenta" Visibility="Collapsed" />
       <TextBlock Text="{Binding State.Diagnostics.ColumnsAccepted, StringFormat=Aceptadas: {0}}" />

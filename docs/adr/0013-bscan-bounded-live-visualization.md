@@ -1,10 +1,33 @@
 # ADR 0013 — B-Scan en vivo acotado, selección exacta y ventana secundaria
 
-Fecha: 2026-09-22. Estado: Aceptado; Fases 1–5 implementadas.
+Fecha: 2026-09-22. Estado: Aceptado, parcialmente sustituido por ADR 0015 en ingreso, autoridad,
+retención RF y selección; Fases 1–5 del incremento original implementadas.
 Trazabilidad: R01–R09, R13 y R14; concreta Q12 y la parte visual de Q13. Complementa
 [ADR 0006](0006-session-window-lifecycle.md), [ADR 0007](0007-frame-source-ownership.md),
 [ADR 0008](0008-latest-only-visual-delivery.md), [ADR 0009](0009-reusable-scan-visualization-controls.md)
 y [ADR 0012](0012-shared-scan-time-navigation.md).
+
+## Estado vigente tras ADR 0015
+
+El ingreso RF descrito originalmente más abajo está sustituido. La implementación vigente recibe
+únicamente `TraceIdentity` y `InspectionRevision` después del commit autoritativo. Reconcilia la
+revisión mediante `IInspectionStreamStateProvider` y consulta `IInspectionRangeProvider` en páginas de
+256 posiciones como máximo. Cada página libera sus leases RF tras producir extremos derivados; no
+existe ring, slot, pin, pool ni presupuesto de copias RF dentro de B-Scan.
+
+Una publicación se construye desde un ticket inmutable con inspección, run, stream completo, revisión,
+estado/final de run, `ResidentRange`, consumidor/generación, viewport, resolución, configuración y
+modo Scan2D. El commit revalida ticket y firma bajo el mismo gate. `ResidentRange` procede de la
+autoridad; `RepresentedRange` describe el trabajo confirmado. `NotAvailable` se representa como
+NoData provisional y `Gap` conserva su causa; los saltos de `Sequence` no sintetizan columnas.
+
+El lifecycle es `Open → AdmissionClosed → Draining → Frozen → Disposed`. La sesión detiene y drena
+adquisición, sella, publica la revisión final, solicita la última reconciliación B, drena trabajo ya
+admitido y congela el raster. La selección usa exclusivamente el mapa inmutable de identidades del
+raster visible. A y B se notifican después del mismo commit, con errores y continuidad independientes.
+
+Las secciones marcadas a continuación como históricas documentan el diseño original sustituido; no
+son contrato vigente.
 
 ## Contexto y alcance
 
@@ -69,7 +92,7 @@ causa, trabajo visual sustituido, publicaciones, renderizados y expulsiones. Un 
 Application, uno recibido pero no admitido por B, una actualización visual coalescida y una expulsión
 normal del ring nunca comparten significado ni contador.
 
-## Contratos públicos previstos
+## Histórico sustituido — contratos públicos originales
 
 La Fase 1 añade en Domain `ScanSpatialCoordinate`, `ScanSpatialUnit` y `ScanAxisId`. Contracts
 amplía `ConventionalUtFrame` y el préstamo visual:
@@ -97,7 +120,7 @@ discontinuidades. `IBScanTraceProvider.GetTraceAsync(identity, cancellationToken
 `BScanVisualUpdate` llevarán siempre identidad local, versión y revisión. Ningún contrato visual B
 se añade a Contracts: pertenece a Visualization.Core y conserva el grafo de referencias.
 
-## Fan-out y presupuesto síncrono
+## Histórico sustituido — fan-out RF y presupuesto síncrono
 
 `ApplicationSession` continúa como único lector del `ChannelReader`. Un fan-out visual síncrono invoca
 primero A y después B y presta el mismo `ReadOnlySpan<short>` a ramas aisladas en `OpenRun`, `Accept`
@@ -121,7 +144,7 @@ marca una discontinuidad B para la siguiente columna admitida; A continúa. El w
 una señal coalescida de capacidad uno. La ingestión puede superar la frecuencia visual; trabajo
 intermedio sustituido se contabiliza y no se denomina pérdida de adquisición.
 
-## Ring, generaciones y leases
+## Histórico sustituido — ring, generaciones y leases RF
 
 El `BScanTraceStore` posee un ring preasignado de trazas completas. Cada slot tiene generación y un
 recuento de leases de lectura. Worker, proveedor de selección y lectura regional adquieren bajo la
@@ -139,7 +162,7 @@ El puerto abre con metadata completa para reservar antes del primer préstamo. `
 forma acotada y `WaitForCloseAsync` es la barrera que Application cruza antes de admitir otra run; una
 arena retirada no coexiste así con otra reserva de 32 MiB en la misma instancia.
 
-## Presupuestos de memoria
+## Histórico sustituido — presupuestos de memoria RF
 
 `TraceMemoryBudgetBytes` se aplica a la longitud realmente rentada, incluidos redondeo de `ArrayPool`
 y bloques parcialmente ocupados. Los bloques se rentan progresivamente al abrir y cada longitud real
@@ -197,11 +220,11 @@ La derivación por escenario usa el bucket esperado, ancho raster igual al núme
 
 La tabla no afirma que todos los escenarios quepan en los defaults: con 32 MiB de trazas, N=65.535
 queda limitado aproximadamente a 256 columnas. El presupuesto RF es independiente. El límite neutral
-de 16 MiB cubre la capacidad de payload de todos los arrays poseídos por el subsistema visual: payload
-activo más payload retenido por su pool propio. Se carga la capacidad real del backing storage
-(`Array.Length * sizeof(T)`), no la longitud lógica de un slice. Incluye índices persistentes, copias
-detached, selección exacta, raster current y candidate, intensidad, máscara, procedencia, scratch y
-tablas de índices/pesos.
+de 16 MiB cubre la capacidad de payload numérico poseído por el subsistema visual: payload activo más
+payload retenido por su pool propio. Se carga la capacidad real del backing storage
+(`Array.Length * sizeof(T)`), no la longitud lógica de un slice. Incluye raster candidate, intensidad,
+máscara, procedencia, scratch y tablas de índices/pesos. No existen índices persistentes ni copias RF
+detached.
 
 El allocator neutral usa buckets deterministas y un ledger único y linealizable. Reserva capacidad
 conocida antes de crear un array; devolver un buffer activo lo mueve a retenido sin duplicar el cargo,
@@ -211,12 +234,14 @@ sin liberarlos por fuerza, hasta que el ledger queda en cero.
 
 La cuota proporcional de cada consumidor carga conjuntamente su raster y el scratch transitorio del
 build. Un segundo candidato del mismo consumidor se rechaza si invadiría la cuota del siguiente.
-Tablas de kernel, índices persistentes y detached son payload compartido: se cargan una sola vez al
-ledger global, se mantienen acotados y su capacidad reduce el saldo disponible antes de nuevas
-admisiones; no se duplican artificialmente por consumidor.
+Las tablas de kernel son payload compartido: se cargan una sola vez al ledger global, se mantienen
+acotadas y su capacidad reduce el saldo disponible antes de nuevas admisiones.
 
-Quedan fuera únicamente los bloques RF autoritativos, cubiertos por su presupuesto separado, la
-metadata fija y acotada, y el overhead no portable de objetos y headers del CLR. Los 16 MiB no son una
+Quedan fuera los bloques RF autoritativos, la metadata e identidad acotadas por
+`MaximumColumns × MaximumRasterConsumers` (`TraceIdentity`, diccionarios y wrappers de solo lectura),
+y el overhead no portable de objetos y headers del CLR. Esta exclusión es deliberada: la selección no
+contiene muestras ni escala con `SampleCount`, y nunca supera 1.024 posiciones por consumidor. Los
+16 MiB no son una
 garantía sobre working set, tamaño total del heap ni memoria física del proceso: son un límite estricto
 sobre capacidad de payload gestionada y fuertemente referenciada por el subsistema visual neutral.
 
@@ -231,7 +256,7 @@ overhead de plataforma no controlable. Presentation rechaza antes de solicitarla
 y buffers contables excedan 16 MiB; WPF aplica además el mismo límite de píxeles antes de recrear el
 bitmap. Una configuración imposible o con menos de un bloque/columna efectiva falla antes de iniciar.
 
-## Procesamiento, regiones y frecuencia visual
+## Histórico original — procesamiento, regiones y frecuencia visual
 
 El RF original es la autoridad. El índice conserva mínimo y máximo por grupo configurable. Para una
 celda coloreada se elige determinísticamente el extremo de mayor valor absoluto; en empate, el primer
@@ -262,7 +287,7 @@ petición. La entrega conserva el último snapshot por consumidor y lo reproduce
 Esto rompe el ciclo en el que Presentation necesitaba metadata para pedir render y Delivery necesitaba
 una petición para publicar metadata; la primera región visible sigue siendo un full coherente.
 
-## Revisiones y resincronización
+## Histórico original — revisiones y resincronización
 
 Cada columna confirmada incrementa `StoreRevision`. Una actualización contiene `RunId`, versión de
 snapshot, revisión base, revisión resultante, rango residente, dirty range, generación de wrap y marca
@@ -346,6 +371,9 @@ bindings y el layout WPF pueden reentrar durante esa notificación. El trabajo d
 cancela o sustituye inmediatamente y se permite una única recuperación full; las publicaciones live
 ordinarias continúan coalesciendo y las siguientes revisiones vuelven al desplazamiento incremental.
 Stop, cierre y comandos UI no pueden quedar detrás de una acumulación de renders obsoletos.
+Los indicadores transitorios de estado WPF reservan su espacio aunque estén ocultos y el control no
+vuelve a publicar una dimensión de raster idéntica. Mostrar u ocultar «Actualizando…» no puede cambiar
+la geometría, incrementar la versión de render ni provocar un ciclo de recuperaciones full.
 Cada traza continua representa la celda espacial `[i, i + 1)`, no un punto infinitesimal en `i`. Si la
 superficie tiene más píxeles que trazas visibles, la celda se expande por vecino más próximo y no crea
 franjas `NoData`; los huecos negros quedan reservados para discontinuidades reales entre identidades.
@@ -355,7 +383,7 @@ intensidades de RF y `allMaxColors`, si existe, fija el extremo superior. El par
 resolución externa. La selección de archivo y el estado de carga pertenecen exclusivamente a WPF; el
 raster neutral conserva intensidades, formato y ownership sin conocer colores ni rutas.
 
-## Interacción, inspección y accesibilidad
+## Histórico original — interacción, inspección y accesibilidad
 
 La rueda sin modificador amplía tiempo sobre Y alrededor del puntero; Ctrl+rueda amplía el eje espacial
 X. Botón central o Mayúsculas+arrastre izquierdo hacen pan 2D. Clic izquierdo selecciona columna; una
@@ -370,7 +398,7 @@ Resident/Evicted/NotAvailable. La amplitud exacta pertenece a la traza seleccion
 paleta usa cero neutro y familias distinguibles para negativos/positivos, con clamp y mapeo definido de
 `short.MinValue` y `short.MaxValue`.
 
-## Selección exacta y A-Scan Live/Selected
+## Histórico original — selección y A-Scan Live/Selected
 
 `IBScanTraceProvider` es neutral respecto al almacenamiento y permite implementación live/ring y una
 futura desde archivo. Devuelve `Available`, `NotAvailable`, `Evicted`, `Cancelled` o `Faulted`; no se
@@ -419,7 +447,7 @@ es el dominio autoritativo completo del store; `RepresentedRange` solo describe 
 en el full o incremental actual y no puede utilizarse para rechazar una selección residente. La petición
 optimista se muestra de inmediato y después se confirma con la traza exacta o se revierte si falla.
 
-## Viewport compartido, fronteras y ventanas
+## Histórico original — viewport compartido, fronteras y ventanas
 
 Una instancia de `SharedScanTimeViewport` gobierna el intervalo físico común. Mantiene dominios por
 consumidor, pero cada ViewModel crea su `ScanTimeViewportBinding` con `RunId` y `SnapshotVersion`
@@ -457,7 +485,7 @@ neutral a `BipolarIntensity8` bajo ese token y Visualization.Wpf convierte únic
 a staging local BGRA32 antes del commit transaccional. La vista no recibe `IDisposable`. La continuidad incremental
 se valida con stream, wrap, revisión base y configuración de render, no comparando versiones A/B.
 
-## Riesgos y aplazado
+## Histórico original — riesgos y aplazado
 
 Copiar hasta 131.070 bytes dentro de `Accept` puede afectar al lector; los percentiles deben medirse
 antes de prometer caudal. Los rechazos por slot fijado son visibles, pero una futura exigencia de cero
