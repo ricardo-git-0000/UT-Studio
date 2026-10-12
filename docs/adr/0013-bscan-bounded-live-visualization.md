@@ -337,8 +337,9 @@ configurada por el usuario, acotada por la capacidad efectiva del ring. Los cont
 pasos binarios y solo cambian la ventana visible, sin reasignar el ring. Durante el llenado inicial las
 columnas nuevas ocupan esa superficie
 sin reescalar las anteriores; cuando el ring se llena y hace wrap, la ventana avanza con el rango
-residente y las señales se desplazan. El primer zoom o pan desactiva ese seguimiento; `ResetSpatial` lo
-reactiva.
+residente y las señales se desplazan. Los comandos `Espacio +` y `Espacio −` cambian el número de
+trazas visibles y mantienen el seguimiento del extremo live. El zoom espacial anclado del control y
+el primer pan desactivan ese seguimiento; `ResetSpatial` lo reactiva.
 
 Una petición marcada como seguimiento live reconcilia su ventana con el rango residente capturado por
 el mismo raster. Esto evita franjas `NoData` cuando el ring avanza mientras la petición espera el
@@ -360,8 +361,9 @@ Para conservar la respuesta de la UI durante ese desplazamiento, la publicación
 a un máximo de 10 Hz cuando la ventana supera 512 trazas; hasta 512 conserva 30 Hz. Esto no limita la
 adquisición ni el indexado: únicamente sustituye estados visuales intermedios por el más reciente.
 Cuando la ventana live está llena, el ancho del raster neutral coincide con el número de trazas visibles
-(para todos los tamaños admitidos hasta 1.024, no solo para ventanas grandes) y se escala en WPF por
-vecino más próximo. Cada publicación incorpora conjuntamente todas
+(para todos los tamaños admitidos hasta 1.024, no solo para ventanas grandes) en los modos sin
+interpolación, vecino más próximo y bilineal; WPF escala esa superficie al control. Cada publicación
+incorpora conjuntamente todas
 las revisiones nuevas: Core reduce solo sus columnas y publica `HorizontalPixelShift`; WPF desplaza el
 bitmap existente mediante copias por bloques y aplica únicamente la franja derecha. El RF y el ring de
 adquisición siguen siendo la autoridad y no conocen píxeles, paletas ni WPF. Presentation confirma por

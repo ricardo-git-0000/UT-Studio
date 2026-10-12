@@ -1,6 +1,8 @@
 using System.Windows;
 using System.Windows.Input;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Controls;
 
@@ -90,11 +92,43 @@ public sealed class BScanInteractionTests
         Mouse.Capture(null); int before = pans;
         point = new(400, 150); control.RaiseEvent(Move()); Assert.AreEqual(before, pans);
 
-        double marker = 64 + (control.ActualWidth - 84) * (5d / 11d);
+        double marker = 64 + (control.ActualWidth - 84) * (5.5d / 11d);
         point = new(marker, 100);
         Assert.IsTrue(control.HitSelection(point));
         control.RaiseEvent(Button(MouseButton.Left, UIElement.MouseLeftButtonDownEvent));
         Assert.AreEqual(1, selections); Assert.IsTrue(control.IsMouseCaptured);
+        point = new(64 + (control.ActualWidth - 84) * (7d / 11d), 100);
+        control.RaiseEvent(Move());
+        Assert.AreEqual(2, selections);
+        control.RaiseEvent(Button(MouseButton.Left, Mouse.MouseUpEvent));
+        Assert.IsFalse(control.IsMouseCaptured);
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task Live_viewport_shift_keeps_selection_drag_on_displayed_geometry() => StaTest.Run(() =>
+    {
+        Point point = default;
+        var control = Control(() => ModifierKeys.None, _ => point, _ => 1);
+        control.SelectedAcquisitionIndex = 5;
+        using var host = new TestWindow(control);
+        int selections = 0;
+        control.ColumnRequested += (_, _) => selections++;
+        point = new(64 + (control.ActualWidth - 84) * (5.5d / 11d), 100);
+
+        control.RaiseEvent(Button(MouseButton.Left, UIElement.MouseLeftButtonDownEvent));
+        Assert.IsTrue(control.IsMouseCaptured);
+        Assert.AreEqual(1, selections);
+
+        BScanVisualSnapshot shifted = control.Snapshot! with
+        {
+            SnapshotVersion = 2,
+            SpatialViewport = new(1, 0, 11)
+        };
+        control.Snapshot = shifted;
+        control.SpatialViewport = shifted.SpatialViewport;
+
+        Assert.IsTrue(control.IsMouseCaptured);
         point = new(64 + (control.ActualWidth - 84) * (7d / 11d), 100);
         control.RaiseEvent(Move());
         Assert.AreEqual(2, selections);
@@ -142,7 +176,13 @@ public sealed class BScanInteractionTests
         return new(run, 1, 0, 1, 0, represented, resident, time,
             BScanSpatialViewportOperations.Reset(resident), time, 11, 10, 0,
             new(2, 8, 0, 1), new(0, 0, 11, 10), false, true, BScanFullRefreshReason.Initial)
-        { Stream = new(new UtSourceId("events"), run, new PhysicalChannelId(0)) };
+        {
+            Stream = new(new UtSourceId("events"), run, new PhysicalChannelId(0)),
+            SelectableTraceIdentities = Array.AsReadOnly(Enumerable.Range(0, 11)
+                .Select(index => (TraceIdentity?)new TraceIdentity(new(new InspectionId(
+                    Guid.Parse("11111111-1111-1111-1111-111111111111")), run,
+                    new UtSourceId("events"), new PhysicalChannelId(0)), (ulong)index)).ToArray())
+        };
     }
     private static MouseWheelEventArgs Wheel(int delta) => new(Mouse.PrimaryDevice, Environment.TickCount, delta)
     { RoutedEvent = Mouse.MouseWheelEvent };

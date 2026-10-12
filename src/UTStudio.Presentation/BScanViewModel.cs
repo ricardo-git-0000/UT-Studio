@@ -235,15 +235,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
 
     public void ZoomSpatialAt(decimal anchorRatio, decimal factor) => _lifetime.Post(() =>
     {
-        if (_state is not { SpatialViewport: { } viewport, ResidentRange: { } domain }) { return; }
-        ReplaceState(_state with
-        {
-            SpatialViewport = BScanSpatialViewportOperations.ZoomAt(viewport, domain,
-            anchorRatio, factor),
-            IsSpatialAutoFit = false,
-            RequiresFullRefresh = true
-        });
-        RequestRefresh();
+        ApplySpatialZoom(anchorRatio, factor, followLive: false);
     });
 
     public void PanSpatialBy(decimal delta) => _lifetime.Post(() =>
@@ -409,11 +401,40 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private void ResetTime() => _timeViewport.Reset();
     private bool CanPanTimeUp() => _timeViewport.Viewport is { } v && v.VisibleMinimumSeconds > v.DomainMinimumSeconds;
     private bool CanPanTimeDown() => _timeViewport.Viewport is { } v && v.VisibleMaximumSeconds < v.DomainMaximumSeconds;
-    private void ZoomSpatial(decimal factor) => ZoomSpatialAt(.5m, factor);
+    private void ZoomSpatial(decimal factor) => _lifetime.Post(() =>
+        ApplySpatialZoom(.5m, factor, followLive: true));
+
+    private void ApplySpatialZoom(decimal anchorRatio, decimal factor, bool followLive)
+    {
+        if (_state is not { SpatialViewport: { } viewport, ResidentRange: { } domain }) { return; }
+        BScanSpatialViewport zoomed = BScanSpatialViewportOperations.ZoomAt(viewport, domain,
+            anchorRatio, factor);
+        if (followLive)
+        {
+            int columns = Math.Clamp((int)decimal.Round(zoomed.Span, 0,
+                MidpointRounding.AwayFromZero), 1, _maximumLiveWindowColumns);
+            zoomed = CreateLiveWindow(domain, columns);
+        }
+        ReplaceState(_state with
+        {
+            SpatialViewport = zoomed,
+            IsSpatialAutoFit = followLive,
+            RequiresFullRefresh = true
+        });
+        RequestRefresh();
+    }
     private bool CanZoomSpatialIn() => _state is { SpatialViewport: { } v, ResidentRange: { } d } &&
-        v.Span > Math.Max(1m, ((decimal)(d.Last - d.First) + 1) / BScanSpatialViewportOperations.MaximumZoom);
-    private bool CanZoomSpatialOut() => _state is { SpatialViewport: { } v, ResidentRange: { } d } &&
-        v != BScanSpatialViewportOperations.Reset(d);
+        (_state.IsSpatialAutoFit ? v.Span > 1 :
+            v.Span > Math.Max(1m, ((decimal)(d.Last - d.First) + 1) /
+                BScanSpatialViewportOperations.MaximumZoom));
+    private bool CanZoomSpatialOut()
+    {
+        if (_state is not { SpatialViewport: { } viewport, ResidentRange: { } domain }) { return false; }
+        decimal domainSpan = checked((decimal)(domain.Last - domain.First) + 1);
+        return _state.IsSpatialAutoFit
+            ? viewport.Span < Math.Min(domainSpan, _maximumLiveWindowColumns)
+            : viewport != BScanSpatialViewportOperations.Reset(domain);
+    }
     private void PanSpatial(decimal fraction)
     { if (_state.SpatialViewport is { } v) { PanSpatialBy(v.Span * fraction); } }
     private bool CanPanSpatialLeft() => _state is { SpatialViewport: { } v, ResidentRange: { } d } &&
@@ -425,7 +446,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         if (_state.ResidentRange is not { } domain) { return; }
         ReplaceState(_state with
         {
-            SpatialViewport = BScanSpatialViewportOperations.Reset(domain),
+            SpatialViewport = CreateLiveWindow(domain, _liveWindowColumns),
             IsSpatialAutoFit = true,
             RequiresFullRefresh = true
         });
@@ -492,9 +513,14 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             _liveWindowColumns = liveWindow;
             OnPropertyChanged(nameof(LiveWindowColumns));
         }
-        BScanSpatialViewport spatial = newRun || _state.SpatialViewport is null || _state.IsSpatialAutoFit
+        BScanSpatialViewport spatial = newRun || _state.SpatialViewport is null
             ? CreateLiveWindow(snapshot.ResidentRange, liveWindow)
-            : BScanSpatialViewportOperations.Reconcile(_state.SpatialViewport.Value, snapshot.ResidentRange);
+            : _state.IsSpatialAutoFit
+                ? CreateLiveWindow(snapshot.ResidentRange, Math.Clamp(
+                    (int)decimal.Round(_state.SpatialViewport.Value.Span, 0,
+                        MidpointRounding.AwayFromZero), 1, maximumLiveWindow))
+                : BScanSpatialViewportOperations.Reconcile(_state.SpatialViewport.Value,
+                    snapshot.ResidentRange);
         // Metadata wakes the consumer; the subsequent region request carries the authoritative
         // displayed identity. Do not discard that base merely because a queued metadata request
         // was created before the latest region reached the UI.
@@ -780,12 +806,17 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
 
     private int CurrentRasterWidth()
     {
-        if (_state.RequestedResamplingMode == Scan2DInterpolationMode.None &&
-            _state.IsSpatialAutoFit && _state.ResidentRange is { } resident)
+        // Incremental live scrolling needs an integral pixel shift per trace. WPF scales this
+        // bounded trace-aligned surface to the control; the selected mode handles temporal resampling.
+        if (_state.RequestedResamplingMode is (
+                Scan2DInterpolationMode.None or Scan2DInterpolationMode.NearestNeighbor or
+                Scan2DInterpolationMode.Bilinear) && _state.IsSpatialAutoFit &&
+            _state.ResidentRange is { } resident && _state.SpatialViewport is { } viewport)
         {
             decimal residentCount = checked((decimal)(resident.Last - resident.First) + 1);
-            if (residentCount >= _liveWindowColumns && _liveWindowColumns <= 1024)
-            { return _liveWindowColumns; }
+            decimal span = viewport.Span;
+            if (span == decimal.Truncate(span) && span is >= 1 and <= 1024 && residentCount >= span)
+            { return (int)span; }
         }
         return _pixelWidth;
     }

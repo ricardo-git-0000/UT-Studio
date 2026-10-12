@@ -413,7 +413,7 @@ public sealed class BScanControl : FrameworkElement
         if (plot.Width <= 0 || plot.Height <= 0) { return; }
         if (_bitmap is not null) { drawing.DrawImage(_bitmap, plot); }
         drawing.DrawRectangle(null, Axis, plot);
-        if (SpatialViewport is { } spatialTicks)
+        if (DisplayedSpatialViewport is { } spatialTicks)
         {
             foreach (AdaptiveAxisTick tick in AdaptiveAxisTicks.Create(
                 spatialTicks.MinimumOffset, spatialTicks.MaximumOffset, plot.Width))
@@ -473,8 +473,7 @@ public sealed class BScanControl : FrameworkElement
         Focus();
         Point position = _position(this);
         bool onSelection = HitSelection(position);
-        bool hasColumn = TryAcquisitionIndex(position, out ulong index);
-        _ = TryRasterPixelX(position, out int rasterPixelX);
+        bool hasColumn = TrySelectableColumn(position, out ulong index, out int rasterPixelX);
         if (_clickCount(args) == 2 && PlotBounds().Contains(position) && !onSelection)
         { ResetAllRequested?.Invoke(this, EventArgs.Empty); args.Handled = true; return; }
         if ((_modifiers() & ModifierKeys.Shift) != 0 && !onSelection)
@@ -502,13 +501,13 @@ public sealed class BScanControl : FrameworkElement
         if (_selectingColumn)
         {
             Point position = _position(this);
-            if (TryAcquisitionIndex(position, out ulong index) && index != SelectedAcquisitionIndex &&
-                TryRasterPixelX(position, out int rasterPixelX))
+            if (TrySelectableColumn(position, out ulong index, out int rasterPixelX) &&
+                index != SelectedAcquisitionIndex)
             { ColumnRequested?.Invoke(this, new(index, rasterPixelX)); }
             args.Handled = true;
             return;
         }
-        if (!_panning || TimeViewport is not { } time || SpatialViewport is not { } spatial) { return; }
+        if (!_panning || TimeViewport is not { } time || DisplayedSpatialViewport is not { } spatial) { return; }
         Point current = _position(this);
         Rect plot = PlotBounds();
         if (plot.Width <= 0 || plot.Height <= 0) { EndInteraction(); return; }
@@ -536,7 +535,8 @@ public sealed class BScanControl : FrameworkElement
     {
         index = 0;
         Rect plot = PlotBounds();
-        if (!plot.Contains(point) || SpatialViewport is not { } viewport || ResidentRange is not { } resident)
+        if (!plot.Contains(point) || DisplayedSpatialViewport is not { } viewport ||
+            ResidentRange is not { } resident)
         { return false; }
         decimal offset = viewport.MinimumOffset + (decimal)((point.X - plot.Left) / plot.Width) * viewport.Span;
         decimal absolute = viewport.OriginAcquisitionIndex + offset;
@@ -556,6 +556,19 @@ public sealed class BScanControl : FrameworkElement
         return true;
     }
 
+    private bool TrySelectableColumn(Point point, out ulong index, out int pixel)
+    {
+        index = 0;
+        if (TryRasterPixelX(point, out pixel) && Snapshot is { } snapshot &&
+            (uint)pixel < (uint)snapshot.SelectableTraceIdentities.Count &&
+            snapshot.SelectableTraceIdentities[pixel] is { } identity)
+        {
+            index = identity.AcquisitionIndex;
+            return true;
+        }
+        return TryAcquisitionIndex(point, out index);
+    }
+
     private static bool TrySpatialCoordinate(ulong index, BScanSpatialViewport viewport, Rect plot, out double x)
     {
         decimal offset = BScanSpatialViewportOperations.RelativeOffset(index, viewport.OriginAcquisitionIndex);
@@ -565,12 +578,35 @@ public sealed class BScanControl : FrameworkElement
     }
 
     internal bool HitSelection(Point point) => SelectedAcquisitionIndex is { } selected &&
-        SpatialViewport is { } viewport && TrySpatialCoordinate(selected, viewport, PlotBounds(), out double x) &&
+        TryDisplayedSelectionCoordinate(selected, PlotBounds(), out double x) &&
         Math.Abs(point.X - x) <= 8 && point.Y >= PlotBounds().Top && point.Y <= PlotBounds().Bottom;
+
+    private bool TryDisplayedSelectionCoordinate(ulong index, Rect plot, out double x)
+    {
+        x = 0;
+        if (Snapshot is { RasterWidth: > 0 } snapshot)
+        {
+            int first = -1, last = -1;
+            for (int pixel = 0; pixel < snapshot.SelectableTraceIdentities.Count; pixel++)
+            {
+                if (snapshot.SelectableTraceIdentities[pixel] is not { } identity ||
+                    identity.AcquisitionIndex != index) { continue; }
+                if (first < 0) { first = pixel; }
+                last = pixel;
+            }
+            if (first >= 0)
+            {
+                x = plot.Left + ((first + last + 1d) / 2d) / snapshot.RasterWidth * plot.Width;
+                return true;
+            }
+        }
+        return DisplayedSpatialViewport is { } viewport &&
+            TrySpatialCoordinate(index, viewport, plot, out x);
+    }
 
     private void DrawAxisLabels(DrawingContext drawing, Rect plot)
     {
-        if (SpatialViewport is { } spatial)
+        if (DisplayedSpatialViewport is { } spatial)
         {
             foreach (AdaptiveAxisTick tick in AdaptiveAxisTicks.Create(
                 spatial.MinimumOffset, spatial.MaximumOffset, plot.Width))
@@ -606,13 +642,14 @@ public sealed class BScanControl : FrameworkElement
         using DrawingContext drawing = _selectionVisual.RenderOpen();
         Rect plot = PlotBounds();
         if (plot.Width > 0 && plot.Height > 0 && SelectedAcquisitionIndex is { } selected &&
-            SpatialViewport is { } spatial && TrySpatialCoordinate(selected, spatial, plot, out double selectedX))
+            TryDisplayedSelectionCoordinate(selected, plot, out double selectedX))
         {
             drawing.DrawLine(Selection, new Point(selectedX, plot.Top), new Point(selectedX, plot.Bottom));
             _hasSelectionVisual = true;
         }
         else { _hasSelectionVisual = false; }
     }
+    private BScanSpatialViewport? DisplayedSpatialViewport => Snapshot?.SpatialViewport ?? SpatialViewport;
     private static T Freeze<T>(T value) where T : Freezable { value.Freeze(); return value; }
     private void Label(DrawingContext drawing, string value, Point origin) => drawing.DrawText(
         new FormattedText(value, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,

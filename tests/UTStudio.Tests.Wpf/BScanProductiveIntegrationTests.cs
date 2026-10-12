@@ -377,6 +377,67 @@ public sealed class BScanProductiveIntegrationTests
     });
 
     [TestMethod]
+    public Task Bilinear_full_live_ring_uses_trace_aligned_surface_and_keeps_scrolling() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512, initialRasterWidth: 419);
+        await fixture.WaitForRevisionAsync(512);
+        BScanPresentedRegionToken previous = fixture.ViewModel.State.Region!.Token;
+
+        fixture.ViewModel.SetResamplingMode(Scan2DInterpolationMode.Bilinear);
+        await fixture.WaitForTokenChangeAsync(previous);
+        await DiagnosticWait.Until(() => fixture.Control.AppliedSnapshot is
+        {
+            RasterWidth: 512,
+            Resampling.Mode: Scan2DInterpolationMode.Bilinear
+        }, "bilinear live ring has a trace-aligned raster surface");
+        var bitmap = (WriteableBitmap)fixture.Control.RasterSource!;
+        ulong fullBefore = fixture.Delivery.Diagnostics.FullRefreshesBuilt;
+
+        await fixture.AddAndPublishAsync(512);
+
+        Assert.AreSame(bitmap, fixture.Control.RasterSource);
+        Assert.AreEqual(513UL, fixture.Control.AppliedSnapshot!.StoreRevision);
+        Assert.AreEqual(new BScanAcquisitionRange(1, 512),
+            fixture.Control.AppliedSnapshot.RepresentedRange);
+        Assert.IsFalse(fixture.Control.AppliedSnapshot.RequiresFullRefresh);
+        Assert.AreEqual(1, fixture.Control.AppliedSnapshot.HorizontalPixelShift);
+        Assert.AreEqual(fullBefore, fixture.Delivery.Diagnostics.FullRefreshesBuilt);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
+    public Task Spatial_zoom_keeps_nearest_neighbor_live_ring_following_the_tail() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512, initialRasterWidth: 419);
+        await fixture.WaitForRevisionAsync(512);
+        fixture.ViewModel.SetResamplingMode(Scan2DInterpolationMode.NearestNeighbor);
+        await fixture.WaitForPresentedModeAsync(Scan2DInterpolationMode.NearestNeighbor);
+        BScanPresentedRegionToken previous = fixture.ViewModel.State.Region!.Token;
+
+        fixture.ViewModel.ZoomSpatialInCommand.Execute(null);
+        await fixture.WaitForTokenChangeAsync(previous);
+
+        Assert.IsTrue(fixture.ViewModel.State.IsSpatialAutoFit);
+        Assert.AreEqual(427m, fixture.ViewModel.State.SpatialViewport!.Value.Span);
+        Assert.AreEqual(427, fixture.Control.AppliedSnapshot!.RasterWidth);
+        Assert.AreEqual(new BScanAcquisitionRange(85, 511),
+            fixture.Control.AppliedSnapshot.RepresentedRange);
+        var bitmap = (WriteableBitmap)fixture.Control.RasterSource!;
+        ulong fullBefore = fixture.Delivery.Diagnostics.FullRefreshesBuilt;
+
+        await fixture.AddAndPublishAsync(512);
+
+        Assert.AreSame(bitmap, fixture.Control.RasterSource);
+        Assert.AreEqual(513UL, fixture.Control.AppliedSnapshot!.StoreRevision);
+        Assert.AreEqual(new BScanAcquisitionRange(86, 512),
+            fixture.Control.AppliedSnapshot.RepresentedRange);
+        Assert.IsFalse(fixture.Control.AppliedSnapshot.RequiresFullRefresh);
+        Assert.AreEqual(1, fixture.Control.AppliedSnapshot.HorizontalPixelShift);
+        Assert.AreEqual(fullBefore, fixture.Delivery.Diagnostics.FullRefreshesBuilt);
+        fixture.AssertOpenBalances();
+    });
+
+    [TestMethod]
     public Task Reducing_full_live_ring_keeps_incremental_scroll_and_ui_work_bounded() => StaTest.Run(async () =>
     {
         await using var fixture = await ProductiveBScanFixture.CreateAsync(512, initialRasterWidth: 512);

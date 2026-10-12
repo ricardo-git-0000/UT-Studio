@@ -702,6 +702,31 @@ public sealed class BScanRangeProjectionTests
     }
 
     [TestMethod]
+    public async Task FollowLiveRasterAcceptsNewerPageRevisionsForItsCapturedResidentPrefix()
+    {
+        await using var fixture = await Fixture.CreateAsync(maximumColumns: 1024);
+        InspectionAppendResult last = default;
+        for (ulong index = 0; index <= 511; index++)
+        { last = await fixture.AppendAsync(index, sequence: index); }
+        fixture.Ingress.NotifyCommitted(fixture.Identity(511), last.Revision);
+        await fixture.WaitForRevisionAsync(last.Revision);
+        fixture.Provider.ResetRangeReadCount();
+        fixture.Provider.RevisionOverride = read => read == 2
+            ? new(last.Revision.Value + 1)
+            : null;
+        BScanRenderRequest request = fixture.Request(0, 511, 512, 4) with
+        { FollowLiveWindow = true };
+
+        BScanRasterResult result = await fixture.Delivery.GetRegionAsync(request);
+
+        Assert.AreEqual(BScanRasterResultKind.Available, result.Kind, result.Error);
+        using BScanRasterRegion region = result.Region!;
+        Assert.AreEqual(last.Revision.Value, region.Snapshot.StoreRevision);
+        Assert.AreEqual(new BScanAcquisitionRange(0, 511), region.Snapshot.RepresentedRange);
+        Assert.IsTrue(fixture.Provider.Queries.All(static query => query.MaximumCount <= 256));
+    }
+
+    [TestMethod]
     public async Task NewRevisionImmediatelyBeforeCandidateValidationRejectsStaleRaster()
     {
         await using var fixture = await Fixture.CreateAsync(maximumColumns: 256);

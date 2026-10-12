@@ -38,12 +38,11 @@ internal sealed class BScanControlAdapter : IDisposable
     private void PublishState()
     {
         var state = _viewModel.State;
-        _control.SpatialViewport = state.SpatialViewport;
+        _control.SpatialViewport = state.Region?.Snapshot.SpatialViewport ?? state.SpatialViewport;
         _control.TimeViewport = state.TimeViewportBinding?.Viewport;
         _control.ResidentRange = state.ResidentRange;
-        _control.SelectedAcquisitionIndex = state.Selection.IsPending && _requestedColumn is { } requested
-            ? requested : state.Selection.AcquisitionIndex;
-        _control.SelectionStatus = state.Selection.IsPending ? "Resolving" :
+        _control.SelectedAcquisitionIndex = _requestedColumn ?? state.Selection.AcquisitionIndex;
+        _control.SelectionStatus = _requestedColumn is not null || state.Selection.IsPending ? "Resolving" :
             state.Selection.Residency?.ToString() ?? state.Selection.LastResult?.ToString();
         if (state.Region is not { } region)
         { if (_applied is not null) { _control.ClearRaster(); _applied = null; } return; }

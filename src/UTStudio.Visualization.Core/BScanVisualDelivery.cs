@@ -1097,7 +1097,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
         }
         BScanFullRefreshReason reason = BScanFullRefreshReason.None;
         if (request.EffectiveResampling.Mode is not (
-            Scan2DInterpolationMode.None or Scan2DInterpolationMode.Bilinear))
+            Scan2DInterpolationMode.None or Scan2DInterpolationMode.NearestNeighbor or
+            Scan2DInterpolationMode.Bilinear))
         { reason |= BScanFullRefreshReason.RenderConfigurationChanged; }
         if (request.Displayed is null && prior is not null)
         {
@@ -1142,7 +1143,8 @@ public sealed class BScanVisualDelivery : IBScanVisualSource, IAsyncDisposable
     private static int GetHorizontalPixelShift(BScanRenderRequest request)
     {
         if (request.EffectiveResampling.Mode is not (
-                Scan2DInterpolationMode.None or Scan2DInterpolationMode.Bilinear) ||
+                Scan2DInterpolationMode.None or Scan2DInterpolationMode.NearestNeighbor or
+                Scan2DInterpolationMode.Bilinear) ||
             !request.FollowLiveWindow || request.Displayed is not { } displayed ||
             displayed.Render.PixelWidth != request.PixelWidth ||
             displayed.Render.PixelHeight != request.PixelHeight ||

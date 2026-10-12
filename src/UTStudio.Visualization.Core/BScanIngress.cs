@@ -365,7 +365,11 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
                 pages++;
                 statuses.Add(result.Status);
                 foreach (InspectionRangeItem item in result.Items) { statuses.Add(item.Status); }
-                if (result.Revision.Value != ticket.AuthoritativeRevision)
+                // A live ticket projects an immutable prefix bounded by its captured resident range.
+                // Later commits may advance the provider revision while these bounded pages are read;
+                // the final ticket validation still rejects eviction, run and phase changes.
+                if (result.Revision.Value < ticket.AuthoritativeRevision ||
+                    (!ticket.FollowLiveWindow && result.Revision.Value != ticket.AuthoritativeRevision))
                 { return new(statuses, null, true, pages, availableTotal); }
                 if (result.Status is InspectionReadStatus.Closed or InspectionReadStatus.Cancelled or
                     InspectionReadStatus.Faulted or InspectionReadStatus.OutOfRange)
