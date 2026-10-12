@@ -210,4 +210,3 @@ Para todo método no parametrizado, el valor de «Método retirado» de la matri
 ## Criterio de cierre
 
 La matriz se valida junto con las suites Core y WPF completas. Una fila “Migrado” no conserva necesariamente la antigua estructura de fixture: conserva la obligación observable bajo la arquitectura autoritativa. Las filas “Obsoleto” no representan cobertura perdida porque sus objetos de prueba fueron retirados deliberadamente y no existe ya una ruta productiva equivalente.
-

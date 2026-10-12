@@ -362,17 +362,26 @@ public sealed class BScanRangeProjectionTests
             { published.Enqueue(state.StoreState.StoreRevision); }
         };
         int advances = 0;
+        using var candidateEntered = new SemaphoreSlim(0);
+        using var releaseCandidate = new SemaphoreSlim(0);
         fixture.Ingress.BeforeVisualStateCommit = () =>
         {
             int advance = Interlocked.Increment(ref advances);
             if (advance > 3) { return; }
-            InspectionAppendResult next = fixture.AppendAsync((ulong)advance, (ulong)advance)
-                .AsTask().GetAwaiter().GetResult();
-            fixture.Ingress.NotifyCommitted(fixture.Identity((ulong)advance), next.Revision);
+            candidateEntered.Release();
+            if (!releaseCandidate.Wait(TimeSpan.FromSeconds(10)))
+            { throw new TimeoutException("The intermediate candidate gate was not released."); }
         };
         InspectionAppendResult first = await fixture.AppendAsync(0, sequence: 0);
 
         fixture.Ingress.NotifyCommitted(fixture.Identity(0), first.Revision);
+        for (ulong advance = 1; advance <= 3; advance++)
+        {
+            Assert.IsTrue(await candidateEntered.WaitAsync(TimeSpan.FromSeconds(10)));
+            InspectionAppendResult next = await fixture.AppendAsync(advance, advance);
+            fixture.Ingress.NotifyCommitted(fixture.Identity(advance), next.Revision);
+            releaseCandidate.Release();
+        }
         await fixture.WaitForRevisionAsync(new(first.Revision.Value + 3));
 
         ulong[] revisions = published.Distinct().Order().ToArray();
@@ -395,17 +404,14 @@ public sealed class BScanRangeProjectionTests
         fixture.Provider.RevisionOverride = read =>
         {
             if (read != 1 || Interlocked.Exchange(ref injected, 1) != 0) { return null; }
-            _ = Task.Run(async () =>
-            {
-                appended = await fixture.AppendAsync(301, sequence: 301);
-                fixture.Ingress.NotifyCommitted(fixture.Identity(301), appended.Revision);
-                appendCompleted.TrySetResult();
-            });
+            appendCompleted.TrySetResult();
             return null;
         };
 
         fixture.Ingress.NotifyCommitted(fixture.Identity(300), initial.Revision);
         await appendCompleted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        appended = await fixture.AppendAsync(301, sequence: 301);
+        fixture.Ingress.NotifyCommitted(fixture.Identity(301), appended.Revision);
         await fixture.WaitForRevisionAsync(appended.Revision);
 
         Assert.AreEqual(appended.Revision.Value,
@@ -413,6 +419,27 @@ public sealed class BScanRangeProjectionTests
         Assert.AreEqual(new BScanAcquisitionRange(0, 301),
             fixture.Ingress.CurrentVisualState.StoreState.ResidentRange);
         Assert.IsGreaterThanOrEqualTo(4, fixture.Provider.Queries.Count);
+        Assert.IsTrue(fixture.Provider.Queries.All(static query => query.MaximumCount <= 256));
+    }
+
+    [TestMethod]
+    public async Task ContinuouslyAdvancingPageRevisionsStillPublishCapturedBoundedSnapshot()
+    {
+        await using var fixture = await Fixture.CreateAsync(maximumColumns: 1024);
+        InspectionAppendResult initial = default;
+        for (ulong index = 0; index <= 300; index++)
+        { initial = await fixture.AppendAsync(index, sequence: index); }
+        ulong baseline = initial.Revision.Value;
+        fixture.Provider.RevisionOverride = read => new(baseline + checked((ulong)read));
+
+        fixture.Ingress.NotifyCommitted(fixture.Identity(300), initial.Revision);
+        await fixture.WaitForRevisionAsync(initial.Revision);
+
+        Assert.AreEqual(initial.Revision.Value,
+            fixture.Ingress.CurrentVisualState!.StoreState.StoreRevision);
+        Assert.AreEqual(new BScanAcquisitionRange(0, 300),
+            fixture.Ingress.CurrentVisualState.StoreState.ResidentRange);
+        Assert.IsGreaterThanOrEqualTo(2, fixture.Provider.Queries.Count);
         Assert.IsTrue(fixture.Provider.Queries.All(static query => query.MaximumCount <= 256));
     }
 
@@ -428,18 +455,23 @@ public sealed class BScanRangeProjectionTests
         fixture.Ingress.BeforeReconcileWorkerExit = () =>
         {
             if (Interlocked.Exchange(ref injected, 1) != 0) { return; }
-            second = fixture.AppendAsync(1, sequence: 1).AsTask().GetAwaiter().GetResult();
-            fixture.Ingress.NotifyCommitted(fixture.Identity(1), second.Revision);
             exitEntered.TrySetResult();
-            releaseExit.Wait(TimeSpan.FromSeconds(10));
+            if (!releaseExit.Wait(TimeSpan.FromSeconds(10)))
+            { throw new TimeoutException("The worker-exit gate was not released."); }
         };
 
         fixture.Ingress.NotifyCommitted(fixture.Identity(0), first.Revision);
         await exitEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        fixture.Ingress.StopAdmission(fixture.RunId);
-        ValueTask drain = fixture.Ingress.WaitForDrainAsync(fixture.RunId);
-        Assert.IsFalse(drain.IsCompleted);
-        releaseExit.Set();
+        ValueTask drain;
+        try
+        {
+            second = await fixture.AppendAsync(1, sequence: 1);
+            fixture.Ingress.NotifyCommitted(fixture.Identity(1), second.Revision);
+            fixture.Ingress.StopAdmission(fixture.RunId);
+            drain = fixture.Ingress.WaitForDrainAsync(fixture.RunId);
+            Assert.IsFalse(drain.IsCompleted);
+        }
+        finally { releaseExit.Set(); }
         await drain.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.AreEqual(second.Revision.Value,
@@ -523,6 +555,37 @@ public sealed class BScanRangeProjectionTests
         Assert.AreEqual(fixture.Identity(1),
             incrementalRegion.Snapshot.SelectableTraceIdentities[1]);
         Assert.IsTrue(fixture.Provider.Queries.All(static query => query.MaximumCount <= 256));
+    }
+
+    [TestMethod]
+    public async Task LateDisplayAcknowledgementPreservesNewerPendingRenderGeometry()
+    {
+        await using var fixture = await Fixture.CreateAsync(maximumColumns: 256);
+        InspectionAppendResult commit = await fixture.AppendAsync(0, sequence: 0);
+        fixture.Ingress.NotifyCommitted(fixture.Identity(0), commit.Revision);
+        await fixture.WaitForRevisionAsync(commit.Revision);
+        BScanRenderRequest original = fixture.Request(0, 3, 4, 4);
+        fixture.Delivery.RequestRender(original);
+        BScanRenderRequest resized = fixture.Request(0, 1, 2, 4);
+        fixture.Delivery.RequestRender(resized);
+        BScanIngressVisualState state = fixture.Ingress.CurrentVisualState!;
+        var displayed = new BScanDisplayedVisualIdentity(
+            new(fixture.SourceId, fixture.RunId, new(0)),
+            new(checked((ulong)state.Epoch), state.StoreState.StoreRevision,
+                state.StoreState.WrapGeneration),
+            new(original.SpatialViewport, original.TimeViewport, original.PixelWidth,
+                original.PixelHeight, original.RenderConfigurationVersion,
+                original.EffectiveResampling));
+
+        fixture.Delivery.AcknowledgeDisplayed("default", displayed);
+
+        BScanRenderRequest pending = fixture.Delivery.GetLastRequest("default")!;
+        Assert.AreEqual(resized.SpatialViewport, pending.SpatialViewport);
+        Assert.AreEqual(resized.PixelWidth, pending.PixelWidth);
+        Assert.AreEqual(resized.PixelHeight, pending.PixelHeight);
+        Assert.AreEqual(displayed.Revision.SnapshotVersion, pending.DisplayedSnapshotVersion);
+        Assert.AreEqual(displayed.Revision.StoreRevision, pending.DisplayedStoreRevision);
+        Assert.AreSame(displayed, pending.Displayed);
     }
 
     [TestMethod]
@@ -645,14 +708,25 @@ public sealed class BScanRangeProjectionTests
         InspectionAppendResult first = await fixture.AppendAsync(0, sequence: 0);
         fixture.Ingress.NotifyCommitted(fixture.Identity(0), first.Revision);
         await fixture.WaitForRevisionAsync(first.Revision);
+        var candidateReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseCandidate = new ManualResetEventSlim();
         fixture.Delivery.BeforeRasterCandidateValidation = () =>
         {
-            InspectionAppendResult second = fixture.AppendAsync(1, sequence: 1).AsTask()
-                .GetAwaiter().GetResult();
-            fixture.Ingress.NotifyCommitted(fixture.Identity(1), second.Revision);
+            candidateReached.TrySetResult();
+            if (!releaseCandidate.Wait(TimeSpan.FromSeconds(10)))
+            { throw new TimeoutException("The raster candidate gate was not released."); }
         };
 
-        BScanRasterResult result = await fixture.RenderResultAsync(0, 0, 1, 4);
+        Task<BScanRasterResult> render = Task.Run(async () =>
+            await fixture.RenderResultAsync(0, 0, 1, 4));
+        await candidateReached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            InspectionAppendResult second = await fixture.AppendAsync(1, sequence: 1);
+            fixture.Ingress.NotifyCommitted(fixture.Identity(1), second.Revision);
+        }
+        finally { releaseCandidate.Set(); }
+        BScanRasterResult result = await render.WaitAsync(TimeSpan.FromSeconds(10));
         fixture.Delivery.BeforeRasterCandidateValidation = null;
 
         Assert.AreEqual(BScanRasterResultKind.Stale, result.Kind);
@@ -667,10 +741,20 @@ public sealed class BScanRangeProjectionTests
         fixture.Ingress.NotifyCommitted(fixture.Identity(0), first.Revision);
         await fixture.WaitForRevisionAsync(first.Revision);
         InspectionAppendResult second = default;
+        var candidateReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseCandidate = new ManualResetEventSlim();
         fixture.Delivery.BeforeRasterCandidateValidation = () =>
-            second = fixture.AppendAsync(1, sequence: 1).AsTask().GetAwaiter().GetResult();
-
-        BScanRasterResult result = await fixture.RenderResultAsync(0, 0, 1, 4);
+        {
+            candidateReached.TrySetResult();
+            if (!releaseCandidate.Wait(TimeSpan.FromSeconds(10)))
+            { throw new TimeoutException("The historical raster candidate gate was not released."); }
+        };
+        Task<BScanRasterResult> render = Task.Run(async () =>
+            await fixture.RenderResultAsync(0, 0, 1, 4));
+        await candidateReached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try { second = await fixture.AppendAsync(1, sequence: 1); }
+        finally { releaseCandidate.Set(); }
+        BScanRasterResult result = await render.WaitAsync(TimeSpan.FromSeconds(10));
         fixture.Delivery.BeforeRasterCandidateValidation = null;
 
         Assert.AreEqual(BScanRasterResultKind.Available, result.Kind);
@@ -915,10 +999,27 @@ public sealed class BScanRangeProjectionTests
 
         public async ValueTask DisposeAsync()
         {
-            await Delivery.DisposeAsync();
-            await Ingress.DisposeAsync();
-            await _writer.DisposeAsync();
-            await _registry.DisposeAsync();
+            Delivery.BeforeRasterCandidateCommit = null;
+            Delivery.BeforeRasterCandidateValidation = null;
+            Ingress.BeforeReconcileWorkerExit = null;
+            Ingress.BeforeVisualStateCommit = null;
+            var failures = new List<Exception>();
+            await Capture("delivery", () => Delivery.DisposeAsync().AsTask());
+            await Capture("ingress", () => Ingress.DisposeAsync().AsTask());
+            await Capture("writer", () => _writer.DisposeAsync().AsTask());
+            await Capture("registry", () => _registry.DisposeAsync().AsTask());
+            if (failures.Count != 0)
+            { throw new AggregateException("B-Scan fixture cleanup failed.", failures); }
+
+            async Task Capture(string stage, Func<Task> dispose)
+            {
+                try { await dispose().WaitAsync(TimeSpan.FromSeconds(10)); }
+                catch (Exception error)
+                {
+                    failures.Add(new InvalidOperationException(
+                        $"{stage} cleanup failed; ingress={Ingress.Diagnostics}; delivery={Delivery.Diagnostics}", error));
+                }
+            }
         }
 
     }
@@ -963,10 +1064,11 @@ public sealed class BScanRangeProjectionTests
             Queries.Enqueue(query);
             InspectionRangeReadResult result = await inner.ReadRangeAsync(query, cancellationToken);
             int read = Interlocked.Increment(ref _rangeReads);
-            var items = result.Items.Select(item => item.Lease is null ? item : item with
-            { Lease = new CountingLease(item.Lease, this) }).ToArray();
-            return new(result.Status, RevisionOverride?.Invoke(read) ?? result.Revision,
-                items, result.ErrorCode);
+            var items = result.Items.Select(item => item.Lease is null
+                ? InspectionRangeItem.Unavailable(item.Identity, item.Status)
+                : InspectionRangeItem.Available(new CountingLease(item.Lease, this))).ToArray();
+            return InspectionRangeReadResult.Page(
+                RevisionOverride?.Invoke(read) ?? result.Revision, items);
         }
         public async ValueTask<InspectionStreamStateReadResult> ReadStreamStateAsync(UtStreamIdentity stream,
             CancellationToken cancellationToken = default)

@@ -28,7 +28,8 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     private TaskCompletionSource? _metadataCandidateReady;
     private ManualResetEventSlim? _releaseMetadataCandidate;
 
-    private ProductiveBScanFixture(int preloadedColumns, bool useSystemDeliveryClock)
+    private ProductiveBScanFixture(int preloadedColumns, bool useSystemDeliveryClock,
+        int initialRasterWidth, IAuthoritativeAScanSelector? selectionAuthority)
     {
         Clock = new();
         var options = new BScanOptions(16 * 1024 * 1024, 512, 8, 2);
@@ -62,7 +63,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         };
         Dispatcher = new(System.Windows.Threading.Dispatcher.CurrentDispatcher);
         SharedViewport = new(Dispatcher);
-        Selection = new(Dispatcher,
+        Selection = new(Dispatcher, selectionAuthority ??
             new UtTraceAScanSelector(_inspectionStores.Store, new AScanProjector()));
         ViewModel = new(Delivery, SharedViewport, Selection, Dispatcher);
         Control = new();
@@ -70,7 +71,9 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         _host = new() { Content = Control, Width = 420, Height = 300, ShowInTaskbar = false };
         _host.Show();
         _host.UpdateLayout();
-        ViewModel.SetRasterSize(128, 16, 1);
+        // Productive ring tests require one neutral raster column per configured live trace.
+        // Do not depend on a deferred WPF measure pass to establish that initial contract.
+        ViewModel.SetRasterSize(initialRasterWidth, 16, 1);
     }
 
     internal ManualClock Clock { get; }
@@ -88,8 +91,10 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     internal int RasterOwnersOutstanding => _rasters.Outstanding;
 
     internal static Task<ProductiveBScanFixture> CreateAsync(int preloadedColumns = 0,
-        bool useSystemDeliveryClock = false) =>
-        Task.FromResult(new ProductiveBScanFixture(preloadedColumns, useSystemDeliveryClock));
+        bool useSystemDeliveryClock = false, int initialRasterWidth = 128,
+        IAuthoritativeAScanSelector? selectionAuthority = null) =>
+        Task.FromResult(new ProductiveBScanFixture(preloadedColumns, useSystemDeliveryClock,
+            initialRasterWidth, selectionAuthority));
 
     internal async Task SeedAsync(ulong acquisitionIndex = 0)
     {
@@ -256,28 +261,55 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         Delivery.AfterBootstrapRequestQueued = null;
         Delivery.BeforeMetadataCandidateCommit = null;
         Delivery.BeforeRasterCandidateCommit = null;
+        Ingress.BeforeReconcileWorkerExit = null;
+        Ingress.BeforeVisualStateCommit = null;
         _releaseMetadataCandidate?.Set();
+        var failures = new List<Exception>();
+        Capture("adapter", Adapter.Dispose);
+        await CaptureAsync("view model", () => ViewModel.DisposeAsync().AsTask());
+        Capture("delivery registration balances", () =>
+        {
+            Assert.AreEqual(0, Delivery.ActiveConsumerCount);
+            Assert.AreEqual(0, Delivery.PendingBootstrapCount);
+            Assert.AreEqual(0, Delivery.RetainedSnapshotCount);
+        });
+        await CaptureAsync("selection", () => Selection.DisposeAsync().AsTask());
+        await CaptureAsync("shared viewport", () => SharedViewport.DisposeAsync().AsTask());
+        await CaptureAsync("delivery", () => Delivery.DisposeAsync().AsTask());
+        await CaptureAsync("ingress", () => Ingress.DisposeAsync().AsTask());
+        await CaptureAsync("writer seal", () => _inspectionWriter.SealRunAsync().AsTask());
+        await CaptureAsync("writer", () => _inspectionWriter.DisposeAsync().AsTask());
+        await CaptureAsync("inspection stores", () => _inspectionStores.DisposeAsync().AsTask());
+        Capture("host", _host.Close);
+        Capture("resource balances", () =>
+        {
+            Assert.AreEqual(0, TraceOwnersOutstanding);
+            Assert.AreEqual(0, RasterOwnersOutstanding);
+            Assert.AreEqual(0, BlocksOutstanding);
+            Assert.AreEqual(0, Control.ActivePooledRasterBytes);
+            Assert.AreEqual(0, Control.ActiveCandidateBitmaps);
+            Assert.AreEqual(0, Clock.RegisteredTimers);
+            Assert.AreEqual(Delivery.Diagnostics.ObserverCallbacksStarted,
+                Delivery.Diagnostics.ObserverCallbacksCompleted);
+        });
         _releaseMetadataCandidate?.Dispose();
-        Adapter.Dispose();
-        await ViewModel.DisposeAsync();
-        Assert.AreEqual(0, Delivery.ActiveConsumerCount);
-        Assert.AreEqual(0, Delivery.PendingBootstrapCount);
-        Assert.AreEqual(0, Delivery.RetainedSnapshotCount);
-        await Selection.DisposeAsync();
-        await SharedViewport.DisposeAsync();
-        await Delivery.DisposeAsync();
-        await Ingress.DisposeAsync();
-        await _inspectionWriter.SealRunAsync();
-        await _inspectionWriter.DisposeAsync();
-        await _inspectionStores.DisposeAsync();
-        _host.Close();
-        Assert.AreEqual(0, TraceOwnersOutstanding);
-        Assert.AreEqual(0, RasterOwnersOutstanding);
-        Assert.AreEqual(0, BlocksOutstanding);
-        Assert.AreEqual(0, Control.ActivePooledRasterBytes);
-        Assert.AreEqual(0, Control.ActiveCandidateBitmaps);
-        Assert.AreEqual(0, Clock.RegisteredTimers);
-        Assert.AreEqual(Delivery.Diagnostics.ObserverCallbacksStarted, Delivery.Diagnostics.ObserverCallbacksCompleted);
+        if (failures.Count != 0)
+        { throw new AggregateException("Productive B-Scan fixture cleanup failed.", failures); }
+
+        async Task CaptureAsync(string stage, Func<Task> dispose)
+        {
+            try { await dispose().WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (Exception error) { Record(stage, error); }
+        }
+
+        void Capture(string stage, Action dispose)
+        {
+            try { dispose(); }
+            catch (Exception error) { Record(stage, error); }
+        }
+
+        void Record(string stage, Exception error) => failures.Add(new InvalidOperationException(
+            $"{stage} cleanup failed; ingress={Ingress.Diagnostics}; delivery={Delivery.Diagnostics}", error));
     }
 
     private sealed class TrackingBytePool : IByteOwnerPool

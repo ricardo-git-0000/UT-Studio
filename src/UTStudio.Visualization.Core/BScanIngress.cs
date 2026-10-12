@@ -15,10 +15,12 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
     private readonly BScanOptions _options;
     private readonly BoundedBScanVisualBufferPool _visualBuffers;
     private readonly CancellationTokenSource _lifetime = new();
-    private Task _reconcile = Task.CompletedTask;
+    private readonly SemaphoreSlim _reconcileWake = new(0, 1);
+    private readonly Task _reconcileWorker;
     private CancellationTokenSource? _runCancellation;
     private long _runEpoch;
     private bool _reconcilePending;
+    private bool _reconcileScheduled;
     private int _activeOperations;
     private TaskCompletionSource _drained = CompletedDrain();
     private readonly TaskCompletionSource _disposeDrained =
@@ -55,6 +57,7 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
         _states = states ?? throw new ArgumentNullException(nameof(states));
         _options = options ?? new();
         _visualBuffers = visualBuffers ?? throw new ArgumentNullException(nameof(visualBuffers));
+        _reconcileWorker = ReconcileWorkerAsync();
     }
 
     public void OpenRun(AcquisitionRunId runId)
@@ -67,9 +70,8 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
             { throw new InvalidOperationException("A B-Scan run is already open or draining."); }
             if (_activeOperations != 0)
             { throw new InvalidOperationException("The previous B-Scan run is still closing."); }
-            // The stable drain completes in the worker's finally block. Task.Run may mark its
-            // wrapper completed a few instructions later, after no admitted operation remains.
-            _reconcile = Task.CompletedTask;
+            // The stable drain completes in the worker's finally block after no admitted
+            // operation remains.
             _runId = runId;
             _runCancellation?.Dispose();
             _runCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
@@ -81,6 +83,7 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
             _visualState = null;
             _workerError = null;
             _reconcilePending = false;
+            _reconcileScheduled = false;
             _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
             _phase = BScanRunProjectionPhase.Open;
         }
@@ -190,41 +193,58 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
 
     private void ScheduleReconcileUnderLock()
     {
-        if (_disposed || _stream is null || !_reconcilePending || !_reconcile.IsCompleted ||
+        if (_disposed || _stream is null || !_reconcilePending || _reconcileScheduled ||
             _runCancellation is null || _phase is not (BScanRunProjectionPhase.Open or
                 BScanRunProjectionPhase.AdmissionClosed or BScanRunProjectionPhase.Draining)) { return; }
-        long epoch = _runEpoch;
-        CancellationToken token = _runCancellation.Token;
+        _reconcileScheduled = true;
         _activeOperations++;
-        _reconcile = Task.Run(() => ReconcileWorkerAsync(epoch, token));
+        _reconcileWake.Release();
     }
 
-    private async Task ReconcileWorkerAsync(long epoch, CancellationToken token)
+    private async Task ReconcileWorkerAsync()
     {
         try
         {
             while (true)
             {
-                lock (_gate)
+                await _reconcileWake.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+                while (true)
                 {
-                    if (_disposed || epoch != _runEpoch || !_reconcilePending) { return; }
-                    _reconcilePending = false;
-                }
-                await ReconcileAsync(token).ConfigureAwait(false);
-                lock (_gate)
-                {
-                    if (!_reconcilePending || epoch != _runEpoch) { return; }
+                    CancellationToken token;
+                    bool mayBecomeIdle;
+                    lock (_gate)
+                    {
+                        if (_disposed) { return; }
+                        mayBecomeIdle = !_reconcilePending;
+                        token = _runCancellation?.Token ?? _lifetime.Token;
+                        if (!mayBecomeIdle) { _reconcilePending = false; }
+                    }
+                    if (mayBecomeIdle)
+                    {
+                        BeforeReconcileWorkerExit?.Invoke();
+                        lock (_gate)
+                        {
+                            if (_reconcilePending) { continue; }
+                            _reconcileScheduled = false;
+                            _activeOperations--;
+                            TryCompleteDrainUnderLock();
+                            break;
+                        }
+                    }
+                    await ReconcileAsync(token).ConfigureAwait(false);
                 }
             }
         }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         finally
         {
-            BeforeReconcileWorkerExit?.Invoke();
             lock (_gate)
             {
-                _activeOperations--;
-                _reconcile = Task.CompletedTask;
-                ScheduleReconcileUnderLock();
+                if (_reconcileScheduled)
+                {
+                    _reconcileScheduled = false;
+                    _activeOperations--;
+                }
                 TryCompleteDrainUnderLock();
             }
         }
@@ -268,11 +288,10 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
                     int count = (int)Math.Min(remaining, (ulong)InspectionRangeBatchSize);
                     using InspectionRangeReadResult range = await _ranges.ReadRangeAsync(
                         new(stream, cursor, count), token).ConfigureAwait(false);
-                    // The store is append-only for committed identities. A later revision may be
-                    // observed between bounded pages without invalidating the prefix described by
-                    // the stream-state snapshot. Publish that coherent intermediate snapshot and
-                    // let the next reconciliation consume the newer tail. Requiring equality here
-                    // starves forever once a scan takes longer than one acquisition interval.
+                    // Reconciliation is bounded by the stream-state watermarks. Committed identities
+                    // are append-only and AcquisitionIndex is strictly increasing, so a later page
+                    // revision cannot change this captured prefix. Requiring equality would starve
+                    // whenever acquisition advances between pages; raster projection remains stricter.
                     if (range.Revision.Value < snapshot.Revision.Value)
                     { revisionRegressed = true; break; }
                     foreach (InspectionRangeItem available in range.Items.Where(static item =>
@@ -319,7 +338,7 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
 
     private const int InspectionRangeBatchSize = 256;
 
-    internal BScanPageTraversalResult VisitVisualPages(BScanProjectionTicket ticket,
+    internal async ValueTask<BScanPageTraversalResult> VisitVisualPagesAsync(BScanProjectionTicket ticket,
         BScanAcquisitionRange range,
         Action<InspectionRangeReadResult> visit, CancellationToken cancellationToken)
     {
@@ -340,14 +359,13 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
             int pageLeases = 0;
             try
             {
-                result = _ranges.ReadRangeAsync(new(ticket.Stream, cursor, count), cancellationToken)
-                    .AsTask().GetAwaiter().GetResult();
+                result = await _ranges.ReadRangeAsync(new(ticket.Stream, cursor, count), cancellationToken)
+                    .ConfigureAwait(false);
                 Interlocked.Increment(ref _rangeReads);
                 pages++;
                 statuses.Add(result.Status);
                 foreach (InspectionRangeItem item in result.Items) { statuses.Add(item.Status); }
-                if (result.Revision.Value != ticket.AuthoritativeRevision &&
-                    (!ticket.FollowLiveWindow || result.Revision.Value < ticket.AuthoritativeRevision))
+                if (result.Revision.Value != ticket.AuthoritativeRevision)
                 { return new(statuses, null, true, pages, availableTotal); }
                 if (result.Status is InspectionReadStatus.Closed or InspectionReadStatus.Cancelled or
                     InspectionReadStatus.Faulted or InspectionReadStatus.OutOfRange)
@@ -498,7 +516,6 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
         completion.SetResult();
         return completion;
     }
-    internal long VisualBytesReserved => 0;
     public BScanDiagnostics Diagnostics => new(_rangeReads, 0, 0, 0, 0, 0,
         Volatile.Read(ref _activeLeases), Volatile.Read(ref _maximumLeases), 0,
         new(0, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero), 0, 0, 0, 0,
@@ -520,7 +537,7 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
     {
         Stop();
         Task drain;
-        lock (_gate) { drain = Task.WhenAll(_reconcile, _disposeDrained.Task); }
+        lock (_gate) { drain = Task.WhenAll(_reconcileWorker, _disposeDrained.Task); }
         return cancellationToken.CanBeCanceled ? drain.WaitAsync(cancellationToken) : drain;
     }
 
@@ -534,6 +551,7 @@ public sealed class BScanIngress : ICommittedTraceLifecycleSink, IAsyncDisposabl
         Stop();
         await WaitForDrainAsync().ConfigureAwait(false);
         await _visualBuffers.DisposeAsync().ConfigureAwait(false);
+        _reconcileWake.Dispose();
         _runCancellation?.Dispose();
         _lifetime.Dispose();
     }

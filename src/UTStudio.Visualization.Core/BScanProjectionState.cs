@@ -18,4 +18,3 @@ internal sealed record BScanPageTraversalResult(
     bool Stale,
     int PageCount,
     int AvailableCount);
-

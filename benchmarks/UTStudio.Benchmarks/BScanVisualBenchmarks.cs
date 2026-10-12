@@ -414,13 +414,15 @@ internal sealed class BScanVisualBenchmarkFixture : IDisposable
                 ulong index = query.StartAcquisitionIndex + (ulong)offset;
                 if (_samples.TryGetValue(index, out short[]? samples))
                 {
-                    items.Add(new(new TraceIdentity(Stream, index), InspectionReadStatus.Available,
-                    new Lease(Descriptor(index), samples)));
+                    items.Add(InspectionRangeItem.Available(new Lease(Descriptor(index), samples)));
                 }
-                else { items.Add(new(new TraceIdentity(Stream, index), InspectionReadStatus.NotAvailable)); }
+                else
+                {
+                    items.Add(InspectionRangeItem.Unavailable(
+                    new TraceIdentity(Stream, index), InspectionReadStatus.NotAvailable));
+                }
             }
-            return ValueTask.FromResult(new InspectionRangeReadResult(InspectionReadStatus.Available,
-                Revision, items));
+            return ValueTask.FromResult(InspectionRangeReadResult.Page(Revision, items));
         }
 
         public ValueTask<InspectionStreamStateReadResult> ReadStreamStateAsync(UtStreamIdentity stream,

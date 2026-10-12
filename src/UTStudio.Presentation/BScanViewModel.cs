@@ -7,6 +7,22 @@ using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Presentation;
 
+public enum BScanTraceSelectionRequestResult
+{
+    Unknown = 0,
+    Accepted = 1,
+    Selected = 2,
+    InvalidIdentity = 3,
+    InvalidRun = 4,
+    InvalidStream = 5,
+    NotAvailable = 6,
+    Gap = 7,
+    OutOfRange = 8,
+    Superseded = 9,
+    Closed = 10,
+    Faulted = 11
+}
+
 /// <summary>Neutral B-Scan presentation owner. It borrows source, selection and time coordinators.</summary>
 public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
 {
@@ -242,24 +258,42 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         RequestRefresh();
     });
 
-    public async Task SelectColumnAsync(TraceIdentity identity)
+    public async Task<BScanTraceSelectionRequestResult> SelectTraceAsync(TraceIdentity identity)
     {
+        if (!identity.IsValid) { return BScanTraceSelectionRequestResult.InvalidIdentity; }
         Task selection = Task.CompletedTask;
+        BScanTraceSelectionRequestResult validation = BScanTraceSelectionRequestResult.Accepted;
         await _lifetime.InvokeAsync(() =>
         {
-            BScanRasterRegion? visible;
-            lock (_gate) { visible = _visibleRegion; }
-            if (IsClosing || _state.RunId != identity.Stream.AcquisitionRunId || visible is null ||
-                visible.Snapshot.TraceStream != identity.Stream ||
-                !visible.Snapshot.AvailableTraceIdentities.Values.Contains(identity)) { return; }
+            if (IsClosing) { validation = BScanTraceSelectionRequestResult.Closed; return; }
+            if (_state.RunId != identity.Stream.AcquisitionRunId || _latestMetadata is null)
+            { validation = BScanTraceSelectionRequestResult.InvalidRun; return; }
+            if (_latestMetadata.TraceStream != identity.Stream)
+            { validation = BScanTraceSelectionRequestResult.InvalidStream; return; }
             ReplaceState(_state with { SelectedColumn = identity });
             selection = _selection.SelectAsync(_consumerId, identity);
         }).ConfigureAwait(false);
+        if (validation != BScanTraceSelectionRequestResult.Accepted) { return validation; }
         await selection.ConfigureAwait(false);
         await _lifetime.InvokeAsync(ApplySelection).ConfigureAwait(false);
+        return _selection.State.Identity == identity
+            ? BScanTraceSelectionRequestResult.Selected
+            : _selection.State.LastResult switch
+            {
+                BScanTraceResultKind.NotAvailable => BScanTraceSelectionRequestResult.NotAvailable,
+                BScanTraceResultKind.Gap => BScanTraceSelectionRequestResult.Gap,
+                BScanTraceResultKind.OutOfRange => BScanTraceSelectionRequestResult.OutOfRange,
+                BScanTraceResultKind.Cancelled => BScanTraceSelectionRequestResult.Superseded,
+                BScanTraceResultKind.Closed => BScanTraceSelectionRequestResult.Closed,
+                BScanTraceResultKind.Faulted => BScanTraceSelectionRequestResult.Faulted,
+                _ => BScanTraceSelectionRequestResult.Superseded
+            };
     }
 
-    public async Task SelectColumnAsync(ulong acquisitionIndex)
+    public async Task SelectColumnAsync(TraceIdentity identity) =>
+        _ = await SelectTraceAsync(identity).ConfigureAwait(false);
+
+    public async Task SelectVisibleColumnAsync(ulong acquisitionIndex)
     {
         Task selection = Task.CompletedTask;
         await _lifetime.InvokeAsync(() =>
@@ -275,7 +309,9 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         await _lifetime.InvokeAsync(ApplySelection).ConfigureAwait(false);
     }
 
-    public async Task SelectPixelAsync(int rasterPixelX)
+    public Task SelectColumnAsync(ulong acquisitionIndex) => SelectVisibleColumnAsync(acquisitionIndex);
+
+    public async Task SelectVisiblePixelAsync(int rasterPixelX)
     {
         Task selection = Task.CompletedTask;
         await _lifetime.InvokeAsync(() =>
@@ -291,6 +327,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         await selection.ConfigureAwait(false);
         await _lifetime.InvokeAsync(ApplySelection).ConfigureAwait(false);
     }
+
+    public Task SelectPixelAsync(int rasterPixelX) => SelectVisiblePixelAsync(rasterPixelX);
 
     public void CancelSelection() => _lifetime.Post(() => _selection.Cancel(_consumerId));
     public void Refresh() => _lifetime.Post(() => RequestRefresh(force: true, full: true));
@@ -426,7 +464,9 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private void ApplyMetadata(BScanVisualSnapshot snapshot, long generation)
     {
         if (IsClosing || generation <= _appliedMetadataGeneration || (_latestMetadata is { } prior && prior.RunId == snapshot.RunId &&
-            snapshot.SnapshotVersion <= prior.SnapshotVersion)) { return; }
+            snapshot.SnapshotVersion <= prior.SnapshotVersion) ||
+            _state.RunId == snapshot.RunId && _state.DisplayedRevision is { } displayed &&
+            snapshot.StoreRevision < displayed.StoreRevision) { return; }
         _appliedMetadataGeneration = generation;
         bool newRun = _latestMetadata?.RunId != snapshot.RunId;
         _latestMetadata = snapshot;
@@ -605,13 +645,9 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     {
         BScanRasterResult? result = null;
         string? operationError = null;
-        // A visual source may implement ValueTask synchronously. Invoke it on the worker scheduler so
-        // CPU-heavy rasterization can never run inline on the UI dispatcher.
         try
         {
-            result = await Task.Run(async () =>
-                await _source.GetRegionAsync(request, cancellation.Token).ConfigureAwait(false),
-                CancellationToken.None).ConfigureAwait(false);
+            result = await ResolveRegionOffUiAsync(request, cancellation.Token).ConfigureAwait(false);
         }
         catch (Exception error) { operationError = Message(error); }
         BScanRasterRegion? owned = result?.Region;
@@ -655,6 +691,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
                         managed.Snapshot.SnapshotVersion),
                     StoreRevision = Math.Max(_state.StoreRevision.GetValueOrDefault(),
                         managed.Snapshot.StoreRevision),
+                    ResidentRange = managed.Snapshot.ResidentRange,
+                    TemporalDomain = managed.Snapshot.TemporalDomain,
                     SpatialViewport = _state.IsSpatialAutoFit
                         ? managed.Snapshot.SpatialViewport
                         : _state.SpatialViewport,
@@ -710,6 +748,34 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             }).ConfigureAwait(false);
         }
         lock (_gate) { if (generation == _rasterGeneration) { _rasterCancellation = null; } }
+    }
+
+    private Task<BScanRasterResult> ResolveRegionOffUiAsync(BScanRenderRequest request,
+        CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<BScanRasterResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        ThreadPool.UnsafeQueueUserWorkItem(static state =>
+        {
+            var (owner, renderRequest, token, source) =
+                ((BScanViewModel, BScanRenderRequest, CancellationToken,
+                    TaskCompletionSource<BScanRasterResult>))state!;
+            _ = CompleteAsync(owner, renderRequest, token, source);
+        }, (this, request, cancellationToken, completion));
+        return completion.Task;
+
+        static async Task CompleteAsync(BScanViewModel owner, BScanRenderRequest renderRequest,
+            CancellationToken token, TaskCompletionSource<BScanRasterResult> source)
+        {
+            try
+            {
+                source.TrySetResult(await owner._source.GetRegionAsync(renderRequest, token)
+                    .ConfigureAwait(false));
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            { source.TrySetCanceled(token); }
+            catch (Exception error) { source.TrySetException(error); }
+        }
     }
 
     private int CurrentRasterWidth()

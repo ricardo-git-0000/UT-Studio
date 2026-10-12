@@ -11,11 +11,16 @@ internal static class DiagnosticWait
         catch (TimeoutException error) { throw new TimeoutException($"Not reached within 10 seconds: {condition}", error); }
     }
     internal static async Task Until(Func<bool> condition, [CallerArgumentExpression(nameof(condition))] string description = "condition")
+        => await Until(condition, () => description);
+
+    internal static async Task Until(Func<bool> condition, Func<string> diagnostic)
     {
+        ArgumentNullException.ThrowIfNull(diagnostic);
         using var watchdog = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         while (!condition())
         {
-            if (watchdog.IsCancellationRequested) { throw new TimeoutException($"Not reached within 10 seconds: {description}"); }
+            if (watchdog.IsCancellationRequested)
+            { throw new TimeoutException($"Not reached within 10 seconds: {diagnostic()}"); }
             // A normal-priority Task.Yield loop on STA can starve the DataBind operations it awaits.
             if (Dispatcher.FromThread(Thread.CurrentThread) is not null) { await Dispatcher.Yield(DispatcherPriority.Background); }
             else { await Task.Yield(); }

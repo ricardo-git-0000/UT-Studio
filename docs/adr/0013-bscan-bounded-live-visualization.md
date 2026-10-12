@@ -23,8 +23,10 @@ NoData provisional y `Gap` conserva su causa; los saltos de `Sequence` no sintet
 
 El lifecycle es `Open → AdmissionClosed → Draining → Frozen → Disposed`. La sesión detiene y drena
 adquisición, sella, publica la revisión final, solicita la última reconciliación B, drena trabajo ya
-admitido y congela el raster. La selección usa exclusivamente el mapa inmutable de identidades del
-raster visible. A y B se notifican después del mismo commit, con errores y continuidad independientes.
+admitido y congela el raster. La selección de columna visible usa exclusivamente el mapa inmutable del
+raster mostrado; la selección exacta por `TraceIdentity` consulta el provider autoritativo y no exige
+que la traza esté visible. A y B se notifican después del mismo commit, con errores y continuidad
+independientes.
 
 Las secciones marcadas a continuación como históricas documentan el diseño original sustituido; no
 son contrato vigente.
@@ -457,7 +459,7 @@ independiente.
 Visualization.Core contiene modelos, stores, reducción, regiones y transformaciones neutrales.
 Presentation contiene estado observable, solicitudes, coordinadores y ViewModels. Visualization.Wpf
 solo renderiza e interpreta input y continúa referenciando únicamente Visualization.Core. App.Wpf
-compone fan-out, servicios y ventanas.
+compone los servicios autoritativos, las proyecciones derivadas y las ventanas.
 
 Composición posee sesión, deliveries/stores y coordinadores de selección y tiempo. Los ViewModels no se
 referencian. Cada BScanWindow posee su ViewModel y consumer ID, tomando prestados los servicios

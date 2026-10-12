@@ -344,7 +344,7 @@ public sealed class BScanProductiveIntegrationTests
     [TestMethod]
     public Task Full_live_ring_scrolls_one_column_without_rebuilding_the_complete_raster() => StaTest.Run(async () =>
     {
-        await using var fixture = await ProductiveBScanFixture.CreateAsync(512);
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512, initialRasterWidth: 512);
         await fixture.WaitForRevisionAsync(512);
         await DiagnosticWait.Until(() => fixture.Control.AppliedSnapshot is
         { RasterWidth: 512, RenderConfigurationVersion: 1 },
@@ -379,16 +379,21 @@ public sealed class BScanProductiveIntegrationTests
     [TestMethod]
     public Task Reducing_full_live_ring_keeps_incremental_scroll_and_ui_work_bounded() => StaTest.Run(async () =>
     {
-        await using var fixture = await ProductiveBScanFixture.CreateAsync(512);
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(512, initialRasterWidth: 512);
         await fixture.WaitForRevisionAsync(512);
-        await DiagnosticWait.Until(() => fixture.Control.AppliedSnapshot is { RasterWidth: 512 },
-            "initial live ring has applied its configured surface");
+        await DiagnosticWait.Until(() => fixture.Control.AppliedSnapshot is { RasterWidth: 512 }, () =>
+            $"initial live ring has applied its configured surface; ingress={fixture.Ingress.CurrentVisualState}; " +
+            $"view={fixture.ViewModel.State}; delivery={fixture.Delivery.Diagnostics}; " +
+            $"applied={fixture.Control.AppliedSnapshot}");
 
         fixture.ViewModel.DecreaseLiveWindowCommand.Execute(null);
         Assert.AreEqual(256m, fixture.ViewModel.State.SpatialViewport!.Value.Span);
         await DiagnosticWait.Until(() => fixture.ViewModel.LiveWindowColumns == 256 &&
             fixture.Control.AppliedSnapshot is { RasterWidth: 256, SpatialViewport.Span: 256m },
-            "reduced live ring has applied one neutral pixel per trace");
+            () => $"reduced live ring has applied one neutral pixel per trace; " +
+                $"view={fixture.ViewModel.State}; ingress={fixture.Ingress.CurrentVisualState}; " +
+                $"delivery={fixture.Delivery.Diagnostics}; applied={fixture.Control.AppliedSnapshot}; " +
+                $"acknowledged={fixture.Delivery.GetAcknowledgedDisplay(fixture.ViewModel.ConsumerId)}");
         BScanDisplayedVisualIdentity reduced = fixture.Delivery.GetAcknowledgedDisplay(
             fixture.ViewModel.ConsumerId)!;
         Assert.AreEqual(256, reduced.Render.PixelWidth);
@@ -426,8 +431,9 @@ public sealed class BScanProductiveIntegrationTests
             fixture.Metadata.RunId, fixture.Metadata.SourceId,
             fixture.Metadata.Configuration.PhysicalChannelId), 400);
 
-        await fixture.ViewModel.SelectColumnAsync(identity);
+        BScanTraceSelectionRequestResult result = await fixture.ViewModel.SelectTraceAsync(identity);
 
+        Assert.AreEqual(BScanTraceSelectionRequestResult.Selected, result);
         Assert.AreEqual(identity, fixture.Selection.State.Identity);
         Assert.AreEqual(400UL, fixture.Selection.State.AcquisitionIndex);
         CollectionAssert.AreEqual(Enumerable.Range(0, 16).Select(value => (short)(value + 400)).ToArray(),
@@ -436,6 +442,79 @@ public sealed class BScanProductiveIntegrationTests
         Assert.AreEqual(BScanTraceResultKind.Available, fixture.Selection.State.LastResult);
         Assert.AreEqual(400UL, fixture.ViewModel.State.Selection.AcquisitionIndex);
         Assert.AreEqual(400UL, fixture.Control.SelectedAcquisitionIndex);
+    });
+
+    [TestMethod]
+    public Task Exact_selection_rejects_invalid_run_and_every_mismatched_stream_component() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
+        await fixture.WaitForRevisionAsync(4);
+        var inspection = new InspectionId(Guid.Parse("98000000-0000-0000-0000-000000000098"));
+        var stream = new UtStreamIdentity(inspection, fixture.Metadata.RunId,
+            fixture.Metadata.SourceId, fixture.Metadata.Configuration.PhysicalChannelId);
+
+        Assert.AreEqual(BScanTraceSelectionRequestResult.InvalidIdentity,
+            await fixture.ViewModel.SelectTraceAsync(default));
+        Assert.AreEqual(BScanTraceSelectionRequestResult.InvalidRun,
+            await fixture.ViewModel.SelectTraceAsync(new(new(inspection,
+                new(Guid.Parse("97000000-0000-0000-0000-000000000097")), stream.SourceId,
+                stream.PhysicalChannelId), 0)));
+        UtStreamIdentity[] mismatches =
+        [
+            new(new(Guid.Parse("96000000-0000-0000-0000-000000000096")), stream.AcquisitionRunId,
+                stream.SourceId, stream.PhysicalChannelId),
+            new(inspection, stream.AcquisitionRunId, new("other-source"), stream.PhysicalChannelId),
+            new(inspection, stream.AcquisitionRunId, stream.SourceId, new(99)),
+            new(inspection, stream.AcquisitionRunId, stream.SourceId, stream.PhysicalChannelId, new BeamId(0)),
+            new(inspection, stream.AcquisitionRunId, stream.SourceId, stream.PhysicalChannelId,
+                null, new FocalLawId(0))
+        ];
+        foreach (UtStreamIdentity mismatch in mismatches)
+        {
+            Assert.AreEqual(BScanTraceSelectionRequestResult.InvalidStream,
+                await fixture.ViewModel.SelectTraceAsync(new(mismatch, 0)));
+        }
+    });
+
+    [TestMethod]
+    [DataRow(BScanTraceResultKind.NotAvailable, BScanTraceSelectionRequestResult.NotAvailable)]
+    [DataRow(BScanTraceResultKind.Gap, BScanTraceSelectionRequestResult.Gap)]
+    [DataRow(BScanTraceResultKind.OutOfRange, BScanTraceSelectionRequestResult.OutOfRange)]
+    public Task Exact_selection_surfaces_authoritative_non_available_results(
+        BScanTraceResultKind authorityResult, BScanTraceSelectionRequestResult expected) => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(4,
+            selectionAuthority: new FixedSelectionAuthority(authorityResult));
+        await fixture.WaitForRevisionAsync(4);
+        var identity = new TraceIdentity(new(
+            new InspectionId(Guid.Parse("98000000-0000-0000-0000-000000000098")),
+            fixture.Metadata.RunId, fixture.Metadata.SourceId,
+            fixture.Metadata.Configuration.PhysicalChannelId), 400);
+
+        BScanTraceSelectionRequestResult result = await fixture.ViewModel.SelectTraceAsync(identity);
+
+        Assert.AreEqual(expected, result);
+        Assert.AreEqual(authorityResult, fixture.Selection.State.LastResult);
+        Assert.IsNull(fixture.Selection.State.Identity);
+    });
+
+    [TestMethod]
+    public Task Concurrent_exact_selection_is_latest_wins() => StaTest.Run(async () =>
+    {
+        await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
+        await fixture.WaitForRevisionAsync(4);
+        var stream = new UtStreamIdentity(
+            new InspectionId(Guid.Parse("98000000-0000-0000-0000-000000000098")),
+            fixture.Metadata.RunId, fixture.Metadata.SourceId,
+            fixture.Metadata.Configuration.PhysicalChannelId);
+
+        Task<BScanTraceSelectionRequestResult> first = fixture.ViewModel.SelectTraceAsync(new(stream, 0));
+        Task<BScanTraceSelectionRequestResult> latest = fixture.ViewModel.SelectTraceAsync(new(stream, 1));
+        await Task.WhenAll(first, latest);
+
+        Assert.AreEqual(BScanTraceSelectionRequestResult.Selected, latest.Result);
+        Assert.AreEqual(new TraceIdentity(stream, 1), fixture.Selection.State.Identity);
+        Assert.AreEqual(1UL, fixture.ViewModel.State.Selection.AcquisitionIndex);
     });
 
     [TestMethod]
@@ -453,6 +532,13 @@ public sealed class BScanProductiveIntegrationTests
         Assert.IsNotNull(fixture.Selection.State.Snapshot);
         Assert.AreEqual(2UL, fixture.Control.SelectedAcquisitionIndex);
         Assert.IsTrue(fixture.Control.HasSelectionVisual);
+        var exact = new TraceIdentity(new(
+            new InspectionId(Guid.Parse("98000000-0000-0000-0000-000000000098")),
+            fixture.Metadata.RunId, fixture.Metadata.SourceId,
+            fixture.Metadata.Configuration.PhysicalChannelId), 3);
+        Assert.AreEqual(BScanTraceSelectionRequestResult.Selected,
+            await fixture.ViewModel.SelectTraceAsync(exact));
+        Assert.AreEqual(3UL, fixture.Selection.State.AcquisitionIndex);
         int width = Math.Max(1, (int)Math.Ceiling(fixture.Control.ActualWidth));
         int height = Math.Max(1, (int)Math.Ceiling(fixture.Control.ActualHeight));
         var composed = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
@@ -469,6 +555,13 @@ public sealed class BScanProductiveIntegrationTests
         }
         Assert.IsGreaterThan(10, cursorPixels);
     });
+
+    private sealed class FixedSelectionAuthority(BScanTraceResultKind result) : IAuthoritativeAScanSelector
+    {
+        public ValueTask<AScanSelectionResult> ResolveAsync(TraceIdentity identity, ulong visualVersion,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(new AScanSelectionResult(result));
+    }
 
     [TestMethod]
     public Task Frozen_productive_run_can_rebuild_with_a_new_resampling_mode() => StaTest.Run(async () =>

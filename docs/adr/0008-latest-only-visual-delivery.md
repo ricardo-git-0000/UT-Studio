@@ -1,7 +1,7 @@
 # ADR 0008 — Entrega A-Scan latest-only y publicación visual acotada
 
 Fecha original: 2026-09-11. Revisado: 2026-09-22.
-Estado: entrega neutral implementada; cancelación estricta por suscriptor y diagnóstico terminal independiente corregidos según la petición del usuario del 2026-09-15.
+Estado: parcialmente sustituido por ADR 0015. La entrega latest-only derivada continúa vigente, pero el ingreso RF síncrono descrito históricamente aquí fue retirado.
 Trazabilidad: R01, R02, R06–R08 y R13; complementa [ADR 0005](0005-initial-solution-structure.md), [ADR 0006](0006-session-window-lifecycle.md) y [ADR 0007](0007-frame-source-ownership.md).
 
 ## Contexto y sustitución
@@ -10,14 +10,14 @@ La implementación conserva el ownership UT en Application y presta muestras sí
 
 Esta revisión prevalece para la rama visual sobre las referencias anteriores a mailbox de frames, extracción de owners por Presentation y transformación a 30 Hz. ADR 0006/0007 y arquitectura general conservan referencias a esa propuesta; su sincronización queda pendiente fuera del alcance autorizado. Se mantienen las garantías de lector único, liberación UT y parada ordenada. La topología nueva no autoriza ajustar automáticamente ChannelCapacity=4 ni BufferCount=8 del simulador.
 
-## Flujo implementado y ownership
+## Flujo vigente y antecedente sustituido
 
-`Simulador -> Channel -> ApplicationSession -> IConventionalFrameSink.Accept -> AScanProjector -> AScanSnapshot -> mailbox latest-only -> publicación observable`.
+Flujo vigente: `Simulador -> Channel -> ApplicationSession -> InspectionDataStore -> notificación sin muestras -> lectura autoritativa -> snapshot visual latest-only`.
 
-- ApplicationSession conserva el único lector de UtAcquisitionRun.Frames. El B-Scan aprobado añadirá un fan-out visual síncrono, ordenado y aislado por rama; no añadirá otro lector.
+- ApplicationSession conserva el único lector de UtAcquisitionRun.Frames. A-Scan y B-Scan reciben únicamente identidad y revisión confirmadas; no reciben RF prestada ni copiada desde Application.
 - Histórico sustituido por ADR 0013: la sesión recibía opcionalmente el contrato retirado
   `IConventionalFrameSink`; un puerto nulo conservaba el comportamiento sin entrega visual.
-- OpenRun recibe la metadata completa para reservar antes del primer préstamo. Accept recibe datos per-frame, incluido `AcquisitionIndex` y posición opcional, además del `ReadOnlySpan<short>` prestado. Ninguna rama puede retener span, aliases ni owner. A conserva su proyección latest-only; B copia al ring propio dentro de Accept y difiere índice, tiles y publicación. Un fallo B no cierra A y viceversa. `WaitForCloseAsync` constituye la barrera de cleanup previa a otra run. Véase [ADR 0013](0013-bscan-bounded-live-visualization.md).
+- El antiguo `OpenRun/Accept/WaitForCloseAsync` con préstamo RF y ring B pertenece exclusivamente al antecedente sustituido. ADR 0015 define el store autoritativo, los providers por rangos y el lifecycle vigente.
 - ApplicationSession conserva el frame y lo libera en finally, también si falla la transformación o entrega. Ninguna espera de observadores conserva muestras UT.
 - [AScanVisualDelivery](../../src/UTStudio.Visualization.Core/AScanVisualDelivery.cs) implementa el puerto y proyecta fuera del bloqueo del mailbox. Confirma el resultado solo si la ejecución y generación siguen vigentes. Sin suscriptores evita proyección y acumulación.
 - El mailbox retiene solamente un snapshot independiente pendiente. Una entrada sustituye al pendiente anterior; descartarlo elimina una referencia visual, no devuelve un owner UT.
