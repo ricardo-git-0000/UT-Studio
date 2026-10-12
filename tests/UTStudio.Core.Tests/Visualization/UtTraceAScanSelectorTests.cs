@@ -138,7 +138,9 @@ public sealed class UtTraceAScanSelectorTests
 
     private static InspectionTraceReadResult Result(InspectionReadStatus status,
         IInspectionTraceLease? lease = null, string? errorCode = null) =>
-        new(status, new InspectionRevision(7), lease, errorCode);
+        status == InspectionReadStatus.Available
+            ? InspectionTraceReadResult.Available(new InspectionRevision(7), lease!)
+            : InspectionTraceReadResult.Unavailable(status, new InspectionRevision(7), errorCode);
 
     private sealed class ScriptedProvider(
         Func<TraceIdentity, CancellationToken, ValueTask<InspectionTraceReadResult>> read)

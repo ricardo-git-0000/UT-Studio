@@ -220,7 +220,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
 
                 lock (_gate)
                 {
-                    if (_index.Count + _gaps.Count + 1 + commit.Gaps.Count > _options.MaximumEntries ||
+                    if (!HasEntryCapacityUnderLock(checked(1 + commit.Gaps.Count)) ||
                         bytes > _options.SampleCapacityBudgetBytes - _ownedSampleBytes - _reservedSampleBytes)
                     {
                         _capacityRejections++;
@@ -400,7 +400,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                         else { _conflicts++; _runs[runWriter.RunId].Conflicts++; }
                         return ResultUnderLock(duplicate ? InspectionAppendStatus.Duplicate : InspectionAppendStatus.Conflict, true);
                     }
-                    if (_index.Count + _gaps.Count + 1 > _options.MaximumEntries)
+                    if (!HasEntryCapacityUnderLock(1))
                     {
                         _capacityRejections++;
                         _runs[runWriter.RunId].Rejections++;
@@ -447,17 +447,17 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
     {
         if (!identity.IsValid) { throw new ArgumentException("A valid identity is required.", nameof(identity)); }
         if (cancellationToken.IsCancellationRequested)
-        { return ValueTask.FromResult(new InspectionTraceReadResult(InspectionReadStatus.Cancelled, Revision)); }
+        { return ValueTask.FromResult(InspectionTraceReadResult.Unavailable(InspectionReadStatus.Cancelled, Revision)); }
         lock (_gate)
         {
-            if (!_leasesAllowed) { return ValueTask.FromResult(new InspectionTraceReadResult(InspectionReadStatus.Closed, new(_revision))); }
+            if (!_leasesAllowed) { return ValueTask.FromResult(InspectionTraceReadResult.Unavailable(InspectionReadStatus.Closed, new(_revision))); }
             if (!_index.TryGetPrimary(identity, out Entry? entry))
             {
                 InspectionReadStatus missing = MissingStatusUnderLock(identity.Stream,
                     identity.AcquisitionIndex);
-                return ValueTask.FromResult(new InspectionTraceReadResult(missing, new(_revision)));
+                return ValueTask.FromResult(InspectionTraceReadResult.Unavailable(missing, new(_revision)));
             }
-            return ValueTask.FromResult(new InspectionTraceReadResult(InspectionReadStatus.Available,
+            return ValueTask.FromResult(InspectionTraceReadResult.Available(
                 new(_revision), CreateLeaseUnderLock(entry!)));
         }
     }
@@ -467,11 +467,11 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
     {
         if (!query.IsValid) { throw new ArgumentException("A valid bounded range query is required.", nameof(query)); }
         if (cancellationToken.IsCancellationRequested)
-        { return ValueTask.FromResult(new InspectionRangeReadResult(InspectionReadStatus.Cancelled, Revision, [])); }
+        { return ValueTask.FromResult(InspectionRangeReadResult.Terminal(InspectionReadStatus.Cancelled, Revision)); }
         lock (_gate)
         {
             var revision = new InspectionRevision(_revision);
-            if (!_leasesAllowed) { return ValueTask.FromResult(new InspectionRangeReadResult(InspectionReadStatus.Closed, revision, [])); }
+            if (!_leasesAllowed) { return ValueTask.FromResult(InspectionRangeReadResult.Terminal(InspectionReadStatus.Closed, revision)); }
             var items = new List<InspectionRangeItem>(query.MaximumCount);
             var acquired = new List<Lease>();
             try
@@ -497,18 +497,15 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                             if (!transferred) { unownedLease.Dispose(); }
                         }
                         Lease lease = unownedLease;
-                        items.Add(new(entry.Descriptor.Identity, InspectionReadStatus.Available, lease));
+                        items.Add(InspectionRangeItem.Available(lease));
                     }
                     else
                     {
-                        items.Add(new(new TraceIdentity(query.Stream, index),
+                        items.Add(InspectionRangeItem.Unavailable(new TraceIdentity(query.Stream, index),
                             MissingStatusUnderLock(query.Stream, index)));
                     }
                 }
-                return ValueTask.FromResult(new InspectionRangeReadResult(
-                    items.Any(static item => item.Status == InspectionReadStatus.Available)
-                        ? InspectionReadStatus.Available : InspectionReadStatus.NotAvailable,
-                    revision, items));
+                return ValueTask.FromResult(InspectionRangeReadResult.Page(revision, items));
             }
             catch (Exception error)
             {
@@ -520,7 +517,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                     finally { acquired[index].Dispose(); }
                 }
                 if (error is OperationCanceledException && cleanupErrors.Count == 0)
-                { return ValueTask.FromResult(new InspectionRangeReadResult(InspectionReadStatus.Cancelled, revision, [])); }
+                { return ValueTask.FromResult(InspectionRangeReadResult.Terminal(InspectionReadStatus.Cancelled, revision)); }
                 throw new InspectionRangeAcquisitionException(error, cleanupErrors);
             }
         }
@@ -548,17 +545,23 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                 if (!_leasesAllowed)
                 { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.Closed(revision)); }
                 if (stream.InspectionId != _inspectionId)
-                { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
-                    InspectionStreamStateErrorCode.InspectionNotFound)); }
+                {
+                    return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
+                    InspectionStreamStateErrorCode.InspectionNotFound));
+                }
                 if (!_runs.TryGetValue(stream.AcquisitionRunId, out RunState? run))
-                { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
-                    InspectionStreamStateErrorCode.RunNotFound)); }
+                {
+                    return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
+                    InspectionStreamStateErrorCode.RunNotFound));
+                }
 
                 _index.TryGetStream(stream, out SortedDictionary<ulong, Entry>? entries);
                 int gapCount = _gapCountsByStream.GetValueOrDefault(stream);
                 if (entries is null && gapCount == 0)
-                { return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
-                    InspectionStreamStateErrorCode.StreamNotFound)); }
+                {
+                    return CompleteStreamStateReadUnderLock(InspectionStreamStateReadResult.NotAvailable(revision,
+                    InspectionStreamStateErrorCode.StreamNotFound));
+                }
                 ulong? minimum = entries is { Count: > 0 } ? entries.First().Key : null;
                 ulong? maximum = entries is { Count: > 0 } ? entries.Last().Key : null;
                 bool final = run.State == InspectionRunState.Sealed && run.FinalRevision is not null;
@@ -585,8 +588,14 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
 
     internal (long Completed, long Faulted, string? LastFaultType) StreamStateReadDiagnostics
     {
-        get { lock (_gate) { return (_streamStateReadsCompleted, _streamStateReadFaults,
-            _lastStreamStateReadFaultType); } }
+        get
+        {
+            lock (_gate)
+            {
+                return (_streamStateReadsCompleted, _streamStateReadFaults,
+            _lastStreamStateReadFaultType);
+            }
+        }
     }
 
     private InspectionStreamStateReadResult CompleteStreamStateReadUnderLock(
@@ -750,6 +759,17 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
             _maximumWriters = Math.Max(_maximumWriters, _admittedWriters);
             return true;
         }
+    }
+
+    private bool HasEntryCapacityUnderLock(int additionalEntries)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(additionalEntries);
+        int remaining = _options.MaximumEntries;
+        if (_index.Count > remaining) { return false; }
+        remaining -= _index.Count;
+        if (_gaps.Count > remaining) { return false; }
+        remaining -= _gaps.Count;
+        return additionalEntries <= remaining;
     }
 
     private InspectionReadStatus MissingStatusUnderLock(UtStreamIdentity stream, ulong acquisitionIndex)

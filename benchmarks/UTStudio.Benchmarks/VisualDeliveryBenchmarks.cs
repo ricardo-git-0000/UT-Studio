@@ -221,9 +221,9 @@ internal sealed class VisualDeliveryFixture : IDisposable
             lock (_gate)
             {
                 return _traces.TryGetValue(identity, out var trace)
-                    ? ValueTask.FromResult(new InspectionTraceReadResult(InspectionReadStatus.Available,
+                    ? ValueTask.FromResult(InspectionTraceReadResult.Available(
                         trace.Revision, new BenchmarkLease(trace.Descriptor, trace.Samples, this)))
-                    : ValueTask.FromResult(new InspectionTraceReadResult(
+                    : ValueTask.FromResult(InspectionTraceReadResult.Unavailable(
                         InspectionReadStatus.NotAvailable, new InspectionRevision(_revision)));
             }
         }

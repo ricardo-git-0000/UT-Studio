@@ -60,10 +60,12 @@ observable. Simulador y futuras fuentes siguen `IUtFrameSource`.
 Gate: cada frame válido queda aceptado o rechazado explícitamente y se libera una vez; gaps y cierre
 ordenado cubiertos; no dual-write.
 
-Implementado: `ApplicationSession` valida identidad/cabecera, confirma un gap antes de avanzar el
-watermark observado y antes de validar índice/tiempo, espera el commit transaccional de cada traza
-admitida y solo después alimenta el fan-out A-Scan/B-Scan como proyección derivada. Un rechazo o fallo del store es
-un fallo observable de ingestión, detiene la ejecución y drena/libera los frames. El runtime crea un
+Implementado: `ApplicationSession` valida identidad/cabecera y detecta el salto de `Sequence` antes de
+validar índice/tiempo. Si el frame es válido confirma traza y gap en un único commit transaccional y
+una sola revisión; si finalmente se rechaza, confirma exclusivamente el gap. Solo después de una
+confirmación de traza notifica A-Scan y B-Scan mediante identidad y revisión, sin muestras RF ni
+fan-out autoritativo. Un rechazo o fallo del store es un fallo observable de ingestión, detiene la
+ejecución y drena/libera los frames. El runtime crea un
 `InspectionId` estable y un store en memoria único para la inspección; las runs sucesivas comparten
 su presupuesto global y conservan identidades separadas. Cada run tiene un único writer ligado, se
 sella idempotentemente tras drenar operaciones admitidas y no puede reabrirse. `GapRecord` conserva

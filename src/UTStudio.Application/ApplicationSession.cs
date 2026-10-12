@@ -215,9 +215,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                         lock (_gate) { operation.ReceivedFrames++; }
                         if (!drainOnly)
                         {
-                            if (await InspectFrameAsync(operation, run, frame).ConfigureAwait(false))
+                            FrameInspection inspection = await InspectFrameAsync(operation, run, frame)
+                                .ConfigureAwait(false);
+                            if (inspection.IsValid)
                             {
-                                InspectionAppendResult commit = await CommitInspectionAsync(operation, frame).ConfigureAwait(false);
+                                InspectionAppendResult commit = await CommitInspectionAsync(operation, frame,
+                                    inspection.Gap).ConfigureAwait(false);
                                 if (commit.IsCommitted)
                                 {
                                     DeliverCommittedAScan(operation, frame, commit.Revision);
@@ -255,7 +258,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     }
 
     /// <summary>Only immutable metadata is retained; sample ownership remains with this reader.</summary>
-    private async ValueTask<bool> InspectFrameAsync(Operation operation, UtAcquisitionRun run,
+    private async ValueTask<FrameInspection> InspectFrameAsync(Operation operation, UtAcquisitionRun run,
         ConventionalUtFrame frame)
     {
         var metadata = frame.Metadata;
@@ -278,20 +281,20 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 {
                     operation.OutOfOrderFramesRejected++;
                     Publish(operation, _snapshot.Phase);
-                    return false;
+                    return default;
                 }
             }
             else if (frame.Sequence == previousSequence)
             {
                 operation.DuplicateFramesRejected++;
                 Publish(operation, _snapshot.Phase);
-                return false;
+                return default;
             }
             else if (frame.Sequence < previousSequence)
             {
                 operation.OutOfOrderFramesRejected++;
                 Publish(operation, _snapshot.Phase);
-                return false;
+                return default;
             }
             else
             {
@@ -306,53 +309,58 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
         }
 
-        if (confirmedGap is { } observedGap)
-        {
-            var configuration = frame.Metadata.Configuration;
-            var stream = new UtStreamIdentity(_inspectionId, operation.RunId, frame.Metadata.SourceId,
-                configuration.PhysicalChannelId);
-            IInspectionRunWriter writer = operation.InspectionWriter ??
-                throw new InvalidOperationException("The inspection writer is unavailable.");
-            InspectionAppendResult result = await writer.CommitGapAsync(
-                new GapRecord(stream, observedGap.FirstMissing, observedGap.LastMissing,
-                    observedGap.PreviousAdmitted, observedGap.SubsequentObserved,
-                    InspectionGapCause.SourceSequenceDiscontinuity)).ConfigureAwait(false);
-            if (result.Status is not (InspectionAppendStatus.Committed or InspectionAppendStatus.Duplicate))
-            { throw new InspectionAppendException(result.Status, result.ErrorCode); }
-        }
-
+        bool rejected;
         lock (_gate)
         {
-            operation.LastObservedSequence = frame.Sequence;
-            if (confirmedGap is { } gap)
-            {
-                ulong missingCount = checked(gap.LastMissing - gap.FirstMissing + 1);
-                operation.AcquisitionMissingFrames = checked(operation.AcquisitionMissingFrames + missingCount);
-                Publish(operation, _snapshot.Phase);
-            }
+            rejected = false;
             if (operation.LastObservedAcquisitionIndex is not { } previousIndex)
             {
                 if (frame.AcquisitionIndex != 0)
                 {
                     operation.InvalidAcquisitionIndexFramesRejected++;
                     Publish(operation, _snapshot.Phase);
-                    return false;
+                    rejected = true;
                 }
             }
             else if (frame.AcquisitionIndex <= previousIndex)
             {
                 operation.InvalidAcquisitionIndexFramesRejected++;
                 Publish(operation, _snapshot.Phase);
-                return false;
+                rejected = true;
             }
 
-            if (frame.ElapsedSinceRunStart < operation.LastElapsed)
+            if (!rejected && frame.ElapsedSinceRunStart < operation.LastElapsed)
             {
                 operation.TimestampRegressionsRejected++;
                 Publish(operation, _snapshot.Phase);
-                return false;
+                rejected = true;
             }
-            return true;
+        }
+        if (!rejected) { return new(true, confirmedGap); }
+        if (confirmedGap is { } rejectedGap)
+        { await CommitRejectedFrameGapAsync(operation, frame, rejectedGap).ConfigureAwait(false); }
+        else
+        {
+            lock (_gate) { operation.LastObservedSequence = frame.Sequence; }
+        }
+        return default;
+    }
+
+    private async ValueTask CommitRejectedFrameGapAsync(Operation operation, ConventionalUtFrame frame,
+        PendingGap gap)
+    {
+        var configuration = frame.Metadata.Configuration;
+        var stream = new UtStreamIdentity(_inspectionId, operation.RunId, frame.Metadata.SourceId,
+            configuration.PhysicalChannelId);
+        IInspectionRunWriter writer = operation.InspectionWriter ??
+            throw new InvalidOperationException("The inspection writer is unavailable.");
+        InspectionAppendResult result = await writer.CommitGapAsync(ToGapRecord(stream, gap)).ConfigureAwait(false);
+        if (result.Status is not (InspectionAppendStatus.Committed or InspectionAppendStatus.Duplicate))
+        { throw new InspectionAppendException(result.Status, result.ErrorCode); }
+        lock (_gate)
+        {
+            operation.LastObservedSequence = frame.Sequence;
+            ApplyConfirmedGap(operation, gap);
         }
     }
 
@@ -388,7 +396,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         }
     }
 
-    private async ValueTask<InspectionAppendResult> CommitInspectionAsync(Operation operation, ConventionalUtFrame frame)
+    private async ValueTask<InspectionAppendResult> CommitInspectionAsync(Operation operation,
+        ConventionalUtFrame frame, PendingGap? gap)
     {
         var configuration = frame.Metadata.Configuration;
         var stream = new UtStreamIdentity(_inspectionId, operation.RunId, frame.Metadata.SourceId,
@@ -399,14 +408,16 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             configuration.FirstSampleOffsetSeconds, configuration.SignalMode);
         IInspectionRunWriter writer = operation.InspectionWriter ??
             throw new InvalidOperationException("The inspection writer is unavailable.");
+        IReadOnlyList<GapRecord> gaps = gap is { } confirmed ? [ToGapRecord(stream, confirmed)] : [];
         InspectionAppendResult result = await writer.CommitAsync(
-            new InspectionCommitInput(new InspectionTraceInput(descriptor, frame.Samples))).ConfigureAwait(false);
+            new InspectionCommitInput(new InspectionTraceInput(descriptor, frame.Samples), gaps))
+            .ConfigureAwait(false);
         if (result.Status == InspectionAppendStatus.Duplicate) { return result; }
         if (!result.IsCommitted)
         {
             throw new InspectionAppendException(result.Status, result.ErrorCode);
         }
-        ApplyCommittedFrame(operation, frame);
+        ApplyCommittedFrame(operation, frame, gap);
         return result;
     }
 
@@ -429,7 +440,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         }
     }
 
-    private void ApplyCommittedFrame(Operation operation, ConventionalUtFrame frame)
+    private void ApplyCommittedFrame(Operation operation, ConventionalUtFrame frame, PendingGap? gap)
     {
         lock (_gate)
         {
@@ -438,7 +449,19 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             operation.LastSequence = frame.Sequence;
             operation.LastElapsed = frame.ElapsedSinceRunStart;
             operation.LastMetadata = frame.Metadata;
+            if (gap is { } confirmed) { ApplyConfirmedGap(operation, confirmed); }
         }
+    }
+
+    private static GapRecord ToGapRecord(UtStreamIdentity stream, PendingGap gap) =>
+        new(stream, gap.FirstMissing, gap.LastMissing, gap.PreviousAdmitted,
+            gap.SubsequentObserved, InspectionGapCause.SourceSequenceDiscontinuity);
+
+    private void ApplyConfirmedGap(Operation operation, PendingGap gap)
+    {
+        ulong missingCount = checked(gap.LastMissing - gap.FirstMissing + 1);
+        operation.AcquisitionMissingFrames = checked(operation.AcquisitionMissingFrames + missingCount);
+        Publish(operation, _snapshot.Phase);
     }
 
     private void CloseVisual(Operation operation)
@@ -761,6 +784,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
     private readonly record struct PendingGap(ulong FirstMissing, ulong LastMissing,
         ulong PreviousAdmitted, ulong SubsequentObserved);
+    private readonly record struct FrameInspection(bool IsValid, PendingGap? Gap);
 }
 
 public sealed class InspectionAppendException : Exception

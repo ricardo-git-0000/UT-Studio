@@ -400,10 +400,20 @@ public readonly record struct InspectionAppendResult
 }
 
 /// <summary>
-/// The in-memory store returns NotAvailable for an absent index because it has no authoritative closed-range
-/// watermark. Gap and OutOfRange are reserved for later producers that can prove those states.
+/// An absent index is NotAvailable while the run is open or when it lies inside confirmed watermarks.
+/// A sealed run returns OutOfRange outside its final committed acquisition-index watermarks.
 /// </summary>
-public enum InspectionReadStatus { Available, NotAvailable, Gap, OutOfRange, Cancelled, Closed, Faulted }
+public enum InspectionReadStatus
+{
+    Unknown = 0,
+    Available = 1,
+    NotAvailable = 2,
+    Gap = 3,
+    OutOfRange = 4,
+    Cancelled = 5,
+    Closed = 6,
+    Faulted = 7
+}
 
 /// <summary>
 /// A forward-only range expressed as a start index and positive count. An inverted range is not

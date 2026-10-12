@@ -228,6 +228,28 @@ public sealed class InMemoryInspectionDataStoreTests
     }
 
     [TestMethod]
+    public async Task MaximumEntries_near_int_max_rejects_joint_trace_and_gap_before_mutation()
+    {
+        var index = new CountOverrideTraceIndex(int.MaxValue - 1);
+        await using var store = new InMemoryInspectionDataStore(InspectionIdentityTests.Inspection,
+            new InMemoryInspectionStoreOptions(1024, int.MaxValue),
+            DefaultInspectionSampleMaterializer.Instance, DefaultInspectionOwnerReleaser.Instance, index);
+        IInspectionRunWriter writer = await store.OpenRunAsync(InspectionIdentityTests.Run);
+        InspectionTraceInput trace = InputForRun(InspectionIdentityTests.Run, 2, 2);
+        var gap = new GapRecord(trace.Descriptor.Identity.Stream, 1, 1, 0, 2,
+            InspectionGapCause.SourceSequenceDiscontinuity);
+
+        InspectionAppendResult result = await writer.CommitAsync(new(trace, [gap]));
+
+        Assert.AreEqual(InspectionAppendStatus.CapacityExceeded, result.Status);
+        Assert.AreEqual(InspectionRevision.Initial, store.Revision);
+        Assert.AreEqual(0, index.AddCalls);
+        Assert.AreEqual(0L, store.Diagnostics.OwnedSampleCapacityBytes);
+        Assert.IsEmpty(await store.ReadGapsAsync(trace.Descriptor.Identity.Stream, 1));
+        await writer.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task ConcurrentDifferentIdentitiesNeverOversubscribeBudget()
     {
         await using var store = Store(8, maximumEntries: 2);
@@ -983,9 +1005,11 @@ public sealed class InMemoryInspectionDataStoreTests
         await store.AppendAsync(Input(1, [3, 4]));
         InspectionRangeReadResult range = await store.ReadRangeAsync(
             new(InspectionIdentityTests.Stream(), 0, 2));
+        IInspectionTraceLease firstLease = range.Items[0].Lease!;
         Parallel.Invoke(range.Dispose, range.Dispose, range.Dispose);
         Assert.AreEqual(0, store.Diagnostics.ActiveLeases);
-        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = range.Items[0].Lease!.Samples);
+        Assert.IsEmpty(range.Items);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = firstLease.Samples);
     }
 
     [TestMethod]
@@ -1547,6 +1571,25 @@ public sealed class InMemoryInspectionDataStoreTests
         }
         public void RemoveStream(UtStreamIdentity stream) => _inner.RemoveStream(stream);
         public void Clear() => _inner.Clear();
+    }
+
+    private sealed class CountOverrideTraceIndex(int count) : IInspectionTraceIndex
+    {
+        internal int AddCalls { get; private set; }
+        public int Count => count;
+        public IEnumerable<InMemoryInspectionDataStore.Entry> Values => [];
+        public bool TryGetPrimary(TraceIdentity identity, out InMemoryInspectionDataStore.Entry? entry)
+        { entry = null; return false; }
+        public void AddPrimary(TraceIdentity identity, InMemoryInspectionDataStore.Entry entry) => AddCalls++;
+        public void RemovePrimary(TraceIdentity identity) { }
+        public bool TryGetStream(UtStreamIdentity stream,
+            out SortedDictionary<ulong, InMemoryInspectionDataStore.Entry>? entries)
+        { entries = null; return false; }
+        public bool ContainsStream(UtStreamIdentity stream) => false;
+        public void AddStream(UtStreamIdentity stream,
+            SortedDictionary<ulong, InMemoryInspectionDataStore.Entry> entries) => AddCalls++;
+        public void RemoveStream(UtStreamIdentity stream) { }
+        public void Clear() { }
     }
 
     private sealed class ThrowingSealResultFactory : IInspectionSealResultFactory

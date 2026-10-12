@@ -60,7 +60,7 @@ Application registra una cancelación para la operación de inicio completa, inc
 2. Escritura aceptada transfiere al Channel. Si no se acepta, libera el productor. No decidir ownership solo por un token cancelado después de escribir exitosamente.
 3. Application adquiere al leer y presta las muestras síncronamente a la rama visual.
 4. Cada delivery produce almacenamiento visual independiente antes de retornar; Application libera el frame en `finally`.
-5. El fan-out B-Scan aprobado no comparte ownership UT: sus leases pertenecen exclusivamente a la copia de su ring. Persistencia y procesamiento futuros requieren contratos lossless distintos.
+5. Histórico sustituido por ADR 0015: el antiguo fan-out B-Scan copiaba RF a su ring. El flujo vigente confirma muestras en el store autoritativo y las proyecciones visuales sólo adquieren leases de lectura; persistencia y procesamiento futuros requieren contratos lossless distintos.
 
 Los mailboxes visuales contienen snapshots o copias independientes, nunca frames UT. Application libera siempre el frame en `finally` después del préstamo síncrono. Cerrar una entrega invalida publicaciones tardías sin transferir ownership de adquisición.
 

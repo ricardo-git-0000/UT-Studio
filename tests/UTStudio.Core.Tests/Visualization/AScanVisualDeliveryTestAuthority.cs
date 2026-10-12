@@ -62,9 +62,10 @@ internal static class AScanVisualDeliveryTestFactory
             lock (_gate)
             {
                 return _traces.TryGetValue(identity, out var trace)
-                    ? ValueTask.FromResult(new InspectionTraceReadResult(InspectionReadStatus.Available,
+                    ? ValueTask.FromResult(InspectionTraceReadResult.Available(
                         trace.Revision, new Lease(trace.Descriptor, trace.Samples)))
-                    : ValueTask.FromResult(new InspectionTraceReadResult(InspectionReadStatus.NotAvailable, new(_revision)));
+                    : ValueTask.FromResult(InspectionTraceReadResult.Unavailable(
+                        InspectionReadStatus.NotAvailable, new(_revision)));
             }
         }
     }

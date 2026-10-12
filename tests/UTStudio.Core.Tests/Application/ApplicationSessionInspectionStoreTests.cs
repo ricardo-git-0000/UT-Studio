@@ -90,6 +90,8 @@ public sealed class ApplicationSessionInspectionStoreTests
         Assert.HasCount(1, gaps);
         Assert.AreEqual(1UL, gaps[0].FirstMissingSequence);
         Assert.AreEqual(2UL, gaps[0].LastMissingSequence);
+        Assert.AreEqual(2UL, stores.Store.Revision.Value);
+        Assert.AreEqual(stores.Store.Revision, gaps[0].ConfirmedRevision);
         Assert.AreEqual(2, sink.AcceptCount);
         Assert.AreEqual(1, first.DisposeCount);
         Assert.AreEqual(1, later.DisposeCount);
@@ -109,7 +111,7 @@ public sealed class ApplicationSessionInspectionStoreTests
         var first = source.QueueFrame(0);
         await first.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
         ((InMemoryInspectionDataStore)stores.Store).TestHooks = new()
-        { BeforeGapOnlyCommit = () => throw new InvalidOperationException("synthetic") };
+        { AfterGapPrepared = _ => throw new InvalidOperationException("synthetic") };
         var later = source.QueueFrame(2);
         await later.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await ApplicationSessionTests.WaitForPhaseAsync(session, UTStudio.Contracts.Application.SessionPhase.Faulted);
