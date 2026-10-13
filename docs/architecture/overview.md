@@ -53,6 +53,12 @@ dependiente de Domain y Contracts. Application coordina, Visualization.Core cons
 App.Wpf compone. No se crea todavía `UTStudio.Inspection.Storage`; el futuro adaptador persistente no
 dependerá de Application ni UI. Véase [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
 
+La [propuesta ADR 0016](../adr/0016-reusable-complete-scan-components.md) y su
+[plan](../plans/2026-10-13-reusable-scan-components.md) evalúan componentes completos por scan con
+comunes mínimos. Aún no cambian el grafo: el host conservaría hardware, `ApplicationSession` y store;
+los componentes consumirían puertos neutrales y preservarían `TraceIdentity`. C-Scan, proyectos y
+NuGet permanecen pendientes de decisiones posteriores.
+
 ## Contratos y límites
 
 Contracts se organiza conceptualmente en `Acquisition`, `Application`, `Presentation` y `Diagnostics`: fuente y capacidades; casos de uso y sesión; intercambios neutrales compartidos de presentación; estado y contadores diagnósticos, respectivamente. No crear contratos futuros innecesarios ni un proyecto por carpeta. Los modelos A-Scan pertenecen a Visualization.Core; no se duplican en Contracts ni hacen que Contracts lo referencie.
