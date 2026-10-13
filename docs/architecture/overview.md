@@ -15,6 +15,7 @@ La primera sección vertical implementada es simulador -> sesión -> A-Scan neut
 | Acquisition.Simulator | Fuente sintética determinista, tiempo controlable y fallos reproducibles | Domain, Contracts |
 | Visualization.Core | Modelo y transformación A-Scan neutrales, sin controles ni renderizador concreto | Domain, Contracts |
 | Visualization.Wpf | Control y renderizado A-Scan específicos de WPF | Visualization.Core |
+| ScanVisualization.AScan.Wpf | Componente A-Scan completo, toolbar, interacción, accesibilidad y lifecycle WPF | Presentation, Visualization.Wpf |
 | Presentation | ViewModels, estado observable, coordinación de la transformación visual y servicios UI abstractos | Domain, Contracts, Visualization.Core |
 | App.Wpf | Ejecutable, vistas, adaptación WPF y raíz de composición | Los seis proyectos neutrales y Visualization.Wpf |
 | Core.Tests | Pruebas neutrales agrupadas por responsabilidad y comprobaciones de arquitectura | Los seis proyectos neutrales; nunca App.Wpf |

@@ -19,9 +19,10 @@ namespace UTStudio.Presentation;
 public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly object _gate = new();
-    private readonly IApplicationSession _session;
+    private readonly IApplicationSession? _session;
+    private readonly bool _canControlSession;
     private readonly UiLifetime _lifetime;
-    private readonly ConventionalAcquisitionConfiguration _configuration;
+    private readonly ConventionalAcquisitionConfiguration? _configuration;
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
     private readonly SharedScanTimeViewport _timeViewport;
@@ -51,12 +52,33 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         Func<AcquisitionRunId>? newRun = null, Func<AScanDeliveryStatistics>? readVisualStatistics = null,
         IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null,
         BScanSelectionCoordinator? selectionCoordinator = null)
+        : this(session, session, session.Snapshot, visualFeed, dispatcher, configuration, newRun,
+            readVisualStatistics, visualStatus, timeViewport, selectionCoordinator)
+    { }
+
+    /// <summary>Creates a visual-only A-Scan scope from borrowed neutral state and visual feeds.</summary>
+    public AScanViewModel(IObservable<SessionSnapshot> sessionStates, SessionSnapshot initialSession,
+        IObservable<AScanSnapshot> visualFeed, IUiDispatcher dispatcher,
+        Func<AScanDeliveryStatistics>? readVisualStatistics = null,
+        IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null,
+        BScanSelectionCoordinator? selectionCoordinator = null)
+        : this(null, sessionStates, initialSession, visualFeed, dispatcher, null, null,
+            readVisualStatistics, visualStatus, timeViewport, selectionCoordinator)
+    { }
+
+    private AScanViewModel(IApplicationSession? controllableSession,
+        IObservable<SessionSnapshot> sessionStates, SessionSnapshot initialSession,
+        IObservable<AScanSnapshot> visualFeed, IUiDispatcher dispatcher,
+        ConventionalAcquisitionConfiguration? configuration, Func<AcquisitionRunId>? newRun,
+        Func<AScanDeliveryStatistics>? readVisualStatistics,
+        IObservable<AScanDeliveryStatus>? visualStatus, SharedScanTimeViewport? timeViewport,
+        BScanSelectionCoordinator? selectionCoordinator)
     {
-        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(sessionStates);
         ArgumentNullException.ThrowIfNull(visualFeed);
         ArgumentNullException.ThrowIfNull(dispatcher);
-        ArgumentNullException.ThrowIfNull(configuration);
-        _session = session;
+        _session = controllableSession;
+        _canControlSession = _session is not null && configuration is not null;
         _configuration = configuration;
         _newRun = newRun ?? (() => new AcquisitionRunId(Guid.NewGuid()));
         _readStatistics = readVisualStatistics;
@@ -66,11 +88,11 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _selectionCoordinator = selectionCoordinator;
         _timeViewport.PropertyChanged += OnTimeViewportChanged;
         if (_selectionCoordinator is not null) { _selectionCoordinator.PropertyChanged += OnSelectionChanged; }
-        _latestSession = session.Snapshot;
+        _latestSession = initialSession;
         _state = new(_latestSession, null, null, null, null);
-        _start = new(_lifetime, StartAsync, () => !IsClosing && _state.Session.CanStart && !_start!.IsRunning && !_stop!.IsRunning,
+        _start = new(_lifetime, StartAsync, () => _canControlSession && !IsClosing && _state.Session.CanStart && !_start!.IsRunning && !_stop!.IsRunning,
             ReportCommandError, RefreshCommands);
-        _stop = new(_lifetime, StopAsync, () => !IsClosing && (_state.Session.CanStop || _start.IsRunning) && !_stop!.IsRunning,
+        _stop = new(_lifetime, StopAsync, () => _canControlSession && !IsClosing && (_state.Session.CanStop || _start.IsRunning) && !_stop!.IsRunning,
             ReportCommandError, RefreshCommands);
         _toggleCursors = new(ToggleCursors, () => !IsClosing && !_lifetime.IsClosed && _state.Cursors is not null);
         _resetCursors = new(ResetCursors, () => !IsClosing && !_lifetime.IsClosed && _state.AScan is not null && _state.Cursors is not null);
@@ -87,7 +109,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
             (_state.DisplayMode == AScanDisplayMode.Selected || _state.Selection?.IsPending == true));
         _start.Initialize();
         _stop.Initialize();
-        try { _sessionSubscription = session.Subscribe(new Observer<SessionSnapshot>(ReceiveSession, ReceiveError)); }
+        try { _sessionSubscription = sessionStates.Subscribe(new Observer<SessionSnapshot>(ReceiveSession, ReceiveError)); }
         catch (Exception error) { ReceiveError(error); }
         try { _visualSubscription = visualFeed.Subscribe(new Observer<AScanSnapshot>(ReceiveVisual, ReceiveError)); }
         catch (Exception error) { ReceiveError(error); }
@@ -114,6 +136,10 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         ? new(snapshot.Metadata.RunId, snapshot.Version, viewport) : null;
     public UtSourceError? VisualError => _state.VisualStatus?.TerminalError ?? _state.Session.VisualError ?? _state.VisualStatistics?.LastError;
     public UtSourceError? NotificationError => _notificationError;
+    public AScanComponentPhase ComponentPhase => Error is not null || VisualError is not null || NotificationError is not null
+        ? AScanComponentPhase.Error : AScan is null ? AScanComponentPhase.Empty
+        : DisplayMode == AScanDisplayMode.Selected || Session.Phase != SessionPhase.Running
+            ? AScanComponentPhase.Frozen : AScanComponentPhase.Live;
     public IAsyncRelayCommand StartCommand => _start;
     public IAsyncRelayCommand StopCommand => _stop;
     public IRelayCommand ToggleCursorsCommand => _toggleCursors;
@@ -187,6 +213,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private async Task StartAsync(CancellationToken token)
     {
+        if (_session is null || _configuration is null) { return; }
         await _lifetime.InvokeAsync(() => ReplaceState(_state with { CommandError = null })).ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
         try { await _session.StartAsync(_configuration, _newRun(), token).ConfigureAwait(false); }
@@ -195,6 +222,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private async Task StopAsync(CancellationToken token)
     {
+        if (_session is null) { return; }
         var startCancellation = _start.CancelPending();
         await _lifetime.InvokeAsync(() => ReplaceState(_state with { CommandError = null })).ConfigureAwait(false);
         try { await _session.StopAsync(token).ConfigureAwait(false); }
@@ -209,6 +237,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     // on UI before UiAsyncCommand clears IsRunning and refreshes CanExecute.
     private async Task SynchronizeSessionAsync()
     {
+        if (_session is null) { return; }
         ReceiveSession(_session.Snapshot);
         await _lifetime.InvokeAsync(ApplyLatest).ConfigureAwait(false);
     }
@@ -364,6 +393,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         {
             OnPropertyChanged(name);
         }
+        OnPropertyChanged(nameof(ComponentPhase));
         return true;
     }
 

@@ -126,7 +126,8 @@ public sealed class ShutdownRobustnessTests
     });
 
     private static MainWindow CreateWindow(DesktopRuntime runtime, ShutdownCoordinator coordinator) => new(
-        runtime.Host.Services.GetRequiredService<AScanViewModel>(), coordinator,
+        runtime.Host.Services.GetRequiredService<AScanHostViewModel>(),
+        runtime.Host.Services.GetRequiredService<AScanComponentContext>(), coordinator,
         runtime.Host.Services.GetRequiredService<BScanWindowManager>(),
         runtime.Host.Services.GetRequiredService<ShutdownInteractionGate>(),
         runtime.Host.Services.GetRequiredService<VisualMetrics>(), new ManualClock(), NullLogger<MainWindow>.Instance);

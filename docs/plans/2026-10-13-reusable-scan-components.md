@@ -1,8 +1,7 @@
 # Plan por fases — Componentes WPF reutilizables A-Scan, B-Scan y preparación C-Scan
 
-Fecha: 2026-10-13. Estado: Propuesto; pendiente de aprobación. Fuente propuesta:
-[ADR 0016](../adr/0016-reusable-complete-scan-components.md). Esta Fase 0 es exclusivamente
-documental y no autoriza fases de código.
+Fecha: 2026-10-13. Estado: Fase documental y encapsulación A-Scan implementadas; B/C, extracción 2D
+y NuGet siguen pendientes. Fuente: [ADR 0016](../adr/0016-reusable-complete-scan-components.md).
 
 ## Objetivo y límites
 
@@ -147,6 +146,10 @@ Crear scope A completo y mover toolbar/panel/adaptación visual desde MainWindow
 MainWindow conserva Start/Stop, configuración, run y shell; esas acciones no son toolbar del scan.
 Gate: host de prueba instancia A sin `ApplicationSession` ni store concreto;
 paridad funcional y cierre sin regresión.
+
+Resultado 2026-10-13: implementado mediante `UTStudio.ScanVisualization.AScan.Wpf`, contexto neutral,
+scope visual propio, `AScanControl` compuesto, integración en MainWindow y host demo independiente.
+Start/Stop, sesión, store, B-Scan, métricas globales y shutdown permanecen en el host.
 
 ### Fase 3 — encapsulación B-Scan
 

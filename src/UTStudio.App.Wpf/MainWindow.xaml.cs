@@ -4,7 +4,7 @@ using System.Windows.Threading;
 using Microsoft.Extensions.Logging;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Presentation;
-using UTStudio.Visualization.Wpf.Controls;
+using UTStudio.ScanVisualization.AScan.Wpf;
 
 namespace UTStudio.App.Wpf;
 
@@ -18,12 +18,13 @@ public partial class MainWindow : Window
     private readonly BScanWindowManager _bScanWindows;
     private bool _closing, _allowClose;
 
-    public MainWindow(AScanViewModel viewModel, ShutdownCoordinator shutdown, BScanWindowManager bScanWindows,
+    public MainWindow(AScanHostViewModel viewModel, AScanComponentContext aScanContext, ShutdownCoordinator shutdown, BScanWindowManager bScanWindows,
         ShutdownInteractionGate interactionGate, VisualMetrics metrics,
         TimeProvider clock, ILogger<MainWindow> logger)
     {
         InitializeComponent();
         DataContext = viewModel;
+        AScan.Context = aScanContext;
         _shutdown = shutdown;
         _bScanWindows = bScanWindows;
         _logger = logger;
@@ -62,31 +63,7 @@ public partial class MainWindow : Window
         catch (Exception error) { _logger.LogError(error, "Status update failed"); ShutdownText.Text = error.Message; }
     }
 
-    private void OnCursorActivated(object sender, AScanCursorActivatedEventArgs args)
-    {
-        if (DataContext is AScanViewModel viewModel) { viewModel.ActivateCursor(args.Cursor); }
-    }
-
-    private void OnCursorMoveRequested(object sender, AScanCursorMoveRequestedEventArgs args)
-    {
-        if (DataContext is AScanViewModel viewModel) { viewModel.MoveCursor(args.Cursor, args.TimeSeconds); }
-    }
-
-    private void OnTimeZoomRequested(object sender, ScanTimeZoomRequestedEventArgs args)
-    {
-        if (DataContext is AScanViewModel viewModel) { viewModel.ZoomTime(args.AnchorSeconds, args.Factor); }
-    }
-
-    private void OnTimePanRequested(object sender, ScanTimePanRequestedEventArgs args)
-    {
-        if (DataContext is AScanViewModel viewModel) { viewModel.PanTime(args.DeltaSeconds); }
-    }
-
-    private void OnTimeResetRequested(object? sender, EventArgs args)
-    {
-        if (DataContext is AScanViewModel viewModel && viewModel.ResetViewportCommand.CanExecute(null))
-        { viewModel.ResetViewportCommand.Execute(null); }
-    }
+    internal Task CloseAScanAsync() => AScan.CloseAsync();
 
     // WPF requires a void Closing event. Every asynchronous failure is caught and logged.
     private async void OnClosing(object? sender, CancelEventArgs args)

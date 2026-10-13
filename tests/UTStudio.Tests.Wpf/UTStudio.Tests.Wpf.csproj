@@ -11,5 +11,6 @@
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
     <ProjectReference Include="../../src/UTStudio.App.Wpf/UTStudio.App.Wpf.csproj" />
     <ProjectReference Include="../../src/UTStudio.Visualization.Wpf/UTStudio.Visualization.Wpf.csproj" />
+    <ProjectReference Include="../../src/UTStudio.ScanVisualization.AScan.Wpf/UTStudio.ScanVisualization.AScan.Wpf.csproj" />
   </ItemGroup>
 </Project>

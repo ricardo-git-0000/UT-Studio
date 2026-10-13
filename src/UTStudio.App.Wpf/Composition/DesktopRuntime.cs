@@ -13,6 +13,7 @@ using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
+using UTStudio.ScanVisualization.AScan.Wpf;
 
 namespace UTStudio.App.Wpf.Composition;
 
@@ -31,7 +32,8 @@ public sealed class DesktopRuntime
     private BScanWindowManager? _bScanWindows;
     private ApplicationSession? _session;
     private InspectionDataStoreRegistry? _inspectionStores;
-    private AScanViewModel? _viewModel;
+    private AScanHostViewModel? _viewModel;
+    private MainWindow? _mainWindow;
     private SharedScanTimeViewport? _timeViewport;
     private ShutdownInteractionGate? _interactionGate;
     private bool _viewModelReleased;
@@ -66,7 +68,10 @@ public sealed class DesktopRuntime
 
     private async Task ReleaseAScanAsync()
     {
-        await (_viewModel?.DisposeAsync().AsTask() ?? Task.CompletedTask).ConfigureAwait(false);
+        List<Exception> failures = [];
+        await TryDisposeAsync(() => _mainWindow?.CloseAScanAsync() ?? Task.CompletedTask, failures).ConfigureAwait(false);
+        await TryDisposeAsync(() => _viewModel?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
+        if (failures.Count != 0) { throw new AggregateException("A-Scan cleanup failed.", failures); }
         _viewModelReleased = true;
     }
 
@@ -235,9 +240,9 @@ public sealed class DesktopRuntime
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
             var selection = runtime._selection = new BScanSelectionCoordinator(dispatcher, selectionResolver);
-            var viewModel = runtime._viewModel = new AScanViewModel(session, visual, dispatcher, configuration,
-                readVisualStatistics: () => visual.Statistics, visualStatus: visual.StatusChanges, timeViewport: timeViewport,
-                selectionCoordinator: selection);
+            var viewModel = runtime._viewModel = new AScanHostViewModel(session, dispatcher, configuration);
+            var aScanContext = new AScanComponentContext(session, session.Snapshot, visual, visual.StatusChanges,
+                () => visual.Statistics, timeViewport, selection);
             System.Windows.Threading.Dispatcher windowDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
             var preferenceStore = new BScanResamplingPreferenceStore(BScanResamplingPreferenceStore.DefaultPath);
             await preferenceStore.LoadAsync().ConfigureAwait(false);
@@ -252,6 +257,7 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton(inspectionStores);
             builder.Services.AddSingleton<IApplicationSession>(session);
             builder.Services.AddSingleton(viewModel);
+            builder.Services.AddSingleton(aScanContext);
             builder.Services.AddSingleton(timeViewport);
             builder.Services.AddSingleton(bScanIngress);
             builder.Services.AddSingleton(bScanVisual);
@@ -264,7 +270,12 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton(clock);
             builder.Services.AddSingleton(runtime.Shutdown);
             builder.Services.AddSingleton(new VisualMetrics(() => visual.Statistics));
-            builder.Services.AddSingleton<MainWindow>();
+            builder.Services.AddSingleton(sp =>
+            {
+                var window = ActivatorUtilities.CreateInstance<MainWindow>(sp);
+                runtime._mainWindow = window;
+                return window;
+            });
             runtime._host = builder.Build();
             checkpoint?.Invoke("host");
         }

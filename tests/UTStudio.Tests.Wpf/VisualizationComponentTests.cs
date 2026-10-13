@@ -13,6 +13,7 @@ using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Controls;
+using UTStudio.ScanVisualization.AScan.Wpf;
 
 namespace UTStudio.Tests.Wpf;
 
@@ -30,7 +31,12 @@ public sealed class VisualizationComponentTests
         ];
         var violations = new List<string>();
 
-        foreach (Assembly assembly in new[] { typeof(MainWindow).Assembly, typeof(AScanControl).Assembly })
+        foreach (Assembly assembly in new[]
+        {
+            typeof(MainWindow).Assembly,
+            typeof(AScanControl).Assembly,
+            typeof(AScanView).Assembly
+        })
         {
             foreach (Type type in assembly.GetTypes())
             {

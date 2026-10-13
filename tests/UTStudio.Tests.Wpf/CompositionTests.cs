@@ -1,3 +1,4 @@
+using System.Windows;
 using System.Windows.Threading;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
@@ -89,14 +90,18 @@ public sealed class CompositionTests
             Assert.IsNotNull(services.GetRequiredService<InspectionDataStoreRegistry>());
             Assert.IsNotNull(services.GetRequiredService<BScanIngress>());
             Assert.AreSame(services.GetRequiredService<AScanVisualDelivery>(), services.GetRequiredService<IObservable<AScanSnapshot>>());
-            var vm = services.GetRequiredService<AScanViewModel>();
+            var vm = services.GetRequiredService<AScanHostViewModel>();
             var session = services.GetRequiredService<IApplicationSession>();
             var window = services.GetRequiredService<MainWindow>();
             Assert.AreSame(window, services.GetRequiredService<MainWindow>());
             Assert.AreSame(vm, window.DataContext);
+            window.Show();
             await runtime.Host.StartAsync();
             await vm.StartCommand.ExecuteAsync(null);
             Assert.AreEqual(SessionPhase.Running, services.GetRequiredService<IApplicationSession>().Snapshot.Phase);
+            await DiagnosticWait.Until(() => window.AScan.ViewModel?.Session.Phase == SessionPhase.Running,
+                "host session state forwarded to AScanView");
+            Assert.AreEqual(vm.Session.Version, window.AScan.ViewModel!.Session.Version);
             await runtime.Shutdown.ShutdownAsync();
             Assert.AreEqual(SessionPhase.Disposed, session.Snapshot.Phase);
         }
@@ -109,12 +114,15 @@ public sealed class CompositionTests
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
             ["--Simulator:AScansPerSecond=100"]);
         var services = runtime.Host.Services;
-        var aScan = services.GetRequiredService<AScanViewModel>();
+        var host = services.GetRequiredService<AScanHostViewModel>();
+        var mainWindow = services.GetRequiredService<MainWindow>();
+        mainWindow.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, mainWindow.AScan));
+        var aScan = mainWindow.AScan.ViewModel!;
         var windows = services.GetRequiredService<BScanWindowManager>();
         try
         {
             await runtime.Host.StartAsync();
-            await aScan.StartCommand.ExecuteAsync(null);
+            await host.StartCommand.ExecuteAsync(null);
             await DiagnosticWait.Until(() => aScan.AScan is not null, "productive simulator A-Scan");
 
             await windows.OpenAsync();
@@ -156,7 +164,10 @@ public sealed class CompositionTests
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher),
             ["--Simulator:AScansPerSecond=100"]);
         var services = runtime.Host.Services;
-        var aScan = services.GetRequiredService<AScanViewModel>();
+        var host = services.GetRequiredService<AScanHostViewModel>();
+        var mainWindow = services.GetRequiredService<MainWindow>();
+        mainWindow.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, mainWindow.AScan));
+        var aScan = mainWindow.AScan.ViewModel!;
         var windows = services.GetRequiredService<BScanWindowManager>();
         try
         {
@@ -166,7 +177,7 @@ public sealed class CompositionTests
             var bScan = (BScanViewModel)window.DataContext;
             var control = (BScanControl)window.FindName("Scan");
             bScan.SetResamplingMode(Scan2DInterpolationMode.Bilinear);
-            await aScan.StartCommand.ExecuteAsync(null);
+            await host.StartCommand.ExecuteAsync(null);
             try
             {
                 await DiagnosticWait.Until(() => control.AppliedSnapshot?.StoreRevision >= 450,
@@ -323,9 +334,9 @@ public sealed class CompositionTests
         try
         {
             var window = runtime.Host.Services.GetRequiredService<MainWindow>();
-            var vm = (AScanViewModel)window.DataContext;
             window.Show();
             window.UpdateLayout();
+            var vm = window.AScan.ViewModel!;
             AssertBinding(Key.Home, ModifierKeys.None, vm.ResetViewportCommand);
             AssertBinding(Key.Add, ModifierKeys.None, vm.ZoomInCommand);
             AssertBinding(Key.Subtract, ModifierKeys.None, vm.ZoomOutCommand);
@@ -334,7 +345,7 @@ public sealed class CompositionTests
 
             void AssertBinding(Key key, ModifierKeys modifiers, System.Windows.Input.ICommand expected)
             {
-                var binding = window.InputBindings.OfType<KeyBinding>().Single(item =>
+                var binding = window.AScan.InputBindings.OfType<KeyBinding>().Single(item =>
                     item.Key == key && item.Modifiers == modifiers);
                 Assert.AreSame(expected, binding.Command);
             }
@@ -530,7 +541,7 @@ public sealed class CompositionTests
         window.Closed += (_, _) => closed.TrySetResult();
         window.Show();
         await runtime.Host.StartAsync();
-        await ((AScanViewModel)window.DataContext).StartCommand.ExecuteAsync(null);
+        await ((AScanHostViewModel)window.DataContext).StartCommand.ExecuteAsync(null);
         window.Close();
         window.Close();
         Assert.IsTrue(window.IsVisible);

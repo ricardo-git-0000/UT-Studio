@@ -1,7 +1,7 @@
 # ADR 0016 — Componentes WPF completos y reutilizables de scan
 
-Fecha: 2026-10-13. Estado: Propuesto; pendiente de aprobación. Este ADR no autoriza código,
-proyectos, referencias, paquetes ni C-Scan.
+Fecha: 2026-10-13. Estado: Aceptado; encapsulación A-Scan implementada. B/C, NuGet y las demás
+fases continúan pendientes de aprobación independiente.
 
 Trazabilidad: amplía [ADR 0009](0009-reusable-scan-visualization-controls.md), conserva
 [ADR 0010](0010-ascan-manual-cursor-measurements.md), [ADR 0013](0013-bscan-bounded-live-visualization.md),
@@ -78,27 +78,40 @@ compone instancias de puertos neutrales. Una dependencia de Core neutral hacia C
 una dependencia hacia la interfaz agregada `IInspectionDataStore` no lo es: se inyectan solamente los
 roles de lectura necesarios.
 
-### API pública objetivo
+### API pública objetivo e incremento A implementado
 
-La forma concreta queda pendiente de una prueba de caracterización, pero el contrato objetivo es:
+El primer incremento fija esta superficie pública mínima de A-Scan:
 
 ```csharp
 public sealed class AScanView : UserControl, IAsyncDisposable
 {
     public AScanView();
     public AScanComponentContext? Context { get; set; } // DP asignable solo antes de activar
-    public AScanViewState State { get; }                 // DependencyProperty de solo lectura
-    public ScanComponentError? Error { get; }            // código neutral acotado
-    public ValueTask CloseAsync(CancellationToken cancellationToken = default);
+    public AScanViewState? State { get; }                 // DependencyProperty de solo lectura
+    public UtSourceError? Error { get; }                  // DependencyProperty de solo lectura
+    public Task CloseAsync();                             // idempotente
+    public ValueTask CloseAsync(CancellationToken cancellationToken); // cancela solo la espera
     public ValueTask DisposeAsync();
 }
 
 public sealed record AScanComponentContext(
-    IObservable<AScanSnapshot> LiveVisuals,
-    IObservable<AScanDeliveryStatus> DeliveryStatus,
-    ScanPresentationGroup Group,
-    SharedScanTimeViewport TimeViewport,
-    AScanComponentOptions Options);
+    IObservable<SessionSnapshot> SessionStates,
+    SessionSnapshot InitialSession,
+    IObservable<AScanSnapshot> Visuals,
+    IObservable<AScanDeliveryStatus>? VisualStatus = null,
+    Func<AScanDeliveryStatistics>? ReadStatistics = null,
+    SharedScanTimeViewport? TimeViewport = null,
+    BScanSelectionCoordinator? SelectionCoordinator = null);
+```
+
+Los feeds, viewport y coordinador son prestados; la View solo posee sus suscripciones y su
+`AScanViewModel`. El contexto es one-shot: se asigna una vez y la reapertura crea otra View. La View
+no sustituye el `DataContext` heredado. El primer `Loaded` activa el scope; `CloseAsync` es la barrera
+obligatoria y no depende de `Unloaded`.
+
+La superficie siguiente de B-Scan continúa siendo ilustrativa y pendiente de su incremento:
+
+```csharp
 
 public sealed class BScanView : UserControl, IAsyncDisposable
 {
@@ -118,15 +131,15 @@ public sealed record BScanComponentContext(
     BScanComponentOptions Options);
 ```
 
-Los nombres y la granularidad son ilustrativos, no API aceptada. `ScanPresentationGroup` representa
+Los nombres y la granularidad de B-Scan son ilustrativos, no API aceptada. `ScanPresentationGroup` representa
 el coordinador neutral live/selected y el selector autoritativo compartidos por un grupo; su ownership
 es explícitamente prestado o procede de una factoría de grupo. Dos grupos no comparten estado. El
 adaptador al Dispatcher se crea en cada assembly WPF y no se filtra al contrato neutral. No se expondrá
 `DataContext` como contrato ni se requerirá que el host construya ViewModel o adaptador. La View nunca
 sustituye el `DataContext` heredado; su raíz interna enlaza a una propiedad privada. Se
 preferirán DependencyProperties para entradas/salidas enlazables y comandos públicos de solo lectura
-para automatización. `Context` admite `null → contexto` antes de `Loaded`; el primer `Loaded` activa el
-scope. Después, sustitución o `ClearValue` se rechazan mediante coerción y error tipado. Toda operación
+para automatización. En A-Scan, `Context` admite `null → contexto` y activa el scope en `Loaded`.
+Después, sustitución o `ClearValue` se rechazan mediante callback y excepción. Toda operación
 pública tiene afinidad con el Dispatcher de la View. Una factoría/`AttachAsync` one-shot se preferirá
 si resulta más clara tras caracterizar WPF.
 

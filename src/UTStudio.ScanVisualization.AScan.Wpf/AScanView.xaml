@@ -1,0 +1,46 @@
+<UserControl x:Class="UTStudio.ScanVisualization.AScan.Wpf.AScanView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:UTStudio.Visualization.Wpf.Controls;assembly=UTStudio.Visualization.Wpf"
+    Focusable="True" AutomationProperties.Name="Componente A-Scan"
+    KeyboardNavigation.TabNavigation="Local">
+  <UserControl.InputBindings>
+    <KeyBinding Key="Home" Command="{Binding ResetViewportCommand, ElementName=Root}" />
+    <KeyBinding Key="Add" Command="{Binding ZoomInCommand, ElementName=Root}" />
+    <KeyBinding Key="Subtract" Command="{Binding ZoomOutCommand, ElementName=Root}" />
+    <KeyBinding Key="Left" Modifiers="Alt" Command="{Binding PanLeftCommand, ElementName=Root}" />
+    <KeyBinding Key="Right" Modifiers="Alt" Command="{Binding PanRightCommand, ElementName=Root}" />
+  </UserControl.InputBindings>
+  <Grid x:Name="Root">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel Orientation="Horizontal" Margin="0,0,0,12" AutomationProperties.Name="Herramientas A-Scan">
+      <TextBlock Text="{Binding ComponentPhase}" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,12,0" AutomationProperties.LiveSetting="Polite"/>
+      <Button Content="Cursores" Command="{Binding ToggleCursorsCommand}" MinWidth="90" Padding="16,8" Margin="0,0,8,0" AutomationProperties.HelpText="Muestra u oculta los cursores A y B"/>
+      <Button Content="Restablecer" Command="{Binding ResetCursorsCommand}" MinWidth="100" Padding="16,8" Margin="0,0,8,0" AutomationProperties.HelpText="Restablece cursores y medidas"/>
+      <Button Content="Restablecer zoom" Command="{Binding ResetViewportCommand}" Padding="16,8" Margin="0,0,8,0" AutomationProperties.HelpText="Atajo Home"/>
+      <Button Content="Live" Command="{Binding ReturnToLiveCommand}" Padding="12,8"/>
+    </StackPanel>
+    <controls:AScanControl x:Name="Scan" Grid.Row="1" Snapshot="{Binding AScan}" CursorState="{Binding Cursors}"
+      ViewportBinding="{Binding ViewportBinding}" AutomationProperties.Name="Gráfico A-Scan"
+      CursorActivated="OnCursorActivated" CursorMoveRequested="OnCursorMoveRequested"
+      TimeZoomRequested="OnTimeZoomRequested" TimePanRequested="OnTimePanRequested" TimeResetRequested="OnTimeResetRequested"/>
+    <StackPanel Grid.Row="2" Margin="0,12,0,0">
+      <TextBlock Text="Zoom temporal: rueda sobre el gráfico · desplazar: botón central o Mayús + arrastre izquierdo." Foreground="#AEBFD4"/>
+      <StackPanel Orientation="Horizontal" AutomationProperties.Name="Rango visible A-Scan">
+        <TextBlock Text="Vista: " FontWeight="SemiBold"/><TextBlock Text="{Binding TimeViewport.VisibleMinimumSeconds, StringFormat={}{0:0.#########} s, TargetNullValue=—}"/>
+        <TextBlock Text=" – "/><TextBlock Text="{Binding TimeViewport.VisibleMaximumSeconds, StringFormat={}{0:0.#########} s, TargetNullValue=—}"/>
+        <TextBlock Text="   RF: −100…+100 %   Zoom: "/><TextBlock Text="{Binding TimeViewport.ZoomFactor, StringFormat={}{0:0.##}×, TargetNullValue=—}"/>
+      </StackPanel>
+      <TextBlock Text="Medida manual aproximada sobre los puntos visuales reducidos; no representa precisión de muestra original." Foreground="#AEBFD4"/>
+      <StackPanel Orientation="Horizontal" AutomationProperties.Name="Medidas de cursores A-Scan">
+        <TextBlock Text="A: " FontWeight="SemiBold"/><TextBlock Text="{Binding Cursors.A.TimeMicroseconds, StringFormat={}{0:0.###} µs, TargetNullValue=—}"/><TextBlock Text=" / "/><TextBlock Text="{Binding Cursors.A.AmplitudePercent, StringFormat={}{0:+0.##;-0.##;0} %, TargetNullValue=—}"/>
+        <TextBlock Text="   B: " FontWeight="SemiBold" Margin="20,0,0,0"/><TextBlock Text="{Binding Cursors.B.TimeMicroseconds, StringFormat={}{0:0.###} µs, TargetNullValue=—}"/><TextBlock Text=" / "/><TextBlock Text="{Binding Cursors.B.AmplitudePercent, StringFormat={}{0:+0.##;-0.##;0} %, TargetNullValue=—}"/>
+        <TextBlock Text="   Δt: " FontWeight="SemiBold" Margin="20,0,0,0"/><TextBlock Text="{Binding Cursors.DeltaTimeMicroseconds, StringFormat={}{0:+0.###;-0.###;0} µs, TargetNullValue=—}"/>
+        <TextBlock Text="   ΔRF: " FontWeight="SemiBold" Margin="20,0,0,0"/><TextBlock Text="{Binding Cursors.DeltaAmplitudePercent, StringFormat={}{0:+0.##;-0.##;0} %, TargetNullValue=—}"/>
+      </StackPanel>
+      <TextBlock Text="{Binding Error.Message}" Foreground="#FFB4AB" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+      <TextBlock x:Name="VisualErrorText" Text="{Binding VisualError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+      <TextBlock Text="{Binding NotificationError.Message}" Foreground="#FFD18A" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+    </StackPanel>
+  </Grid>
+</UserControl>

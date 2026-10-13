@@ -1,5 +1,6 @@
 using System.IO;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -25,29 +26,35 @@ public sealed class RenderTests
         try
         {
             await DiagnosticWait.For(runtime.Host.StartAsync());
-            var vm = (AScanViewModel)window.DataContext;
+            window.Show();
+            var host = (AScanHostViewModel)window.DataContext;
+            var vm = window.AScan.ViewModel!;
             var received = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             vm.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(vm.AScan) && vm.AScan is not null) { received.TrySetResult(); } };
-            await DiagnosticWait.For(vm.StartCommand.ExecuteAsync(null));
+            await DiagnosticWait.For(host.StartCommand.ExecuteAsync(null));
             await DiagnosticWait.For(received.Task, "first A-Scan in ViewModel");
             Assert.IsNotNull(vm.AScan);
             Assert.AreEqual(2048, vm.AScan.OriginalSampleCount);
             Assert.IsLessThanOrEqualTo(1024, vm.Points.Count);
-            var control = (AScanControl)window.FindName("Scan");
-            window.Show();
+            var control = window.AScan.Renderer;
             control.Snapshot = vm.AScan;
             control.RefreshSnapshot();
             window.Measure(new Size(1100, 680));
             window.Arrange(new Rect(0, 0, 1100, 680));
             window.UpdateLayout();
-            Assert.IsNotNull(vm.Cursors);
+            await Dispatcher.Yield(DispatcherPriority.DataBind);
+            var visualVm = window.AScan.ViewModel!;
+            Assert.IsNotNull(visualVm.Cursors);
+            Assert.IsNotNull(control.CursorState);
+            window.Activate();
             double cursorAX = 64 + Math.Max(0, control.ActualWidth - 84) *
-                (vm.Cursors.A.TimeSeconds - vm.AScan.MinimumTimeSeconds) /
+                (control.CursorState.A.TimeSeconds - visualVm.AScan!.MinimumTimeSeconds) /
                 (vm.AScan.MaximumTimeSeconds - vm.AScan.MinimumTimeSeconds);
+            Assert.IsTrue(Mouse.Capture(control, CaptureMode.Element));
             Assert.IsTrue(control.BeginCursorDrag(new Point(cursorAX, 120)));
             control.ContinueCursorDrag(new Point(control.ActualWidth + 100, 120));
             control.EndCursorDrag();
-            Assert.AreEqual(vm.AScan.MaximumTimeSeconds, vm.Cursors.A.TimeSeconds);
+            Assert.AreEqual(visualVm.AScan.MaximumTimeSeconds, visualVm.Cursors.A.TimeSeconds);
             clock.Advance(TimeSpan.FromMilliseconds(200));
             window.UpdateStatus(null, EventArgs.Empty);
             window.UpdateLayout();

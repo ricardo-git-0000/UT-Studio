@@ -19,14 +19,15 @@ public sealed class VisualDiagnosticTests
         var clock = new ManualClock();
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher), clock: clock);
         var window = runtime.Host.Services.GetRequiredService<MainWindow>();
-        var vm = (AScanViewModel)window.DataContext;
+        window.Show();
+        var host = (AScanHostViewModel)window.DataContext;
+        var vm = window.AScan.ViewModel!;
         var delivery = runtime.Host.Services.GetRequiredService<AScanVisualDelivery>();
         var session = runtime.Host.Services.GetRequiredService<IApplicationSession>();
         try
         {
             await DiagnosticWait.For(runtime.Host.StartAsync());
-            window.Show();
-            await DiagnosticWait.For(vm.StartCommand.ExecuteAsync(null));
+            await DiagnosticWait.For(host.StartCommand.ExecuteAsync(null));
             await DiagnosticWait.Until(() => vm.AScan is not null && clock.RegisteredTimers > 0,
                 "first curve and simulator waiting on its manual timer");
             var first = vm.AScan!;
@@ -34,7 +35,7 @@ public sealed class VisualDiagnosticTests
             // Source remains paused at its manual timer. Re-reading the already confirmed identity
             // exercises the provider/lease path and fails the publisher's next timer.
             delivery.NotifyCommitted(first.TraceIdentity!.Value, first.InspectionRevision);
-            var text = (TextBlock)window.FindName("VisualErrorText");
+            var text = (TextBlock)window.AScan.FindName("VisualErrorText");
             await DiagnosticWait.Until(() => text.Text.Contains("Synthetic clock failure", StringComparison.Ordinal),
                 "terminal visual error visible through WPF binding");
             Assert.AreEqual(1L, delivery.Statistics.Published);
