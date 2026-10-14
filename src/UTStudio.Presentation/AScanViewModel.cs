@@ -2,6 +2,7 @@ using System.ComponentModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using UTStudio.Contracts.Application;
+using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Visualization.Core;
 
@@ -26,7 +27,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
     private readonly SharedScanTimeViewport _timeViewport;
-    private readonly BScanSelectionCoordinator? _selectionCoordinator;
+    private readonly TraceSelectionScope? _selectionCoordinator;
     private readonly bool _ownsTimeViewport;
     private readonly string _viewportConsumerId = $"ascan-{Guid.NewGuid():N}";
     private readonly UiAsyncCommand _start, _stop;
@@ -51,7 +52,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         IUiDispatcher dispatcher, ConventionalAcquisitionConfiguration configuration,
         Func<AcquisitionRunId>? newRun = null, Func<AScanDeliveryStatistics>? readVisualStatistics = null,
         IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null,
-        BScanSelectionCoordinator? selectionCoordinator = null)
+        TraceSelectionScope? selectionCoordinator = null)
         : this(session, session, session.Snapshot, visualFeed, dispatcher, configuration, newRun,
             readVisualStatistics, visualStatus, timeViewport, selectionCoordinator)
     { }
@@ -61,7 +62,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         IObservable<AScanSnapshot> visualFeed, IUiDispatcher dispatcher,
         Func<AScanDeliveryStatistics>? readVisualStatistics = null,
         IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null,
-        BScanSelectionCoordinator? selectionCoordinator = null)
+        TraceSelectionScope? selectionCoordinator = null)
         : this(null, sessionStates, initialSession, visualFeed, dispatcher, null, null,
             readVisualStatistics, visualStatus, timeViewport, selectionCoordinator)
     { }
@@ -72,7 +73,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         ConventionalAcquisitionConfiguration? configuration, Func<AcquisitionRunId>? newRun,
         Func<AScanDeliveryStatistics>? readVisualStatistics,
         IObservable<AScanDeliveryStatus>? visualStatus, SharedScanTimeViewport? timeViewport,
-        BScanSelectionCoordinator? selectionCoordinator)
+        TraceSelectionScope? selectionCoordinator)
     {
         ArgumentNullException.ThrowIfNull(sessionStates);
         ArgumentNullException.ThrowIfNull(visualFeed);
@@ -129,7 +130,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public AScanDeliveryStatus? VisualStatus => _state.VisualStatus;
     public AScanCursorState? Cursors => _state.Cursors;
     public AScanDisplayMode DisplayMode => _state.DisplayMode;
-    public BScanSelectionState? Selection => _state.Selection;
+    public TraceSelectionState? Selection => _state.Selection;
     public ScanTimeViewport? TimeViewport => _timeViewport.Viewport;
     public ScanTimeViewportBinding? ViewportBinding => _state.AScan is { } snapshot &&
         _timeViewport.RunId == snapshot.Metadata.RunId && _timeViewport.Viewport is { } viewport
@@ -178,7 +179,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public void ReturnToLive() => _lifetime.Post(() =>
     {
         if (IsClosing) { return; }
-        _selectionCoordinator?.CancelPending();
+        _selectionCoordinator?.ReturnToLive();
         if (_state.DisplayMode != AScanDisplayMode.Selected) { return; }
         _returnedSelection = _state.Selection?.Snapshot;
         AScanSnapshot? live = _state.LatestCompatibleLive;
@@ -361,7 +362,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         AcquisitionRunId? previousEffectiveRun = _state.Session.RunId ?? _state.LatestCompatibleLive?.Metadata.RunId;
         bool runChanged = previousEffectiveRun != effectiveRun;
         if (runChanged) { _returnedSelection = null; _ = _selectionCoordinator?.SetRunAsync(session.RunId); }
-        BScanSelectionState? selection = runChanged ? null : _selectionCoordinator?.State ?? _state.Selection;
+        TraceSelectionState? selection = runChanged ? null : _selectionCoordinator?.State ?? _state.Selection;
         bool selected = !runChanged && _state.DisplayMode == AScanDisplayMode.Selected &&
             selection?.Snapshot is not null && selection.RunId == effectiveRun;
         AScanSnapshot? current = selected ? selection!.Snapshot : live;
@@ -442,26 +443,29 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private void OnSelectionChanged(object? sender, PropertyChangedEventArgs args)
     {
-        if (args.PropertyName != nameof(BScanSelectionCoordinator.State)) { return; }
+        if (args.PropertyName != nameof(TraceSelectionScope.State)) { return; }
         _lifetime.Post(() =>
         {
             if (IsClosing || _selectionCoordinator?.State is not { } selection ||
                 selection.RunId != (_state.Session.RunId ?? _state.LatestCompatibleLive?.Metadata.RunId)) { return; }
             if (selection.LastResult == BScanTraceResultKind.Available && selection.Snapshot is { } selected &&
-                !ReferenceEquals(selected, _returnedSelection) && IsCompatibleSelection(selected))
+                !ReferenceEquals(selected, _returnedSelection) && IsCompatibleSelection(selected, selection.Identity))
             { ReplaceVisibleSnapshot(selected, AScanDisplayMode.Selected, selection); }
             else { ReplaceState(_state with { Selection = selection }); }
             RefreshCommands();
         });
     }
 
-    private bool IsCompatibleSelection(AScanSnapshot selected) => _state.LatestCompatibleLive is { } live &&
+    private bool IsCompatibleSelection(AScanSnapshot selected, TraceIdentity? requested) =>
+        requested is { } identity && selected.TraceIdentity == identity &&
+        _state.LatestCompatibleLive is { } live &&
+        (live.TraceIdentity is null || live.TraceIdentity.Value.Stream == identity.Stream) &&
         selected.Metadata.SourceId == live.Metadata.SourceId && selected.Metadata.RunId == live.Metadata.RunId &&
         selected.Metadata.Configuration.PhysicalChannelId == live.Metadata.Configuration.PhysicalChannelId &&
         selected.MinimumTimeSeconds == live.MinimumTimeSeconds && selected.MaximumTimeSeconds == live.MaximumTimeSeconds;
 
     private void ReplaceVisibleSnapshot(AScanSnapshot? snapshot, AScanDisplayMode mode,
-        BScanSelectionState? selection)
+        TraceSelectionState? selection)
     {
         AScanCursorState? cursors = snapshot is null ? null : _state.Cursors is null ||
             _state.AScan?.Metadata.RunId != snapshot.Metadata.RunId

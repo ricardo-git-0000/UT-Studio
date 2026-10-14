@@ -1,7 +1,7 @@
 # ADR 0016 — Componentes WPF completos y reutilizables de scan
 
-Fecha: 2026-10-13. Estado: Aceptado; encapsulación A-Scan implementada. B/C, NuGet y las demás
-fases continúan pendientes de aprobación independiente.
+Fecha: 2026-10-13. Estado: Aceptado; encapsulaciones A-Scan y B-Scan implementadas. C-Scan, NuGet y
+la extracción 2D común continúan pendientes de aprobación independiente.
 
 Trazabilidad: amplía [ADR 0009](0009-reusable-scan-visualization-controls.md), conserva
 [ADR 0010](0010-ascan-manual-cursor-measurements.md), [ADR 0013](0013-bscan-bounded-live-visualization.md),
@@ -78,7 +78,7 @@ compone instancias de puertos neutrales. Una dependencia de Core neutral hacia C
 una dependencia hacia la interfaz agregada `IInspectionDataStore` no lo es: se inyectan solamente los
 roles de lectura necesarios.
 
-### API pública objetivo e incremento A implementado
+### API pública implementada
 
 El primer incremento fija esta superficie pública mínima de A-Scan:
 
@@ -101,7 +101,7 @@ public sealed record AScanComponentContext(
     IObservable<AScanDeliveryStatus>? VisualStatus = null,
     Func<AScanDeliveryStatistics>? ReadStatistics = null,
     SharedScanTimeViewport? TimeViewport = null,
-    BScanSelectionCoordinator? SelectionCoordinator = null);
+    TraceSelectionScope? SelectionScope = null);
 ```
 
 Los feeds, viewport y coordinador son prestados; la View solo posee sus suscripciones y su
@@ -109,7 +109,7 @@ Los feeds, viewport y coordinador son prestados; la View solo posee sus suscripc
 no sustituye el `DataContext` heredado. El primer `Loaded` activa el scope; `CloseAsync` es la barrera
 obligatoria y no depende de `Unloaded`.
 
-La superficie siguiente de B-Scan continúa siendo ilustrativa y pendiente de su incremento:
+El incremento B-Scan fija esta superficie pública mínima:
 
 ```csharp
 
@@ -117,23 +117,27 @@ public sealed class BScanView : UserControl, IAsyncDisposable
 {
     public BScanView();
     public BScanComponentContext? Context { get; set; } // DP asignable solo antes de activar
-    public BScanViewState State { get; }                // DependencyProperty de solo lectura
-    public ScanComponentError? Error { get; }
-    public ValueTask CloseAsync(CancellationToken cancellationToken = default);
+    public BScanViewState? State { get; }               // DependencyProperty de solo lectura
+    public BScanComponentPhase Phase { get; }           // DependencyProperty de solo lectura
+    public string? Error { get; }                       // DependencyProperty de solo lectura
+    public IBScanPaletteLoader? PaletteLoader { get; set; }
+    public string? ConsumerId { get; }
+    public Task CloseAsync();
+    public ValueTask CloseAsync(CancellationToken cancellationToken);
     public ValueTask DisposeAsync();
 }
 
 public sealed record BScanComponentContext(
     IBScanVisualSource Visuals,
-    ScanPresentationGroup Group,
     SharedScanTimeViewport TimeViewport,
-    IBScanResamplingPreferenceWriter? Preferences,
-    BScanComponentOptions Options);
+    TraceSelectionScope SelectionScope,
+    Scan2DInterpolationMode InitialResamplingMode = Scan2DInterpolationMode.None,
+    IBScanResamplingPreferenceWriter? ResamplingPreferences = null);
 ```
 
-Los nombres y la granularidad de B-Scan son ilustrativos, no API aceptada. `ScanPresentationGroup` representa
-el coordinador neutral live/selected y el selector autoritativo compartidos por un grupo; su ownership
-es explícitamente prestado o procede de una factoría de grupo. Dos grupos no comparten estado. El
+`TraceSelectionScope` representa la selección exacta live/selected compartida por un grupo compatible;
+su resolver A es opcional, de modo que B puede publicar `TraceIdentity` sin consumidor A. Su ownership
+es explícitamente prestado. Dos grupos no comparten estado. El
 adaptador al Dispatcher se crea en cada assembly WPF y no se filtra al contrato neutral. No se expondrá
 `DataContext` como contrato ni se requerirá que el host construya ViewModel o adaptador. La View nunca
 sustituye el `DataContext` heredado; su raíz interna enlaza a una propiedad privada. Se
@@ -174,6 +178,37 @@ liberan recursos WPF. Se probarán cierre antes de `Loaded`, remove/re-add, conc
 Dispatcher en shutdown. Cancelar el token de `CloseAsync` cancela solo la espera del llamador: cleanup
 continúa monotónico, no reabre admisión y `Closed` solo se publica al cruzar la barrera real; otra espera
 puede observar su final. No detiene adquisición ni dispone objetos prestados.
+
+### Modelo de ejecución síncrono de B-Scan
+
+El adaptador concreta el lifecycle como `Created → Prepared (Attached) → Active → Closing → Closed`.
+`Prepared` linealiza después de capturar el control vacío y registrar sus recursos internos; todavía no
+es observable como conectado, ignora notificaciones externas y puede revertirse por completo. `Active`
+linealiza, mediante CAS, después de aplicar estado y raster iniciales e inmediatamente antes del commit
+síncrono que expone DataContext, bindings y estado de `BScanView`; cualquier observador reentrante de
+esa publicación ya ve `Active`.
+Si la activación falla, el rollback se espera y restaura el control vacío antes de propagar el error
+principal, agregando por etapa los errores secundarios de cleanup. Conectar un control cuyo
+`RasterSource` ya esté poblado continúa siendo un error de precondición, no una ruta de adopción.
+
+La visita protegida linealiza al validar y admitir el token bajo el gate neutral. En el dispatcher WPF,
+visita, copia a staging, segunda validación del token y commit del bitmap forman un tramo síncrono y
+atómico respecto de trabajo externo: no contiene `await` ni punto de suspensión productivo. La única
+intercalación posible dentro del tramo es una llamada reentrante originada por el propio callback. El
+inicio de cierre linealiza al publicar `Closing`: desde ahí se rechazan nuevas visitas; una visita ya
+admitida puede retornar y solo entonces `Closed` cruza su barrera. Un token invalidado reentrantemente
+descarta el candidato y solicita una única recuperación full.
+
+El productor neutral latest-only también está serializado: una construcción activa conserva su turno
+lógico; las solicitudes posteriores reemplazan una única pendiente. Al retornar la activa se valida su
+generación y se descarta si fue sustituida; después se construye exclusivamente la última pendiente.
+Ninguna solicitud intermedia se publica.
+
+Por ello no forman parte de la matriz de aceptación las supuestas pausas externas entre admisión,
+staging y commit, ni un cierre externo insertado en ese tramo: son físicamente imposibles con el
+dispatcher productivo síncrono. No son pruebas omitidas; no aplican al modelo. La matriz conserva la
+intercalación reentrante real, el rollback de construcción que vuelve a control vacío y, por separado,
+el fallo de una actualización ya conectada que preserva bitmap, bytes e identidad confirmados.
 
 En salida global, el host bloquea interacción/admisión UI, completa Stop, drenado y commits de sesión,
 sella y entrega `FinalRevision`, solicita la reconciliación B y espera freeze/barrera; después cierra y

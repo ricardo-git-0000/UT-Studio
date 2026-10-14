@@ -83,7 +83,10 @@ ViewModel de ventana y escribe de forma serializada y atómica en la configuraci
 Presentation solo conoce el contrato neutral de escritura y nunca rutas, JSON ni tipos WPF; cada ventana
 y su ViewModel conservan lifetime propio, mientras la preferencia sobrevive a reaperturas.
 Solo proyectos .Wpf referencian WPF. Tipos UI como Brush, Color, Point, BitmapSource, WriteableBitmap, Dispatcher y Window no aparecen en APIs públicas del núcleo. Usar unidades, coordenadas y formatos de píxel neutrales explícitos.
-La raíz App.Wpf compone ViewModels independientes. MainWindow aloja A-Scan y gobierna la salida global. BScanWindow es la primera secundaria: posee ViewModel, suscripciones y consumer ID, toma prestados servicios compartidos y puede cerrarse sin detener sesión. No se crean scopes genéricos ni controles XAML por muestra.
+La raíz App.Wpf compone los hosts. MainWindow aloja `AScanView` y gobierna la salida global;
+`BScanWindow` es un shell fino que aloja `BScanView`. Cada componente posee únicamente su ViewModel,
+suscripciones, consumer ID y adaptador visual, toma prestados los puertos neutrales y puede cerrarse sin
+detener sesión ni store. `TraceSelectionScope` coordina identidad exacta A/B sin poseer RF.
 La futura UI Avalonia sustituirá adaptadores y composición. La portabilidad del núcleo no garantiza soporte Linux del SDK PCIe. Aislar también SDK de futuros PLC, robot y encoders.
 
 El B-Scan mantiene la frontera reutilizable: Core define raster/viewports neutrales; Visualization.Wpf

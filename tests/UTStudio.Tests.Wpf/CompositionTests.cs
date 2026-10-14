@@ -127,9 +127,9 @@ public sealed class CompositionTests
 
             await windows.OpenAsync();
             BScanWindow window = windows.ActiveWindow!;
-            var bScan = (BScanViewModel)window.DataContext;
+            BScanViewModel bScan = window.Component.ViewModel!;
             await DiagnosticWait.Until(() => bScan.State.Region is not null, "productive simulator B-Scan raster");
-            var control = (BScanControl)window.FindName("Scan");
+            BScanControl control = window.Component.Renderer;
 
             Assert.AreEqual(BScanViewPhase.Ready, bScan.State.Phase);
             Assert.IsNull(bScan.State.BScanIngressError);
@@ -146,8 +146,8 @@ public sealed class CompositionTests
             await window.CloseOwnedAsync();
             await windows.OpenAsync();
             BScanWindow reopened = windows.ActiveWindow!;
-            var reopenedViewModel = (BScanViewModel)reopened.DataContext;
-            var reopenedControl = (BScanControl)reopened.FindName("Scan");
+            BScanViewModel reopenedViewModel = reopened.Component.ViewModel!;
+            BScanControl reopenedControl = reopened.Component.Renderer;
             await DiagnosticWait.Until(() => reopenedViewModel.State.Region is not null &&
                 reopenedControl.RasterSource is not null, "reopened productive simulator B-Scan raster");
             await DiagnosticWait.Until(() => reopenedControl.RasterSource is BitmapSource
@@ -174,8 +174,8 @@ public sealed class CompositionTests
             await runtime.Host.StartAsync();
             await windows.OpenAsync();
             BScanWindow window = windows.ActiveWindow!;
-            var bScan = (BScanViewModel)window.DataContext;
-            var control = (BScanControl)window.FindName("Scan");
+            BScanViewModel bScan = window.Component.ViewModel!;
+            BScanControl control = window.Component.Renderer;
             bScan.SetResamplingMode(Scan2DInterpolationMode.Bilinear);
             await host.StartCommand.ExecuteAsync(null);
             try
@@ -391,9 +391,9 @@ public sealed class CompositionTests
             var delivery = services.GetRequiredService<BScanVisualDelivery>();
             var manager = new BScanWindowManager(delivery,
                 services.GetRequiredService<SharedScanTimeViewport>(),
-                services.GetRequiredService<BScanSelectionCoordinator>(),
-                services.GetRequiredService<IUiDispatcher>(), Dispatcher.CurrentDispatcher,
-                null, null, _ => throw new InvalidOperationException("show failed"));
+                services.GetRequiredService<TraceSelectionScope>(),
+                Dispatcher.CurrentDispatcher, null, null, null,
+                _ => throw new InvalidOperationException("show failed"));
 
             InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() => manager.OpenAsync());
 
@@ -407,10 +407,7 @@ public sealed class CompositionTests
     });
 
     [TestMethod]
-    [DataRow("adapter")]
-    [DataRow("viewmodel")]
-    [DataRow("window")]
-    public Task BScan_window_close_attempts_adapter_viewmodel_and_window_once(string failingStage) => StaTest.Run(async () =>
+    public Task BScan_window_close_is_idempotent_through_public_component_context() => StaTest.Run(async () =>
     {
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
         BScanWindow? window = null;
@@ -418,26 +415,16 @@ public sealed class CompositionTests
         {
             var services = runtime.Host.Services;
             var delivery = services.GetRequiredService<BScanVisualDelivery>();
-            var vm = new BScanViewModel(delivery, services.GetRequiredService<SharedScanTimeViewport>(),
-                services.GetRequiredService<BScanSelectionCoordinator>(), services.GetRequiredService<IUiDispatcher>());
-            List<string> calls = [];
-            window = new BScanWindow(vm,
-                () => { calls.Add("adapter"); if (failingStage == "adapter") throw new InvalidOperationException("adapter"); },
-                async () =>
-                {
-                    calls.Add("viewmodel");
-                    await vm.DisposeAsync();
-                    if (failingStage == "viewmodel") throw new InvalidOperationException("viewmodel");
-                },
-                () => { calls.Add("window"); if (failingStage == "window") throw new InvalidOperationException("window"); });
+            window = new BScanWindow(new(delivery, services.GetRequiredService<SharedScanTimeViewport>(),
+                services.GetRequiredService<TraceSelectionScope>()));
             window.Show();
+            await window.Component.Activation;
 
             Task first = window.CloseOwnedAsync();
-            CleanupFailureException error = await Assert.ThrowsAsync<CleanupFailureException>(() => first);
+            Task second = window.CloseOwnedAsync();
+            await first;
 
-            Assert.AreEqual(failingStage, error.PrimaryError.Message);
-            CollectionAssert.AreEqual(new[] { "adapter", "viewmodel", "window" }, calls);
-            Assert.AreSame(first, window.CloseOwnedAsync());
+            Assert.AreSame(first, second);
             Assert.IsFalse(window.IsVisible);
             Assert.AreEqual(0, delivery.ActiveConsumerCount);
         }
@@ -449,39 +436,25 @@ public sealed class CompositionTests
     });
 
     [TestMethod]
-    public Task BScan_window_close_preserves_multiple_failures_in_stage_order() => StaTest.Run(async () =>
+    public Task BScan_window_reopens_with_a_new_public_context_after_close() => StaTest.Run(async () =>
     {
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
         try
         {
             var services = runtime.Host.Services;
             var delivery = services.GetRequiredService<BScanVisualDelivery>();
-            var vm = new BScanViewModel(delivery, services.GetRequiredService<SharedScanTimeViewport>(),
-                services.GetRequiredService<BScanSelectionCoordinator>(), services.GetRequiredService<IUiDispatcher>());
-            var adapterError = new InvalidOperationException("adapter");
-            var viewModelError = new InvalidOperationException("viewmodel");
-            var windowError = new InvalidOperationException("window");
-            var window = new BScanWindow(vm,
-                () => throw adapterError,
-                async () => { await vm.DisposeAsync(); throw viewModelError; },
-                () => throw windowError);
-            int notifications = 0;
-            window.CleanupFailed += _ => notifications++;
-            window.CleanupFailed += _ => throw new InvalidOperationException("observer");
-            window.Show();
-
-            window.Close();
-            CleanupFailureException error = await Assert.ThrowsAsync<CleanupFailureException>(() => window.CloseOwnedAsync());
-
-            Assert.AreSame(adapterError, error.PrimaryError);
-            Assert.AreEqual("adapter", error.PrimaryFailure.Stage);
-            Assert.HasCount(2, error.SecondaryErrors);
-            Assert.AreSame(viewModelError, error.SecondaryErrors[0]);
-            Assert.AreSame(windowError, error.SecondaryErrors[1]);
-            CollectionAssert.AreEqual(new[] { "viewmodel", "window" },
-                error.SecondaryFailures.Select(failure => failure.Stage).ToArray());
-            Assert.IsFalse(window.IsVisible);
-            Assert.AreEqual(1, notifications);
+            BScanComponentContext Context() => new(delivery,
+                services.GetRequiredService<SharedScanTimeViewport>(), services.GetRequiredService<TraceSelectionScope>());
+            var first = new BScanWindow(Context());
+            first.Show();
+            await first.Component.Activation;
+            string firstConsumer = first.ConsumerId;
+            await first.CloseOwnedAsync();
+            var second = new BScanWindow(Context());
+            second.Show();
+            await second.Component.Activation;
+            Assert.AreNotEqual(firstConsumer, second.ConsumerId);
+            await second.CloseOwnedAsync();
             Assert.AreEqual(0, delivery.ActiveConsumerCount);
         }
         finally { await runtime.Shutdown.ShutdownAsync(); }

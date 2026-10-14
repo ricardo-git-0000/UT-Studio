@@ -1,142 +1,30 @@
 using System.ComponentModel;
-using System.IO;
 using System.Windows;
-using System.Xml;
-using Microsoft.Win32;
-using UTStudio.App.Wpf.Adapters;
 using UTStudio.Presentation;
-using UTStudio.Visualization.Wpf.Rendering;
-using UTStudio.Visualization.Core.Scan2D;
+using UTStudio.ScanVisualization.BScan.Wpf;
 
 namespace UTStudio.App.Wpf;
 
 public partial class BScanWindow : Window
 {
     private readonly object _closeGate = new();
-    private readonly BScanViewModel _viewModel;
-    private readonly BScanControlAdapter? _adapter;
-    private readonly Action _disposeAdapter;
-    private readonly Func<Task> _disposeViewModel;
-    private readonly Action? _beforeWindowClose;
     private Task? _closingTask;
     private bool _allowClose;
     private int _cleanupErrorPublished;
-    private bool _updatingResamplingSelector;
-    private bool _resamplingSubscriptionAttached;
-    private long _resamplingIntentCount;
     internal Exception? CleanupError { get; private set; }
     internal event Action<Exception>? CleanupFailed;
 
-    public BScanWindow(BScanViewModel viewModel)
+    public BScanWindow(BScanComponentContext context, IBScanPaletteLoader? paletteLoader = null)
     {
         InitializeComponent();
-        DataContext = _viewModel = viewModel;
-        var adapter = _adapter = new BScanControlAdapter(viewModel, Scan);
-        _disposeAdapter = adapter.Dispose;
-        _disposeViewModel = () => viewModel.DisposeAsync().AsTask();
-        _beforeWindowClose = null;
+        ScanView.Context = context;
+        ScanView.PaletteLoader = paletteLoader;
         Closing += OnClosing;
-        InitializeResamplingSelector();
     }
 
-    internal BScanWindow(BScanViewModel viewModel, Action disposeAdapter, Func<Task> disposeViewModel,
-        Action? beforeWindowClose = null)
-    {
-        InitializeComponent();
-        DataContext = _viewModel = viewModel;
-        _adapter = null;
-        _disposeAdapter = disposeAdapter;
-        _disposeViewModel = disposeViewModel;
-        _beforeWindowClose = beforeWindowClose;
-        Closing += OnClosing;
-        InitializeResamplingSelector();
-    }
-
-    private void InitializeResamplingSelector()
-    {
-        ResamplingSelector.ItemsSource = BScanResamplingDisplayOption.All;
-        ResamplingSelector.SelectedValuePath = nameof(BScanResamplingDisplayOption.Mode);
-        ResamplingSelector.DisplayMemberPath = nameof(BScanResamplingDisplayOption.DisplayName);
-        _viewModel.PropertyChanged += OnViewModelPropertyChanged;
-        _resamplingSubscriptionAttached = true;
-        SynchronizeResamplingSelector();
-    }
-
-    private void OnResamplingSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
-    {
-        if (_updatingResamplingSelector) return;
-        if (ResamplingSelector.SelectedValue is not Scan2DInterpolationMode mode) return;
-        if (mode == _viewModel.RequestedResamplingMode) { SynchronizeResamplingSelector(); return; }
-        Interlocked.Increment(ref _resamplingIntentCount);
-        if (_viewModel.ChangeResamplingModeCommand.CanExecute(mode))
-        { _viewModel.ChangeResamplingModeCommand.Execute(mode); }
-    }
-
-    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (e.PropertyName == nameof(BScanViewModel.RequestedResamplingMode))
-        { SynchronizeResamplingSelector(); }
-    }
-
-    private void SynchronizeResamplingSelector()
-    {
-        _updatingResamplingSelector = true;
-        try
-        {
-            Scan2DInterpolationMode mode = _viewModel.RequestedResamplingMode;
-            ResamplingSelector.SelectedValue = mode;
-            LanczosWarning.Visibility = mode == Scan2DInterpolationMode.Lanczos
-                ? Visibility.Visible : Visibility.Collapsed;
-        }
-        finally { _updatingResamplingSelector = false; }
-    }
-
-    internal Scan2DInterpolationMode? SelectedResamplingMode =>
-        ResamplingSelector.SelectedValue as Scan2DInterpolationMode?;
-    internal bool IsLanczosWarningVisible => LanczosWarning.Visibility == Visibility.Visible;
-    internal long ResamplingIntentCount => Interlocked.Read(ref _resamplingIntentCount);
-    internal void SelectResamplingMode(Scan2DInterpolationMode mode) =>
-        ResamplingSelector.SelectedValue = mode;
-
-    internal sealed record BScanResamplingDisplayOption(Scan2DInterpolationMode Mode, string DisplayName)
-    {
-        internal static IReadOnlyList<BScanResamplingDisplayOption> All { get; } =
-        [new(Scan2DInterpolationMode.None, "Sin interpolación"),
-         new(Scan2DInterpolationMode.NearestNeighbor, "Vecino más próximo"),
-         new(Scan2DInterpolationMode.Bilinear, "Bilineal — recomendado"),
-         new(Scan2DInterpolationMode.Bicubic, "Bicúbica — recomendado"),
-         new(Scan2DInterpolationMode.Lanczos, "Lanczos-3 — alta calidad")];
-    }
-
-    internal string ConsumerId => _viewModel.ConsumerId;
-
-    private void OnLoadPalette(object sender, RoutedEventArgs e)
-    {
-        if (_adapter is null)
-        {
-            PaletteStatus.Text = "Paleta: carga no disponible en esta composición.";
-            return;
-        }
-        var dialog = new OpenFileDialog
-        {
-            Title = "Cargar paleta B-Scan",
-            Filter = "Paleta XML (*.xml)|*.xml|Todos los archivos (*.*)|*.*",
-            CheckFileExists = true,
-            Multiselect = false
-        };
-        if (dialog.ShowDialog(this) != true) { return; }
-        try
-        {
-            BScanColorPalette palette = BScanPaletteFile.Load(dialog.FileName);
-            _adapter.SetPalette(palette);
-            PaletteStatus.Text = $"Paleta: {palette.Name}";
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or XmlException or InvalidDataException)
-        {
-            PaletteStatus.Text = $"Paleta no cargada: {error.Message}";
-        }
-    }
-
+    internal string ConsumerId => ScanView.ConsumerId
+        ?? throw new InvalidOperationException("B-Scan has not been activated yet.");
+    internal BScanView Component => ScanView;
     internal Task CloseOwnedAsync()
     {
         lock (_closeGate) { return _closingTask ??= CloseCoreAsync(); }
@@ -145,35 +33,33 @@ public partial class BScanWindow : Window
     private async Task CloseCoreAsync()
     {
         List<CleanupStageFailure> failures = [];
-        if (_resamplingSubscriptionAttached)
+        try { await ScanView.CloseAsync().ConfigureAwait(true); }
+        catch (CleanupFailureException error)
         {
-            _resamplingSubscriptionAttached = false;
-            _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
+            failures.Add(error.PrimaryFailure);
+            failures.AddRange(error.SecondaryFailures);
         }
-        try { _disposeAdapter(); } catch (Exception error) { failures.Add(new("adapter", error)); }
-        try { await _disposeViewModel().ConfigureAwait(false); }
-        catch (Exception error) { failures.Add(new("viewmodel", error)); }
-        try { _beforeWindowClose?.Invoke(); }
-        catch (Exception error) { failures.Add(new("window", error)); }
+        catch (Exception error) { failures.Add(new("component", error)); }
         if (Dispatcher.HasShutdownStarted)
-        { failures.Add(new("ui-barrier", new InvalidOperationException("B-Scan UI barrier is unavailable because its Dispatcher is shutting down."))); }
+        {
+            failures.Add(new("ui-barrier", new InvalidOperationException(
+                "B-Scan UI barrier is unavailable because its Dispatcher is shutting down.")));
+        }
         else
         {
-            try { await Dispatcher.InvokeAsync(() => { _allowClose = true; Close(); }); }
+            try { _allowClose = true; Close(); }
             catch (Exception error) { failures.Add(new("window", error)); }
         }
-        if (failures.Count != 0)
-        {
-            var cleanup = new CleanupFailureException("B-Scan window cleanup failed.", failures[0], failures.Skip(1).ToArray());
-            PublishCleanupError(cleanup);
-            throw cleanup;
-        }
+        if (failures.Count == 0) { return; }
+        var cleanup = new CleanupFailureException("B-Scan window cleanup failed.", failures[0], failures.Skip(1).ToArray());
+        PublishCleanupError(cleanup);
+        throw cleanup;
     }
 
-    private async void OnClosing(object? sender, CancelEventArgs e)
+    private async void OnClosing(object? sender, CancelEventArgs args)
     {
-        if (_allowClose) return;
-        e.Cancel = true;
+        if (_allowClose) { return; }
+        args.Cancel = true;
         try { await CloseOwnedAsync(); }
         catch (Exception error)
         {

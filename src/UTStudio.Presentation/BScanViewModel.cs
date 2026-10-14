@@ -30,13 +30,13 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private readonly UiLifetime _lifetime;
     private readonly IBScanVisualSource _source;
     private readonly SharedScanTimeViewport _timeViewport;
-    private readonly BScanSelectionCoordinator _selection;
+    private readonly TraceSelectionScope _selection;
     private readonly string _consumerId = $"bscan-{Guid.NewGuid():N}";
     private readonly IDisposable _subscription;
     private BScanRasterRegion? _visibleRegion;
     private readonly SafeRelayCommand _zoomTimeIn, _zoomTimeOut, _panTimeUp, _panTimeDown, _resetTime,
         _zoomSpatialIn, _zoomSpatialOut, _panSpatialLeft, _panSpatialRight, _resetSpatial, _resetAll,
-        _decreaseLiveWindow, _increaseLiveWindow, _refresh, _cancelSelection;
+        _decreaseLiveWindow, _increaseLiveWindow, _refresh, _cancelSelection, _returnToLive;
     private readonly SafeParameterRelayCommand _changeResamplingMode;
     private readonly IBScanResamplingPreferenceWriter? _preferenceWriter;
     private BScanViewState _state = BScanViewState.Empty;
@@ -65,20 +65,20 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     private readonly Action<string>? _afterCleanupStage;
 
     public BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher)
+        TraceSelectionScope selection, IUiDispatcher dispatcher)
         : this(source, timeViewport, selection, dispatcher, Scan2DInterpolationMode.None, null, null) { }
 
     public BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Scan2DInterpolationMode initialResamplingMode,
+        TraceSelectionScope selection, IUiDispatcher dispatcher, Scan2DInterpolationMode initialResamplingMode,
         IBScanResamplingPreferenceWriter? preferenceWriter)
         : this(source, timeViewport, selection, dispatcher, initialResamplingMode, preferenceWriter, null) { }
 
     internal BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Action<string>? afterCleanupStage)
+        TraceSelectionScope selection, IUiDispatcher dispatcher, Action<string>? afterCleanupStage)
         : this(source, timeViewport, selection, dispatcher, Scan2DInterpolationMode.None, null, afterCleanupStage) { }
 
     internal BScanViewModel(IBScanVisualSource source, SharedScanTimeViewport timeViewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Scan2DInterpolationMode initialResamplingMode,
+        TraceSelectionScope selection, IUiDispatcher dispatcher, Scan2DInterpolationMode initialResamplingMode,
         IBScanResamplingPreferenceWriter? preferenceWriter, Action<string>? afterCleanupStage)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
@@ -88,9 +88,10 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         _preferenceWriter = preferenceWriter;
         if (!Enum.IsDefined(initialResamplingMode)) { initialResamplingMode = Scan2DInterpolationMode.None; }
         _state = BScanViewState.Empty with { RequestedResamplingMode = initialResamplingMode };
+        ArgumentNullException.ThrowIfNull(dispatcher);
         if (!_source.RegisterConsumer(_consumerId))
         { throw new InvalidOperationException("The B-Scan raster consumer limit has been reached."); }
-        _lifetime = new(dispatcher ?? throw new ArgumentNullException(nameof(dispatcher)));
+        _lifetime = new(dispatcher);
         _timeViewport.PropertyChanged += OnTimeViewportChanged;
         _selection.PropertyChanged += OnSelectionChanged;
         _zoomTimeIn = Command(() => ZoomTime(1.2), HasTime);
@@ -110,6 +111,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             () => _liveWindowColumns < _maximumLiveWindowColumns);
         _refresh = Command(() => RequestRefresh(force: true, full: true), HasRenderableState);
         _cancelSelection = Command(() => _selection.Cancel(_consumerId), () => _state.Selection.IsPending);
+        _returnToLive = Command(_selection.ReturnToLive,
+            () => _state.Selection.Snapshot is not null || _state.Selection.IsPending);
         _changeResamplingMode = new(parameter =>
         {
             if (parameter is Scan2DInterpolationMode mode) SetResamplingMode(mode);
@@ -118,6 +121,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         try { _subscription = _source.Subscribe(new Observer(this)); }
         catch
         {
+            _timeViewport.PropertyChanged -= OnTimeViewportChanged;
+            _selection.PropertyChanged -= OnSelectionChanged;
             _source.UnregisterConsumer(_consumerId);
             throw;
         }
@@ -125,6 +130,8 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         catch
         {
             _subscription.Dispose();
+            _timeViewport.PropertyChanged -= OnTimeViewportChanged;
+            _selection.PropertyChanged -= OnSelectionChanged;
             _source.UnregisterConsumer(_consumerId);
             throw;
         }
@@ -152,6 +159,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     public IRelayCommand IncreaseLiveWindowCommand => _increaseLiveWindow;
     public IRelayCommand RefreshCommand => _refresh;
     public IRelayCommand CancelSelectionCommand => _cancelSelection;
+    public IRelayCommand ReturnToLiveCommand => _returnToLive;
     public IRelayCommand ChangeResamplingModeCommand => _changeResamplingMode;
     public IReadOnlyList<BScanResamplingOption> AvailableResamplingModes => BScanResamplingOptions.All;
     public Scan2DInterpolationMode RequestedResamplingMode
@@ -370,16 +378,24 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     public bool TryVisitPresentedRegion(BScanPresentedRegionToken token, BScanIntensityVisitor visitor)
     {
         ArgumentNullException.ThrowIfNull(visitor);
+        bool stale;
         lock (_gate)
         {
-            if (IsClosing || _visibleRegion is null || _state.Region is not { } descriptor ||
-                descriptor.Token != token || descriptor.PresentationGeneration != _rasterGeneration ||
-                descriptor.Snapshot != _visibleRegion.Snapshot)
-            { return false; }
-            visitor(_visibleRegion.Pixels.Span, _visibleRegion.ValidityMask.Span, descriptor.Stride);
-            return true;
+            if (!IsPresentedRegionCurrent(token)) { return false; }
+            BScanPresentedRegion descriptor = _state.Region!;
+            BScanRasterRegion visible = _visibleRegion!;
+            visitor(visible.Pixels.Span, visible.ValidityMask.Span, descriptor.Stride);
+            stale = !IsPresentedRegionCurrent(token);
         }
+        if (stale && !IsClosing && Interlocked.Exchange(ref _recoveryPosted, 1) == 0)
+        { _lifetime.Post(() => RequestRefresh(force: true, full: true)); }
+        return !stale;
     }
+
+    private bool IsPresentedRegionCurrent(BScanPresentedRegionToken token) =>
+        !IsClosing && _visibleRegion is not null && _state.Region is { } descriptor &&
+        descriptor.Token == token && descriptor.PresentationGeneration == _rasterGeneration &&
+        descriptor.Snapshot == _visibleRegion.Snapshot;
 
     private SafeRelayCommand Command(Action execute, Func<bool> canExecute) =>
         new(() => { if (!IsClosing) { _lifetime.Post(() => { if (!IsClosing) { execute(); } }); } },
@@ -542,7 +558,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
             SpatialViewport = spatial,
             TimeViewportBinding = binding,
             RequiresFullRefresh = newRun || metadataRequiresFull || _state.RequiresFullRefresh,
-            Selection = newRun ? BScanSelectionState.Empty with { RunId = snapshot.RunId } : _selection.State,
+            Selection = newRun ? TraceSelectionState.Empty with { RunId = snapshot.RunId } : _selection.State,
             SelectionError = newRun ? null : _selection.State.SelectionError,
             IsSpatialAutoFit = newRun || _state.IsSpatialAutoFit,
             Region = newRun ? null : _state.Region,
@@ -554,7 +570,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         _timeViewport.PublishDeferredChanges();
         _applyingMetadata = false;
         PublishTimeBinding();
-        _selection.UpdateResidency(_consumerId, snapshot.RunId, snapshot.SnapshotVersion, snapshot.ResidentRange);
+        _selection.UpdateResidency(_consumerId, snapshot.TraceStream, snapshot.SnapshotVersion, snapshot.ResidentRange);
         RefreshCommands();
         // The render request carries the displayed base, not the target store revision. A prior
         // no-change request can therefore compare equal after new metadata arrives; metadata is
@@ -846,13 +862,13 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     }
     private void OnSelectionChanged(object? sender, PropertyChangedEventArgs args)
     {
-        if (args.PropertyName != nameof(BScanSelectionCoordinator.State)) { return; }
+        if (args.PropertyName != nameof(TraceSelectionScope.State)) { return; }
         _lifetime.Post(ApplySelection);
     }
 
     private void ApplySelection()
     {
-        BScanSelectionState selection = _selection.State;
+        TraceSelectionState selection = _selection.State;
         bool compatible = selection.RunId is null || selection.RunId == _state.RunId;
         if (compatible && selection.Identity is { } identity && _latestMetadata is { } metadata)
         {
@@ -862,7 +878,7 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
         ReplaceState(_state with
         {
             Selection = selection,
-            SelectedColumn = selection.Identity ?? _state.SelectedColumn,
+            SelectedColumn = selection.Identity,
             SelectionError = selection.SelectionError
         });
         RefreshCommands();
@@ -883,28 +899,27 @@ public sealed class BScanViewModel : SafeObservableObject, IAsyncDisposable
     }
     private SafeRelayCommand[] Commands => [_zoomTimeIn, _zoomTimeOut, _panTimeUp, _panTimeDown, _resetTime,
         _zoomSpatialIn, _zoomSpatialOut, _panSpatialLeft, _panSpatialRight, _resetSpatial, _resetAll,
-        _decreaseLiveWindow, _increaseLiveWindow, _refresh, _cancelSelection];
+        _decreaseLiveWindow, _increaseLiveWindow, _refresh, _cancelSelection, _returnToLive];
 
     public ValueTask DisposeAsync()
     {
-        TaskCompletionSource? completion = null;
-        lock (_gate)
+        Task? existing = Volatile.Read(ref _disposal);
+        if (existing is not null) { return new(existing); }
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref _disposal, completion.Task, null) is null)
         {
-            if (_disposal is null)
-            {
-                Volatile.Write(ref _closing, 1);
-                completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-                _disposal = completion.Task;
-                _rasterGeneration++;
-            }
+            Volatile.Write(ref _closing, 1);
+            _ = CloseAsync(completion);
         }
-        if (completion is not null)
-        { _ = CloseAsync(completion); }
         return new(_disposal!);
     }
 
     private async Task CloseAsync(TaskCompletionSource completion)
     {
+        // Ensure DisposeAsync publishes Closing and returns its shared task before cleanup can
+        // contend with a protected presentation visit on the STA thread.
+        await Task.Yield();
+        lock (_gate) { _rasterGeneration++; }
         List<CleanupStageFailure> failures = [];
         void Capture(string stage, Action action)
         {

@@ -2,9 +2,9 @@ using System.Globalization;
 using System.Windows.Data;
 using UTStudio.Visualization.Core.Scan2D;
 
-namespace UTStudio.App.Wpf.Adapters;
+namespace UTStudio.ScanVisualization.BScan.Wpf;
 
-public sealed class BScanResamplingModeConverter : IValueConverter
+internal sealed class BScanResamplingModeConverter : IValueConverter
 {
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture) => value switch
     {
@@ -15,6 +15,6 @@ public sealed class BScanResamplingModeConverter : IValueConverter
         Scan2DInterpolationMode.Lanczos => "Lanczos-3 — alta calidad",
         _ => "Ninguno"
     };
-    public object ConvertBack(object value, Type targetType, object? parameter, CultureInfo culture) =>
+    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>
         Binding.DoNothing;
 }

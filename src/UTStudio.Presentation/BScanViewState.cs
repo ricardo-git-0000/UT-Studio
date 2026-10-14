@@ -36,7 +36,7 @@ public sealed record BScanViewState(
     BScanVisualRevision? DisplayedRevision,
     bool RequiresFullRefresh,
     TraceIdentity? SelectedColumn,
-    BScanSelectionState Selection,
+    TraceSelectionState Selection,
     string? AcquisitionError,
     string? BScanIngressError,
     string? BScanVisualError,
@@ -51,6 +51,6 @@ public sealed record BScanViewState(
     string? ConfigurationError = null)
 {
     public static BScanViewState Empty { get; } = new(BScanViewPhase.NoData, null, null, null, null,
-        null, null, null, null, null, null, true, null, BScanSelectionState.Empty,
+        null, null, null, null, null, null, true, null, TraceSelectionState.Empty,
         null, null, null, null, null);
 }

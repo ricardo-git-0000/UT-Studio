@@ -28,7 +28,7 @@ public sealed class DesktopRuntime
     private AScanVisualDelivery? _visual;
     private BScanIngress? _bScanIngress;
     private BScanVisualDelivery? _bScanVisual;
-    private BScanSelectionCoordinator? _selection;
+    private TraceSelectionScope? _selection;
     private BScanWindowManager? _bScanWindows;
     private ApplicationSession? _session;
     private InspectionDataStoreRegistry? _inspectionStores;
@@ -239,7 +239,7 @@ public sealed class DesktopRuntime
                 runId => inspectionStores.OpenRun(runId), bScanIngress, visual);
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
-            var selection = runtime._selection = new BScanSelectionCoordinator(dispatcher, selectionResolver);
+            var selection = runtime._selection = new TraceSelectionScope(dispatcher, selectionResolver);
             var viewModel = runtime._viewModel = new AScanHostViewModel(session, dispatcher, configuration);
             var aScanContext = new AScanComponentContext(session, session.Snapshot, visual, visual.StatusChanges,
                 () => visual.Statistics, timeViewport, selection);
@@ -247,7 +247,7 @@ public sealed class DesktopRuntime
             var preferenceStore = new BScanResamplingPreferenceStore(BScanResamplingPreferenceStore.DefaultPath);
             await preferenceStore.LoadAsync().ConfigureAwait(false);
             var bScanWindows = runtime._bScanWindows = new BScanWindowManager(bScanVisual, timeViewport, selection,
-                dispatcher, windowDispatcher, preferenceStore);
+                windowDispatcher, preferenceStore);
             // Instance registrations, including aliases, are borrowed and never disposed by DI.
             if (simulator is not null) { builder.Services.AddSingleton(simulator); }
             builder.Services.AddSingleton<IUtFrameSource>(source);

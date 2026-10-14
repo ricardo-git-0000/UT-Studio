@@ -12,5 +12,6 @@
     <ProjectReference Include="../../src/UTStudio.App.Wpf/UTStudio.App.Wpf.csproj" />
     <ProjectReference Include="../../src/UTStudio.Visualization.Wpf/UTStudio.Visualization.Wpf.csproj" />
     <ProjectReference Include="../../src/UTStudio.ScanVisualization.AScan.Wpf/UTStudio.ScanVisualization.AScan.Wpf.csproj" />
+    <ProjectReference Include="../../src/UTStudio.ScanVisualization.BScan.Wpf/UTStudio.ScanVisualization.BScan.Wpf.csproj" />
   </ItemGroup>
 </Project>

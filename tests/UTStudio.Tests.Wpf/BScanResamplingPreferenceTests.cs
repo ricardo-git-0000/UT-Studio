@@ -2,6 +2,7 @@ using System.IO;
 using System.Text.Json;
 using UTStudio.App.Wpf;
 using UTStudio.App.Wpf.Services;
+using UTStudio.ScanVisualization.BScan.Wpf;
 using UTStudio.Visualization.Core.Scan2D;
 
 namespace UTStudio.Tests.Wpf;
@@ -89,8 +90,8 @@ public sealed class BScanResamplingPreferenceTests
     public void Display_options_are_exactly_the_five_supported_modes()
     {
         CollectionAssert.AreEqual(Enum.GetValues<Scan2DInterpolationMode>(),
-            BScanWindow.BScanResamplingDisplayOption.All.Select(option => option.Mode).ToArray());
-        StringAssert.Contains(BScanWindow.BScanResamplingDisplayOption.All[^1].DisplayName, "alta calidad");
+            BScanView.DisplayOptions.Select(option => option.Mode).ToArray());
+        StringAssert.Contains(BScanView.DisplayOptions[^1].DisplayName, "alta calidad");
     }
 
     private static string NewDirectory()

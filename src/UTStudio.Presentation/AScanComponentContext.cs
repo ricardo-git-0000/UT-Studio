@@ -14,4 +14,4 @@ public sealed record AScanComponentContext(
     IObservable<AScanDeliveryStatus>? VisualStatus = null,
     Func<AScanDeliveryStatistics>? ReadStatistics = null,
     SharedScanTimeViewport? TimeViewport = null,
-    BScanSelectionCoordinator? SelectionCoordinator = null);
+    TraceSelectionScope? SelectionScope = null);

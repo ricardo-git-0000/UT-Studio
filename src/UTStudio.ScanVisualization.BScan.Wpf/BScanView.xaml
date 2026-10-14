@@ -1,0 +1,75 @@
+<UserControl x:Class="UTStudio.ScanVisualization.BScan.Wpf.BScanView"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:UTStudio.Visualization.Wpf.Controls;assembly=UTStudio.Visualization.Wpf"
+        xmlns:local="clr-namespace:UTStudio.ScanVisualization.BScan.Wpf"
+        Focusable="True" KeyboardNavigation.TabNavigation="Local" AutomationProperties.Name="Componente B-Scan"
+        AutomationProperties.HelpText="B-Scan completo. Rueda: tiempo; Control y rueda: espacio; Mayúsculas y arrastre: desplazar; Home: restablecer.">
+  <UserControl.Resources>
+    <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+    <local:BScanResamplingModeConverter x:Key="BScanResamplingModeConverter" />
+  </UserControl.Resources>
+  <UserControl.InputBindings>
+    <KeyBinding Key="Home" />
+    <KeyBinding Key="Add" />
+    <KeyBinding Key="Subtract" />
+    <KeyBinding Key="Left" Modifiers="Alt" />
+    <KeyBinding Key="Right" Modifiers="Alt" />
+    <KeyBinding Key="Up" Modifiers="Alt" />
+    <KeyBinding Key="Down" Modifiers="Alt" />
+  </UserControl.InputBindings>
+  <DockPanel x:Name="Root" Margin="16">
+    <WrapPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,10"
+               AutomationProperties.Name="Herramientas B-Scan">
+      <Button Content="Tiempo +" Command="{Binding ZoomTimeInCommand}" Margin="0,0,6,0" />
+      <Button Content="Tiempo −" Command="{Binding ZoomTimeOutCommand}" Margin="0,0,6,0" />
+      <Button Content="Espacio +" Command="{Binding ZoomSpatialInCommand}" Margin="0,0,6,0" />
+      <Button Content="Espacio −" Command="{Binding ZoomSpatialOutCommand}" Margin="0,0,6,0" />
+      <Button Content="Tamaño B -" Command="{Binding DecreaseLiveWindowCommand}" Margin="0,0,6,0"
+              AutomationProperties.Name="Reducir número de trazas visibles B-Scan" />
+      <TextBlock Text="{Binding LiveWindowColumns, StringFormat={}{0} trazas}" VerticalAlignment="Center"
+                 Margin="0,0,6,0" AutomationProperties.Name="Tamaño visible B-Scan" />
+      <Button Content="Tamaño B +" Command="{Binding IncreaseLiveWindowCommand}" Margin="0,0,6,0"
+              AutomationProperties.Name="Aumentar número de trazas visibles B-Scan" />
+      <Button x:Name="LoadPaletteButton" Content="Cargar paleta" Click="OnLoadPalette" Margin="0,0,6,0"
+              AutomationProperties.Name="Cargar paleta de colores B-Scan" />
+      <Button Content="Restablecer" Command="{Binding ResetAllCommand}" Margin="0,0,12,0" />
+      <Button Content="Volver a Live" Command="{Binding ReturnToLiveCommand}" Margin="0,0,12,0"
+              AutomationProperties.Name="Volver a B-Scan en vivo" />
+      <TextBlock Text="Remuestreo:" VerticalAlignment="Center" Margin="0,0,4,0" />
+      <ComboBox x:Name="ResamplingSelector" Width="190" Margin="0,0,10,0"
+                SelectionChanged="OnResamplingSelectionChanged" IsTextSearchEnabled="True"
+                AutomationProperties.Name="Modo de remuestreo B-Scan"
+                AutomationProperties.HelpText="Bilineal y bicúbica para interacción. Lanczos-3 ofrece alta calidad con cadencia reducida." />
+      <TextBlock Text="{Binding RelativeSource={RelativeSource AncestorType={x:Type local:BScanView}}, Path=Phase}"
+                 VerticalAlignment="Center" AutomationProperties.LiveSetting="Polite" />
+    </WrapPanel>
+    <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0" AutomationProperties.Name="Estado B-Scan">
+      <TextBlock x:Name="PaletteStatus" Text="Paleta: predeterminada" />
+      <TextBlock><Run Text="Solicitado: "/><Run Text="{Binding State.RequestedResamplingMode, Converter={StaticResource BScanResamplingModeConverter}, Mode=OneWay}" /></TextBlock>
+      <Grid Height="16"><TextBlock Text="Actualizando…" Visibility="{Binding State.IsRenderPending, Converter={StaticResource BooleanToVisibilityConverter}}" /></Grid>
+      <TextBlock><Run Text="Presentado: "/><Run Text="{Binding State.PresentedResamplingMode, Converter={StaticResource BScanResamplingModeConverter}, Mode=OneWay}" /></TextBlock>
+      <TextBlock x:Name="LanczosWarning" Text="Alta calidad; la actualización puede ser más lenta" Visibility="Collapsed" />
+      <TextBlock><Run Text="Residente: "/><Run Text="{Binding State.ResidentRange}" /></TextBlock>
+      <TextBlock><Run Text="Representado: "/><Run Text="{Binding State.Region.Snapshot.RepresentedRange}" /></TextBlock>
+      <TextBlock Text="{Binding State.Region.Snapshot.HasDiscontinuities, StringFormat=Discontinuidades: {0}}" />
+      <TextBlock Text="{Binding State.Diagnostics.ColumnsAccepted, StringFormat=Aceptadas: {0}}" />
+      <TextBlock Text="{Binding State.Diagnostics.ColumnsRejectedPinnedSlot, StringFormat=Rechazadas por slot fijado: {0}}" />
+      <TextBlock Text="{Binding State.Diagnostics.ColumnsEvicted, StringFormat=Columnas desalojadas: {0}}" />
+      <TextBlock Text="{Binding State.Selection.Residency, StringFormat=Selección: {0}, TargetNullValue=Selección: ninguna}" />
+      <TextBlock Foreground="#FFD18A" Text="{Binding State.SelectionError}" />
+      <TextBlock Foreground="#FFD18A" Text="{Binding State.BScanVisualError}" />
+      <TextBlock Foreground="#FFD18A" Text="{Binding State.BScanIngressError}" />
+      <TextBlock Foreground="#FFD18A" Text="{Binding State.UiInteractionError}" />
+      <TextBlock Foreground="#FFD18A" Text="{Binding State.PersistenceError}" />
+      <TextBlock Foreground="#FFD18A" Text="{Binding State.ConfigurationError}" />
+      <TextBlock Foreground="#FFD18A" Text="{Binding State.AcquisitionError}"
+                 AutomationProperties.LiveSetting="Assertive" />
+      <TextBlock Foreground="#FFD18A"
+                 Text="{Binding RelativeSource={RelativeSource AncestorType={x:Type local:BScanView}}, Path=Error}"
+                 AutomationProperties.LiveSetting="Assertive" />
+    </StackPanel>
+    <controls:BScanControl x:Name="Scan" Focusable="True" AutomationProperties.Name="B-Scan en vivo"
+                           AutomationProperties.HelpText="Seleccione una columna para publicar su TraceIdentity exacta." />
+  </DockPanel>
+</UserControl>

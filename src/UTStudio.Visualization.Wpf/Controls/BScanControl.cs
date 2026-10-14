@@ -64,6 +64,8 @@ public sealed class BScanControl : FrameworkElement
     private int _activePooledRasterBytes;
     private int _peakPooledRasterBytes;
     private int _activeCandidateBitmaps;
+    private int _activeStagingBuffers, _activeStagingBytes;
+    private int _activeBackupBuffers, _activeBackupBytes;
     private bool _hasSelectionVisual;
     private static readonly Brush Background = Freeze(new SolidColorBrush(Color.FromRgb(11, 18, 32)));
     private static readonly Brush Text = Freeze(new SolidColorBrush(Color.FromRgb(205, 218, 232)));
@@ -108,6 +110,10 @@ public sealed class BScanControl : FrameworkElement
     internal int ActivePooledRasterBytes => _activePooledRasterBytes;
     internal int PeakPooledRasterBytes => _peakPooledRasterBytes;
     internal int ActiveCandidateBitmaps => Volatile.Read(ref _activeCandidateBitmaps);
+    internal int ActiveStagingBuffers => Volatile.Read(ref _activeStagingBuffers);
+    internal int ActiveStagingBytes => Volatile.Read(ref _activeStagingBytes);
+    internal int ActiveBackupBuffers => Volatile.Read(ref _activeBackupBuffers);
+    internal int ActiveBackupBytes => Volatile.Read(ref _activeBackupBytes);
     internal string? LastIncrementalRejection { get; private set; }
     internal bool HasSelectionVisual => _hasSelectionVisual;
     internal int? FailFullCommitAtRow { get; set; }
@@ -170,6 +176,8 @@ public sealed class BScanControl : FrameworkElement
         int stagedStride = checked(descriptor.AffectedRegion.Width * 4);
         int stagedBytes = checked(stagedStride * descriptor.AffectedRegion.Height);
         byte[] staging = RentRasterBuffer(stagedBytes);
+        Interlocked.Increment(ref _activeStagingBuffers);
+        Interlocked.Add(ref _activeStagingBytes, stagedBytes);
         try
         {
             bool prepared;
@@ -189,7 +197,11 @@ public sealed class BScanControl : FrameworkElement
         catch
         { FullRefreshRequired?.Invoke(this, EventArgs.Empty); throw; }
         finally
-        { ReturnRasterBuffer(staging); }
+        {
+            Interlocked.Decrement(ref _activeStagingBuffers);
+            Interlocked.Add(ref _activeStagingBytes, -stagedBytes);
+            ReturnRasterBuffer(staging);
+        }
     }
 
     private bool CommitScrolledIncremental(BScanVisualSnapshot descriptor, ReadOnlySpan<byte> staging,
@@ -200,6 +212,8 @@ public sealed class BScanControl : FrameworkElement
         int fullStride = checked(descriptor.RasterWidth * 4);
         int fullBytes = checked(fullStride * descriptor.RasterHeight);
         byte[] backup = RentRasterBuffer(fullBytes);
+        Interlocked.Increment(ref _activeBackupBuffers);
+        Interlocked.Add(ref _activeBackupBytes, fullBytes);
         bool locked = false;
         try
         {
@@ -230,7 +244,12 @@ public sealed class BScanControl : FrameworkElement
         finally
         {
             try { if (locked) { bitmap.Unlock(); } }
-            finally { ReturnRasterBuffer(backup); }
+            finally
+            {
+                Interlocked.Decrement(ref _activeBackupBuffers);
+                Interlocked.Add(ref _activeBackupBytes, -fullBytes);
+                ReturnRasterBuffer(backup);
+            }
         }
         PublishCommittedRaster(bitmap, descriptor);
         return true;
@@ -279,6 +298,8 @@ public sealed class BScanControl : FrameworkElement
         int backupStride = checked(affected.Width * 4);
         int backupBytes = checked(backupStride * affected.Height);
         byte[] backup = RentRasterBuffer(backupBytes);
+        Interlocked.Increment(ref _activeBackupBuffers);
+        Interlocked.Add(ref _activeBackupBytes, backupBytes);
         bool locked = false;
         try
         {
@@ -307,7 +328,12 @@ public sealed class BScanControl : FrameworkElement
         finally
         {
             try { if (locked) { bitmap.Unlock(); } }
-            finally { ReturnRasterBuffer(backup); }
+            finally
+            {
+                Interlocked.Decrement(ref _activeBackupBuffers);
+                Interlocked.Add(ref _activeBackupBytes, -backupBytes);
+                ReturnRasterBuffer(backup);
+            }
         }
         PublishCommittedRaster(bitmap, descriptor);
         return true;

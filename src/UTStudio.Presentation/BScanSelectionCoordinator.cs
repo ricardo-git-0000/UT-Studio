@@ -7,30 +7,30 @@ using UTStudio.Contracts.Inspection;
 namespace UTStudio.Presentation;
 
 public enum AScanDisplayMode { NoData, Live, Selected }
-public enum BScanSelectionResidency { Resident, Evicted }
+public enum TraceSelectionResidency { Resident, Evicted }
 
-public sealed record BScanSelectionState(
+public sealed record TraceSelectionState(
     AcquisitionRunId? RunId,
     AScanSnapshot? Snapshot,
     TraceIdentity? Identity,
     ulong? AcquisitionIndex,
-    BScanSelectionResidency? Residency,
+    TraceSelectionResidency? Residency,
     BScanTraceResultKind? LastResult,
     string? SelectionError,
     bool IsPending,
     string? RequestOwnerId)
 {
-    public static BScanSelectionState Empty { get; } = new(null, null, null, null, null, null, null, false, null);
+    public static TraceSelectionState Empty { get; } = new(null, null, null, null, null, null, null, false, null);
 }
 
 /// <summary>Global neutral latest-selection-wins resolver for one related A/B scan group.</summary>
-public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisposable
+public sealed class TraceSelectionScope : SafeObservableObject, IAsyncDisposable
 {
     private readonly object _gate = new();
     private readonly IUiDispatcher _dispatcher;
-    private readonly IAuthoritativeAScanSelector _selector;
+    private readonly IAuthoritativeAScanSelector? _selector;
     private CancellationTokenSource? _activeCancellation;
-    private BScanSelectionState _state = BScanSelectionState.Empty;
+    private TraceSelectionState _state = TraceSelectionState.Empty;
     private AcquisitionRunId? _activeRun;
     private readonly HashSet<AcquisitionRunId> _retiredRuns = [];
     private readonly Queue<AcquisitionRunId> _retiredRunOrder = [];
@@ -45,17 +45,17 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
     private Task? _disposal;
     private long _observerErrors;
 
-    public BScanSelectionCoordinator(IUiDispatcher dispatcher, IAuthoritativeAScanSelector selector)
+    public TraceSelectionScope(IUiDispatcher dispatcher, IAuthoritativeAScanSelector? selector = null)
     {
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
-        _selector = selector ?? throw new ArgumentNullException(nameof(selector));
+        _selector = selector;
     }
 
-    internal BScanSelectionCoordinator(IUiDispatcher dispatcher, IAuthoritativeAScanSelector selector,
+    internal TraceSelectionScope(IUiDispatcher dispatcher, IAuthoritativeAScanSelector selector,
         IAScanProjector unusedProjector) : this(dispatcher, selector)
         => ArgumentNullException.ThrowIfNull(unusedProjector);
 
-    public BScanSelectionState State => _state;
+    public TraceSelectionState State => _state;
     public bool IsClosed => Volatile.Read(ref _closing) != 0;
     public long ObserverErrorCount => Interlocked.Read(ref _observerErrors);
 
@@ -85,7 +85,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         {
             if (Volatile.Read(ref _generation) != generation || _activeRun != runId || IsClosed) { return; }
             _selectedOwnerId = null;
-            ReplaceState(BScanSelectionState.Empty with { RunId = runId });
+            ReplaceState(TraceSelectionState.Empty with { RunId = runId });
         });
     }
 
@@ -148,6 +148,27 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         PublishCancelled(_generation);
     }
 
+    public void ReturnToLive()
+    {
+        CancellationTokenSource? cancellation;
+        long generation;
+        lock (_gate)
+        {
+            if (IsClosed) { return; }
+            generation = ++_generation;
+            cancellation = _activeCancellation;
+            _activeCancellation = null;
+            _activeOwnerId = null;
+            _selectedOwnerId = null;
+        }
+        cancellation?.Cancel();
+        _ = _dispatcher.InvokeAsync(() =>
+        {
+            if (IsClosed || Volatile.Read(ref _generation) != generation) { return; }
+            ReplaceState(TraceSelectionState.Empty with { RunId = _activeRun });
+        });
+    }
+
     private void PublishCancelled(long generation) => _ = _dispatcher.InvokeAsync(() =>
     {
         if (IsClosed || Volatile.Read(ref _generation) != generation) { return; }
@@ -180,19 +201,19 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
         }
     }
 
-    public void UpdateResidency(string ownerId, AcquisitionRunId runId, ulong snapshotVersion,
+    public void UpdateResidency(string ownerId, UtStreamIdentity stream, ulong snapshotVersion,
         BScanAcquisitionRange residentRange)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         _ = _dispatcher.InvokeAsync(() =>
         {
-            if (IsClosed || _state.RunId != runId ||
+            if (IsClosed || _state.RunId != stream.AcquisitionRunId || _state.Identity?.Stream != stream ||
                 _state.AcquisitionIndex is not { } index) { return; }
-            if (_residencyVersions.TryGetValue(ownerId, out var previous) && previous.RunId == runId &&
+            if (_residencyVersions.TryGetValue(ownerId, out var previous) && previous.RunId == stream.AcquisitionRunId &&
                 snapshotVersion <= previous.Version) { return; }
-            _residencyVersions[ownerId] = (runId, snapshotVersion);
-            BScanSelectionResidency next = index >= residentRange.First && index <= residentRange.Last
-                ? BScanSelectionResidency.Resident : BScanSelectionResidency.Evicted;
+            _residencyVersions[ownerId] = (stream.AcquisitionRunId, snapshotVersion);
+            TraceSelectionResidency next = index >= residentRange.First && index <= residentRange.Last
+                ? TraceSelectionResidency.Resident : TraceSelectionResidency.Evicted;
             if (next == _state.Residency) { return; }
             ReplaceState(_state with { Residency = next });
         });
@@ -206,6 +227,23 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
             if (IsCurrent(generation, identity.Stream.AcquisitionRunId))
             { ReplaceState(_state with { IsPending = true, LastResult = null, SelectionError = null, RequestOwnerId = ownerId }); }
         }).ConfigureAwait(false);
+
+        if (_selector is null)
+        {
+            await _dispatcher.InvokeAsync(() =>
+            {
+                if (!IsCurrent(generation, identity.Stream.AcquisitionRunId)) { return; }
+                lock (_gate)
+                {
+                    _selectedOwnerId = ownerId;
+                    _activeCancellation = null;
+                    _activeOwnerId = null;
+                }
+                ReplaceState(new(identity.Stream.AcquisitionRunId, null, identity, identity.AcquisitionIndex,
+                    TraceSelectionResidency.Resident, BScanTraceResultKind.Available, null, false, null));
+            }).ConfigureAwait(false);
+            return;
+        }
 
         AScanSelectionResult result;
         try
@@ -234,7 +272,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
                     published = true;
                 }
                 ReplaceState(new(identity.Stream.AcquisitionRunId, result.Snapshot, identity, identity.AcquisitionIndex,
-                    BScanSelectionResidency.Resident, BScanTraceResultKind.Available, null, false, null));
+                    TraceSelectionResidency.Resident, BScanTraceResultKind.Available, null, false, null));
             }).ConfigureAwait(false);
             if (!published) { return; }
             await _dispatcher.InvokeAsync(() => { }).ConfigureAwait(false);
@@ -260,7 +298,7 @@ public sealed class BScanSelectionCoordinator : SafeObservableObject, IAsyncDisp
     private bool IsCurrent(long generation, AcquisitionRunId runId) =>
         !IsClosed && Volatile.Read(ref _generation) == generation && _activeRun == runId;
 
-    private void ReplaceState(BScanSelectionState state)
+    private void ReplaceState(TraceSelectionState state)
     {
         if (_state == state || IsClosed) { return; }
         _state = state;

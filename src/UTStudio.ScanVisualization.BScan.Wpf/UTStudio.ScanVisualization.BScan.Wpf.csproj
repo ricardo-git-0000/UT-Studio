@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../UTStudio.Presentation/UTStudio.Presentation.csproj" />
+    <ProjectReference Include="../UTStudio.Visualization.Wpf/UTStudio.Visualization.Wpf.csproj" />
+  </ItemGroup>
+</Project>

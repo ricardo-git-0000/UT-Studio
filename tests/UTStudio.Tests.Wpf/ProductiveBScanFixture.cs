@@ -3,7 +3,7 @@ using System.Buffers;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Threading;
-using UTStudio.App.Wpf.Adapters;
+using UTStudio.ScanVisualization.BScan.Wpf;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
@@ -27,6 +27,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     private AcquisitionRunId? _expectedBootstrapRun;
     private TaskCompletionSource? _metadataCandidateReady;
     private ManualResetEventSlim? _releaseMetadataCandidate;
+    private bool _compositionDetached;
 
     private ProductiveBScanFixture(int preloadedColumns, bool useSystemDeliveryClock,
         int initialRasterWidth, IAuthoritativeAScanSelector? selectionAuthority)
@@ -68,6 +69,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         ViewModel = new(Delivery, SharedViewport, Selection, Dispatcher);
         Control = new();
         Adapter = new(ViewModel, Control);
+        Adapter.Activate(static () => { });
         _host = new() { Content = Control, Width = 420, Height = 300, ShowInTaskbar = false };
         _host.Show();
         _host.UpdateLayout();
@@ -77,18 +79,29 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     }
 
     internal ManualClock Clock { get; }
-    internal WpfUiDispatcher Dispatcher { get; }
+    internal UTStudio.App.Wpf.Services.WpfUiDispatcher Dispatcher { get; }
     internal BScanIngress Ingress { get; }
     internal BScanVisualDelivery Delivery { get; }
     internal ConventionalUtFrameMetadata Metadata { get; private set; }
     internal SharedScanTimeViewport SharedViewport { get; }
-    internal BScanSelectionCoordinator Selection { get; }
+    internal TraceSelectionScope Selection { get; }
     internal BScanViewModel ViewModel { get; }
     internal BScanControl Control { get; }
     internal BScanControlAdapter Adapter { get; }
     internal int BlocksOutstanding => 0;
     internal int TraceOwnersOutstanding => 0;
     internal int RasterOwnersOutstanding => _rasters.Outstanding;
+
+    internal async Task DetachLegacyCompositionAsync()
+    {
+        if (_compositionDetached) { return; }
+        Adapter.Dispose();
+        await ViewModel.DisposeAsync();
+        _host.Close();
+        _compositionDetached = true;
+        Assert.AreEqual(0, Delivery.ActiveConsumerCount);
+        Assert.AreEqual(0, RasterOwnersOutstanding);
+    }
 
     internal static Task<ProductiveBScanFixture> CreateAsync(int preloadedColumns = 0,
         bool useSystemDeliveryClock = false, int initialRasterWidth = 128,
@@ -265,8 +278,11 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         Ingress.BeforeVisualStateCommit = null;
         _releaseMetadataCandidate?.Set();
         var failures = new List<Exception>();
-        Capture("adapter", Adapter.Dispose);
-        await CaptureAsync("view model", () => ViewModel.DisposeAsync().AsTask());
+        if (!_compositionDetached)
+        {
+            Capture("adapter", Adapter.Dispose);
+            await CaptureAsync("view model", () => ViewModel.DisposeAsync().AsTask());
+        }
         Capture("delivery registration balances", () =>
         {
             Assert.AreEqual(0, Delivery.ActiveConsumerCount);
@@ -280,7 +296,7 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         await CaptureAsync("writer seal", () => _inspectionWriter.SealRunAsync().AsTask());
         await CaptureAsync("writer", () => _inspectionWriter.DisposeAsync().AsTask());
         await CaptureAsync("inspection stores", () => _inspectionStores.DisposeAsync().AsTask());
-        Capture("host", _host.Close);
+        if (!_compositionDetached) { Capture("host", _host.Close); }
         Capture("resource balances", () =>
         {
             Assert.AreEqual(0, TraceOwnersOutstanding);

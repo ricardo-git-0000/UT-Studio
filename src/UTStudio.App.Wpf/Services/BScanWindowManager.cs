@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Threading;
 using UTStudio.Presentation;
+using UTStudio.ScanVisualization.BScan.Wpf;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
 
@@ -9,14 +10,9 @@ namespace UTStudio.App.Wpf.Services;
 public sealed class BScanWindowManager
 {
     private readonly object _gate = new();
-    private readonly IBScanVisualSource _source;
-    private readonly SharedScanTimeViewport _viewport;
-    private readonly BScanSelectionCoordinator _selection;
-    private readonly IUiDispatcher _dispatcher;
     private readonly Dispatcher _windowDispatcher;
-    private readonly Func<BScanViewModel> _viewModelFactory;
-    private readonly BScanResamplingPreferenceStore? _preferenceStore;
-    private readonly Func<BScanViewModel, BScanWindow> _windowFactory;
+    private readonly Func<BScanComponentContext> _contextFactory;
+    private readonly Func<BScanComponentContext, BScanWindow> _windowFactory;
     private readonly Action<BScanWindow> _showWindow;
     private BScanWindow? _window;
     private Task _closing = Task.CompletedTask;
@@ -29,38 +25,25 @@ public sealed class BScanWindowManager
     internal Exception? LastCloseError { get { lock (_gate) { return _lastCloseError; } } }
 
     public BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher)
-        : this(source, viewport, selection, dispatcher, windowDispatcher, null, null, null, null) { }
+        TraceSelectionScope selection, Dispatcher windowDispatcher)
+        : this(source, viewport, selection, windowDispatcher, null, null, null, null) { }
 
     internal BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher,
-        BScanResamplingPreferenceStore preferenceStore)
-        : this(source, viewport, selection, dispatcher, windowDispatcher, preferenceStore, null, null, null) { }
+        TraceSelectionScope selection, Dispatcher windowDispatcher, BScanResamplingPreferenceStore preferenceStore)
+        : this(source, viewport, selection, windowDispatcher, preferenceStore, new BScanPaletteLoader(), null, null) { }
 
     internal BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher,
-        Func<BScanViewModel>? viewModelFactory, Func<BScanViewModel, BScanWindow>? windowFactory,
-        Action<BScanWindow>? showWindow)
-        : this(source, viewport, selection, dispatcher, windowDispatcher, null, viewModelFactory, windowFactory,
-            showWindow)
-    { }
-
-    internal BScanWindowManager(IBScanVisualSource source, SharedScanTimeViewport viewport,
-        BScanSelectionCoordinator selection, IUiDispatcher dispatcher, Dispatcher windowDispatcher,
-        BScanResamplingPreferenceStore? preferenceStore,
-        Func<BScanViewModel>? viewModelFactory, Func<BScanViewModel, BScanWindow>? windowFactory,
-        Action<BScanWindow>? showWindow)
+        TraceSelectionScope selection, Dispatcher windowDispatcher,
+        BScanResamplingPreferenceStore? preferenceStore, IBScanPaletteLoader? paletteLoader,
+        Func<BScanComponentContext, BScanWindow>? windowFactory, Action<BScanWindow>? showWindow)
     {
-        _source = source; _viewport = viewport; _selection = selection; _dispatcher = dispatcher;
-        _windowDispatcher = windowDispatcher; _preferenceStore = preferenceStore;
-        _viewModelFactory = viewModelFactory ?? (() =>
-        {
-            var viewModel = new BScanViewModel(_source, _viewport, _selection, _dispatcher,
-                _preferenceStore?.Current ?? Scan2DInterpolationMode.None, _preferenceStore);
-            viewModel.ReportPersistenceError(_preferenceStore?.LastError);
-            return viewModel;
-        });
-        _windowFactory = windowFactory ?? (viewModel => new(viewModel));
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(viewport);
+        ArgumentNullException.ThrowIfNull(selection);
+        _windowDispatcher = windowDispatcher ?? throw new ArgumentNullException(nameof(windowDispatcher));
+        _contextFactory = () => new(source, viewport, selection,
+            preferenceStore?.Current ?? Scan2DInterpolationMode.None, preferenceStore);
+        _windowFactory = windowFactory ?? (context => new(context, paletteLoader));
         _showWindow = showWindow ?? (window => window.Show());
     }
 
@@ -75,31 +58,19 @@ public sealed class BScanWindowManager
     {
         lock (_gate)
         {
-            if (_blocked) return;
+            if (_blocked) { return; }
             if (_window is { } existing) { existing.Activate(); return; }
-            if (!_closing.IsCompleted) return;
+            if (!_closing.IsCompleted) { return; }
         }
-        BScanViewModel viewModel = _viewModelFactory();
-        BScanWindow window;
-        try { window = _windowFactory(viewModel); }
-        catch (Exception creationError)
-        {
-            try { await viewModel.DisposeAsync().ConfigureAwait(false); }
-            catch (Exception cleanupError)
-            {
-                throw new CleanupFailureException("B-Scan window creation failed and ViewModel cleanup also failed.",
-                    creationError, [cleanupError]);
-            }
-            throw;
-        }
+        BScanWindow window = _windowFactory(_contextFactory());
         bool accepted;
         lock (_gate)
         {
             accepted = !_blocked && _window is null && _closing.IsCompleted;
             if (accepted) { _window = window; Interlocked.Increment(ref _creationCount); }
-            if (owner is not null) window.Owner = owner;
+            if (owner is not null) { window.Owner = owner; }
             window.CleanupFailed += error => { lock (_gate) { _lastCloseError ??= error; } };
-            window.Closed += (_, _) => { lock (_gate) { if (ReferenceEquals(_window, window)) _window = null; } };
+            window.Closed += (_, _) => { lock (_gate) { if (ReferenceEquals(_window, window)) { _window = null; } } };
         }
         if (!accepted) { await window.CloseOwnedAsync().ConfigureAwait(false); return; }
         try { _showWindow(window); }
@@ -108,10 +79,9 @@ public sealed class BScanWindowManager
             Exception? cleanupError = null;
             try { await window.CloseOwnedAsync().ConfigureAwait(false); }
             catch (Exception error) { cleanupError = error; }
-            lock (_gate) { if (ReferenceEquals(_window, window)) _window = null; }
+            lock (_gate) { if (ReferenceEquals(_window, window)) { _window = null; } }
             if (cleanupError is null) { throw; }
-            throw new CleanupFailureException("B-Scan Show failed and cleanup also reported a failure.",
-                showError, [cleanupError]);
+            throw new CleanupFailureException("B-Scan Show failed and cleanup also reported a failure.", showError, [cleanupError]);
         }
     }
 
@@ -120,7 +90,7 @@ public sealed class BScanWindowManager
         lock (_gate)
         {
             _blocked = true;
-            if (_window is null) return _closing;
+            if (_window is null) { return _closing; }
             if (_closing.IsCompleted)
             {
                 BScanWindow window = _window;

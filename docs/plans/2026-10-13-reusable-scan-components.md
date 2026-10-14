@@ -1,6 +1,6 @@
 # Plan por fases — Componentes WPF reutilizables A-Scan, B-Scan y preparación C-Scan
 
-Fecha: 2026-10-13. Estado: Fase documental y encapsulación A-Scan implementadas; B/C, extracción 2D
+Fecha: 2026-10-13. Estado: Fase documental y encapsulaciones A-Scan/B-Scan implementadas; C, extracción 2D
 y NuGet siguen pendientes. Fuente: [ADR 0016](../adr/0016-reusable-complete-scan-components.md).
 
 ## Objetivo y límites
@@ -156,6 +156,32 @@ Start/Stop, sesión, store, B-Scan, métricas globales y shutdown permanecen en 
 Crear `BScanView` con adaptador, toolbar, interacción y estado; `BScanWindow` queda como shell. Separar
 diálogo/ruta de paleta y preferencias mediante puertos opcionales. Gate: B insertable en cualquier
 Window, selección exacta y coordinación explícita; `ResidentRange`/`RepresentedRange` preservados.
+
+Resultado 2026-10-14: implementado mediante `UTStudio.ScanVisualization.BScan.Wpf`. `BScanView`
+compone ViewModel, adaptador, renderizador, toolbar, selección, remuestreo, estado y cierre; la ventana
+productiva queda como host fino. `TraceSelectionScope` sustituye el nombre público específico de B y
+mantiene `TraceIdentity` exacta sin poseer sesión, store ni RF. Se añade un host demostrador separado.
+
+P2.3 se valida contra el modelo síncrono real. El adaptador recorre `Created → Prepared/Attached →
+Active → Closing → Closed`; Prepared puede registrar recursos internos, pero no publica callbacks ni
+estado conectado y su rollback es completo. Active linealiza por CAS tras aplicar el estado/raster
+inicial e inmediatamente antes del commit síncrono que publica DataContext, bindings y estado de
+`BScanView`; así toda observación reentrante de esa publicación ya ve Active. La precondición exige un
+`BScanControl` sin `RasterSource` previo.
+
+La admisión del token bajo gate es el punto de linealización de la visita. Visita protegida, copia a
+staging, revalidación y commit son atómicos y síncronos en el dispatcher; solo la reentrada del callback
+puede intercalarse. Closing linealiza el rechazo de visitas nuevas y Closed espera el retorno de la ya
+admitida. El productor latest-only mantiene una construcción activa y una sola pendiente reemplazable:
+descarta la activa sustituida al retornar y procesa únicamente la última solicitud.
+
+Matriz P2.3: (a) reentrada que invalida token, inicia cierre, rechaza una segunda visita y deja terminar
+la primera; (b) activa latest-only retenida lógicamente con varias posteriores coalescidas y solo la
+última publicada; (c) fallo de construcción restaura el control vacío; (d) fallo de actualización en
+Active conserva el bitmap, bytes e identidad no nulos confirmados. Las barreras externas entre visita,
+staging y commit, y el cierre externo dentro de ese tramo, se eliminan expresamente: no aplican porque
+el dispatcher productivo no puede suspender ese tramo síncrono; no se contabilizan como pruebas
+omitidas.
 
 ### Fase 4 — extracción 2D común
 
