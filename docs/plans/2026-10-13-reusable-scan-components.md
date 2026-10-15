@@ -190,6 +190,13 @@ traza/columna, wrap, ledger/pooling B quedan
 fuera. Medir memoria, asignaciones, cancelación y respuesta bajo carga. Gate: común sin supuestos B,
 sin WPF en Core y pruebas productivas de prioridad Stop/cierre/UI.
 
+Diseño previo 2026-10-15: el [inventario de primitivas compartidas](../architecture/shared-scan-primitives-design.md)
+concluye que no debe iniciarse aún una extracción productiva ni crearse un assembly común Scan WPF.
+Las primitivas neutrales y gráficas comunes demostradas ya están en Core, Presentation o
+Visualization.Wpf; `WpfUiDispatcher` es la única copia literal, insuficiente por sí sola para una nueva
+unidad de despliegue. Bitmap, staging, rollback, estilos y helpers de lifecycle se reconsiderarán tras
+el ADR de C-Scan. Esta conclusión está pendiente de aprobación antes de cualquier cambio de código.
+
 ### Fase 5 — aplicación WPF mínima de demostración
 
 Aplicación separada con A y B y fuente sintética neutral: uso individual/conjunto, coordinación

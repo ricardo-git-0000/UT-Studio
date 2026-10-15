@@ -298,6 +298,12 @@ un tercer consumidor demostrado. No hay helper común candidato que cumpla esos 
 
 ## Consecuencias y decisiones pendientes
 
+El inventario posterior de primitivas compartidas se documenta en
+[Diseño de primitivas compartidas para componentes Scan](../architecture/shared-scan-primitives-design.md).
+La propuesta, todavía pendiente de aprobación, no crea un ensamblado común: conserva la neutralidad de
+`Visualization.Wpf`, acepta la copia pequeña de `WpfUiDispatcher` y difiere bitmap/staging, recursos y
+lifecycle común hasta disponer del diseño de C-Scan. Se rechaza una clase base WPF A/B/C.
+
 La recomendación minimiza duplicación sin obligar a instalar B/C al consumidor de A. Exige mover
 presentación específica hoy situada en `UTStudio.Presentation` y UI situada en `App.Wpf`, pero ese
 movimiento será incremental y con fachadas temporales si son necesarias.
