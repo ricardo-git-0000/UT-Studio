@@ -1,0 +1,23 @@
+<Window x:Class="UTStudio.ScanVisualization.Wpf.Demo.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:a="clr-namespace:UTStudio.ScanVisualization.AScan.Wpf;assembly=UTStudio.ScanVisualization.AScan.Wpf"
+        Title="UT-Studio · A/B reusable components acceptance" Width="1280" Height="760">
+  <DockPanel Margin="12">
+    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,10">
+      <Button x:Name="StartButton" Content="Start" Click="OnStart" Padding="18,7" Margin="0,0,8,0" />
+      <Button x:Name="StopButton" Content="Stop" Click="OnStop" Padding="18,7" Margin="0,0,8,0" />
+      <Button x:Name="ToggleBButton" Content="Cerrar B-Scan" Click="OnToggleB" Padding="18,7" Margin="0,0,8,0" />
+      <TextBlock x:Name="Status" VerticalAlignment="Center" />
+    </StackPanel>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition /></Grid.ColumnDefinitions>
+      <GroupBox Header="AScanView" Margin="0,0,6,0">
+        <a:AScanView x:Name="AScan" />
+      </GroupBox>
+      <GroupBox Grid.Column="1" Header="BScanView" Margin="6,0,0,0">
+        <ContentControl x:Name="BScanHost" />
+      </GroupBox>
+    </Grid>
+  </DockPanel>
+</Window>

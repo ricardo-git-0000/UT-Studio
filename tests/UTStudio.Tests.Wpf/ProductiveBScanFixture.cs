@@ -88,6 +88,8 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
     internal BScanViewModel ViewModel { get; }
     internal BScanControl Control { get; }
     internal BScanControlAdapter Adapter { get; }
+    internal IUtTraceProvider TraceProvider => _inspectionStores.Store;
+    internal Action<TraceIdentity, InspectionRevision>? AfterCommitted { get; set; }
     internal int BlocksOutstanding => 0;
     internal int TraceOwnersOutstanding => 0;
     internal int RasterOwnersOutstanding => _rasters.Outstanding;
@@ -131,8 +133,10 @@ internal sealed class ProductiveBScanFixture : IAsyncDisposable
         short[] samples = Enumerable.Range(0, Metadata.Configuration.SampleCount)
             .Select(value => (short)((ulong)value + acquisitionIndex)).ToArray();
         InspectionAppendResult commit = Commit(sequence, acquisitionIndex, samples);
-        Ingress.NotifyCommitted(new TraceIdentity(new(_inspectionStores.InspectionId, Metadata.RunId,
-            Metadata.SourceId, Metadata.Configuration.PhysicalChannelId), acquisitionIndex), commit.Revision);
+        var identity = new TraceIdentity(new(_inspectionStores.InspectionId, Metadata.RunId,
+            Metadata.SourceId, Metadata.Configuration.PhysicalChannelId), acquisitionIndex);
+        Ingress.NotifyCommitted(identity, commit.Revision);
+        AfterCommitted?.Invoke(identity, commit.Revision);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         while (Ingress.CurrentVisualState?.StoreState.StoreRevision != commit.Revision.Value)
         { await Task.Delay(10, timeout.Token); }

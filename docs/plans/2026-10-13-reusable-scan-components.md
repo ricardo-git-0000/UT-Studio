@@ -196,6 +196,18 @@ Aplicación separada con A y B y fuente sintética neutral: uso individual/conju
 opcional, errores y cierre. No referencia `UTStudio.App.Wpf` ni hardware. Gate: instrucciones
 reproducibles y cero reconstrucción manual de ViewModel/adaptador/UI.
 
+Resultado 2026-10-15: implementada `UTStudio.ScanVisualization.Wpf.Demo`. Aloja A y B simultáneamente,
+usa una autoridad/store y un scope selección/viewport por grupo, mantiene Start/Stop en el host,
+confirma antes de proyectar y demuestra `Sequence != AcquisitionIndex`. B puede cerrarse y reabrirse
+sin detener A ni el productor. La matriz WPF añade A/B solos, orden de creación/cierre, reapertura,
+selección exacta/latest-only, ReturnToLive, viewport bidireccional, fallos aislados y dos scopes sin
+contaminación. El host cierra Views antes de coordinadores y autoridad.
+
+Duplicación inventariada y aplazada: `WpfUiDispatcher`; esqueleto one-shot de Context/Loaded/Close;
+publicación defensiva; accesibilidad/estilos; wiring de comandos. Solo el dispatcher es casi literal,
+pero extraerlo exigiría introducir una dependencia WPF común por una clase mínima y anticiparía C.
+Lifecycle, comandos, estilos y semántica de error difieren. No se extrae nada en esta fase.
+
 ### Fase 6 — preparación para C-Scan
 
 Solo documentación de unidades/sistema de coordenadas, paso/extensión de celda, grid uniforme o

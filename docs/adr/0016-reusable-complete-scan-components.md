@@ -264,6 +264,38 @@ independientemente y declaran rangos compatibles exactos para comunes. El metapa
 código. Se mantiene compatibilidad conductual de la aplicación mediante pruebas de caracterización,
 incluidos selección exacta, navegación, cierre, accesibilidad, DPI y presupuestos.
 
+## Aceptación conjunta A/B
+
+La aceptación conjunta se materializa en `samples/UTStudio.ScanVisualization.Wpf.Demo`, host externo a
+`UTStudio.App.Wpf` que consume exclusivamente `AScanView`, `BScanView` y sus contextos públicos. El
+host posee una sola autoridad de inspección y confirma cada traza antes de notificar, por separado, a
+los deliveries A y B. La demostración asigna deliberadamente `Sequence` desde 10 000 y
+`AcquisitionIndex` desde cero; la selección B→A se resuelve por `TraceIdentity`, nunca por coincidencia
+de ordinales.
+
+Cada grupo relacionado posee exactamente un `TraceSelectionScope` y un `SharedScanTimeViewport`.
+Ambos son prestados a los contextos; el host crea, retiene y descarta las referencias a los contextos
+(que no son recursos `IDisposable`), mientras las Views poseen
+únicamente sus ViewModels, adaptadores y suscripciones privadas. Los deliveries poseen sus callbacks;
+el ingreso B conserva consumers, raster owners y leases; el reloj del host conserva sus timers. Ninguno
+de esos recursos cambia de propietario al construir un componente. El host conserva Start/Stop y dispone
+en este orden: componentes A/B,
+scope de selección, viewport, deliveries, ingreso B, writer y store. Cerrar o reabrir una View no
+detiene la adquisición ni dispone recursos compartidos. Dos grupos usan coordinadores distintos y no
+comparten selección ni viewport.
+
+La matriz ejecutable cubre A solo, B solo, ambos órdenes de creación, ambos órdenes de cierre,
+reapertura con contextos nuevos, cierre concurrente, selección exacta y supersession, ReturnToLive,
+viewport compartido bidireccional, callback fallido aislado por rama y dos pares independientes. Los
+balances distinguen suscripciones A, consumers/owners/leases B y dominios del viewport.
+
+Inventario de duplicación conservada: ambos paquetes contienen hoy un `WpfUiDispatcher` literalmente
+muy próximo; también repiten parte del patrón one-shot Context/Loaded/CloseAsync, publicación de
+estado y configuración de accesibilidad. No se extraen aún: el lifecycle A es síncrono y más simple,
+el B es transaccional y drena raster/callbacks; estilos, comandos y AutomationProperties son
+específicos de cada scan. Una extracción posterior requiere equivalencia literal, cobertura común y
+un tercer consumidor demostrado. No hay helper común candidato que cumpla esos gates en esta fase.
+
 ## Consecuencias y decisiones pendientes
 
 La recomendación minimiza duplicación sin obligar a instalar B/C al consumidor de A. Exige mover

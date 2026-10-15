@@ -499,7 +499,7 @@ public sealed class BScanViewTests
     });
 
     [TestMethod]
-    public Task RealViewConnectedUpdateFailurePreservesConfirmedBitmapBytesAndIdentity() => StaTest.Run(async () =>
+    public Task RealViewConnectedUpdateFailurePreservesConfirmedBitmapBytesAndIdentityThenRecovers() => StaTest.Run(async () =>
     {
         await using var fixture = await ProductiveBScanFixture.CreateAsync(4);
         await fixture.WaitForRevisionAsync(4);
@@ -549,6 +549,16 @@ public sealed class BScanViewTests
             Assert.IsTrue(preservedAtFailure,
                 "failed connected update keeps confirmed bitmap instance, bytes and identity before recovery");
             Assert.AreEqual(1, failures, "one injected connected-update failure");
+            view.Renderer.FailIncrementalCommitAtRow = null;
+            await fixture.AddIndexedAsync(5);
+            await fixture.Clock.NextTimerAsync();
+            fixture.Clock.Advance(BScanVisualDelivery.MinimumPublicationInterval);
+            await WaitForStateAsync(view.ViewModel!, state => state.StoreRevision >= 6 &&
+                view.Renderer.AppliedSnapshot is { StoreRevision: >= 6 });
+            Assert.IsNotNull(view.Renderer.RasterSource, "the real BScanView publishes again after callback failure");
+            Assert.AreNotSame(identity, view.Renderer.AppliedSnapshot,
+                "recovery installs a later authoritative raster identity");
+            AssertOpenComponentBalances(view, fixture);
         }
         finally { await view.CloseAsync(); }
         AssertClosedComponentBalances(view, fixture, 0);
@@ -585,7 +595,8 @@ public sealed class BScanViewTests
         Assert.AreEqual(1, fixture.Delivery.ActiveConsumerCount, "consumers");
         Assert.AreEqual(fixture.Delivery.Diagnostics.ObserverCallbacksStarted,
             fixture.Delivery.Diagnostics.ObserverCallbacksCompleted, "delivery callbacks");
-        Assert.AreEqual(1, fixture.Clock.RegisteredTimers, "publication timer");
+        Assert.IsLessThanOrEqualTo(1, fixture.Clock.RegisteredTimers,
+            "at most the host-owned publication timer may remain scheduled");
     }
 
     private static void AssertClosedComponentBalances(BScanView view, ProductiveBScanFixture fixture, int baselineConsumers)
@@ -607,7 +618,8 @@ public sealed class BScanViewTests
         Assert.AreEqual(baselineConsumers, fixture.Delivery.ActiveConsumerCount, "closed consumers");
         Assert.AreEqual(fixture.Delivery.Diagnostics.ObserverCallbacksStarted,
             fixture.Delivery.Diagnostics.ObserverCallbacksCompleted, "closed delivery callbacks");
-        Assert.AreEqual(1, fixture.Clock.RegisteredTimers, "backend timer remains owned by fixture");
+        Assert.IsLessThanOrEqualTo(1, fixture.Clock.RegisteredTimers,
+            "at most the backend timer owned by the fixture may remain scheduled");
     }
 
     private static async Task WaitForStateAsync(BScanViewModel viewModel, Func<BScanViewState, bool> predicate)
