@@ -1,12 +1,12 @@
 # ADR 0017 — Procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **propuesto; pendiente de aprobación**.
+Fecha: 2026-10-16. Estado: **Aceptado**.
 Trazabilidad: R01, R02, R04-R08, R10 y R13; complementa [ADR 0007](0007-frame-source-ownership.md),
 [ADR 0008](0008-latest-only-visual-delivery.md), [ADR 0010](0010-ascan-manual-cursor-measurements.md),
 [ADR 0015](0015-authoritative-inspection-data-store.md) y
 [ADR 0016](0016-reusable-complete-scan-components.md).
 Diseño detallado: [procesamiento de puertas UT](../architecture/ut-gate-processing-design.md).
-Ejecución propuesta: [plan por fases](../plans/2026-10-16-ut-gate-processing.md).
+Ejecución: [plan por fases](../plans/2026-10-16-ut-gate-processing.md).
 
 ## Contexto
 
@@ -19,18 +19,18 @@ ni posición espacial.
 y puede coalescer; por tanto no constituye un transporte lossless para procesamiento. Los cursores A/B
 son medidas manuales visuales aproximadas y no son puertas.
 
-## Decisión propuesta
+## Decisión
 
-Se propone una nueva unidad neutral `UTStudio.Processing.Core`, sin referencia WPF, que implemente:
+Se adopta una nueva unidad neutral `UTStudio.Processing.Core`, sin referencia WPF, que implemente:
 
 - `GatePlanCompiler`, puro y thread-safe;
 - `GateEvaluator`, reentrante y sin estado mutable compartido;
 - detectores y transformaciones compartidas;
 - resultados y diagnósticos acotados.
 
-Los contratos compartidos se ubicarían en `UTStudio.Contracts/Processing`; los value objects de identidad
-solo pasarían a `UTStudio.Domain` si se confirma que son vocabulario transversal estable. `Contracts` no
-dependerá de `Processing.Core`. Esta ubicación exacta queda pendiente de aprobación.
+Los contratos compartidos se ubican en `UTStudio.Contracts/Processing`; los value objects de identidad
+permanecen allí mientras no exista otra decisión que los establezca como vocabulario transversal de Domain.
+`Contracts` no dependerá de `Processing.Core`.
 
 El flujo futuro será:
 
@@ -48,9 +48,9 @@ referencias ausentes, autorreferencias, ciclos, parámetros inválidos y combina
 un orden topológico determinista con `GateId` canónico como desempate. Una dependencia solo se satisface
 con `Detected`; cualquier otro estado produce `DependencyNotDetected`, conservando puerta y estado causal.
 
-Para la primera versión se propone `inicio referenciado + duración positiva`, con inicio referido al origen
-temporal de la traza o al evento detectado por una puerta más un offset. Referenciar inicio y fin de forma
-independiente queda reservado hasta que exista un caso UT confirmado.
+La primera versión usa `inicio referenciado + duración positiva`, con inicio referido al origen temporal de
+la traza o al evento detectado por una puerta más un offset. La ventana completa debe quedar dentro de la
+traza. Referenciar inicio y fin independientemente queda fuera del primer incremento.
 
 El evaluator recibe descriptor, vista neutral de muestras, plan compilado y cancelación. No conserva RF,
 no publica UI, no asigna por muestra y devuelve un lote completo por traza. El lease se retiene solo durante
@@ -59,24 +59,35 @@ de un presupuesto acotado mediante espera cancelable o rechazo contabilizado, si
 se devuelve en `finally`. La cancelación se observa en fronteras deterministas; descarta intermedios y produce
 un batch terminal completo `Cancelled` confirmado atómicamente, nunca un lote parcial.
 
-Los derivados se identifican al menos por `TraceIdentity`, plan/revisión, `GateId`, `GateRevision`, versión
-del contrato/algoritmo y `InspectionRevision` fuente. Cambiar cualquier semántica de puerta incrementa
-`GateRevision`; cambiar contenido, topología o política incrementa la revisión del plan. Los resultados
-anteriores no mutan: una nueva generación sustituye la vista activa y queda sujeta a retención/GC explícitos.
+La firma completa de reproducibilidad contiene `TraceIdentity`, `SourceInspectionRevision`, `GatePlanId`,
+`GatePlanRevision`, `GateId`, `GateRevision`, `ProcessingContractVersion`, versión del algoritmo, descriptor/
+eje efectivo y dominio/parámetros efectivos. Cambiar cualquier semántica de puerta incrementa `GateRevision`;
+cambiar contenido, topología o política incrementa la revisión del plan. Los resultados anteriores no mutan.
 
-La asociación espacial ocurre después mediante `TraceIdentity`. Una medida válida puede generar una capa
-C-Scan independiente —por ejemplo amplitud y TOF—, pero solo `Detected` aporta valor; el resto aporta
-`NoData` con causa y procedencia, nunca cero o `NaN` sin máscara. Este ADR no diseña geometría, celdas,
-tiles ni renderizado C-Scan.
+La asociación espacial ocurre después mediante `TraceIdentity`. Las capas iniciales son amplitud, tiempo de
+detección, TOF, estado y calidad. Solo una medida válida aporta su valor; estados y calidad conservan máscara,
+causa y procedencia, nunca cero o `NaN` implícitos. Este ADR no diseña geometría, celdas, tiles ni renderizado
+C-Scan.
+
+Los dominios iniciales son `RawSigned`, `Positive`, `NegativeMagnitude` y `Absolute`. La señal rectificada
+real se aplaza hasta resolver su encoding persistente. Los cruces usan interpolación lineal y la muestra
+izquierda como `SampleIndex`, armado explícito y `NoEvent` cuando no hay flanco. Los máximos locales excluyen
+bordes y representan una meseta por su centro inferior. El tiempo canónico se mide desde el origen de traza.
+`TraceQuality.Degraded` es procesable y degrada la calidad del resultado; `Invalid` no es procesable.
+
+La configuración predeterminada admite 8 puertas y el máximo contractual es 16. El primer incremento no
+incorpora `ElementId`. Stop cierra admisión y drena todo trabajo admitido; no cancela backlog admitido como
+política normal. El store derivado inicial es en memoria, acotado y reconstruible mientras la RF autoritativa
+esté disponible. A-Scan edita mediante Preview y confirmación `Apply` o descarte `Cancel`.
 
 ## Consecuencias
 
 - La autoridad RF, identidades y leases de ADR 0015 se conservan.
-- Procesamiento tiene backpressure y cierre propios; Stop debe cerrar admisión y drenar o cancelar de forma
-  contabilizada antes de cerrar el store.
+- Procesamiento tiene backpressure y cierre propios; Stop cierra admisión y drena todo lo admitido antes de
+  cerrar el store.
 - A-Scan podrá editar y mostrar un plan prestado, pero no poseerlo ni evaluarlo.
 - Reprocesar usa RF almacenada y una revisión concreta del plan; no requiere hardware ni UI.
-- Rectificada adquirida y envolvente permanecen no soportadas hasta definir encoding/calibración y algoritmo.
+- Rectificada real y envolvente permanecen no soportadas hasta decisiones posteriores.
 - No se crea código, proyecto, UI, persistencia ni dependencia NuGet en esta fase documental.
 
 ## Alternativas descartadas por ahora
@@ -88,8 +99,8 @@ tiles ni renderizado C-Scan.
   dinámicamente invertidas y fallos parciales sin un caso confirmado.
 - Integrar geometría/C-Scan en el evaluator: mezcla señal y posicionamiento.
 
-## Aprobación necesaria
+## Cuestiones separadas
 
-Este ADR no está aceptado. Las elecciones enumeradas en el diseño detallado —dominios, ventana parcial,
-cruces, máximos locales, TOF, revisiones, calidad, backpressure, límites y retención— requieren decisión
-del usuario antes de implementar.
+Q19 queda resuelta para el primer incremento. Permanecen separadas únicamente el encoding persistente de
+señal rectificada, el presupuesto final después de benchmarks, la persistencia del store derivado y los
+requisitos PA reales. Ninguna reabre las quince decisiones de este ADR.
