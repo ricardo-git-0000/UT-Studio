@@ -9,6 +9,7 @@ using UTStudio.App.Wpf;
 using UTStudio.App.Wpf.Composition;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Presentation;
+using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Controls;
 
 namespace UTStudio.Tests.Wpf;
@@ -33,28 +34,35 @@ public sealed class RenderTests
             vm.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(vm.AScan) && vm.AScan is not null) { received.TrySetResult(); } };
             await DiagnosticWait.For(host.StartCommand.ExecuteAsync(null));
             await DiagnosticWait.For(received.Task, "first A-Scan in ViewModel");
+            await DiagnosticWait.For(host.StopCommand.ExecuteAsync(null));
             Assert.IsNotNull(vm.AScan);
             Assert.AreEqual(2048, vm.AScan.OriginalSampleCount);
             Assert.IsLessThanOrEqualTo(1024, vm.Points.Count);
             var control = window.AScan.Renderer;
-            control.Snapshot = vm.AScan;
-            control.RefreshSnapshot();
+            var frozenSnapshot = vm.AScan;
             window.Measure(new Size(1100, 680));
             window.Arrange(new Rect(0, 0, 1100, 680));
             window.UpdateLayout();
             await Dispatcher.Yield(DispatcherPriority.DataBind);
+            control.Snapshot = frozenSnapshot;
+            control.CursorState = AScanCursorMeasurements.Create(frozenSnapshot);
+            control.ViewportBinding = new(frozenSnapshot.Metadata.RunId, frozenSnapshot.Version,
+                ScanTimeViewportOperations.Create(frozenSnapshot.MinimumTimeSeconds, frozenSnapshot.MaximumTimeSeconds));
+            control.RefreshSnapshot();
+            await Dispatcher.Yield(DispatcherPriority.Render);
+            Assert.AreEqual(frozenSnapshot.Version, control.DisplayedCursorSnapshotVersion);
             var visualVm = window.AScan.ViewModel!;
             Assert.IsNotNull(visualVm.Cursors);
             Assert.IsNotNull(control.CursorState);
             window.Activate();
             double cursorAX = 64 + Math.Max(0, control.ActualWidth - 84) *
-                (control.CursorState.A.TimeSeconds - visualVm.AScan!.MinimumTimeSeconds) /
-                (vm.AScan.MaximumTimeSeconds - vm.AScan.MinimumTimeSeconds);
+                (control.CursorState.A.TimeSeconds - frozenSnapshot.MinimumTimeSeconds) /
+                (frozenSnapshot.MaximumTimeSeconds - frozenSnapshot.MinimumTimeSeconds);
             Assert.IsTrue(Mouse.Capture(control, CaptureMode.Element));
             Assert.IsTrue(control.BeginCursorDrag(new Point(cursorAX, 120)));
             control.ContinueCursorDrag(new Point(control.ActualWidth + 100, 120));
             control.EndCursorDrag();
-            Assert.AreEqual(visualVm.AScan.MaximumTimeSeconds, visualVm.Cursors.A.TimeSeconds);
+            Assert.AreEqual(frozenSnapshot.MaximumTimeSeconds, visualVm.Cursors!.A.TimeSeconds);
             clock.Advance(TimeSpan.FromMilliseconds(200));
             window.UpdateStatus(null, EventArgs.Empty);
             window.UpdateLayout();
