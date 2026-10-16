@@ -1,6 +1,6 @@
 # Plan aprobado por fases — procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **aprobado; implementación no iniciada**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
+Fecha: 2026-10-16. Estado: **Fase 1 implementada; fases posteriores no iniciadas**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
 Diseño: [procesamiento neutral](../architecture/ut-gate-processing-design.md).
 
 ## Propiedad y alcance
@@ -17,9 +17,10 @@ revisados; árbol sin stage/commit; ADR aceptado y Q19 resuelta.
 
 ## Fase 1 — contratos y compilador
 
-Crear, tras autorización de implementación, contratos neutrales inmutables y `GatePlanCompiler`. Cubrir
-IDs/revisiones, parámetros tipados, mínimo válido de tres puertas, 8 puertas predeterminadas, máximo 16,
-validación, DAG y orden topológico determinista. Sin evaluator, store ni UI.
+Implementado: contratos neutrales inmutables y `GatePlanCompiler`. El compilador acepta entre una puerta y
+el máximo configurado, usa 8 como máximo predeterminado y aplica 16 como máximo absoluto. Cubre identidades/
+revisiones, parámetros tipados, validación, DAG, orden topológico determinista, dependencias por índice y firma
+SHA-256 canónica y versionada. No incluye evaluator, store ni UI.
 
 Gate: ejemplos de tres independientes, A→B→C, A→{B,C}, dependencia fallida y ciclo; pruebas de arquitectura,
 permutación y límites; cero WPF/Application/hardware/store concreto.
@@ -83,9 +84,11 @@ aprobación previas.
 Gate: recuperación, compatibilidad/versionado, benchmark registrado en `docs/performance/` y aprobación de
 targets; no combinar máximos individuales como garantía.
 
-## Validación de esta Fase 0
+## Validación de Fase 1
 
 - revisión del diff, archivos nuevos, enlaces relativos, UTF-8 y estado Git;
 - revisión lectora de arquitectura, dominio, adquisición, procesamiento, storage, visualización, calidad y repo;
-- compilación y pruebas funcionales: no aplican, porque no cambia código, proyectos ni paquetes;
-- benchmarks: no ejecutados; solo se define metodología.
+- formato limitado a los proyectos afectados, build Release completo y pruebas dirigidas;
+- suites Core repetidas y suite WPF completa para regresión;
+- revisión lectora de arquitectura, dominio, procesamiento, calidad y repositorio;
+- benchmarks: no ejecutados; el presupuesto final pertenece a una fase posterior.

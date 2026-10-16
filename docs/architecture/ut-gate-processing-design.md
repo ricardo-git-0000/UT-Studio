@@ -1,16 +1,18 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 0 documental aprobada; ADR 0017 aceptado**.
+Fecha: 2026-10-16. Estado: **Fase 1 implementada; ADR 0017 aceptado**.
 
 ## 1. Alcance y autoridad
 
 Requisitos confirmados por la petición vigente:
 
-- procesar una traza confirmada con un plan de al menos tres puertas independientes o ligadas;
+- procesar una traza confirmada con un plan de una puerta como mínimo y hasta el máximo configurado,
+  con puertas independientes o ligadas;
 - neutralidad respecto a WPF, A/C-Scan, hardware, simulador, `ApplicationSession`, store concreto y posición;
 - determinismo, memoria/colas acotadas, cancelación y resultados versionados;
 - `InspectionDataStore` conserva la autoridad RF; resultados de puertas son derivados reconstruibles;
-- no implementar en esta fase código, UI, C-Scan, persistencia ni paquetes.
+- Fase 1 implementa exclusivamente contratos neutrales y compilación del plan; RF, detectores, UI, C-Scan,
+  persistencia y paquetes nuevos quedan fuera de su alcance.
 
 Las quince decisiones del apartado 15 están aceptadas para el primer incremento.
 
@@ -27,9 +29,9 @@ UTStudio.Domain <- UTStudio.Contracts <- UTStudio.Processing.Core
          stores derivados / Presentation / visualización
 ```
 
-`UTStudio.Processing.Core` contiene algoritmos y no conoce stores, sesión, UI ni posición. Los contratos
-compartidos viven en `UTStudio.Contracts/Processing`. `GateId` y revisiones permanecen allí mientras otra
-decisión no los convierta en lenguaje transversal de Domain. No se admite `Contracts -> Processing.Core`.
+`UTStudio.Processing.Core` contiene el compilador neutral y no conoce stores, sesión, UI ni posición. Las
+identidades y revisiones estables viven en `UTStudio.Domain/Processing`; los contratos públicos compartidos,
+en `UTStudio.Contracts/Processing`. `Contracts` depende de `Domain`, y ninguno depende de `Processing.Core`.
 
 Propietario de los documentos de esta fase: agente principal. Revisores especializados: solo lectura.
 
@@ -38,16 +40,16 @@ Propietario de los documentos de esta fase: agente principal. Revisores especial
 API conceptual, no firma C# definitiva:
 
 ```text
-GateId                    value object no-default, orden canónico
+GateId                    value object no-default, identidad ordinal
 GateRevision              revisión monotónica, no reutilizable por GateId
 GatePlanId                identidad estable del plan
 GatePlanRevision          revisión de contenido, topología y políticas
-ProcessingContractVersion versión de serialización y semántica algorítmica
+GateSchemaVersion         versión del esquema del plan
+GateAlgorithmVersion      versión de la semántica algorítmica
 
 GatePlan
-  Id, Revision, ContractVersion
+  Id, Revision, SchemaVersion, AlgorithmVersion
   Gates: immutable ordered collection<GateDefinition>
-  RequestedLayers: immutable collection<GateLayerDefinition>
 
 GateDefinition
   GateId, GateRevision, SignalDomain, DetectorDefinition
@@ -74,6 +76,11 @@ TraceIdentity + SourceInspectionRevision + GatePlanId + GatePlanRevision
 + GateId + GateRevision + ProcessingContractVersion + AlgorithmVersion
 + EffectiveTraceDescriptor/SampleAxis + EffectiveSignalDomain/Parameters
 ```
+
+En Fase 1, `GatePlanCompiler` produce además una firma SHA-256 canónica y versionada del plan declarado:
+identidad y revisión del plan, versiones de esquema y algoritmo, orden declarado, definiciones completas,
+dependencias, parámetros y medidas solicitadas. Los `double` se codifican por sus bits IEEE 754 y `+0.0` y
+`-0.0` se normalizan a una única representación antes de calcular la firma.
 
 `TraceIdentity` ya distingue inspección, run, fuente, canal físico, beam y ley focal opcionales, además de
 `AcquisitionIndex`. El primer incremento no contiene `ElementId` y no lo infiere de canal, beam ni ley. Los
@@ -183,19 +190,25 @@ amplitud, prominencia ni posición durante detección; el redondeo es solo de pr
 El grafo tiene un nodo por `GateId` y una arista padre→hija por referencia de inicio. El compilador rechaza:
 
 - `GateId` duplicado/default, revisiones inválidas o límite configurado excedido;
-- menos de tres puertas; tres es cardinalidad mínima válida y capacidad mínima soportada;
+- cero puertas; la cardinalidad válida es de 1 al máximo configurado;
 - autorreferencias e IDs inexistentes;
 - ciclos, incluidos los indirectos;
 - duración, offsets, umbrales, histéresis o parámetros no finitos/fuera de rango;
 - detector/dominio/medidas incompatibles o dominios futuros.
 
-Orden topológico: Kahn con cola priorizada por representación canónica de `GateId`; nunca orden incidental de
-`Dictionary` ni del scheduler.
+El máximo configurado predeterminado es 8 y el máximo absoluto es 16. El orden topológico usa el orden declarado
+como desempate entre nodos listos; nunca el orden incidental de `Dictionary` ni del scheduler. Las dependencias
+se compilan a índices sobre la colección declarada para evitar búsquedas durante la futura evaluación.
+
+La compilación devuelve un resultado discriminado: `Compiled` contiene necesariamente un plan compilado
+completo; cualquier estado fallido contiene errores estructurados y ningún plan parcial. El compilador comprueba
+la cancelación antes del punto de publicación; después de publicar, una cancelación posterior no invalida el
+resultado ya entregado.
 
 Ejemplos conceptuales:
 
 ```text
-Independientes: A   B   C        orden canónico A,B,C
+Independientes: A   B   C        orden declarado A,B,C
 Cadena:         A -> B -> C      B parte de evento(A); C de evento(B)
 Abanico:        A -> B           B y C usan evento(A)
                  \-> C
@@ -326,7 +339,7 @@ y tasa como requisito simultáneo.
 Un scratch `int` de 65.535 muestras cuesta 262.140 bytes; cuatro dominios materializados costarían 1.048.560
 bytes por evaluación concurrente, antes de candidatos/resultados. Por ello el diseño favorece accessors y
 materialización lazy compartida solo cuando un benchmark la justifique. La configuración predeterminada es
-8 puertas y el máximo contractual 16; el mínimo válido sigue siendo 3. La concurrencia se valida contra
+8 puertas, el máximo absoluto es 16 y la cardinalidad mínima válida es 1. La concurrencia se valida contra
 presupuesto.
 Agotar scratch aplica espera cancelable y contabilizada o rechazo de admisión según política configurada;
 nunca reserva memoria de fallback ni bloquea sin cancelación.
@@ -346,11 +359,11 @@ Matriz de benchmark futura:
 Medir por separado lease/read, transformación, detector y commit; p50/p95/p99, throughput ofrecido/admitido/
 completado, CPU, bytes asignados/traza, GC, scratch actual/máximo, profundidad/espera de cola, vida del lease,
 cancelaciones y tiempo de drain. Registrar hardware, runtime, commit y configuración. Los gates productivos se
-deciden después; esta Fase 0 no declara objetivos.
+deciden después; la Fase 1 no declara objetivos productivos de rendimiento.
 
-## 12. Estrategia de pruebas futura
+## 12. Estrategia de pruebas
 
-- compilador: IDs, self/missing/ciclos, orden estable bajo permutaciones, límites y parámetros;
+- compilador implementado en Fase 1: IDs, self/missing/ciclos, orden declarado determinista, límites y parámetros;
 - ejemplos obligatorios: 3 independientes, cadena, abanico, dependencia fallida y ciclo;
 - golden/exhaustivas pequeñas: 1/2 muestras, min/max Int16, constantes, alternancia, igualdad de umbral,
   mesetas, múltiples cruces, histéresis/rearme e interpolación conocida;
@@ -394,7 +407,7 @@ revisiones y procedencia.
 | --- | --- | --- |
 | P1 | usar `latest-only` y perder procesamiento | puerto acotado lossless separado y contabilidad |
 | P1 | segunda autoridad/copia RF | lease breve del provider; ningún RF en resultado/core |
-| P1 | resultado no reproducible | firma completa con identidad, revisiones, esquema, algoritmo, eje, dominio y parámetros |
+| P1 | resultado no reproducible | firma SHA-256 canónica y versionada con identidad, revisiones, esquema, algoritmo, eje, dominio y parámetros |
 | P1 | semánticas ambiguas o no deterministas | compiler estricto, reglas matemáticas y goldens |
 | P1 | backlog/leases impiden Stop | cerrar admisión, drenar todo lo admitido y medir la barrera |
 | P1 | plan cíclico/fallback silencioso | rechazo previo y propagación causal explícita |

@@ -28,9 +28,9 @@ Se adopta una nueva unidad neutral `UTStudio.Processing.Core`, sin referencia WP
 - detectores y transformaciones compartidas;
 - resultados y diagnósticos acotados.
 
-Los contratos compartidos se ubican en `UTStudio.Contracts/Processing`; los value objects de identidad
-permanecen allí mientras no exista otra decisión que los establezca como vocabulario transversal de Domain.
-`Contracts` no dependerá de `Processing.Core`.
+Los contratos compartidos se ubican en `UTStudio.Contracts/Processing`; los value objects de identidad y
+revisión se ubican en `UTStudio.Domain/Processing`. `Contracts` depende de `Domain`, y ninguno depende de
+`Processing.Core`.
 
 El flujo futuro será:
 
@@ -45,7 +45,7 @@ commit RF.
 
 Cada plan será un snapshot inmutable identificado y versionado. El compilador rechazará IDs duplicados,
 referencias ausentes, autorreferencias, ciclos, parámetros inválidos y combinaciones no soportadas; emitirá
-un orden topológico determinista con `GateId` canónico como desempate. Una dependencia solo se satisface
+un orden topológico determinista con el orden declarado como desempate. Una dependencia solo se satisface
 con `Detected`; cualquier otro estado produce `DependencyNotDetected`, conservando puerta y estado causal.
 
 La primera versión usa `inicio referenciado + duración positiva`, con inicio referido al origen temporal de
@@ -80,6 +80,12 @@ incorpora `ElementId`. Stop cierra admisión y drena todo trabajo admitido; no c
 política normal. El store derivado inicial es en memoria, acotado y reconstruible mientras la RF autoritativa
 esté disponible. A-Scan edita mediante Preview y confirmación `Apply` o descarte `Cancel`.
 
+Precisión de Fase 1: el compilador neutral acepta planes de 1 a su máximo configurado para permitir composición
+y pruebas incrementales. El máximo configurado predeterminado es 8 y nunca puede superar 16. El requisito de
+producto de tres puertas describe la capacidad/caso mínimo que debe demostrarse, no una prohibición contractual
+de compilar un plan de una o dos puertas. Esta precisión, junto con la ubicación de identidades y el desempate
+por orden declarado, prevalece sobre cualquier redacción incompatible del diseño detallado anterior.
+
 ## Consecuencias
 
 - La autoridad RF, identidades y leases de ADR 0015 se conservan.
@@ -88,7 +94,8 @@ esté disponible. A-Scan edita mediante Preview y confirmación `Apply` o descar
 - A-Scan podrá editar y mostrar un plan prestado, pero no poseerlo ni evaluarlo.
 - Reprocesar usa RF almacenada y una revisión concreta del plan; no requiere hardware ni UI.
 - Rectificada real y envolvente permanecen no soportadas hasta decisiones posteriores.
-- No se crea código, proyecto, UI, persistencia ni dependencia NuGet en esta fase documental.
+- La Fase 1 añade únicamente contratos neutrales y compilador; no añade procesamiento RF, UI, persistencia ni
+  dependencia NuGet.
 
 ## Alternativas descartadas por ahora
 
