@@ -1,6 +1,6 @@
 # Plan aprobado por fases — procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 1 implementada; fases posteriores no iniciadas**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
+Fecha: 2026-10-16. Estado: **Fase 2 implementada; fases posteriores no iniciadas**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
 Diseño: [procesamiento neutral](../architecture/ut-gate-processing-design.md).
 
 ## Propiedad y alcance
@@ -27,12 +27,16 @@ permutación y límites; cero WPF/Application/hardware/store concreto.
 
 ## Fase 2 — evaluator RF y dominios básicos
 
-Implementar evaluator reentrante y detectores para `RawSigned`, `Positive`, `NegativeMagnitude` y `Absolute`.
+Implementado evaluator reentrante y detectores para `RawSigned`, `Positive`, `NegativeMagnitude` y `Absolute`.
 Scratch acotado, transformaciones compartidas medidas, cancelación determinista y lote atómico. `Degraded`
 se procesa con calidad degradada e `Invalid` no se procesa. Rectificada real y envolvente quedan fuera.
 
 Gate: golden, exhaustivas pequeñas, metamórficas, concurrencia, ownership de scratch y benchmarks diagnósticos
 para 2.048/65.535 muestras y tres topologías. Sin objetivo productivo aún.
+
+Corrección P2 de cierre: contrato de evaluación v3 con error principal/secundarios, diagnósticos y métricas;
+máximos locales `O(N log N)`; leases y buckets con presupuesto por pool compartido; referencia escalar de los
+nueve detectores; benchmark independiente, cadena, fan-out y señal local adversa.
 
 ## Fase 3 — orquestación post-commit
 
@@ -92,3 +96,12 @@ targets; no combinar máximos individuales como garantía.
 - suites Core repetidas y suite WPF completa para regresión;
 - revisión lectora de arquitectura, dominio, procesamiento, calidad y repositorio;
 - benchmarks: no ejecutados; el presupuesto final pertenece a una fase posterior.
+
+## Validación de Fase 2
+
+- build Release completo sin avisos ni errores;
+- pruebas Processing dirigidas, suite Core completa tres veces consecutivas y suite WPF completa;
+- regresiones sensibles de evaluación repetidas diez veces;
+- BenchmarkDotNet `Dry` para 2.048 y 65.535 muestras, solo como diagnóstico sin baseline;
+- formato de los proyectos afectados, enlaces Markdown, UTF-8, `git diff --check`, dependencias y alcance;
+- revisiones lectoras de arquitectura, dominio, procesamiento, adquisición, calidad y repositorio.

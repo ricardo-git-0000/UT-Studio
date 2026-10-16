@@ -95,6 +95,10 @@ public sealed class GatePlanCompilerTests
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([])), GateCompilationErrorCode.EmptyPlan);
         AssertFailure(_compiler.Compile(new GatePlan(default, default, default, default,
             [GateTestPlan.Gate("A")])), GateCompilationErrorCode.InvalidIdentity);
+        AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A")], schema: 1)),
+            GateCompilationErrorCode.InvalidVersion);
+        AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A")], algorithm: 3)),
+            GateCompilationErrorCode.InvalidVersion);
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A", durationSeconds: 0)])),
             GateCompilationErrorCode.InvalidDuration);
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A",

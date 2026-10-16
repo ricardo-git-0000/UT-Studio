@@ -10,14 +10,31 @@ public enum GateDetectorKind
 }
 public enum GatePlateauPolicy { Unknown = 0, LowerCenter = 1 }
 public enum GateMeasureKind { Unknown = 0, Amplitude = 1, DetectionTime = 2, TimeOfFlight = 3, Status = 4, Quality = 5 }
-public enum GateAcceptedTraceQuality { Unknown = 0, GoodOnly = 1, GoodAndDegraded = 2 }
 public enum GateAmplitudeUnit { Unknown = 0, DigitalCounts = 1 }
 public enum GateTimeBasis { Unknown = 0, TraceOrigin = 1 }
 public enum GateTofReferenceKind { Unknown = 0, TraceOrigin = 1, DependencyGateEvent = 2 }
 public enum GateResultStatus
 {
     Unknown = 0, Detected = 1, BelowThreshold = 2, NoEvent = 3, DependencyNotDetected = 4,
-    TraceNotAvailable = 5, WindowOutOfRange = 6, Cancelled = 7, Faulted = 8
+    InvalidTrace = 5, WindowOutOfRange = 6, Cancelled = 7, Faulted = 8, EmptyResolvedWindow = 9
+}
+public enum GateDiagnosticCode
+{
+    Unknown = 0, None = 1, NoEvent = 2, BelowAcceptanceThreshold = 3,
+    DependencyNotDetected = 4, InvalidTrace = 5, WindowOutsideTrace = 6,
+    EmptyResolvedWindow = 7, Cancelled = 8, InternalFailure = 9
+}
+public enum GateDetectionEventKind
+{
+    Unknown = 0, GlobalMaximum = 1, GlobalMinimum = 2, AbsoluteMaximum = 3,
+    RisingCrossing = 4, FallingCrossing = 5, LocalMaximum = 6
+}
+public enum GateResultQuality { Unknown = 0, Valid = 1, Degraded = 2, Invalid = 3 }
+public enum GateEvaluationStatus { Unknown = 0, Completed = 1, Cancelled = 2, Failed = 3 }
+public enum GateEvaluationErrorCode
+{
+    Unknown = 0, InvalidInput = 1, InvalidQuality = 2, ScratchUnavailable = 3,
+    ScratchReturnFailed = 4, InternalFailure = 5, Cancellation = 6
 }
 public enum GatePlanCompilationStatus
 {
@@ -31,6 +48,5 @@ public enum GateCompilationErrorCode
     CapacityExceeded = 5, DuplicateGate = 6, InvalidDuration = 7, TemporalOverflow = 8,
     InvalidThreshold = 9, InvalidHysteresis = 10, InvalidLocalExtremaParameters = 11,
     UnsupportedCombination = 12, MissingDependency = 13, SelfDependency = 14,
-    CycleDetected = 15, InvalidMeasure = 16, InvalidTraceQuality = 17, Cancelled = 18,
-    InternalFailure = 19
+    CycleDetected = 15, InvalidMeasure = 16, Cancelled = 17, InternalFailure = 18
 }

@@ -86,8 +86,10 @@ public sealed class GatePlanCompiler
     {
         if (!plan.Id.IsValid) { errors.Add(Error(GateCompilationErrorCode.InvalidIdentity, "GatePlanId is invalid.")); }
         if (!plan.Revision.IsValid) { errors.Add(Error(GateCompilationErrorCode.InvalidRevision, "GatePlanRevision is invalid.")); }
-        if (!plan.SchemaVersion.IsValid) { errors.Add(Error(GateCompilationErrorCode.InvalidVersion, "GateSchemaVersion is invalid.")); }
-        if (!plan.AlgorithmVersion.IsValid) { errors.Add(Error(GateCompilationErrorCode.InvalidVersion, "GateAlgorithmVersion is invalid.")); }
+        if (plan.SchemaVersion.Value != GatePlanCompilerOptions.CurrentSchemaVersion)
+        { errors.Add(Error(GateCompilationErrorCode.InvalidVersion, $"GateSchemaVersion must be {GatePlanCompilerOptions.CurrentSchemaVersion}.")); }
+        if (plan.AlgorithmVersion.Value != GatePlanCompilerOptions.CurrentAlgorithmVersion)
+        { errors.Add(Error(GateCompilationErrorCode.InvalidVersion, $"GateAlgorithmVersion must be {GatePlanCompilerOptions.CurrentAlgorithmVersion}.")); }
     }
 
     private static void ValidateGate(GateDefinition gate, List<GateCompilationError> errors)
@@ -95,8 +97,6 @@ public sealed class GatePlanCompiler
         if (!gate.Revision.IsValid) { errors.Add(Error(GateCompilationErrorCode.InvalidRevision, "GateRevision is invalid.", gate.Id)); }
         if (!Enum.IsDefined(gate.SignalDomain) || gate.SignalDomain == GateSignalDomain.Unknown)
         { errors.Add(Error(GateCompilationErrorCode.UnsupportedCombination, "Signal domain is unknown.", gate.Id)); }
-        if (!Enum.IsDefined(gate.AcceptedTraceQuality) || gate.AcceptedTraceQuality == GateAcceptedTraceQuality.Unknown)
-        { errors.Add(Error(GateCompilationErrorCode.InvalidTraceQuality, "Accepted trace quality is unknown.", gate.Id)); }
         ValidateWindow(gate, errors);
         ValidateDetector(gate, errors);
         if (gate.RequestedMeasures.Count == 0 || gate.RequestedMeasures.Any(x => !Enum.IsDefined(x) || x == GateMeasureKind.Unknown) ||
@@ -201,7 +201,7 @@ public sealed class GatePlanCompiler
         using MemoryStream stream = new();
         using (BinaryWriter writer = new(stream, new UTF8Encoding(false, true), true))
         {
-            Write(writer, "UTSTUDIO-GATE-PLAN"); writer.Write((byte)1);
+            Write(writer, "UTSTUDIO-GATE-PLAN"); writer.Write((byte)2);
             Write(writer, plan.Id.Value); writer.Write(plan.Revision.Value);
             writer.Write(plan.SchemaVersion.Value); writer.Write(plan.AlgorithmVersion.Value);
             writer.Write(plan.Gates.Count);
@@ -223,7 +223,6 @@ public sealed class GatePlanCompiler
                     writer.Write(CanonicalDoubleBits(local.MinimumProminenceCounts));
                     writer.Write(local.MinimumDistanceSamples); writer.Write((int)local.PlateauPolicy);
                 }
-                writer.Write((int)gate.AcceptedTraceQuality);
                 writer.Write(gate.RequestedMeasures.Count);
                 foreach (GateMeasureKind measure in gate.RequestedMeasures) { writer.Write((int)measure); }
             }

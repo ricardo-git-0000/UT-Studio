@@ -27,8 +27,6 @@ public sealed class GateSignatureAndArchitectureTests
         [
             GateTestPlan.Plan([GateTestPlan.Gate("A")], id: "other"),
             GateTestPlan.Plan([GateTestPlan.Gate("A")], revision: 2),
-            GateTestPlan.Plan([GateTestPlan.Gate("A")], schema: 2),
-            GateTestPlan.Plan([GateTestPlan.Gate("A")], algorithm: 2),
             GateTestPlan.Plan([GateTestPlan.Gate("B")]),
             GateTestPlan.Plan([GateTestPlan.Gate("A", revision: 2)]),
             GateTestPlan.Plan([GateTestPlan.Gate("A", offsetSeconds: 0.0000001)]),
@@ -42,7 +40,6 @@ public sealed class GateSignatureAndArchitectureTests
                 local: new(2, .3, 4))]),
             GateTestPlan.Plan([GateTestPlan.Gate("A", measures: [GateMeasureKind.Status])]),
             GateTestPlan.Plan([GateTestPlan.Gate("A", measures: [GateMeasureKind.Status, GateMeasureKind.Amplitude])]),
-            GateTestPlan.Plan([GateTestPlan.Gate("A", quality: GateAcceptedTraceQuality.GoodOnly)]),
             GateTestPlan.Plan([GateTestPlan.Gate("A"), GateTestPlan.Gate("B", "A")]),
             GateTestPlan.Plan([GateTestPlan.Gate("B"), GateTestPlan.Gate("A")])
         ];
@@ -71,7 +68,7 @@ public sealed class GateSignatureAndArchitectureTests
     {
         string actual = new GatePlanCompiler().Compile(
             GateTestPlan.Plan([GateTestPlan.Gate("A")])).CompiledPlan!.Signature.Hex;
-        Assert.AreEqual("EBAFDCA922CBD8E1510762B9F24E251D3383E5778BC20266FF8BA662C586AA9D", actual);
+        Assert.AreEqual("ADBA1CC30AEAEB12536FA8974A15B89D8F20C0980AAA452C51485EBC09EE29E4", actual);
     }
 
     [TestMethod]
@@ -118,6 +115,15 @@ public sealed class GateSignatureAndArchitectureTests
                 { Assert.IsFalse(text.Contains(forbidden, StringComparison.Ordinal), $"{file} contains {forbidden}."); }
             }
         }
+    }
+
+    [TestMethod]
+    public void ProcessingCoreDoesNotExposeInternalsToBenchmarks()
+    {
+        string assemblyInfo = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "src",
+            "UTStudio.Processing.Core", "Properties", "AssemblyInfo.cs"));
+        Assert.IsFalse(assemblyInfo.Contains("InternalsVisibleTo(\"UTStudio.Benchmarks\")", StringComparison.Ordinal));
+        Assert.Contains("InternalsVisibleTo(\"UTStudio.Core.Tests\")", assemblyInfo);
     }
 
     private static string FindRepositoryRoot()

@@ -103,8 +103,8 @@ public sealed class GateContractTests
     public void FutureResultDescriptorCapturesReproducibilityAndOutputSemantics()
     {
         List<GateMeasureKind> measures = [GateMeasureKind.Amplitude, GateMeasureKind.TimeOfFlight];
-        var descriptor = new GateFutureResultDescriptor(new("plan"), new(2), new(1), new(3), new("A"), new(4),
-            GateSignalDomain.RawSigned, measures, GateAcceptedTraceQuality.GoodAndDegraded,
+        var descriptor = new GateFutureResultDescriptor(new("plan"), new(2), new(2), new(2), new("A"), new(4),
+            GateSignalDomain.RawSigned, measures,
             GateAmplitudeUnit.DigitalCounts, GateTimeBasis.TraceOrigin, GateTofReferenceKind.DependencyGateEvent,
             new GateId("parent"));
         measures.Clear();
@@ -113,16 +113,16 @@ public sealed class GateContractTests
         Assert.AreEqual(GateTimeBasis.TraceOrigin, descriptor.TimeBasis);
         Assert.AreEqual(new GateId("parent"), descriptor.TofReferenceGateId);
         Assert.ThrowsExactly<ArgumentException>(() => new GateFutureResultDescriptor(new("plan"), new(2), new(1),
-            new(3), new("A"), new(4), GateSignalDomain.RawSigned, [GateMeasureKind.Status],
-            GateAcceptedTraceQuality.GoodAndDegraded, GateAmplitudeUnit.DigitalCounts, GateTimeBasis.TraceOrigin,
+            new(2), new("A"), new(4), GateSignalDomain.RawSigned, [GateMeasureKind.Status],
+            GateAmplitudeUnit.DigitalCounts, GateTimeBasis.TraceOrigin,
             GateTofReferenceKind.DependencyGateEvent));
         Assert.ThrowsExactly<ArgumentException>(() => new GateFutureResultDescriptor(new("plan"), new(2), new(1),
-            new(3), new("A"), new(4), GateSignalDomain.RawSigned, [GateMeasureKind.Status],
-            GateAcceptedTraceQuality.GoodAndDegraded, GateAmplitudeUnit.DigitalCounts, GateTimeBasis.TraceOrigin,
+            new(2), new("A"), new(4), GateSignalDomain.RawSigned, [GateMeasureKind.Status],
+            GateAmplitudeUnit.DigitalCounts, GateTimeBasis.TraceOrigin,
             GateTofReferenceKind.TraceOrigin, default(GateId)));
         Assert.ThrowsExactly<ArgumentException>(() => new GateFutureResultDescriptor(new("plan"), new(2), new(1),
-            new(3), new("A"), new(4), GateSignalDomain.RawSigned, [GateMeasureKind.Status],
-            GateAcceptedTraceQuality.GoodAndDegraded, GateAmplitudeUnit.DigitalCounts, GateTimeBasis.TraceOrigin,
+            new(2), new("A"), new(4), GateSignalDomain.RawSigned, [GateMeasureKind.Status],
+            GateAmplitudeUnit.DigitalCounts, GateTimeBasis.TraceOrigin,
             GateTofReferenceKind.DependencyGateEvent, new GateId("A")));
     }
 }

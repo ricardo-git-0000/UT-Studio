@@ -24,7 +24,7 @@ son medidas manuales visuales aproximadas y no son puertas.
 Se adopta una nueva unidad neutral `UTStudio.Processing.Core`, sin referencia WPF, que implemente:
 
 - `GatePlanCompiler`, puro y thread-safe;
-- `GateEvaluator`, reentrante y sin estado mutable compartido;
+- `GateEvaluator`, reentrante y sin estado semántico mutable; únicamente puede compartir scratch acotado;
 - detectores y transformaciones compartidas;
 - resultados y diagnósticos acotados.
 
@@ -59,10 +59,19 @@ de un presupuesto acotado mediante espera cancelable o rechazo contabilizado, si
 se devuelve en `finally`. La cancelación se observa en fronteras deterministas; descarta intermedios y produce
 un batch terminal completo `Cancelled` confirmado atómicamente, nunca un lote parcial.
 
+Los fallos conservan un error principal y errores secundarios de cleanup ordenados. Una cancelación o excepción
+original nunca es sustituida por un fallo de devolución de scratch; si solo falla la devolución, ese fallo es el
+principal.
+
 La firma completa de reproducibilidad contiene `TraceIdentity`, `SourceInspectionRevision`, `GatePlanId`,
 `GatePlanRevision`, `GateId`, `GateRevision`, `ProcessingContractVersion`, versión del algoritmo, descriptor/
 eje efectivo y dominio/parámetros efectivos. Cambiar cualquier semántica de puerta incrementa `GateRevision`;
 cambiar contenido, topología o política incrementa la revisión del plan. Los resultados anteriores no mutan.
+
+En Fase 2 `ProcessingContractVersion=3`. El descriptor DSP efectivo firmado comprende identidad confirmada,
+revisión fuente, número de muestras, frecuencia, offset de primera muestra, encoding, calidad efectiva y
+procedencia. Secuencia, tiempo desde inicio de run, timestamp, calidad de reloj y coordenada espacial se excluyen
+porque no alteran muestras, eje temporal, ventanas ni detectores; su variación no cambia la firma.
 
 La asociación espacial ocurre después mediante `TraceIdentity`. Las capas iniciales son amplitud, tiempo de
 detección, TOF, estado y calidad. Solo una medida válida aporta su valor; estados y calidad conservan máscara,
@@ -86,6 +95,14 @@ producto de tres puertas describe la capacidad/caso mínimo que debe demostrarse
 de compilar un plan de una o dos puertas. Esta precisión, junto con la ubicación de identidades y el desempate
 por orden declarado, prevalece sobre cualquier redacción incompatible del diseño detallado anterior.
 
+Precisión de Fase 2: el esquema y algoritmo canónicos pasan a versión 2 al retirar la política por puerta
+`GoodOnly`. La calidad efectiva confirmada es la única autoridad: `Good` y `Degraded` se procesan, mientras
+`Invalid` produce `InvalidTrace` sin leer muestras. El descriptor confirmado conserva el `TraceDescriptor`,
+la identidad confirmada y una `SourceInspectionRevision` no inicial. Los umbrales normalizados `u` se convierten
+en `double`, sin redondeo ni clamp: `RawSigned=-32768+65535u`, `Positive=32767u` y
+`NegativeMagnitude/Absolute=32768u`. El TOF publicado es absoluto respecto al origen de la traza; la referencia
+causal de una puerta ligada se conserva por separado.
+
 ## Consecuencias
 
 - La autoridad RF, identidades y leases de ADR 0015 se conservan.
@@ -94,8 +111,8 @@ por orden declarado, prevalece sobre cualquier redacción incompatible del dise�
 - A-Scan podrá editar y mostrar un plan prestado, pero no poseerlo ni evaluarlo.
 - Reprocesar usa RF almacenada y una revisión concreta del plan; no requiere hardware ni UI.
 - Rectificada real y envolvente permanecen no soportadas hasta decisiones posteriores.
-- La Fase 1 añade únicamente contratos neutrales y compilador; no añade procesamiento RF, UI, persistencia ni
-  dependencia NuGet.
+- Las Fases 1 y 2 añaden contratos, compilador y evaluación síncrona neutral de una traza; no añaden pipeline,
+  store derivado, UI, persistencia ni dependencia NuGet.
 
 ## Alternativas descartadas por ahora
 

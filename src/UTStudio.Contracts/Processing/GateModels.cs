@@ -79,7 +79,7 @@ public sealed class GateDefinition
     private readonly ReadOnlyCollection<GateMeasureKind> _measures;
     public GateDefinition(GateId id, GateRevision revision, GateWindowDefinition window,
         GateSignalDomain signalDomain, GateDetectorDefinition detector,
-        IEnumerable<GateMeasureKind> requestedMeasures, GateAcceptedTraceQuality acceptedTraceQuality)
+        IEnumerable<GateMeasureKind> requestedMeasures)
     {
         ArgumentNullException.ThrowIfNull(window);
         ArgumentNullException.ThrowIfNull(detector);
@@ -90,7 +90,6 @@ public sealed class GateDefinition
         SignalDomain = signalDomain;
         Detector = detector;
         _measures = Array.AsReadOnly(requestedMeasures.ToArray());
-        AcceptedTraceQuality = acceptedTraceQuality;
     }
     public GateId Id { get; }
     public GateRevision Revision { get; }
@@ -98,7 +97,6 @@ public sealed class GateDefinition
     public GateSignalDomain SignalDomain { get; }
     public GateDetectorDefinition Detector { get; }
     public IReadOnlyList<GateMeasureKind> RequestedMeasures => _measures;
-    public GateAcceptedTraceQuality AcceptedTraceQuality { get; }
 }
 
 public sealed class GatePlan
@@ -124,7 +122,7 @@ public sealed class GateFutureResultDescriptor
     public GateFutureResultDescriptor(GatePlanId planId, GatePlanRevision planRevision,
         GateSchemaVersion schemaVersion, GateAlgorithmVersion algorithmVersion,
         GateId gateId, GateRevision gateRevision, GateSignalDomain signalDomain,
-        IEnumerable<GateMeasureKind> measures, GateAcceptedTraceQuality acceptedTraceQuality,
+        IEnumerable<GateMeasureKind> measures,
         GateAmplitudeUnit amplitudeUnit, GateTimeBasis timeBasis, GateTofReferenceKind tofReference,
         GateId? tofReferenceGateId = null)
     {
@@ -133,7 +131,6 @@ public sealed class GateFutureResultDescriptor
             !gateId.IsValid || !gateRevision.IsValid)
         { throw new ArgumentException("Valid plan and gate identities, revisions, and versions are required."); }
         if (!Enum.IsDefined(signalDomain) || signalDomain == GateSignalDomain.Unknown) { throw new ArgumentOutOfRangeException(nameof(signalDomain)); }
-        if (!Enum.IsDefined(acceptedTraceQuality) || acceptedTraceQuality == GateAcceptedTraceQuality.Unknown) { throw new ArgumentOutOfRangeException(nameof(acceptedTraceQuality)); }
         if (!Enum.IsDefined(amplitudeUnit) || amplitudeUnit == GateAmplitudeUnit.Unknown) { throw new ArgumentOutOfRangeException(nameof(amplitudeUnit)); }
         if (!Enum.IsDefined(timeBasis) || timeBasis == GateTimeBasis.Unknown) { throw new ArgumentOutOfRangeException(nameof(timeBasis)); }
         if (!Enum.IsDefined(tofReference) || tofReference == GateTofReferenceKind.Unknown) { throw new ArgumentOutOfRangeException(nameof(tofReference)); }
@@ -151,7 +148,7 @@ public sealed class GateFutureResultDescriptor
         { throw new ArgumentException("Measures must be nonempty, known, and unique.", nameof(measures)); }
         PlanId = planId; PlanRevision = planRevision; SchemaVersion = schemaVersion; AlgorithmVersion = algorithmVersion;
         GateId = gateId; GateRevision = gateRevision; SignalDomain = signalDomain;
-        AcceptedTraceQuality = acceptedTraceQuality; AmplitudeUnit = amplitudeUnit;
+        AmplitudeUnit = amplitudeUnit;
         TimeBasis = timeBasis; TofReference = tofReference; TofReferenceGateId = tofReferenceGateId;
         _measures = Array.AsReadOnly(captured);
     }
@@ -163,7 +160,6 @@ public sealed class GateFutureResultDescriptor
     public GateRevision GateRevision { get; }
     public GateSignalDomain SignalDomain { get; }
     public IReadOnlyList<GateMeasureKind> Measures => _measures;
-    public GateAcceptedTraceQuality AcceptedTraceQuality { get; }
     public GateAmplitudeUnit AmplitudeUnit { get; }
     public GateTimeBasis TimeBasis { get; }
     public GateTofReferenceKind TofReference { get; }

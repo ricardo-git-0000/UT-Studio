@@ -1,6 +1,6 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 1 implementada; ADR 0017 aceptado**.
+Fecha: 2026-10-16. Estado: **Fase 2 implementada; ADR 0017 aceptado**.
 
 ## 1. Alcance y autoridad
 
@@ -11,7 +11,7 @@ Requisitos confirmados por la petición vigente:
 - neutralidad respecto a WPF, A/C-Scan, hardware, simulador, `ApplicationSession`, store concreto y posición;
 - determinismo, memoria/colas acotadas, cancelación y resultados versionados;
 - `InspectionDataStore` conserva la autoridad RF; resultados de puertas son derivados reconstruibles;
-- Fase 1 implementa exclusivamente contratos neutrales y compilación del plan; RF, detectores, UI, C-Scan,
+- Fase 2 implementa exclusivamente evaluación síncrona neutral de una traza; pipeline, stores, UI, C-Scan,
   persistencia y paquetes nuevos quedan fuera de su alcance.
 
 Las quince decisiones del apartado 15 están aceptadas para el primer incremento.
@@ -60,14 +60,17 @@ WindowDefinition                         [primera versión]
   StartOffsetSeconds: finite double
   DurationSeconds: finite double > 0
 
-IGatePlanCompiler.Compile(GatePlan) -> GatePlanCompilationResult
-IGateEvaluator.Evaluate(TraceDescriptor, IReadOnlyUtSamples,
-                        CompiledGatePlan, CancellationToken) -> GateEvaluationBatch
+GatePlanCompiler.Compile(GatePlan, CancellationToken) -> GatePlanCompilationResult
+GateEvaluator.Evaluate(CompiledGatePlan, ConfirmedGateTraceDescriptor,
+                       ReadOnlySpan<short>, CancellationToken) -> GateEvaluationResult
 ```
 
 Colecciones se copian al construir; no se usan diccionarios `string/object`. Cada detector tiene parámetros
 tipados. Segundos son `double` finitos; amplitud inicial, cuentas digitales. El porcentaje visual del A-Scan
 no es unidad de procesamiento.
+
+El modelo canónico de Fase 2 usa `GateSchemaVersion=2` y `GateAlgorithmVersion=2`. No existe una política
+`GoodOnly` por puerta: la calidad efectiva del descriptor confirmado es la única autoridad.
 
 Firma completa de reproducibilidad:
 
@@ -104,8 +107,8 @@ endExclusive = ceil((end - offset) * fs)
 
 La implementación deberá definir aritmética robusta alrededor de enteros/ULP y probarla; no redondeará
 primero a ticks ni hará clamp silencioso. Se exige la ventana completa; cualquier extremo fuera
-de la traza produce `WindowOutOfRange`. Una ventana dentro del eje que resuelva cero muestras también produce
-`WindowOutOfRange`, con diagnóstico `EmptyResolvedWindow`; no llega al detector. Evaluar una intersección
+de la traza produce `WindowOutOfRange`. Una ventana dentro del eje que resuelva cero muestras produce
+`EmptyResolvedWindow`, con diagnóstico homónimo; no llega al detector. Evaluar una intersección
 parcial degradada no forma parte del primer incremento.
 
 Una puerta ligada empieza en `DetectionTimeSeconds(parent) + offset`. Usa la posición submuestra, si existe,
@@ -124,6 +127,10 @@ no un índice redondeado. Solo `Detected` satisface la referencia.
 
 `RectifiedInput` no es alias de `Absolute`. La señal rectificada real se aplaza hasta resolver su encoding
 persistente. La envolvente no se aproxima mediante absoluto.
+
+Un umbral normalizado `u` en `[0,1]` se convierte en `double`, sin redondeo previo ni clamp:
+`RawSigned=-32768+65535u`, `Positive=32767u` y `NegativeMagnitude/Absolute=32768u`. Se rechazan valores
+no finitos o fuera del intervalo.
 
 RF, componentes y absoluto pueden evaluarse como accessors promovidos sin buffer por defecto. Materializar
 una transformación común solo se adoptará si un benchmark demuestra beneficio.
@@ -234,7 +241,7 @@ FractionalSamplePosition?
 SampleIndex?                    índice original, no índice de buffer transformado
 Amplitude? + AmplitudeUnit + SignalDomain
 SignedRfAmplitude? / Magnitude? cuando el detector lo necesite
-RelativeTofSeconds? + TofReference
+TimeOfFlightSeconds?             absoluto respecto al origen de traza
 OffsetWithinWindowSeconds?      no se sobrecarga como TOF
 Quality + detector metrics
 DiagnosticCode + CausalGateId?/CausalStatus?
@@ -246,19 +253,24 @@ DiagnosticCode + CausalGateId?/CausalStatus?
 | `BelowThreshold` | candidato/extremo existe pero incumple un criterio de aceptación definido |
 | `NoEvent` | detector válido no encuentra cruce/pico/evento |
 | `DependencyNotDetected` | puerta padre no terminó `Detected` |
-| `TraceNotAvailable` | no se puede procesar: not found/gap/closed o `TraceQuality.Invalid`, distinguido por diagnóstico |
+| `InvalidTrace` | la calidad efectiva confirmada es `Invalid`; no se leen muestras |
 | `WindowOutOfRange` | ventana resuelta inválida respecto al eje de muestra |
 | `Cancelled` | batch terminal completo; todas sus puertas están Cancelled y no conservan medidas parciales |
 | `Faulted` | fallo interno inesperado; plan inválido nunca llega al evaluator |
 
 Diagnósticos son enums/códigos y escalares acotados; mensajes sirven para logs, no como contrato. Calidad no
 es un `double` sin definición: usa `Good/Degraded/Invalid` y flags versionadas. Una traza `Degraded` se procesa
-y añade `SourceTraceDegraded`; una traza `Invalid` no se evalúa y produce `TraceNotAvailable` con diagnóstico
-`InvalidSourceTraceQuality`. Se conservan `Interpolated`/`Discrete` y métricas como prominencia o margen.
+y conserva calidad degradada; una traza `Invalid` no se evalúa y produce `InvalidTrace` sin recorrer muestras.
+Se conservan `Interpolated`/`Discrete` y métricas como prominencia o margen.
 
-El tiempo canónico `DetectionTimeSeconds` se refiere siempre al origen temporal de traza. Para una puerta
-independiente, `RelativeTofSeconds` usa también ese origen; para una ligada, expresa adicionalmente el intervalo
-desde el evento padre. El tiempo desde inicio de ventana usa el nombre distinto `OffsetWithinWindowSeconds`.
+`GateDetectorMetrics` siempre existe: `ProminenceCounts` y `ThresholdMarginCounts` son nullable para expresar
+ausencia explícita. La prominencia solo aplica a máximos locales; el margen solo a criterios de aceptación.
+`GateDiagnosticCode` distingue `WindowOutsideTrace`, `EmptyResolvedWindow`, `NoEvent` y
+`BelowAcceptanceThreshold` sin depender de mensajes libres.
+
+El tiempo canónico `DetectionTimeSeconds` y el TOF se refieren siempre al origen temporal de traza. Una puerta
+ligada conserva por separado la identidad y estado de su causa. El tiempo desde inicio de ventana usa el nombre
+distinto `OffsetWithinWindowSeconds`.
 
 Cada medida solicitada puede declarar una capa derivada:
 
@@ -336,16 +348,18 @@ Payload RF por traza: `N * 2` bytes. Solo lectura de entrada a 1.000 trazas/s eq
 Son caudales de payload, no capacidad garantizada. No se combinan máximos de canales, beams, leyes, muestras
 y tasa como requisito simultáneo.
 
-Un scratch `int` de 65.535 muestras cuesta 262.140 bytes; cuatro dominios materializados costarían 1.048.560
-bytes por evaluación concurrente, antes de candidatos/resultados. Por ello el diseño favorece accessors y
-materialización lazy compartida solo cuando un benchmark la justifique. La configuración predeterminada es
-8 puertas, el máximo absoluto es 16 y la cardinalidad mínima válida es 1. La concurrencia se valida contra
-presupuesto.
+El scratch usa leases verificables y buckets potencia de dos proporcionales al número de muestras. Cada buffer
+contiene valores transformados, árbol RMQ reutilizable, candidatos y Fenwick; se reserva antes del trabajo,
+está acotado por concurrencia y elementos retenidos, y no existe fallback. El límite pertenece al pool
+inyectado: la composición productiva comparte una instancia entre evaluadores y no afirma un límite global si
+crea pools independientes. La configuración predeterminada sigue siendo 8 puertas, máximo 16 y mínimo 1.
 Agotar scratch aplica espera cancelable y contabilizada o rechazo de admisión según política configurada;
 nunca reserva memoria de fallback ni bloquea sin cancelación.
 
-Coste esperado: `O(transformaciones materializadas + suma de muestras visitadas por detector + candidatos)`;
-una implementación ingenua puede ser `O(G*N)`. Resultados asignan por puerta/lote, no por muestra.
+Máximos locales construyen RMQ máximo/mínimo, resuelven límites estrictamente mayores, ordenan con heapsort
+cancelable y aplican distancia con Fenwick. Su coste es `O(N log N)` y scratch `O(N)`; no hay rescans de
+prominencia `O(N²)`. Los bucles largos, incluida la ordenación, comprueban cancelación como máximo cada 256
+operaciones. Resultados asignan por puerta/lote, no por muestra.
 
 Matriz de benchmark futura:
 

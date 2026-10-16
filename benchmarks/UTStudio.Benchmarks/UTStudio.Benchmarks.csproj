@@ -20,6 +20,7 @@
     <ProjectReference Include="../../src/UTStudio.Acquisition.Simulator/UTStudio.Acquisition.Simulator.csproj" />
     <ProjectReference Include="../../src/UTStudio.Visualization.Core/UTStudio.Visualization.Core.csproj" />
     <ProjectReference Include="../../src/UTStudio.Inspection.Core/UTStudio.Inspection.Core.csproj" />
+    <ProjectReference Include="../../src/UTStudio.Processing.Core/UTStudio.Processing.Core.csproj" />
     <ProjectReference Include="../../src/UTStudio.Visualization.Wpf/UTStudio.Visualization.Wpf.csproj"
                       Condition="'$(TargetFramework)' == 'net10.0-windows'" />
   </ItemGroup>
