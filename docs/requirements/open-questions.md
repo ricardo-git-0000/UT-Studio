@@ -22,6 +22,7 @@ No asumir respuestas ni bloquear la fase documental por estas incógnitas. Resol
 | Q16 | Identidad hardware/PA: ámbito de `Sequence`, agrupación de trigger/imagen, relaciones canal–elemento–beam–ley y layout phased-array | ut_domain_specialist / ut_acquisition |
 | Q17 | Señal y posición: encoding/unidades de rectificada, crudo/derivados a conservar, encoder, sistema de coordenadas, calibración y calidad | ut_domain_specialist / ut_processing |
 | Q18 | C-Scan posterior: definición de gates, geometría/celdas/tiles, multirresolución y gates de rendimiento sobre hardware acordado | ut_processing / ut_visualization |
+| Q19 | Puertas UT: semántica final de ventanas, dominios, cruces, máximos locales, TOF, calidad, revisiones, backpressure, límites y retención de derivados antes de implementar ADR 0017 | ut_processing / ut_domain_specialist / solution_architect |
 
 La representación binaria de rectificadas reales sigue abierta; inicialmente solo RF bipolar `ReadOnlyMemory<short>`. Véanse [ADR 0007](../adr/0007-frame-source-ownership.md), [ADR 0008](../adr/0008-latest-only-visual-delivery.md) y [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 
