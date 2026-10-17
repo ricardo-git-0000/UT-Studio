@@ -49,7 +49,11 @@ public sealed class RenderTests
             control.ViewportBinding = new(frozenSnapshot.Metadata.RunId, frozenSnapshot.Version,
                 ScanTimeViewportOperations.Create(frozenSnapshot.MinimumTimeSeconds, frozenSnapshot.MaximumTimeSeconds));
             control.RefreshSnapshot();
-            await Dispatcher.Yield(DispatcherPriority.Render);
+            clock.Advance(AScanVisualDelivery.MinimumPublicationInterval);
+            await DiagnosticWait.Until(() => control.DisplayedCursorSnapshotVersion == frozenSnapshot.Version,
+                () => $"snapshot admission during OnRender; loaded={control.IsLoaded}, " +
+                    $"size={control.ActualWidth}x{control.ActualHeight}, timer={control.IsRefreshTimerEnabled}, " +
+                    $"displayed={control.HasDisplayedSnapshot}, cursor={control.DisplayedCursorSnapshotVersion}");
             Assert.AreEqual(frozenSnapshot.Version, control.DisplayedCursorSnapshotVersion);
             var visualVm = window.AScan.ViewModel!;
             Assert.IsNotNull(visualVm.Cursors);
