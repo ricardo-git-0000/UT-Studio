@@ -498,7 +498,8 @@ public sealed class AScanVisualDelivery : ICommittedTraceSink, IObservable<AScan
             if (_diagnosticWorkerState == waiter.Expectation.WorkerState &&
                 _diagnosticWorkerWait is { IsCompleted: false } && _generation == waiter.Generation &&
                 _projectionsInFlight == 0 &&
-                (_pending is not null) == waiter.Expectation.HasPendingSnapshot && subscriptionsQuiescent)
+                (_pending is not null) == waiter.Expectation.HasPendingSnapshot &&
+                _replaced >= waiter.Expectation.MinimumReplaced && subscriptionsQuiescent)
             {
                 _diagnosticWaiters.RemoveAt(index);
                 waiter.Completion.TrySetResult();
@@ -734,4 +735,4 @@ internal readonly record struct TraceRequest(TraceIdentity Identity, InspectionR
 internal enum VisualDiagnosticWorkerState { Starting, Processing, WaitingForSignal, WaitingForTimer, Stopped }
 
 internal readonly record struct VisualDiagnosticExpectation(
-    VisualDiagnosticWorkerState WorkerState, bool HasPendingSnapshot);
+    VisualDiagnosticWorkerState WorkerState, bool HasPendingSnapshot, long MinimumReplaced = 0);

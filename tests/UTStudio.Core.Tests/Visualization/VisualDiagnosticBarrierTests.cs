@@ -159,6 +159,8 @@ public sealed class VisualDiagnosticBarrierTests
         delivery.ConfirmAndNotify(metadata, 2, 2, TimeSpan.FromTicks(2), new short[8]);
         await DiagnosticWait.For(projector.WaitForCallsAsync(preparedProjections + 1),
             "latest confirmed trace projected");
+        await delivery.WaitForDiagnosticStateAsync(
+            new(VisualDiagnosticWorkerState.WaitingForTimer, true, MinimumReplaced: 1), Limit);
         Assert.AreEqual(preparedProjections + 1, projector.Calls);
         Assert.AreEqual(preparedCallbacks, callbacks);
         Assert.AreEqual(1L, delivery.Statistics.Replaced);
