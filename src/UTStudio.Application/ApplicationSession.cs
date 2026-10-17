@@ -1,6 +1,7 @@
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Inspection;
+using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 
@@ -21,6 +22,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private readonly Func<AcquisitionRunId, IInspectionRunWriter> _inspectionWriterFactory;
     private readonly ICommittedTraceSink? _bScanSink;
     private readonly ICommittedTraceSink? _aScanSink;
+    private readonly ICommittedGateProcessingIngress? _processingIngress;
+    private readonly CompiledGatePlan? _processingPlan;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
     private Operation? _active;
@@ -31,7 +34,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
     public ApplicationSession(IUtFrameSource source, InspectionId inspectionId,
         Func<AcquisitionRunId, IInspectionRunWriter> inspectionWriterFactory,
-        ICommittedTraceSink? bScanSink = null, ICommittedTraceSink? aScanSink = null)
+        ICommittedTraceSink? bScanSink = null, ICommittedTraceSink? aScanSink = null,
+        ICommittedGateProcessingIngress? processingIngress = null, CompiledGatePlan? processingPlan = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
@@ -43,6 +47,10 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _inspectionWriterFactory = inspectionWriterFactory;
         _bScanSink = bScanSink;
         _aScanSink = aScanSink;
+        if ((processingIngress is null) != (processingPlan is null))
+        { throw new ArgumentException("Processing ingress and plan must be supplied together."); }
+        _processingIngress = processingIngress;
+        _processingPlan = processingPlan;
         _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0, canStart: true);
         _publisher = new SessionSnapshotPublisher(_snapshot);
     }
@@ -124,6 +132,21 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             {
                 // Receiving a descriptor transfers its reader even if the token is already cancelled.
                 operation.Run = run;
+                if (run.Metadata.SourceId != _source.SourceId || run.Metadata.RunId != operation.RunId ||
+                    !SameConfiguration(run.Metadata.Configuration, operation.Configuration))
+                {
+                    throw new InvalidOperationException("The execution descriptor does not match the request.");
+                }
+                if (!operation.CleanupRequested && _processingIngress is not null)
+                {
+                    var stream = new UtStreamIdentity(_inspectionId, operation.RunId, run.Metadata.SourceId,
+                        run.Metadata.Configuration.PhysicalChannelId);
+                    GateProcessingAdmissionStatus admission = _processingIngress.OpenRun(
+                        new(_inspectionId, operation.RunId, [stream], _processingPlan!));
+                    operation.ProcessingOpened = admission == GateProcessingAdmissionStatus.Accepted;
+                    if (!operation.ProcessingOpened)
+                    { AddBranchError(operation, new("session.processing.open", $"Processing admission was {admission}.")); }
+                }
                 if (!operation.CleanupRequested && _bScanSink is not null)
                 {
                     operation.VisualOpened = true;
@@ -139,11 +162,6 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 }
                 operation.Consumer = Task.Run(() => ConsumeAsync(operation, run));
                 operation.Supervisor = Task.Run(() => SuperviseProducerAsync(operation, run));
-                if (run.Metadata.SourceId != _source.SourceId || run.Metadata.RunId != operation.RunId ||
-                    !SameConfiguration(run.Metadata.Configuration, operation.Configuration))
-                {
-                    throw new InvalidOperationException("The execution descriptor does not match the request.");
-                }
                 token.ThrowIfCancellationRequested();
                 if (operation.CleanupRequested) { throw new OperationCanceledException(token); }
                 Publish(operation, SessionPhase.Running);
@@ -223,6 +241,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                                     inspection.Gap).ConfigureAwait(false);
                                 if (commit.IsCommitted)
                                 {
+                                    DeliverCommittedProcessing(operation, frame, commit.Revision);
                                     DeliverCommittedAScan(operation, frame, commit.Revision);
                                     DeliverCommittedBScan(operation, frame, commit.Revision);
                                 }
@@ -396,6 +415,24 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         }
     }
 
+    private void DeliverCommittedProcessing(Operation operation, ConventionalUtFrame frame,
+        InspectionRevision revision)
+    {
+        if (!operation.ProcessingOpened || _processingIngress is null) { return; }
+        try
+        {
+            var configuration = frame.Metadata.Configuration;
+            var stream = new UtStreamIdentity(_inspectionId, operation.RunId, frame.Metadata.SourceId,
+                configuration.PhysicalChannelId);
+            GateProcessingAdmissionStatus status = _processingIngress.NotifyCommitted(
+                new(new TraceIdentity(stream, frame.AcquisitionIndex), revision));
+            if (status is GateProcessingAdmissionStatus.Rejected or GateProcessingAdmissionStatus.Closed)
+            { lock (_gate) { AddBranchError(operation, new("session.processing.signal", $"Processing signal was {status}.")); } }
+        }
+        catch (Exception error)
+        { lock (_gate) { AddBranchError(operation, Describe("session.processing.signal", error)); } }
+    }
+
     private async ValueTask<InspectionAppendResult> CommitInspectionAsync(Operation operation,
         ConventionalUtFrame frame, PendingGap? gap)
     {
@@ -562,6 +599,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 }
             }
 
+            await FinalizeProcessingAsync(operation, sealedRun).ConfigureAwait(false);
             await FinalizeBScanAsync(operation, sealedRun).ConfigureAwait(false);
 
             lock (_gate) { CloseAScan(operation); }
@@ -623,6 +661,41 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         lock (_gate) { CloseVisual(operation); }
         await WaitForVisualCloseAsync(operation).ConfigureAwait(false);
         operation.VisualRunRequiresDrain = false;
+    }
+
+    private async Task FinalizeProcessingAsync(Operation operation, InspectionRunSealResult? sealedRun)
+    {
+        if (!operation.ProcessingOpened || _processingIngress is null) { return; }
+        try { _processingIngress.StopAdmission(operation.RunId); }
+        catch (Exception error)
+        { lock (_gate) { AddBranchError(operation, Describe("session.processing.stop", error)); } }
+
+        if (sealedRun is { } final)
+        {
+            try
+            {
+                _processingIngress.RequestFinalReconciliation(operation.RunId, final.FinalRevision);
+            }
+            catch (Exception error)
+            { lock (_gate) { AddBranchError(operation, Describe("session.processing.final", error)); } }
+        }
+        else
+        { lock (_gate) { AddBranchError(operation, new("session.processing.final", "Processing cannot drain without FinalRevision.")); } }
+
+        try
+        {
+            await _processingIngress.WaitForDrainAsync(operation.RunId).ConfigureAwait(false);
+            operation.ProcessingOpened = false;
+        }
+        catch (Exception error)
+        { lock (_gate) { AddBranchError(operation, Describe("session.processing.drain", error)); } }
+    }
+
+    private static void AddBranchError(Operation operation, UtSourceError error)
+    {
+        if (operation.CleanupErrors.Any(existing => existing.Code == error.Code)) { return; }
+        if (operation.CleanupErrors.Count < 8) { operation.CleanupErrors.Add(error); }
+        else { operation.AdditionalErrorCount++; }
     }
 
     private async Task DisposeCoreAsync(Operation? operation, Task cleanup)
@@ -769,6 +842,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal bool VisualOpened;
         internal bool VisualRunRequiresDrain;
         internal bool AScanOpened;
+        internal bool ProcessingOpened;
         internal UtSourceError? BScanError;
         internal UtSourceError? AScanError;
         internal UtSourceError? VisualError;

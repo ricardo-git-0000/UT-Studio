@@ -1,8 +1,11 @@
 using UTStudio.Application;
 using UTStudio.Contracts.Inspection;
+using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
+using UTStudio.Processing.Core;
+using UTStudio.Core.Tests.Processing;
 
 namespace UTStudio.Core.Tests.Application;
 
@@ -11,6 +14,20 @@ public sealed class ApplicationSessionInspectionStoreTests
 {
     private static readonly ConventionalAcquisitionConfiguration Configuration =
         new(new PhysicalChannelId(0), 8, 50_000_000, firstSampleOffsetSeconds: 0.000_001);
+
+    [TestMethod]
+    [DataRow(1, 1_000_000d, 0.000_003d)]
+    [DataRow(8, 2_000_000d, -0.000_002d)]
+    public async Task ProductivePlanCoversTheCompleteConfiguredTrace(int samples, double rate, double offset)
+    {
+        var inspection = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspection, new(1024, 8));
+        var configuration = new ConventionalAcquisitionConfiguration(new(0), samples, rate, offset);
+        await using ProductiveGateProcessing processing = ProductiveGateProcessingFactory.Create(stores.Store, configuration);
+        GateWindowDefinition window = processing.Plan.DeclaredGates.Single().Definition.Window;
+        Assert.AreEqual(offset, window.StartOffsetSeconds);
+        Assert.AreEqual(samples / rate, window.DurationSeconds);
+    }
 
     [TestMethod]
     public async Task CommittedFrameIsAuthoritativeBeforeVisualProjectionAndSurvivesOwnerReturn()
@@ -291,6 +308,62 @@ public sealed class ApplicationSessionInspectionStoreTests
         Assert.AreEqual(1, stores.Store.Diagnostics.SealedRuns);
     }
 
+    [TestMethod]
+    public async Task Scenarios01_02_08_CommitPrecedesSampleFreeProcessingAndThenVisualBranches()
+    {
+        await using var source = new ManualSessionSource(); var inspection = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspection, new(1024, 10));
+        var events = new List<string>(); var processing = new ProcessingProbe(stores.Store, events);
+        var b = new OrderedSink("B", events); var a = new OrderedSink("A", events);
+        await using var session = new ApplicationSession(source, inspection, stores.OpenRun, b, a,
+            processing, ProcessingPlan());
+        await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
+        var owner = source.QueueFrame(0); await owner.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        CollectionAssert.AreEqual(new[] { "processing", "A", "B" }, events.Take(3).ToArray());
+        Assert.IsTrue(processing.StoreWasAuthoritative);
+        Assert.IsFalse(typeof(GateProcessingSignal).GetProperties().Any(x =>
+            x.Name.Contains("Sample", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [TestMethod]
+    [DataRow(GateProcessingAdmissionStatus.Rejected, false)]
+    [DataRow(GateProcessingAdmissionStatus.Closed, false)]
+    [DataRow(GateProcessingAdmissionStatus.Accepted, true)]
+    public async Task Scenarios09_10_17_ProcessingFailureNeverUndoesCommitOrBlocksVisuals(
+        GateProcessingAdmissionStatus status, bool throws)
+    {
+        await using var source = new ManualSessionSource(); var inspection = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspection, new(1024, 10));
+        var processing = new ProcessingProbe(stores.Store, [], status, throws);
+        var b = new CountingSink(); var a = new CountingSink();
+        await using var session = new ApplicationSession(source, inspection, stores.OpenRun, b, a,
+            processing, ProcessingPlan());
+        AcquisitionRunId run = new(Guid.NewGuid());
+        await session.StartAsync(Configuration, run).WaitAsync(TimeSpan.FromSeconds(10));
+        var owner = source.QueueFrame(0); await owner.Returned.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(1UL, stores.Store.Revision.Value);
+        Assert.AreEqual(1, a.AcceptCount); Assert.AreEqual(1, b.AcceptCount);
+        InspectionTraceReadResult read = await stores.Store.ReadAsync(new(new(inspection, run, source.SourceId,
+            Configuration.PhysicalChannelId), 0));
+        Assert.AreEqual(InspectionReadStatus.Available, read.Status); read.Lease!.Dispose();
+    }
+
+    [TestMethod]
+    public async Task ProcessingCleanupAttemptsDrainAfterFinalReconciliationFails()
+    {
+        await using var source = new ManualSessionSource(); var inspection = new InspectionId(Guid.NewGuid());
+        await using var stores = new InspectionDataStoreRegistry(inspection, new(1024, 10));
+        var processing = new FinalFailureProbe();
+        await using var session = new ApplicationSession(source, inspection, stores.OpenRun,
+            new CountingSink(), new CountingSink(), processing, ProcessingPlan());
+        await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
+        await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsTrue(processing.DrainAttempted);
+        Assert.IsTrue(session.Snapshot.CleanupErrors.Any(x => x.Code == "session.processing.final"));
+    }
+
     private sealed class StoreCheckingSink(IInspectionDataStore store, InspectionId inspectionId,
         AcquisitionRunId runId, UtSourceId sourceId) : ICommittedTraceSink
     {
@@ -316,6 +389,48 @@ public sealed class ApplicationSessionInspectionStoreTests
         public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision) => AcceptCount++;
         public void CloseRun(AcquisitionRunId runId) { }
     }
+
+    private sealed class OrderedSink(string name, List<string> events) : ICommittedTraceSink
+    {
+        public void OpenRun(AcquisitionRunId runId) { }
+        public void NotifyCommitted(TraceIdentity identity, InspectionRevision revision) => events.Add(name);
+        public void CloseRun(AcquisitionRunId runId) { }
+    }
+
+    private sealed class ProcessingProbe(IInspectionDataStore store, List<string> events,
+        GateProcessingAdmissionStatus notification = GateProcessingAdmissionStatus.Accepted,
+        bool throws = false) : ICommittedGateProcessingIngress
+    {
+        internal bool StoreWasAuthoritative;
+        public GateProcessingAdmissionStatus OpenRun(GateProcessingRunRegistration registration) => GateProcessingAdmissionStatus.Accepted;
+        public GateProcessingAdmissionStatus NotifyCommitted(GateProcessingSignal signal)
+        {
+            InspectionTraceReadResult read = store.ReadAsync(signal.TraceIdentity).AsTask().GetAwaiter().GetResult();
+            StoreWasAuthoritative = read.Status == InspectionReadStatus.Available && read.Revision == signal.Revision;
+            read.Lease?.Dispose(); events.Add("processing");
+            if (throws) { throw new InvalidOperationException("synthetic processing failure"); }
+            return notification;
+        }
+        public void NotifyProviderProgress(AcquisitionRunId runId) { }
+        public void RequestFinalReconciliation(AcquisitionRunId runId, InspectionRevision finalRevision) { }
+        public void StopAdmission(AcquisitionRunId runId) { }
+        public ValueTask WaitForDrainAsync(AcquisitionRunId runId) => ValueTask.CompletedTask;
+    }
+
+    private sealed class FinalFailureProbe : ICommittedGateProcessingIngress
+    {
+        internal bool DrainAttempted;
+        public GateProcessingAdmissionStatus OpenRun(GateProcessingRunRegistration registration) => GateProcessingAdmissionStatus.Accepted;
+        public GateProcessingAdmissionStatus NotifyCommitted(GateProcessingSignal signal) => GateProcessingAdmissionStatus.Accepted;
+        public void NotifyProviderProgress(AcquisitionRunId runId) { }
+        public void RequestFinalReconciliation(AcquisitionRunId runId, InspectionRevision finalRevision) =>
+            throw new InvalidOperationException("final");
+        public void StopAdmission(AcquisitionRunId runId) { }
+        public ValueTask WaitForDrainAsync(AcquisitionRunId runId) { DrainAttempted = true; return ValueTask.CompletedTask; }
+    }
+
+    private static CompiledGatePlan ProcessingPlan() => new GatePlanCompiler().Compile(
+        GateTestPlan.Plan([GateTestPlan.Gate("A", durationSeconds: 0.0000001)])).CompiledPlan!;
 
     private sealed class FailingNotifySink : ICommittedTraceSink
     {

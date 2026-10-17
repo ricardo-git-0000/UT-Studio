@@ -251,7 +251,7 @@ public interface IInspectionStreamStateProvider
 }
 
 public interface IInspectionDataStore : IInspectionDataWriter, IUtTraceProvider, IInspectionRangeProvider,
-    IInspectionStreamStateProvider, IAsyncDisposable
+    IInspectionStreamStateProvider, IInspectionChangeProvider, IAsyncDisposable
 {
     InspectionRevision Revision { get; }
     StoreDiagnostics Diagnostics { get; }

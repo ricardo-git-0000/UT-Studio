@@ -32,16 +32,24 @@ Los contratos compartidos se ubican en `UTStudio.Contracts/Processing`; los valu
 revisión se ubican en `UTStudio.Domain/Processing`. `Contracts` depende de `Domain`, y ninguno depende de
 `Processing.Core`.
 
-El flujo futuro será:
+El flujo de Fase 3 es:
 
-`commit RF -> aviso sample-free acotado y lossless -> lease IUtTraceProvider -> evaluación -> liberar lease
--> commit derivado atómico -> notificación a consumidores`.
+`commit RF -> aviso sample-free acotado -> reconciliación por InspectionRevision -> lease IUtTraceProvider
+-> evaluación -> sink transitorio -> liberar lease`. El commit derivado y su notificación corresponden a
+Fase 4 y todavía no existen.
 
 El puerto de ingreso de procesamiento será distinto de `ICommittedTraceSink`. Su saturación será
-observable y nunca usará `DropOldest`, coalescing ni fallback silencioso. Una cola no constituye por sí
+observable y nunca usará `DropOldest`, coalescing de trabajo lógico ni fallback silencioso; los avisos
+sample-free sí pueden coalescerse en un watermark porque el catálogo conserva todas las identidades. Una cola no constituye por sí
 sola una garantía lossless: el scheduler deberá reconciliar identidades/revisiones confirmadas contra la
 autoridad —y `FinalRevision` al sellar— o usar un outbox/ledger futuro. Un fallo derivado no revierte el
 commit RF.
+
+La implementación usa un catálogo paginado de commits (`Trace` o `GapOnly`) como extensión necesaria del
+store autoritativo. La señal solo eleva un watermark coalescido: pérdida, duplicación, desorden, llegada tardía
+o saturación no elimina trabajo lógico, y el sellado obliga a reconciliar hasta `FinalRevision`. El punto de
+admisión es `OpenRun`; después de aceptarlo, Stop drena la run. El estado queda acotado por runs, streams,
+épocas de plan y tamaño de página, no por número de trazas.
 
 Cada plan será un snapshot inmutable identificado y versionado. El compilador rechazará IDs duplicados,
 referencias ausentes, autorreferencias, ciclos, parámetros inválidos y combinaciones no soportadas; emitirá

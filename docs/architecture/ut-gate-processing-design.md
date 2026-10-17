@@ -1,6 +1,6 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 2 implementada; ADR 0017 aceptado**.
+Fecha: 2026-10-16. Estado: **Fase 3 implementada; matriz P1/P2/P3 cerrada; ADR 0017 aceptado**.
 
 ## 1. Alcance y autoridad
 
@@ -12,7 +12,8 @@ Requisitos confirmados por la petición vigente:
 - determinismo, memoria/colas acotadas, cancelación y resultados versionados;
 - `InspectionDataStore` conserva la autoridad RF; resultados de puertas son derivados reconstruibles;
 - Fase 2 implementa exclusivamente evaluación síncrona neutral de una traza; pipeline, stores, UI, C-Scan,
-  persistencia y paquetes nuevos quedan fuera de su alcance.
+  persistencia y paquetes nuevos quedan fuera de Fase 2; Fase 3 incorpora únicamente la orquestación
+  post-commit y un consumo transitorio sin retención.
 
 Las quince decisiones del apartado 15 están aceptadas para el primer incremento.
 
@@ -34,6 +35,48 @@ identidades y revisiones estables viven en `UTStudio.Domain/Processing`; los con
 en `UTStudio.Contracts/Processing`. `Contracts` depende de `Domain`, y ninguno depende de `Processing.Core`.
 
 Propietario de los documentos de esta fase: agente principal. Revisores especializados: solo lectura.
+
+### Orquestación productiva de Fase 3
+
+`ApplicationSession` valida el frame y confirma RF y gaps atómicamente. Solo si el resultado es `Committed`
+envía `TraceIdentity + InspectionRevision` al puerto de procesamiento y después notifica A-Scan y B-Scan.
+La señal no contiene muestras, es un aviso de progreso y nunca es autoridad. Rechazo, cierre o fallo del
+procesador se registra como error de rama y no revierte el commit RF.
+
+El scheduler conserva por run únicamente cursor, revisión objetivo, streams y épocas de plan: no encola una
+entrada por traza. Su presupuesto predeterminado es dos runs, ocho streams y ocho épocas por run, más páginas
+de 256 cambios; los máximos se validan al construir. Una run o época que excede capacidad se rechaza con estado
+tipado y saturación contabilizada. Las señales aceptadas se coalescen en el watermark y no bloquean esperando
+al worker. Duplicadas, tardías o desordenadas no provocan doble evaluación.
+
+La reconciliación consulta el catálogo autoritativo en el intervalo `(cursor, objetivo]`, sin equiparar
+`Sequence`, `AcquisitionIndex` e `InspectionRevision`. Un cambio `GapOnly` avanza el cursor sin fabricar una
+traza. Para `Trace`, Processing.Core hace una lectura exacta por identidad, valida identidad y revisión, copia
+las muestras dentro de la llamada, evalúa el `CompiledGatePlan` de la época fijada y espera el callback del sink.
+El lease se libera en `finally`. `NotAvailable` provisional conserva el cursor y se reintenta con la próxima
+señal o con `NotifyProviderProgress`; este aviso de disponibilidad evita polling y delays arbitrarios. Los demás
+estados permanecen diferenciados y diagnosticados.
+
+Al cambiar de plan, el nuevo snapshot entra en vigor desde una revisión explícita; el trabajo anterior mantiene
+su plan y no se generan batches híbridos. No hay reprocesado histórico: un rango sin época válida se rechaza y
+queda diagnosticado para Fase 5.
+
+El cierre normal detiene la fuente, drena frames y commits, sella la run, publica `FinalRevision`, cierra la
+admisión y espera cursor final, evaluaciones, callbacks y leases antes de cerrar las proyecciones. La cancelación
+del worker se reserva para `Dispose` excepcional. El sink de Fase 3 recibe batches inmutables prestados, en orden
+de revisión y mediante callback esperado; puede aceptar, rechazar, fallar o cancelar, pero no retenerlos. No hay
+durabilidad, persistencia ni store derivado hasta Fase 4.
+
+El diagnóstico es un snapshot inmutable por run, nunca una selección global de plan. Expone `RunId`, lifecycle,
+revisión y firma del plan activo, revisiones objetivo/observada/reconciliada/final, finalidad confirmada,
+watermarks por stream, balances por época, trabajo admitido/terminal/pendiente, recursos activos y último error
+estructurado. Las runs retiradas pasan a un FIFO terminal acotado (ocho por defecto). Las lecturas concurrentes
+se construyen bajo el mismo lock, de modo que no combinan campos de runs o épocas distintas.
+
+Por cada run y plan se exige `ConfirmedEligible = EvaluatedAndDelivered + ExplicitlyRejectedBeforeAdmission +
+TerminallyFailed + ExplicitlyUnprocessedByPlanTransition`. `Drained` requiere además `FinalRevision`
+reconciliada y saldo cero de workers, callbacks y leases. Gaps, índices ausentes, señales y revisiones
+coalescidas no son identidades elegibles ni resultados terminales.
 
 ## 3. Modelo inmutable y versionado
 
@@ -287,31 +330,30 @@ aportan valor con medida válida; estado y calidad conservan todos los resultado
 ```text
 ApplicationSession confirma RF en autoridad
   -> aviso sample-free (TraceIdentity, InspectionRevision)
-  -> scheduler/cola acotados, sin drop/coalescing, reconciliables por revisión
+  -> scheduler por watermarks acotados; señales coalescidas, sin drop lógico
   -> worker obtiene lease exacto de IUtTraceProvider
   -> GateEvaluator evalúa bajo el lease
+  -> sink transitorio esperado, sin retención ni durabilidad
   -> lease.Dispose en finally
-  -> writer derivado confirma lote todo-o-nada
-  -> notificación sample-free a consumidores
 ```
 
-El aviso visual `ICommittedTraceSink` no se reutiliza. El puerto futuro de procesamiento debe expresar
-admisión, saturación y cierre; la política exacta (esperar, rechazar contabilizadamente o parar) depende de
-capacidades y presupuesto. Nunca desaparece una identidad confirmada silenciosamente. La cola no basta
-para cubrir la carrera commit→enqueue ni una caída: un cursor/watermark, dirty coverage o outbox futuro debe
-permitir reconciliar desde la autoridad. Al sellar una run, procesamiento compara su cobertura con
+El aviso visual `ICommittedTraceSink` no se reutiliza. `ICommittedGateProcessingIngress` expresa admisión,
+saturación y cierre. Nunca desaparece una identidad confirmada silenciosamente. La señal no basta para cubrir
+la carrera commit→enqueue: el cursor/watermark reconcilia el catálogo paginado de la autoridad. El catálogo
+comparte el máximo de entradas configurado del store y el scheduler no conserva una cola por traza. Al sellar
+una run, procesamiento compara su cobertura con
 `FinalRevision` antes de declararse drenado.
 
 Orden de cierre aceptado: cerrar admisión RF/procesamiento; detener productor y drenar commits; sellar la run
 RF y obtener `FinalRevision`; reconciliar trabajo pendiente; drenar todo el backlog admitido; esperar workers
-y leases; sellar/finalizar derivados; cerrar store RF. Stop no cancela trabajo admitido como política normal.
-Un timeout solo diagnostica y no fuerza liberación. Un worker no hace `await` ni publica callbacks externos
-mientras conserva el lease.
+y leases; cerrar el sink transitorio; cerrar store RF. Stop no cancela trabajo admitido como política normal.
+Un timeout solo diagnostica y no fuerza liberación. El único callback externo se espera antes de liberar el
+lease; el batch no contiene ni presta muestras y el sink no puede retenerlo.
 
 El lote de una traza se confirma todo-o-nada. Si se observa cancelación tras admitir el work item, se descartan
-intermedios y el evaluator devuelve un batch completo con todas las puertas `Cancelled`, sin medidas. El writer
-lo confirma atómicamente como resultado auditable; cancelar la espera del llamador no cancela ese cleanup/commit
-ya admitido. Las dependencias no se evalúan dentro de un batch cancelado. Se comprueba antes de adquirir lease,
+intermedios y el evaluator devuelve un batch completo con todas las puertas `Cancelled`, sin medidas. Fase 3
+solo lo contabiliza; la confirmación atómica de derivados corresponde a Fase 4. Las dependencias no se evalúan
+dentro de un batch cancelado. Se comprueba antes de adquirir lease,
 entre puertas y por bloques largos con stride medido/documentado.
 
 ## 10. Store derivado, invalidación y reprocesado

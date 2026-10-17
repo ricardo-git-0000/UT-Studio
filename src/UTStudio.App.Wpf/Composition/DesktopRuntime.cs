@@ -8,6 +8,7 @@ using UTStudio.Application;
 using UTStudio.App.Wpf.Services;
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
+using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 using UTStudio.Inspection.Core;
@@ -32,6 +33,7 @@ public sealed class DesktopRuntime
     private BScanWindowManager? _bScanWindows;
     private ApplicationSession? _session;
     private InspectionDataStoreRegistry? _inspectionStores;
+    private ProductiveGateProcessing? _processing;
     private AScanHostViewModel? _viewModel;
     private MainWindow? _mainWindow;
     private SharedScanTimeViewport? _timeViewport;
@@ -116,6 +118,7 @@ public sealed class DesktopRuntime
         await TryDisposeAsync(() => _bScanIngress?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _selection?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _visual?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
+        await TryDisposeAsync(() => _processing?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _inspectionStores?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _timeViewport?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _source?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
@@ -228,6 +231,8 @@ public sealed class DesktopRuntime
                 builder.Configuration.GetValue<int?>("InspectionStore:TargetChunkBytes") ?? 4 * 1024 * 1024);
             var inspectionStores = runtime._inspectionStores = new InspectionDataStoreRegistry(
                 new InspectionId(Guid.NewGuid()), inspectionOptions);
+            var processing = runtime._processing = ProductiveGateProcessingFactory.Create(
+                inspectionStores.Store, configuration);
             var visual = runtime._visual = new AScanVisualDelivery(inspectionStores.Store, timeProvider: clock);
             var bScanIngress = runtime._bScanIngress = new BScanIngress(
                 inspectionStores.Store, inspectionStores.Store, bScanOptions, clock);
@@ -236,7 +241,7 @@ public sealed class DesktopRuntime
                 : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
             checkpoint?.Invoke("visual");
             var session = runtime._session = new ApplicationSession(source, inspectionStores.InspectionId,
-                runId => inspectionStores.OpenRun(runId), bScanIngress, visual);
+                runId => inspectionStores.OpenRun(runId), bScanIngress, visual, processing.Ingress, processing.Plan);
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
             var selection = runtime._selection = new TraceSelectionScope(dispatcher, selectionResolver);
@@ -255,6 +260,8 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton<IObservable<AScanSnapshot>>(visual);
             builder.Services.AddSingleton(session);
             builder.Services.AddSingleton(inspectionStores);
+            builder.Services.AddSingleton(processing);
+            builder.Services.AddSingleton<ICommittedGateProcessingIngress>(processing.Ingress);
             builder.Services.AddSingleton<IApplicationSession>(session);
             builder.Services.AddSingleton(viewModel);
             builder.Services.AddSingleton(aScanContext);

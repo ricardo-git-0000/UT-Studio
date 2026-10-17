@@ -25,10 +25,10 @@ public sealed class GateEvaluator
         if (plan is null || trace is null)
         { return GateEvaluationResult.Failed(GateEvaluationErrorCode.InvalidInput, "A compiled plan and confirmed trace are required."); }
         TraceDescriptor descriptor = trace.Descriptor;
+        if (trace.EffectiveQuality == UtTraceQuality.Invalid) { return CompletedTerminal(plan, trace, GateResultStatus.InvalidTrace); }
         if (samples.Length != descriptor.SampleCount)
         { return GateEvaluationResult.Failed(GateEvaluationErrorCode.InvalidInput, "Sample length must match the confirmed descriptor."); }
         if (IsCancelled(GateEvaluationCheckpoint.BeforeStart, cancellationToken)) { return Cancelled(plan, trace); }
-        if (trace.EffectiveQuality == UtTraceQuality.Invalid) { return CompletedTerminal(plan, trace, GateResultStatus.InvalidTrace); }
 
         bool needsScratch = plan.DeclaredGates.Any(x => x.Definition.Detector.Kind is
             GateDetectorKind.FirstLocalMaximum or GateDetectorKind.LastLocalMaximum);

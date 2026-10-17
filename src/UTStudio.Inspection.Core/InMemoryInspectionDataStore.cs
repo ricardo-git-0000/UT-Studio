@@ -37,6 +37,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
     private readonly Dictionary<GapKey, GapRecord> _gaps = [];
     private readonly Dictionary<UtStreamIdentity, int> _gapCountsByStream = [];
     private readonly Dictionary<AcquisitionRunId, RunState> _runs = [];
+    private readonly List<InspectionCommittedChange> _changes = [];
     private readonly List<Chunk> _chunks = [];
     private Chunk? _activeChunk;
     private bool _accepting = true, _leasesAllowed = true, _closing, _closed;
@@ -168,6 +169,25 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
         }
     }
 
+    public ValueTask<InspectionChangePage> ReadChangesAsync(InspectionChangeQuery query,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(!_leasesAllowed, this);
+            if (query.InspectionId != _inspectionId) { throw new ArgumentException("The query belongs to another inspection.", nameof(query)); }
+            InspectionRevision through = new(Math.Min(query.ThroughInclusive.Value, _revision));
+            InspectionCommittedChange[] changes = _changes.Where(change => change.RunId == query.RunId &&
+                change.Revision.Value > query.AfterExclusive.Value && change.Revision.Value <= through.Value)
+                .Take(query.MaximumCount).ToArray();
+            bool hasMore = changes.Length == query.MaximumCount && _changes.Any(change => change.RunId == query.RunId &&
+                change.Revision.Value > changes[^1].Revision.Value && change.Revision.Value <= through.Value);
+            InspectionRevision scanned = hasMore ? changes[^1].Revision : through;
+            return ValueTask.FromResult(new InspectionChangePage(scanned, Array.AsReadOnly(changes), hasMore));
+        }
+    }
+
     public async ValueTask<InspectionAppendResult> AppendAsync(InspectionTraceInput trace,
         CancellationToken cancellationToken = default)
     {
@@ -258,12 +278,13 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                         Chunk? priorActive = _activeChunk;
                         int priorChunkCount = _chunks.Count;
                         bool primaryAdded = false, streamCreated = false, streamAdded = false,
-                            chunkAdded = false, logicalAdded = false;
+                            chunkAdded = false, logicalAdded = false, changeAdded = false;
                         var addedGaps = new List<GapKey>();
                         try
                         {
                             EnsureChunkUnderLock(trace.Descriptor, bytes);
-                            entry = new Entry(trace.Descriptor, owner, _activeChunk!,
+                            var committedRevision = new InspectionRevision(checked(_revision + 1));
+                            entry = new Entry(trace.Descriptor, committedRevision, owner, _activeChunk!,
                                 commit.Gaps.Select(GapKey.From).ToArray());
                             TestHooks?.AfterTracePrepared?.Invoke();
                             for (int gapIndex = 0; gapIndex < commit.Gaps.Count; gapIndex++)
@@ -291,7 +312,10 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                             _activeChunk.UsedBytes = checked(_activeChunk.UsedBytes + bytes);
                             _logicalBytes = checked(_logicalBytes + bytes); logicalAdded = true;
                             TestHooks?.BeforeRevisionPublished?.Invoke();
-                            _revision = checked(_revision + 1);
+                            _changes.Add(new(committedRevision, trace.Descriptor.Identity.Stream.AcquisitionRunId,
+                                trace.Descriptor.Identity.Stream, InspectionCommittedChangeKind.Trace,
+                                trace.Descriptor.Identity)); changeAdded = true;
+                            _revision = committedRevision.Value;
                             if (runWriter is not null)
                             { _runs[runWriter.RunId].RecordCommit(trace.Descriptor, addedGaps.Count, new(_revision)); }
                             _committedTraces = checked(_committedTraces + 1);
@@ -299,6 +323,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                         }
                         catch (Exception primary)
                         {
+                            if (changeAdded) { _changes.RemoveAt(_changes.Count - 1); }
                             if (logicalAdded) { _logicalBytes -= bytes; }
                             if (chunkAdded) { _activeChunk!.Entries.Remove(entry!); _activeChunk.UsedBytes -= bytes; }
                             if (_index.TryGetStream(trace.Descriptor.Identity.Stream, out var rollbackStream))
@@ -415,12 +440,15 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                     try
                     {
                         TestHooks?.BeforeRevisionPublished?.Invoke();
+                        _changes.Add(new(revision, gap.Stream.AcquisitionRunId, gap.Stream,
+                            InspectionCommittedChangeKind.GapOnly));
                         _revision = revision.Value;
                         _runs[runWriter.RunId].RecordGap();
                         committed = true;
                     }
                     catch
                     {
+                        if (_changes.Count > 0 && _changes[^1].Revision == revision) { _changes.RemoveAt(_changes.Count - 1); }
                         _gaps.Remove(key);
                         DecrementGapCountUnderLock(gap.Stream);
                         throw;
@@ -458,7 +486,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                 return ValueTask.FromResult(InspectionTraceReadResult.Unavailable(missing, new(_revision)));
             }
             return ValueTask.FromResult(InspectionTraceReadResult.Available(
-                new(_revision), CreateLeaseUnderLock(entry!)));
+                entry!.Revision, CreateLeaseUnderLock(entry)));
         }
     }
 
@@ -942,10 +970,12 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
             MinimumIndex, MaximumIndex, MinimumSequence, MaximumSequence);
     }
 
-    internal sealed class Entry(TraceDescriptor descriptor, ImmutableShortMemory samples, Chunk chunk,
+    internal sealed class Entry(TraceDescriptor descriptor, InspectionRevision revision,
+        ImmutableShortMemory samples, Chunk chunk,
         IReadOnlyList<GapKey> gaps)
     {
         internal TraceDescriptor Descriptor { get; } = descriptor;
+        internal InspectionRevision Revision { get; } = revision;
         internal ImmutableShortMemory Samples { get; } = samples;
         internal Chunk Chunk { get; } = chunk;
         internal IReadOnlyList<GapKey> Gaps { get; } = gaps;

@@ -36,7 +36,10 @@ se sobrescribe. Duplicate, Conflict, CapacityExceeded, Cancelled y Faulted son r
 Cancelación precommit revierte; después del commit no deshace datos.
 
 Flujo actual implementado: simulador → Channel → ApplicationSession (único lector) → commit autoritativo.
-Tras `Committed`, A y B reciben solo `TraceIdentity`+revisión. A lee mediante `IUtTraceProvider`; B
+Tras `Committed`, la rama de procesamiento recibe primero una señal sample-free y reconcilia por
+`InspectionRevision` contra un catálogo autoritativo; después A y B reciben `TraceIdentity`+revisión. El worker
+de procesamiento lee mediante `IUtTraceProvider`, evalúa un plan compilado fijado y entrega a un sink transitorio
+sin persistencia. A lee mediante `IUtTraceProvider`; B
 reconcilia estado mediante `IInspectionStreamStateProvider` y lee páginas de hasta 256 posiciones con
 `IInspectionRangeProvider`. Ambos proyectan bajo leases retenidos solo en Visualization.Core. Véanse
 [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md) y su refinamiento en
@@ -53,11 +56,11 @@ El presupuesto de reducción es configurable entre 4 y 1.024 puntos; conserva pr
 admisión, error y continuidad independientes. Un fallo de A no impide intentar B, ni a la inversa;
 ambos se agregan con códigos estructurados sin alterar el commit autoritativo.
 
-La futura distribución tendrá ramas separadas:
+La distribución mantiene ramas separadas:
 
 | Rama futura | Política aprobada |
 | --- | --- |
-| Procesamiento | Sin pérdida silenciosa; saturación, discontinuidades y fallos observables |
+| Procesamiento | Watermarks acotados y reconciliación autoritativa; saturación, discontinuidades y fallos observables |
 | Almacenamiento | Sin pérdida silenciosa; confirmaciones y recuperación conforme al ADR 0003 |
 | Visualización | Latest-only de snapshots independientes; sustitución contabilizada exclusivamente en esta rama |
 | Métricas | Muestreo de publicación/observación; no exige consumir cada payload |
@@ -70,9 +73,8 @@ ensamblados parciales, buffers en procesamiento, leases y caches en el límite t
 tiempo de absorción como bytes disponibles / exceso de bytes por segundo.
 Un ChannelReader no se comparte entre consumidores competidores: dividirían frames. Application conserva
 el único lector, confirma en el store y notifica A/B después del commit. Los leases de A/B protegen la
-lectura autoritativa durante la proyección; no existe copia RF propietaria de B. Procesamiento y
-persistencia futuros requerirán ramas separadas sin pérdida silenciosa y mantienen abierta su estrategia
-de ownership.
+lectura autoritativa durante la proyección; no existe copia RF propietaria de B. Procesamiento ya usa una rama
+separada reconciliable; la persistencia futura mantendrá otra rama sin pérdida silenciosa.
 
 La retención RF pertenece exclusivamente al store autoritativo. B mantiene sólo reducciones e
 índices derivados bajo el presupuesto visual y coalesce notificaciones como estado latest-only:
@@ -87,8 +89,8 @@ El intervalo representado por un snapshot incremental describe únicamente su tr
 Memoria UT contigua reutilizable; evitar asignaciones innecesarias en adquisición. La implementación visual actual sí asigna puntos propios por entrada interesada; su coste está pendiente de benchmark. El contenido publicado es inmutable. Un propietario devuelve el buffer exactamente una vez; no reutilizarlo mientras un consumidor lo conserva. `Span<T>` no atraviesa esperas asíncronas; `Memory<T>` exige vida útil documentada.
 ADR 0007 define ownership del frame y adquisición; la revisión de ADR 0008 sustituye para esta rama visual su antigua transferencia a mailbox/coordinador por préstamo síncrono y liberación en Application. Frame `ReadOnlyMemory<short>` RF bipolar; representación binaria de rectificadas reales abierta. ChannelCapacity=4 y BufferCount=8 son configurables internos del simulador sujetos a benchmarks, no propiedades del contrato general. Cancelar, fallar, descartar o drenar libera todos los buffers implicados. Los observadores lentos no retienen muestras UT. El snapshot A-Scan sí sobrevive a devolver y sobrescribir el buffer UT porque posee datos independientes. Presupuestar pendiente, actual, proyección en curso y estado por suscriptor; no afirmar 30 asignaciones/s ni cuatro snapshots como límite demostrado.
 
-En live convencional, `ApplicationSession` confirma primero el store y luego notifica de forma
-sample-free a A y B, aislando sus fallos. `BScanVisualDelivery` publica regiones latest-only;
+En live convencional, `ApplicationSession` confirma primero el store, notifica procesamiento y luego A y B,
+siempre de forma sample-free y aislando sus fallos. `BScanVisualDelivery` publica regiones latest-only;
 `BScanViewModel` conserva el owner y App.Wpf copia por filas al `WriteableBitmap`. Cerrar una ventana B
 retira sólo su consumidor.
 
@@ -106,7 +108,7 @@ selección B→A continúa consultando el rango residente y el proveedor de traz
 raster remuestreado o reconstruido.
 
 ## Saturación e integridad
-Visualización sustituye snapshots independientes pendientes mediante latest-only y cuenta esas sustituciones; no descarta frames del Channel de adquisición. Las futuras ramas de procesamiento y almacenamiento no descartan silenciosamente. Si el dispositivo permite pausar de forma segura, la coordinación puede usarlo; si se desconoce, no usar bloqueo del receptor como política de backpressure; emitir fallo observable y coordinar parada conforme a capacidades. Saturación/disco lleno produce estado de fallo observable, discontinuidad registrada y parada conforme a capacidades reales.
+Visualización sustituye snapshots independientes pendientes mediante latest-only y cuenta esas sustituciones; no descarta frames del Channel de adquisición. Procesamiento reconcilia watermarks sin descarte lógico y la futura rama de almacenamiento tampoco descartará silenciosamente. Si el dispositivo permite pausar de forma segura, la coordinación puede usarlo; si se desconoce, no usar bloqueo del receptor como política de backpressure; emitir fallo observable y coordinar parada conforme a capacidades. Saturación/disco lleno produce estado de fallo observable, discontinuidad registrada y parada conforme a capacidades reales.
 Acotar ventana y plazo de reordenación/ensamblado. Detectar pérdidas, duplicados, overrun, paquetes fuera de orden e imágenes incompletas. Decidir si estas últimas se rechazan o conservan marcadas; nunca tratarlas como completas.
 Cerrar sólo BScanWindow cancela su ViewModel/solicitudes y retira su consumidor temporal sin detener
 sesión. El cierre de run B es monotónico: `Open → AdmissionClosed → Draining → Frozen → Disposed`.

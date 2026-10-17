@@ -13,6 +13,7 @@ using UTStudio.App.Wpf.Services;
 using UTStudio.Contracts.Acquisition;
 using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Inspection;
+using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 using UTStudio.Visualization.Core;
@@ -25,6 +26,20 @@ namespace UTStudio.Tests.Wpf;
 [TestClass]
 public sealed class CompositionTests
 {
+    [TestMethod]
+    public Task ProductiveGateProcessingFactoryIsRegisteredWithItsSampleFreeIngress() => StaTest.Run(async () =>
+    {
+        var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
+        try
+        {
+            ProductiveGateProcessing processing = runtime.Host.Services.GetRequiredService<ProductiveGateProcessing>();
+            ICommittedGateProcessingIngress ingress = runtime.Host.Services.GetRequiredService<ICommittedGateProcessingIngress>();
+            Assert.AreSame(processing.Ingress, ingress);
+            Assert.IsNotNull(processing.Plan);
+        }
+        finally { await runtime.Shutdown.ShutdownAsync(); }
+    });
+
     [TestMethod]
     [DataRow("visual")]
     [DataRow("host")]

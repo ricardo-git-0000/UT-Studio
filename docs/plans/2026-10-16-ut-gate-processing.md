@@ -1,6 +1,6 @@
 # Plan aprobado por fases — procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 2 implementada; fases posteriores no iniciadas**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
+Fecha: 2026-10-16. Estado: **Fase 3 implementada; matriz de aceptación cerrada; fases posteriores no iniciadas**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
 Diseño: [procesamiento neutral](../architecture/ut-gate-processing-design.md).
 
 ## Propiedad y alcance
@@ -40,12 +40,20 @@ nueve detectores; benchmark independiente, cadena, fan-out y señal local advers
 
 ## Fase 3 — orquestación post-commit
 
-Introducir puerto sample-free de procesamiento distinto del visual, scheduler/cola acotados y reconciliación
-por revisión contra la autoridad; el worker adquiere/libera leases del provider. Stop cierra admisión y drena
-todo lo admitido. Definir saturación, cancelación excepcional y métricas. No persistir derivados.
+Implementado un puerto sample-free distinto del visual, un scheduler por watermarks acotados y un catálogo
+autoritativo paginado de cambios por `InspectionRevision`. El worker adquiere exactamente un lease por traza
+disponible, evalúa el plan fijado y entrega el batch prestado a un sink transitorio que no lo retiene. Stop
+cierra admisión, sella la run y reconcilia hasta `FinalRevision` antes de cerrar las proyecciones. La capacidad
+predeterminada es dos runs, ocho streams y ocho épocas de plan por run; cada página contiene como máximo 256
+cambios (límite contractual 4.096). No existe cola por traza ni store derivado.
 
 Gate: ningún drop silencioso incluida la carrera commit→enqueue, reconciliación hasta `FinalRevision`, lease
 exactamente una vez, commit RF independiente y carga/cierre/fallos cubiertos.
+
+Cierre P1/P2/P3: matriz trazable de 73 escenarios en
+[aceptación de Fase 3](2026-10-17-ut-gate-processing-phase3-acceptance.md), smoke determinista y benchmarks
+propios del orquestador, contabilidad lossless por run/plan y diagnóstico multirun inmutable con historial
+terminal acotado.
 
 ## Fase 4 — store derivado en RAM
 

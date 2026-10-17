@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\UTStudio.Domain\UTStudio.Domain.csproj" />
     <ProjectReference Include="..\UTStudio.Contracts\UTStudio.Contracts.csproj" />
+    <ProjectReference Include="..\UTStudio.Processing.Core\UTStudio.Processing.Core.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
