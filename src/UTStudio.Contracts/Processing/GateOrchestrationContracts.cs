@@ -6,7 +6,10 @@ using UTStudio.Domain.Processing;
 namespace UTStudio.Contracts.Processing;
 
 public enum GateProcessingAdmissionStatus { Unknown, Accepted, Coalesced, Duplicate, Late, Rejected, Closed }
-public enum GateBatchDeliveryStatus { Unknown, Accepted, Rejected, Failed, Cancelled }
+public enum GateBatchDeliveryStatus
+{
+    Unknown, Accepted, Duplicate, Conflict, CapacityExceeded, Rejected, Closed, Failed, Cancelled
+}
 public enum GateProcessingLifecycleState { Unknown, Created, Running, AdmissionClosed, FinalReconciling, Draining, Stopped, Disposing, Closed, Faulted }
 
 public readonly struct GateProcessingSignal

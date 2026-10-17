@@ -451,7 +451,7 @@ public sealed class GateEvaluator
         return new(trace.ConfirmedIdentity,
             trace.SourceInspectionRevision, plan.Source.Id, plan.Source.Revision, plan.Signature,
             plan.Source.SchemaVersion, plan.Source.AlgorithmVersion, gate.Definition.Id, gate.Definition.Revision,
-            status, eventKind, timeRequested ? sampleIndex : null, timeRequested ? position : null,
+            measures, status, eventKind, timeRequested ? sampleIndex : null, timeRequested ? position : null,
             timeRequested ? time : null, amplitudeRequested ? amplitude : null,
             amplitudeRequested ? signedAmplitude : null, tofRequested ? tof : null,
             timeRequested ? offset : null,

@@ -32,11 +32,11 @@ Los contratos compartidos se ubican en `UTStudio.Contracts/Processing`; los valu
 revisión se ubican en `UTStudio.Domain/Processing`. `Contracts` depende de `Domain`, y ninguno depende de
 `Processing.Core`.
 
-El flujo de Fase 3 es:
+El flujo base introducido en Fase 3 es:
 
 `commit RF -> aviso sample-free acotado -> reconciliación por InspectionRevision -> lease IUtTraceProvider
--> evaluación -> sink transitorio -> liberar lease`. El commit derivado y su notificación corresponden a
-Fase 4 y todavía no existen.
+-> evaluación -> sink esperado -> liberar lease`. Fase 4 reemplaza el sink transitorio productivo por el
+commit atómico en el store derivado RAM, manteniendo el mismo contrato de batch prestado.
 
 El puerto de ingreso de procesamiento será distinto de `ICommittedTraceSink`. Su saturación será
 observable y nunca usará `DropOldest`, coalescing de trabajo lógico ni fallback silencioso; los avisos
@@ -110,6 +110,44 @@ la identidad confirmada y una `SourceInspectionRevision` no inicial. Los umbrale
 en `double`, sin redondeo ni clamp: `RawSigned=-32768+65535u`, `Positive=32767u` y
 `NegativeMagnitude/Absolute=32768u`. El TOF publicado es absoluto respecto al origen de la traza; la referencia
 causal de una puerta ligada se conserva por separado.
+
+## Refinamiento aceptado de Fase 4
+
+El store derivado inicial es RAM, acotado, reconstruible y no autoritativo. `DerivedStoreRevision` es
+monótona por instancia y avanza una vez por cada commit nuevo, activación, invalidación lógica o reclamación
+física confirmada. No avanza por duplicado, conflicto, saturación, cancelación previa, rollback, consulta ni
+liberación de lease. Cada mutación devuelve la revisión que la confirmó.
+
+La unidad indivisible es un `GateEvaluationBatch` completo. Su clave contiene `TraceIdentity`, revisión RF,
+plan/revisión/firma, esquema y algoritmo; la clave de capa añade puerta/revisión, medida, unidad y dominio.
+Un duplicado equivalente es idempotente, una clave con contenido diferente es conflicto y nunca se sobrescribe.
+
+La cobertura se declara mediante un manifest cerrado y disperso producido por el ledger terminal de Fase 3:
+streams explícitos, watermarks opcionales, recuento exacto y SHA-256 canónico de identidades ordenadas,
+`SourceFinalRevision`, epoch completo y `CapturedStoreRevision`, la revisión exacta del store usada para formar
+la evidencia. Activar materializa una membresía inmutable de claves confirmadas hasta esa revisión y los leases
+leen exclusivamente esa membresía. Al drenar, el orquestador publica en una
+sola operación atómica la revisión terminal RF y la cobertura completa de identidades elegibles de todos los
+epochs; claves terminales repetidas o un lote que mezcle run/revisión final son conflicto sin publicación. Activar
+exige igualdad exacta. No se inventan identidades entre
+watermarks; una run vacía es válida con digest del conjunto vacío. La activación linealizable solo cambia la
+vista cuando recuentos, digest, revisión final, streams y epoch coinciden por completo.
+
+Un lease fija una revisión, descriptor de vista y epoch. Las consultas exactas y regionales usan páginas de
+1..256, intervalos inclusivos de `AcquisitionIndex` y cursores opacos ligados a consulta, vista, revisión y
+lease. Ausencias se omiten o se expresan como `NoData`, nunca como cero.
+
+La retención inicial es `KeepUntilInvalidatedOrClose`: sin LRU ni expulsión implícita. Invalidar la vista
+activa la deja sin vista; `ReclaimInvalidatedAsync` es explícito y devuelve `Busy` si un lease captura contenido
+afectado. El presupuesto usa límites independientes de batches y bytes lógicos mediante fórmula pública,
+checked y versionada; su versión 2 incluye cardinalidad de medidas, índices, membresías exactas, batches,
+manifests, evidencia terminal, vistas y el tombstone permanente de cada
+`DerivedViewId`. Reserva antes de copiar y revierte en rollback. La saturación es inmediata y no muta el store.
+
+`DisposeAsync` bloquea admisión y espera writers, lectores en construcción y leases admitidos, sin liberarlos
+por fuerza. El store copia/proyecta el batch prestado por el sink antes de responder y nunca conserva RF ni
+referencias al almacenamiento del evaluator. Persistencia, reprocesado general, UI y geometría C-Scan siguen
+fuera de Fase 4.
 
 ## Consecuencias
 

@@ -1,6 +1,6 @@
 # Plan aprobado por fases — procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 3 implementada; matriz de aceptación cerrada; fases posteriores no iniciadas**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
+Fecha: 2026-10-16. Estado: **Fase 4 implementada sobre Fase 3 aceptada; fases posteriores no iniciadas**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
 Diseño: [procesamiento neutral](../architecture/ut-gate-processing-design.md).
 
 ## Propiedad y alcance
@@ -57,11 +57,18 @@ terminal acotado.
 
 ## Fase 4 — store derivado en RAM
 
-Agregar puertos y un store derivado en memoria, acotado y reconstruible mientras exista RF, con revisión/
+Implementados puertos y un store derivado en memoria, acotado y reconstruible mientras exista RF, con revisión/
 procedencia, vista activa sin revisiones híbridas, invalidación lógica y consulta parcial. El store RF no
 cambia y sigue siendo autoridad.
 
 Gate: atomicidad, retención explícita, revisión concurrente y cierre; no elegir todavía formato persistente.
+
+Decisiones cerradas: revisión por mutación observable, batch completo como commit, clave completa sin duplicar
+`TraceIdentity`, manifest terminal disperso con digest SHA-256, activación linealizable, leases de vista
+coherentes, páginas 1..256 con cursor ligado al lease, `KeepUntilInvalidatedOrClose`, reclamación explícita,
+límites independientes por batches/bytes lógicos, saturación inmediata y cierre que espera trabajo admitido.
+El drenaje publica en bloque la cobertura terminal de todos los epochs; no admite claves de plan repetidas ni
+lotes que mezclen inspección, run o revisión RF final. Evidencia terminal y tombstones forman parte del presupuesto.
 
 ## Fase 5 — reprocesado
 

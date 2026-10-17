@@ -1,6 +1,6 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 3 implementada; matriz P1/P2/P3 cerrada; ADR 0017 aceptado**.
+Fecha: 2026-10-16. Estado: **Fase 4 implementada sobre la matriz P1/P2/P3 cerrada de Fase 3; ADR 0017 aceptado**.
 
 ## 1. Alcance y autoridad
 
@@ -12,8 +12,8 @@ Requisitos confirmados por la petición vigente:
 - determinismo, memoria/colas acotadas, cancelación y resultados versionados;
 - `InspectionDataStore` conserva la autoridad RF; resultados de puertas son derivados reconstruibles;
 - Fase 2 implementa exclusivamente evaluación síncrona neutral de una traza; pipeline, stores, UI, C-Scan,
-  persistencia y paquetes nuevos quedan fuera de Fase 2; Fase 3 incorpora únicamente la orquestación
-  post-commit y un consumo transitorio sin retención.
+  persistencia y paquetes nuevos quedan fuera de Fase 2; Fase 3 incorporó la orquestación post-commit y
+  Fase 4 sustituye su consumo transitorio por el store derivado RAM.
 
 Las quince decisiones del apartado 15 están aceptadas para el primer incremento.
 
@@ -30,7 +30,8 @@ UTStudio.Domain <- UTStudio.Contracts <- UTStudio.Processing.Core
          stores derivados / Presentation / visualización
 ```
 
-`UTStudio.Processing.Core` contiene el compilador neutral y no conoce stores, sesión, UI ni posición. Las
+`UTStudio.Processing.Core` contiene el compilador/evaluator neutral y, en una unidad separada sin RF, la
+implementación RAM del store derivado; no conoce sesión, UI ni posición. Las
 identidades y revisiones estables viven en `UTStudio.Domain/Processing`; los contratos públicos compartidos,
 en `UTStudio.Contracts/Processing`. `Contracts` depende de `Domain`, y ninguno depende de `Processing.Core`.
 
@@ -63,9 +64,9 @@ queda diagnosticado para Fase 5.
 
 El cierre normal detiene la fuente, drena frames y commits, sella la run, publica `FinalRevision`, cierra la
 admisión y espera cursor final, evaluaciones, callbacks y leases antes de cerrar las proyecciones. La cancelación
-del worker se reserva para `Dispose` excepcional. El sink de Fase 3 recibe batches inmutables prestados, en orden
-de revisión y mediante callback esperado; puede aceptar, rechazar, fallar o cancelar, pero no retenerlos. No hay
-durabilidad, persistencia ni store derivado hasta Fase 4.
+del worker se reserva para `Dispose` excepcional. El contrato de sink introducido en Fase 3 recibe batches
+inmutables prestados, en orden de revisión y mediante callback esperado. En Fase 4 el store copia/proyecta el
+batch antes de completar el callback; no hay durabilidad ni persistencia.
 
 El diagnóstico es un snapshot inmutable por run, nunca una selección global de plan. Expone `RunId`, lifecycle,
 revisión y firma del plan activo, revisiones objetivo/observada/reconciliada/final, finalidad confirmada,
@@ -358,8 +359,8 @@ entre puertas y por bloques largos con stride medido/documentado.
 
 ## 10. Store derivado, invalidación y reprocesado
 
-El store derivado inicial es en memoria, acotado y un puerto separado, no parte de `Processing.Core`
-algorítmico ni del commit RF. Los datos
+El store derivado inicial es en memoria y acotado. Su implementación reside en `UTStudio.Processing.Core`,
+separada del núcleo algorítmico y del commit RF. Los datos
 son reconstruibles desde RF autoritativa mientras esta permanezca disponible, más plan/revisión y versión
 algorítmica; el store RAM vigente no promete recuperación tras proceso. Debe permitir:
 
@@ -377,6 +378,45 @@ durabilidad están fuera del primer incremento. Un futuro reproceso no
 carga inspecciones completas y aplica backpressure independiente de live. Consultas regionales fijan un
 snapshot/revisión derivada coherente y leen páginas por stream/rango de `AcquisitionIndex`; no presuponen cubo
 rectangular. Cancelled/Faulted o cobertura parcial no desplazan por sí solos una revisión activa válida.
+
+### Contrato cerrado de Fase 4
+
+`DerivedStoreRevision` avanza exclusivamente por commit nuevo, activación, invalidación o reclamación
+confirmados. El commit copia un `GateEvaluationBatch` completo y publica todos sus resultados bajo una sola
+revisión. La clave evita duplicar inspección/run/stream fuera de `TraceIdentity` y añade revisión fuente,
+plan/revisión/firma, esquema y algoritmo. Cada capa añade puerta/revisión, medida, unidad y dominio.
+
+`GateDerivedCoverageManifest` describe cobertura dispersa por stream mediante watermarks opcionales, recuento
+y SHA-256 canónico v1. La entrada binaria usa versión y cantidad, identidades ordenadas por campos tipados,
+GUID de inspección/run, source UTF-8 con longitud, canal/beam/ley enteros e índice `UInt64`; el conjunto vacío
+firma versión y cantidad cero. Incluye revisión RF final, epoch y `CapturedStoreRevision`: la revisión exacta
+del store cuyos batches pueden formar la cobertura. La activación materializa las claves exactas con commit no
+posterior a esa revisión; cada lease conserva esa membresía y nunca incorpora batches posteriores. Al completar el
+drenaje, el orquestador registra atómicamente en el sink la revisión terminal RF y la cobertura completa de
+identidades elegibles de todos los epochs. El lote exige una sola inspección, run y revisión final; una clave de
+plan repetida es conflicto sin visibilidad parcial. Activar exige igualdad exacta, verifica el
+conjunto real —no el intervalo entre watermarks— y publica un `ActiveDerivedViewDescriptor` indivisible.
+
+El ledger que retiene las identidades terminales está acotado por
+`MaximumEligibleTracesPerPlanEpoch` (65 536 por defecto); alcanzar la cota rechaza nueva admisión,
+incrementa saturaciones y lleva la run a fallo explícito, sin crecimiento silencioso.
+
+Los leases de lectura son inmutables, prestados y fijan revisión/vista/epoch. Las páginas regionales admiten
+1..256 elementos y sus cursores solo viven dentro del lease que los creó. `NoData` es explícito u omitido según
+consulta. Dispose concurrente es idempotente. Tras cerrar el lease, las operaciones
+síncronas fallan con `ObjectDisposedException`; `ReadExactAsync`, por ser el contrato
+discriminado y no excepcional, devuelve `Closed`.
+
+La política `KeepUntilInvalidatedOrClose` prohíbe expulsión automática y sobrescribir un `DerivedViewId`.
+Invalidar la vista activa la elimina;
+la reclamación física separada usa las membresías exactas, conserva batches compartidos y falla con `Busy` solo
+ante leases que capturan claves reclamables. El presupuesto lógico v2 suma 160 bytes
+por batch, 176 por entrada, cuatro bytes por medida solicitada, UTF-8 acotado de IDs causales/plan, firmas SHA-256, 128 bytes más UTF-8 por manifest o
+evidencia terminal, 144 por stream y 64 más UTF-8 por descriptor de vista o tombstone de `DerivedViewId`.
+Cada membresía carga 32 bytes base más 96 por clave. El tombstone permanece cargado tras reclaim para impedir reutilización. Es aritmética checked; batch y bytes se reservan antes
+de copiar y se revierten íntegramente. Cubre capacidad administrada, no headers CLR, fragmentación ni working set.
+Cobertura terminal, activación, invalidación y reclaim preparan colecciones completas en staging y publican
+raíces coherentes bajo el lock; ningún lector observa staging ni una mutación compuesta parcial.
 
 ## 11. Presupuesto preliminar, no objetivo de producción
 

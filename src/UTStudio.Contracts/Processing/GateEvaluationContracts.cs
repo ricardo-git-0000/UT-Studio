@@ -66,7 +66,7 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
     internal GateEvaluationEntry(TraceIdentity traceIdentity, InspectionRevision sourceInspectionRevision,
         GatePlanId planId, GatePlanRevision planRevision, GatePlanSignature planSignature,
         GateSchemaVersion schemaVersion, GateAlgorithmVersion algorithmVersion,
-        GateId gateId, GateRevision gateRevision, GateResultStatus status,
+        GateId gateId, GateRevision gateRevision, IEnumerable<GateMeasureKind> requestedMeasures, GateResultStatus status,
         GateDetectionEventKind eventKind, int? sampleIndex, double? fractionalSamplePosition,
         double? detectionTimeSeconds, double? amplitudeCounts, short? signedRfAmplitudeCounts,
         double? timeOfFlightSeconds, double? offsetWithinWindowSeconds, GateResultQuality quality,
@@ -76,7 +76,8 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
         TraceIdentity = traceIdentity; SourceInspectionRevision = sourceInspectionRevision;
         PlanId = planId; PlanRevision = planRevision; PlanSignature = planSignature;
         SchemaVersion = schemaVersion; AlgorithmVersion = algorithmVersion;
-        GateId = gateId; GateRevision = gateRevision; Status = status; EventKind = eventKind;
+        GateId = gateId; GateRevision = gateRevision;
+        RequestedMeasures = Array.AsReadOnly(requestedMeasures.ToArray()); Status = status; EventKind = eventKind;
         SampleIndex = sampleIndex; FractionalSamplePosition = Canonical(fractionalSamplePosition);
         DetectionTimeSeconds = Canonical(detectionTimeSeconds); AmplitudeCounts = Canonical(amplitudeCounts);
         SignedRfAmplitudeCounts = signedRfAmplitudeCounts; TimeOfFlightSeconds = Canonical(timeOfFlightSeconds);
@@ -94,6 +95,7 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
     public GateAlgorithmVersion AlgorithmVersion { get; }
     public GateId GateId { get; }
     public GateRevision GateRevision { get; }
+    public IReadOnlyList<GateMeasureKind> RequestedMeasures { get; }
     public GateResultStatus Status { get; }
     public GateDetectionEventKind EventKind { get; }
     public int? SampleIndex { get; }
@@ -116,7 +118,7 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
         TraceIdentity == other.TraceIdentity && SourceInspectionRevision == other.SourceInspectionRevision &&
         PlanId == other.PlanId && PlanRevision == other.PlanRevision && PlanSignature.Equals(other.PlanSignature) &&
         SchemaVersion == other.SchemaVersion && AlgorithmVersion == other.AlgorithmVersion &&
-        GateId == other.GateId && GateRevision == other.GateRevision && Status == other.Status &&
+        GateId == other.GateId && GateRevision == other.GateRevision && RequestedMeasures.SequenceEqual(other.RequestedMeasures) && Status == other.Status &&
         EventKind == other.EventKind && SampleIndex == other.SampleIndex && Bits(FractionalSamplePosition) == Bits(other.FractionalSamplePosition) &&
         Bits(DetectionTimeSeconds) == Bits(other.DetectionTimeSeconds) && Bits(AmplitudeCounts) == Bits(other.AmplitudeCounts) &&
         SignedRfAmplitudeCounts == other.SignedRfAmplitudeCounts && Bits(TimeOfFlightSeconds) == Bits(other.TimeOfFlightSeconds) &&

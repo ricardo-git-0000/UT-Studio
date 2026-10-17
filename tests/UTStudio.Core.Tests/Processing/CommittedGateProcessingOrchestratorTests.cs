@@ -65,6 +65,34 @@ public sealed class CommittedGateProcessingOrchestratorTests
         Assert.AreEqual(8, options.MaximumStreamsPerRun);
         Assert.AreEqual(8, options.MaximumPlanEpochsPerRun);
         Assert.AreEqual(256, options.CatalogPageSize);
+        Assert.AreEqual(65_536, options.MaximumEligibleTracesPerPlanEpoch);
+    }
+
+    [TestMethod]
+    public async Task TerminalCoverageLedgerAdmitsExactLimitAndFaultsBeforeNextIdentity()
+    {
+        await using var fixture = new Fixture(new(maximumEligibleTracesPerPlanEpoch: 2));
+        _ = await fixture.CommitAsync(0, [1, 2]);
+        _ = await fixture.CommitAsync(1, [2, 3]);
+        InspectionAppendResult third = await fixture.CommitAsync(2, [3, 4]);
+        fixture.Orchestrator.NotifyCommitted(new(fixture.Identity(2), third.Revision));
+        InspectionRunSealResult seal = await fixture.Writer.SealRunAsync();
+        fixture.MarkSealed();
+        fixture.Orchestrator.StopAdmission(fixture.Run);
+        fixture.Orchestrator.RequestFinalReconciliation(fixture.Run, seal.FinalRevision);
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+            fixture.Orchestrator.WaitForDrainAsync(fixture.Run).AsTask());
+
+        GateProcessingDiagnostics diagnostics = fixture.Orchestrator.Diagnostics;
+        GateProcessingRunDiagnostics failed = diagnostics.ActiveRuns.Concat(diagnostics.TerminalRuns).Single();
+        Assert.AreEqual(GateProcessingLifecycleState.Faulted, failed.Lifecycle);
+        Assert.AreEqual(2L, failed.WorkAdmitted);
+        Assert.AreEqual(2L, failed.WorkTerminal);
+        Assert.AreEqual(2L, failed.Plans.Single().ConfirmedEligible);
+        Assert.AreEqual(2L, failed.Plans.Single().EvaluatedAndDelivered);
+        Assert.AreEqual(1L, diagnostics.Saturations);
+        Assert.HasCount(2, fixture.Sink.Batches);
     }
 
     [TestMethod]
@@ -753,11 +781,11 @@ public sealed class CommittedGateProcessingOrchestratorTests
         internal readonly CommittedGateProcessingOrchestrator Orchestrator;
         private bool _sealed;
 
-        internal Fixture()
+        internal Fixture(GateProcessingOptions? options = null)
         {
             Registry = new(Inspection, new InMemoryInspectionStoreOptions(1024 * 1024, 100));
             Writer = Registry.OpenRun(Run);
-            Orchestrator = new(Registry.Store, Registry.Store, Sink, new GateEvaluator(new GateScratchPool()));
+            Orchestrator = new(Registry.Store, Registry.Store, Sink, new GateEvaluator(new GateScratchPool()), options);
             Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
                 Orchestrator.OpenRun(new(Inspection, Run, [Stream], CompilePlan())));
         }

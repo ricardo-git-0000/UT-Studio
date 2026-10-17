@@ -9,7 +9,8 @@ namespace UTStudio.Processing.Core;
 public sealed record GateProcessingOptions
 {
     public GateProcessingOptions(int maximumRuns = 2, int maximumStreamsPerRun = 8,
-        int maximumPlanEpochsPerRun = 8, int catalogPageSize = 256, int maximumTerminalRunSummaries = 8)
+        int maximumPlanEpochsPerRun = 8, int catalogPageSize = 256, int maximumTerminalRunSummaries = 8,
+        int maximumEligibleTracesPerPlanEpoch = 65_536)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maximumRuns, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maximumStreamsPerRun, 1);
@@ -17,15 +18,18 @@ public sealed record GateProcessingOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(catalogPageSize, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(catalogPageSize, 4096);
         ArgumentOutOfRangeException.ThrowIfNegative(maximumTerminalRunSummaries);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maximumEligibleTracesPerPlanEpoch, 1);
         MaximumRuns = maximumRuns; MaximumStreamsPerRun = maximumStreamsPerRun;
         MaximumPlanEpochsPerRun = maximumPlanEpochsPerRun; CatalogPageSize = catalogPageSize;
         MaximumTerminalRunSummaries = maximumTerminalRunSummaries;
+        MaximumEligibleTracesPerPlanEpoch = maximumEligibleTracesPerPlanEpoch;
     }
     public int MaximumRuns { get; }
     public int MaximumStreamsPerRun { get; }
     public int MaximumPlanEpochsPerRun { get; }
     public int CatalogPageSize { get; }
     public int MaximumTerminalRunSummaries { get; }
+    public int MaximumEligibleTracesPerPlanEpoch { get; }
     public int MaximumMetadataUnits => checked(MaximumRuns * (MaximumStreamsPerRun + MaximumPlanEpochsPerRun));
 }
 
@@ -93,6 +97,8 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
             if (!_runs.TryGetValue(runId, out RunState? run) || run.AdmissionClosed)
             { _rejected++; return GateProcessingAdmissionStatus.Closed; }
             if (run.Epochs.Count >= run.MaximumEpochs || effectiveFromInclusive.Value <= run.Epochs[^1].From.Value ||
+                run.Epochs.Any(x => x.Plan.Source.Id == plan.Source.Id &&
+                    x.Plan.Source.Revision == plan.Source.Revision && x.Plan.Signature == plan.Signature) ||
                 effectiveFromInclusive.Value <= run.Target.Value)
             { _rejected++; _saturations++; return GateProcessingAdmissionStatus.Rejected; }
             run.Epochs.Add(new(effectiveFromInclusive, plan, new()));
@@ -288,8 +294,15 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
             if (epoch is null) { _rejected++; return true; }
             if (run.PendingRevision != change.Revision)
             {
+                if (epoch.EligibleIdentities.Count == _options.MaximumEligibleTracesPerPlanEpoch)
+                {
+                    _saturations++;
+                    FailRun(run, new InvalidOperationException("The bounded terminal coverage ledger is full."));
+                    return false;
+                }
                 run.PendingRevision = change.Revision; run.PendingEpoch = epoch;
                 epoch.Balance.ConfirmedEligible++; run.WorkAdmitted++; _admitted++;
+                epoch.EligibleIdentities.Add(change.TraceIdentity!.Value);
             }
             else { epoch = run.PendingEpoch ?? epoch; }
         }
@@ -337,8 +350,10 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                 {
                     if (run.Failed)
                     { _batchesFailed++; CompleteFailed(run, epoch); }
-                    else if (delivery.Status == GateBatchDeliveryStatus.Accepted)
-                    { _batchesAccepted++; epoch.Balance.EvaluatedAndDelivered++; run.WorkTerminal++; }
+                    else if (delivery.Status is GateBatchDeliveryStatus.Accepted or GateBatchDeliveryStatus.Duplicate)
+                    {
+                        _batchesAccepted++; epoch.Balance.EvaluatedAndDelivered++; run.WorkTerminal++;
+                    }
                     else
                     {
                         if (delivery.Status == GateBatchDeliveryStatus.Rejected) { _batchesRejected++; }
@@ -423,6 +438,33 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
             run.ActiveWorkers != 0 || run.ActiveLeases != 0 || run.ActiveCallbacks != 0 ||
             run.WorkAdmitted != run.WorkTerminal) { return; }
         run.Lifecycle = GateProcessingLifecycleState.Stopped;
+        if (!run.TerminalCoveragePublished && _sink is IGateProcessingTerminalCoverageSink terminal)
+        {
+            GateProcessingTerminalCoverage[] coverage = run.Epochs.Select(epoch =>
+            {
+                GateDerivedStreamCoverage[] streams = run.Registration.Streams.Select(stream =>
+                {
+                    TraceIdentity[] identities = epoch.EligibleIdentities.Where(x => x.Stream == stream).ToArray();
+                    return new GateDerivedStreamCoverage(stream,
+                        identities.Length == 0 ? null : identities.Min(x => x.AcquisitionIndex),
+                        identities.Length == 0 ? null : identities.Max(x => x.AcquisitionIndex),
+                        identities.Length, GateDerivedStreamCoverage.ComputeIdentityDigest(identities));
+                }).ToArray();
+                return new GateProcessingTerminalCoverage(run.Registration.InspectionId, run.Registration.RunId,
+                    final, epoch.Plan.Source.Id, epoch.Plan.Source.Revision, epoch.Plan.Signature.Hex,
+                    epoch.Plan.Source.SchemaVersion, epoch.Plan.Source.AlgorithmVersion, streams);
+            }).ToArray();
+            GateProcessingTerminalCoverageStatus terminalStatus = terminal.ConfirmTerminalCoverage(coverage);
+            if (terminalStatus is not (GateProcessingTerminalCoverageStatus.Accepted or
+                GateProcessingTerminalCoverageStatus.Duplicate))
+            {
+                var error = new InvalidOperationException($"Terminal coverage ended as {terminalStatus}.");
+                run.Failed = true; run.Lifecycle = GateProcessingLifecycleState.Faulted; run.Failure = error;
+                run.LastError = new GateProcessingError("processing.terminal-coverage", terminalStatus.ToString());
+                _failedRuns++; run.Drained.TrySetException(error); return;
+            }
+            run.TerminalCoveragePublished = true;
+        }
         if (run.Drained.TrySetResult()) { _drainedRuns++; _state = GateProcessingLifecycleState.Stopped; }
     }
 
@@ -561,6 +603,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         internal InspectionRevision Cursor, Target, Observed;
         internal InspectionRevision PendingRevision;
         internal PlanEpoch? PendingEpoch;
+        internal bool TerminalCoveragePublished;
         internal InspectionRevision? FinalRevision;
         internal bool AdmissionClosed, Failed;
         internal Exception? Failure;
@@ -570,7 +613,10 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         internal GateProcessingError? LastError;
         internal TaskCompletionSource Drained { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
-    private sealed record PlanEpoch(InspectionRevision From, CompiledGatePlan Plan, MutablePlanBalance Balance);
+    private sealed record PlanEpoch(InspectionRevision From, CompiledGatePlan Plan, MutablePlanBalance Balance)
+    {
+        internal HashSet<TraceIdentity> EligibleIdentities { get; } = [];
+    }
     private sealed class MutablePlanBalance
     {
         internal long ConfirmedEligible { get; set; }
