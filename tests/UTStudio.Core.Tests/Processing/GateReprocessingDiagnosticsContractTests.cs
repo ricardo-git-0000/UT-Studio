@@ -2,6 +2,9 @@ using UTStudio.Contracts.Processing;
 using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
+using System.Globalization;
+using System.Reflection;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace UTStudio.Core.Tests.Processing;
@@ -16,32 +19,125 @@ public sealed class GateReprocessingDiagnosticsContractTests
         string matrix = File.ReadAllText(Path.Combine(root, "docs", "testing",
             "gate-reprocessing-phase5-traceability.md"));
         string[] rows = matrix.Split('\n').Where(line => Regex.IsMatch(line, @"^\| \d{2} \|")).ToArray();
-        CollectionAssert.AreEqual(Enumerable.Range(1, 37).Select(value => value.ToString("D2")).ToArray(),
-            rows.Select(line => Regex.Match(line, @"^\| (\d{2}) \|").Groups[1].Value).ToArray());
+        Assert.HasCount(37, rows);
+        string[] ids = rows.Select(line => Regex.Match(line, @"^\| (\d{2}) \|").Groups[1].Value).ToArray();
+        Assert.HasCount(37, ids.Distinct().ToArray());
+        CollectionAssert.AreEqual(Enumerable.Range(1, 37).Select(value => value.ToString("D2")).ToArray(), ids);
+
+        var expectedClassifications = new Dictionary<string, int>(StringComparer.Ordinal)
+        {
+            ["Ejecutable"] = 26,
+            ["CoveredBeforeSchedulerAdmission"] = 2,
+            ["IndivisibleContractOperation"] = 1,
+            ["NotRepresentableByContract"] = 8
+        };
+        Dictionary<string, int> actualClassifications = rows
+            .Select(row => row.Split('|')[3].Trim())
+            .GroupBy(value => value, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        CollectionAssert.AreEquivalent(expectedClassifications.Keys.ToArray(), actualClassifications.Keys.ToArray());
+        foreach ((string classification, int count) in expectedClassifications)
+            Assert.AreEqual(count, actualClassifications[classification], classification);
+
         string forbidden = string.Join('\n', rows);
-        Assert.IsFalse(Regex.IsMatch(forbidden, @"\*|casos?\s+[A-D](?:\s*[–-]\s*[A-D])?|matriz general|\d{2}\s*[–-]\s*\d{2}",
+        Assert.IsFalse(Regex.IsMatch(forbidden,
+            @"\*|\.\.\.|…|placeholders?|\bTBD\b|casos?\s+[A-D](?:\s*[–-]\s*[A-D])?|matriz general|\d{2}\s*[–-]\s*\d{2}",
             RegexOptions.IgnoreCase));
 
-        string[] testFiles = Directory.EnumerateFiles(Path.Combine(root, "tests"), "*.cs",
-            SearchOption.AllDirectories).ToArray();
+        Assembly testAssembly = typeof(GateReprocessingDiagnosticsContractTests).Assembly;
+        int[] parameterizedIds = [11, 21, 24, 25, 26, 27, 28];
         foreach (string row in rows)
         {
             MatchCollection references = Regex.Matches(row,
-                @"prueba(?: [A-D])?: `([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)`");
+                @"(?:prueba(?: [A-D])?|caso): `([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)(?:\(([^`]*)\))?`");
             Assert.IsGreaterThanOrEqualTo(1, references.Count, row);
+            var citedDataRows = new HashSet<string>(StringComparer.Ordinal);
             foreach (Match reference in references)
             {
-                string className = Regex.Escape(reference.Groups[1].Value);
-                string methodName = Regex.Escape(reference.Groups[2].Value);
-                bool resolved = testFiles.Select(File.ReadAllText).Any(source =>
-                    Regex.IsMatch(source, $@"class\s+{className}\b") &&
-                    Regex.IsMatch(source,
-                        $@"\[(?:TestMethod|DataTestMethod)\][\s\S]{{0,1000}}?\b{methodName}\s*\("));
-                Assert.IsTrue(resolved, reference.Value);
+                Type testClass = testAssembly.GetTypes().Single(type => type.Name == reference.Groups[1].Value);
+                MethodInfo testMethod = testClass.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                    .Single(method => method.Name == reference.Groups[2].Value);
+                Assert.IsTrue(testMethod.GetCustomAttributes(inherit: true).Any(attribute =>
+                    attribute is TestMethodAttribute || attribute is DataTestMethodAttribute), reference.Value);
+
+                if (reference.Groups[3].Success)
+                {
+                    string signature = NormalizeCitationArguments(reference.Groups[3].Value,
+                        testMethod.GetParameters());
+                    Assert.IsTrue(citedDataRows.Add($"{testClass.FullName}.{testMethod.Name}({signature})"),
+                        $"Duplicate cited DataRow: {reference.Value}");
+                    Assert.IsTrue(testMethod.GetCustomAttributes<DataRowAttribute>()
+                        .Select(attribute => NormalizeDataRow(attribute.Data))
+                        .Contains(signature, StringComparer.Ordinal), $"Missing DataRow: {reference.Value}");
+                }
             }
-            Assert.IsTrue(row.Contains("Aserciones:", StringComparison.Ordinal), row);
+
+            int id = int.Parse(Regex.Match(row, @"^\| (\d{2}) \|").Groups[1].Value,
+                CultureInfo.InvariantCulture);
+            if (parameterizedIds.Contains(id))
+                Assert.IsGreaterThanOrEqualTo(1, citedDataRows.Count, row);
+            Match assertions = Regex.Match(row, @"Aserciones:\s*([^|.][^|]*)\|\s*Verde\s*\|");
+            Assert.IsTrue(assertions.Success && !string.IsNullOrWhiteSpace(assertions.Groups[1].Value), row);
         }
+
+        CollectionAssert.AreEquivalent(new[] { "A", "B", "C", "D" }, Regex.Matches(rows[12], @"prueba ([A-D]):")
+            .Select(match => match.Groups[1].Value).ToArray());
     }
+
+    private static string NormalizeCitationArguments(string arguments, ParameterInfo[] parameters)
+    {
+        string[] tokens = Regex.Matches(arguments, "(?:\\\"(?:\\\\\\\\.|[^\\\"\\\\\\\\])*\\\"|[^,])+")
+            .Select(match => match.Value.Trim()).ToArray();
+        Assert.HasCount(parameters.Length, tokens);
+        return string.Join(',', tokens.Select((token, index) => NormalizeCitationValue(token,
+            parameters[index].ParameterType)));
+    }
+
+    private static string NormalizeCitationValue(string token, Type parameterType)
+    {
+        if (token == "null")
+            return "null";
+        if (parameterType == typeof(string))
+            return $"string:{JsonSerializer.Deserialize<string>(token)}";
+        if (parameterType == typeof(bool) && bool.TryParse(token, out bool boolean))
+            return $"bool:{boolean.ToString().ToLowerInvariant()}";
+        if (parameterType.IsEnum)
+        {
+            string prefix = $"{parameterType.Name}.";
+            Assert.IsTrue(token.StartsWith(prefix, StringComparison.Ordinal), token);
+            object value = Enum.Parse(parameterType, token[prefix.Length..], ignoreCase: false);
+            return $"enum:{parameterType.FullName}:{value}";
+        }
+
+        var numericSyntax = new Dictionary<Type, string>(8)
+        {
+            [typeof(sbyte)] = @"^-?\d+sbyte$",
+            [typeof(byte)] = @"^\d+byte$",
+            [typeof(short)] = @"^-?\d+short$",
+            [typeof(ushort)] = @"^\d+ushort$",
+            [typeof(int)] = @"^-?\d+$",
+            [typeof(uint)] = @"^\d+U$",
+            [typeof(long)] = @"^-?\d+L$",
+            [typeof(ulong)] = @"^\d+UL$"
+        };
+        Assert.IsTrue(numericSyntax.TryGetValue(parameterType, out string? syntax) &&
+            Regex.IsMatch(token, syntax, RegexOptions.CultureInvariant), token);
+        string digits = Regex.Replace(token, @"(?:sbyte|byte|short|ushort|U|L|UL)$", string.Empty);
+        object number = Convert.ChangeType(digits, parameterType, CultureInfo.InvariantCulture);
+        return $"{parameterType.Name}:{Convert.ToString(number, CultureInfo.InvariantCulture)}";
+    }
+
+    private static string NormalizeDataRow(object?[] values) => string.Join(',', values.Select(value => value switch
+    {
+        null => "null",
+        string text => $"string:{text}",
+        bool boolean => $"bool:{boolean.ToString().ToLowerInvariant()}",
+        Enum enumeration => $"enum:{enumeration.GetType().FullName}:{enumeration}",
+        sbyte or byte or short or ushort or int or uint or long or ulong =>
+            $"{value.GetType().Name}:{Convert.ToString(value, CultureInfo.InvariantCulture)}",
+        _ => throw new AssertFailedException($"Unsupported DataRow value type: {value.GetType().FullName}")
+    }));
 
     [TestMethod]
     public void AdmissionResultRejectsImpossibleStatesAndCopiesSecondaryErrors()

@@ -38,6 +38,14 @@ En esta iteración esas validaciones no quedaron satisfechas; el cambio no está
 
 ## Cuestiones pendientes
 
+### Estado histórico al 8 de octubre de 2026
+
 La migración de rangos B y la retirada progresiva de `BScanTraceStore` pertenecen a Fase 4; la
-persistencia incremental permanece fuera de Fase 5 y aplazada a la Fase 8 del plan de procesamiento vigente o
-a una fase futura sujeta a requisitos y aprobación.
+persistencia incremental pertenece a Fase 5. Esa era la numeración y documentación vigentes al redactar este
+resumen histórico.
+
+### Nota de supersesión del 18 de octubre de 2026
+
+La planificación posterior sustituyó esa numeración: la persistencia quedó aplazada a la
+[Fase 8 del plan de procesamiento vigente](../plans/2026-10-16-ut-gate-processing.md#fase-8--persistencia-y-gates-productivos)
+o a una fase futura expresamente aprobada.

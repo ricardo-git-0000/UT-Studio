@@ -45,5 +45,12 @@ contrato productivo legítimo.
 
 ## Estado Git
 
-La implementación base está en `aee0bc1e8493192430274b1f248dba17a9cf29ff`. Las correcciones posteriores a
-la auditoría permanecen sin stage ni commit; la integración en `main` sigue pendiente de revalidación y merge.
+En el cierre original de este resumen, la implementación base estaba confirmada en
+`aee0bc1e8493192430274b1f248dba17a9cf29ff` y las correcciones posteriores aún no se habían confirmado.
+
+### Actualización posterior — 18 de octubre de 2026
+
+La implementación está confirmada en `aee0bc1e8493192430274b1f248dba17a9cf29ff` y las correcciones posteriores
+en `91091a1c328d1e9ffe8cd519debda04df1b12a9d`, ambas en `feature/ut-gate-reprocessing`. La integración en
+`main` continúa pendiente; no se afirma que esos commits formen parte de `main`. El working tree estaba limpio
+en el momento de esta actualización.

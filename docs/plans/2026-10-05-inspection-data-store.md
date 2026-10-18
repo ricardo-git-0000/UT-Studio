@@ -160,6 +160,7 @@ Gate: ADR y plan propios aprobados. Esta fase no está autorizada por el present
 
 ## Decisiones previas a fases afectadas
 
-Antes de Fase 5: formato, tamaño de chunk persistente, compresión, checksum, durabilidad y política ante disco lento.
+Antes de la fase persistente —actualmente Fase 8 o una fase futura aprobada—: formato, tamaño de chunk
+persistente, compresión, checksum, durabilidad y política ante disco lento.
 Antes de PA/rectificada: grouping/layout, Sequence y encoding. Antes de Fase 7: encoder, coordenadas,
 gates y objetivos medidos. Ninguna queda resuelta por este plan.
