@@ -149,7 +149,10 @@ por fuerza. El store copia/proyecta el batch prestado por el sink antes de respo
 referencias al almacenamiento del evaluator. Persistencia, reprocesado general, UI y geometría C-Scan siguen
 fuera de Fase 4.
 
-## Refinamiento implementado de Fase 5 pendiente de aceptación: reprocesado histórico
+## Refinamiento aceptado e implementado de Fase 5: reprocesado histórico
+
+El contrato está aceptado y la implementación completada y validada en `feature/ut-gate-reprocessing`; su
+integración en `main` permanece pendiente de superar auditoría y merge.
 
 Un trabajo fija al admitirse `JobId`, `AttemptId`, snapshot RF sellado y su `SourceFinalRevision`, selección
 canónica de streams e intervalos inclusivos, `CompiledGatePlan` completo, epoch, firma, schema, algoritmo,

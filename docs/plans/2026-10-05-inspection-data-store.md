@@ -1,6 +1,8 @@
 # Plan por fases del almacén autoritativo de inspección
 
-Estado: Fases 0 a 4 completadas. Persistencia (Fase 5) no iniciada.
+Estado: Fases 0 a 4 completadas. La numeración histórica de persistencia como Fase 5 queda sustituida: la
+persistencia permanece aplazada a la Fase 8 del plan de procesamiento vigente o a una fase futura sujeta a
+requisitos y aprobación.
 Fuente normativa: [ADR 0015](../adr/0015-authoritative-inspection-data-store.md).
 
 ## Reglas transversales
@@ -122,7 +124,7 @@ gate de publicación y el lifecycle drena antes de congelar. `ResidentRange` pro
 columnas y selección usa la `TraceIdentity` exacta disponible. Se retiraron `IConventionalFrameSink`,
 el fan-out RF, `BScanTraceStore` y sus identidades paralelas.
 
-## Fase 5 — Persistencia incremental
+## Fase futura — Persistencia incremental
 
 Implementar chunks, commits, journal, versiones, checksum e índice reconstruible tras aprobar las
 decisiones tecnológicas necesarias. Inyectar disco lento/lleno, truncamientos y corrupción. Medir

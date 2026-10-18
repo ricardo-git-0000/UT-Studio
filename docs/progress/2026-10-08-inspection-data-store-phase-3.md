@@ -39,4 +39,5 @@ En esta iteración esas validaciones no quedaron satisfechas; el cambio no está
 ## Cuestiones pendientes
 
 La migración de rangos B y la retirada progresiva de `BScanTraceStore` pertenecen a Fase 4; la
-persistencia incremental pertenece a Fase 5.
+persistencia incremental permanece fuera de Fase 5 y aplazada a la Fase 8 del plan de procesamiento vigente o
+a una fase futura sujeta a requisitos y aprobación.

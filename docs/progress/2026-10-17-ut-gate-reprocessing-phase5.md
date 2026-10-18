@@ -1,5 +1,8 @@
 # Fase 5 — reprocesado histórico de gates
 
+Estado: contrato aceptado; implementación completada y validada en `feature/ut-gate-reprocessing`; integración
+en `main` pendiente de auditoría y merge. La persistencia permanece aplazada y fuera de Fase 5.
+
 ## Objetivo y resultado
 
 Se implementó reprocesado por bloques desde snapshots RF sellados autoritativos, con scheduler histórico
@@ -13,8 +16,9 @@ No se añadió composición productiva, UI, persistencia ni C-Scan.
 - RNG, materialización/constructor del snapshot, `ReleaseLease`, entrada exacta a `Evaluate`, retorno interno de
   buffer, construcción interna de manifest y cleanup del acumulador se clasifican
   `NotRepresentableByContract` con inspección estructural e invariantes alcanzables.
-- La integración concurrente representable es `StopDuringRfCopy`; el scheduler propaga el token del trabajo al
-  evaluador y las pruebas directas del evaluador demuestran su cancelación y devolución de scratch.
+- La integración concurrente representable es `StopDuringRfCopy`: al regresar de `CopyTo`, el scheduler observa
+  el token y cancela antes de marcar la frontera o invocar al evaluador. Las pruebas directas del evaluador
+  demuestran separadamente su contrato de cancelación y devolución de scratch.
 - `GateReprocessingAdmissionResult` rechaza estados incoherentes y copia defensivamente secundarios.
 
 ## Archivos y pruebas
@@ -25,10 +29,10 @@ benchmark en [el informe Dry](../performance/2026-10-17-gate-reprocessing-dry.md
 Validación final del working tree:
 
 - build Release: 0 errores, 0 avisos;
-- Fase 5 dirigida: 91/91;
+- Fase 5 dirigida: 92/92;
 - pairwise: 23/23, incluidas 21 filas con expectativas literales;
 - StopDuringRfCopy: 100 repeticiones;
-- Core: 790/790 en tres pasadas;
+- Core: 791/791 en la validación correctiva; la validación original fue 790/790 en tres pasadas;
 - WPF: 134/134 en tres pasadas;
 - BenchmarkDotNet Dry operacional: 10/10;
 - formato, `git diff --check`, UTF-8, enlaces, paquetes, secretos y artefactos: verdes.
@@ -41,5 +45,5 @@ contrato productivo legítimo.
 
 ## Estado Git
 
-HEAD de trabajo: `e058433c1e07d63afb3ea7011be36bd81bf81e23`. Índice vacío. No se hizo stage ni commit.
-Dictamen local: **GO** para `feat(processing): reprocess stored UT traces` si la auditoría final no encuentra P1/P2/P3.
+La implementación base está en `aee0bc1e8493192430274b1f248dba17a9cf29ff`. Las correcciones posteriores a
+la auditoría permanecen sin stage ni commit; la integración en `main` sigue pendiente de revalidación y merge.

@@ -264,30 +264,58 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
                         if (lease.Samples.Count != descriptor.SampleCount)
                         { evaluationOutcome = new(false, "coverage-mismatch:sample-count"); samples = []; }
                         else
-                        { lease.Samples.CopyTo(sampleLease.Buffer); samples = sampleLease.Buffer.AsSpan(0, descriptor.SampleCount); }
-                    }
-                    if (evaluationOutcome.Error is null)
-                    {
-                        job.RecordRead(identity);
-                        var confirmed = new ConfirmedGateTraceDescriptor(descriptor, identity,
-                            read.Revision, descriptor.TraceQuality);
-                        job.CallbackActive(1);
-                        GateEvaluationResult evaluated;
-                        try
                         {
-                            evaluated = job.Evaluator.Evaluate(job.Descriptor.Plan, confirmed,
-                            samples, job.Cancellation.Token);
+                            lease.Samples.CopyTo(sampleLease.Buffer);
+                            if (job.Cancellation.IsCancellationRequested)
+                            { evaluationOutcome = IdentityOutcome.CancelledResult; samples = []; }
+                            else samples = sampleLease.Buffer.AsSpan(0, descriptor.SampleCount);
                         }
-                        finally { job.CallbackActive(-1); }
-                        job.RecordEvaluated(identity);
-                        if (job.Cancellation.IsCancellationRequested || evaluated.Status == GateEvaluationStatus.Cancelled)
-                        { job.RecordEvaluatedNotPublished(); evaluationOutcome = IdentityOutcome.CancelledResult; }
-                        else if (!evaluated.IsCompleted || evaluated.Batch is null)
-                            evaluationOutcome = new(false,
-                                evaluated.PrimaryError?.Code.ToString() ?? "evaluation-failed");
-                        else if (job.Cancellation.IsCancellationRequested)
-                        { job.RecordEvaluatedNotPublished(); evaluationOutcome = IdentityOutcome.CancelledResult; }
-                        else batch = evaluated.Batch;
+                    }
+                    if (!evaluationOutcome.Cancelled && evaluationOutcome.Error is null)
+                    {
+                        if (job.Cancellation.IsCancellationRequested)
+                            evaluationOutcome = IdentityOutcome.CancelledResult;
+                        else
+                        {
+                            job.RecordRead(identity);
+                            var confirmed = new ConfirmedGateTraceDescriptor(descriptor, identity,
+                                read.Revision, descriptor.TraceQuality);
+                            if (job.Cancellation.IsCancellationRequested)
+                                evaluationOutcome = IdentityOutcome.CancelledResult;
+                            else
+                            {
+                                if (job.Cancellation.IsCancellationRequested)
+                                    evaluationOutcome = IdentityOutcome.CancelledResult;
+                                else
+                                {
+                                    job.CallbackActive(1);
+                                    GateEvaluationResult? evaluated = null;
+                                    try
+                                    {
+                                        if (job.Cancellation.IsCancellationRequested)
+                                            evaluationOutcome = IdentityOutcome.CancelledResult;
+                                        else
+                                            evaluated = job.Evaluator.Evaluate(job.Descriptor.Plan, confirmed,
+                                                samples, job.Cancellation.Token);
+                                    }
+                                    finally { job.CallbackActive(-1); }
+                                    if (!evaluationOutcome.Cancelled)
+                                    {
+                                        GateEvaluationResult completed = evaluated!;
+                                        job.RecordEvaluated(identity);
+                                        if (job.Cancellation.IsCancellationRequested ||
+                                            completed.Status == GateEvaluationStatus.Cancelled)
+                                        { job.RecordEvaluatedNotPublished(); evaluationOutcome = IdentityOutcome.CancelledResult; }
+                                        else if (!completed.IsCompleted || completed.Batch is null)
+                                            evaluationOutcome = new(false,
+                                                completed.PrimaryError?.Code.ToString() ?? "evaluation-failed");
+                                        else if (job.Cancellation.IsCancellationRequested)
+                                        { job.RecordEvaluatedNotPublished(); evaluationOutcome = IdentityOutcome.CancelledResult; }
+                                        else batch = completed.Batch;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 catch (Exception error)

@@ -111,9 +111,12 @@ public sealed class GateReprocessingLoadSmokeTests
         LoadScenarioResult stopRfCopy = await RunPairwiseScenarioAsync(PairwiseRows.Single(x => x.Id == 17));
         Assert.IsTrue(stopRfCopy.LiveCompleted);
         Assert.IsTrue(stopRfCopy.RfCopyBoundaryReached);
+        Assert.IsFalse(stopRfCopy.EvaluationBoundaryReached);
         Assert.AreEqual("rf-copy", stopRfCopy.TerminalStage);
         Assert.AreEqual(0L, stopRfCopy.Terminal.ScratchRents);
-        Assert.AreEqual(1L, stopRfCopy.Terminal.EvaluatedNotPublishedCount);
+        Assert.AreEqual(0, stopRfCopy.Terminal.PeakCallbacks);
+        Assert.AreEqual(0L, stopRfCopy.Terminal.EvaluatedTraceCount);
+        Assert.AreEqual(0L, stopRfCopy.Terminal.EvaluatedNotPublishedCount);
 
         LoadScenarioResult stopCommit = await RunPairwiseScenarioAsync(PairwiseRows.Single(x => x.Id == 19));
         Assert.AreEqual(1L, stopCommit.Terminal.CommitProgress!.Admitted);
@@ -333,8 +336,7 @@ public sealed class GateReprocessingLoadSmokeTests
         var result = new LoadScenarioResult(scenario.Id, scenario, expected, terminal, diagnostics, liveCompleted,
             derived.ActiveView is not null,
             scenario.Termination == LoadTermination.StopDuringRfCopy ? "rf-copy" : ActualTerminalStage(terminal),
-            providerReached, storeReached,
-            rfCopyReached);
+            providerReached, storeReached, rfCopyReached, terminal.PeakCallbacks > 0);
         AssertExpected(result, ExpectedOutcomes.Single(item => item.Id == scenario.Id));
         return result;
     }
@@ -400,27 +402,27 @@ public sealed class GateReprocessingLoadSmokeTests
 
     private static readonly PairwiseExpectation[] ExpectedOutcomes =
     [
-        new(1,"complete",false,true,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.StoreOnly,false,2,0),
-        new(2,"complete",true,false,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,2,0),
-        new(3,"complete",true,true,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,8,0),
-        new(4,"complete",false,false,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.StoreOnly,false,0,8),
-        new(5,"complete",true,false,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,0,8),
-        new(6,"complete",true,true,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,0,2),
-        new(7,"commit-before-admission",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0),
-        new(8,"commit-before-admission",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0),
-        new(9,"commit-before-admission",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,0,0),
-        new(10,"commit-admitted",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,1,0),
-        new(11,"commit-admitted",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,1,0),
-        new(12,"commit-admitted",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,1,0),
-        new(13,"read",true,false,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0),
-        new(14,"read",true,false,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0),
-        new(15,"read",true,false,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,0,0),
-        new(16,"rf-copy",false,false,true,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0),
-        new(17,"rf-copy",false,false,true,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,0,0),
-        new(18,"rf-copy",false,false,true,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0),
-        new(19,"commit-admitted",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,1,0),
-        new(20,"commit-admitted",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,1,0),
-        new(21,"commit-admitted",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,1,0)
+        new(1,"complete",false,true,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.StoreOnly,false,2,0,true),
+        new(2,"complete",true,false,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,2,0,true),
+        new(3,"complete",true,true,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,8,0,true),
+        new(4,"complete",false,false,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.StoreOnly,false,0,8,true),
+        new(5,"complete",true,false,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,0,8,true),
+        new(6,"complete",true,true,false,GateReprocessingLifecycle.Completed,GateReprocessingPublicationPolicy.ActivateOnComplete,true,0,2,true),
+        new(7,"commit-before-admission",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0,true),
+        new(8,"commit-before-admission",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0,true),
+        new(9,"commit-before-admission",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,0,0,true),
+        new(10,"commit-admitted",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,1,0,true),
+        new(11,"commit-admitted",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,1,0,true),
+        new(12,"commit-admitted",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,1,0,true),
+        new(13,"read",true,false,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0,false),
+        new(14,"read",true,false,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0,false),
+        new(15,"read",true,false,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,0,0,false),
+        new(16,"rf-copy",false,false,true,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0,false),
+        new(17,"rf-copy",false,false,true,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,0,0,false),
+        new(18,"rf-copy",false,false,true,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,0,0,false),
+        new(19,"commit-admitted",false,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,1,0,true),
+        new(20,"commit-admitted",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.ActivateOnComplete,false,1,0,true),
+        new(21,"commit-admitted",true,true,false,GateReprocessingLifecycle.Cancelled,GateReprocessingPublicationPolicy.StoreOnly,false,1,0,true)
     ];
 
     private static void AssertExpected(LoadScenarioResult actual, PairwiseExpectation expected)
@@ -431,6 +433,7 @@ public sealed class GateReprocessingLoadSmokeTests
         Assert.AreEqual(expected.Provider, actual.ProviderBoundaryReached, message);
         Assert.AreEqual(expected.Store, actual.StoreBoundaryReached, message);
         Assert.AreEqual(expected.RfCopy, actual.RfCopyBoundaryReached, message);
+        Assert.AreEqual(expected.Evaluation, actual.EvaluationBoundaryReached, message);
         Assert.AreEqual(expected.Lifecycle, actual.Terminal.Lifecycle, message);
         Assert.AreEqual(expected.Policy, actual.Dimensions.Policy, message);
         Assert.AreEqual(actual.Dimensions.Policy == GateReprocessingPublicationPolicy.ActivateOnComplete &&
@@ -648,11 +651,12 @@ public sealed class GateReprocessingLoadSmokeTests
     public sealed record LoadScenarioResult(int Id, LoadScenario Dimensions, long ExpectedIdentities,
         GateReprocessingProgressSnapshot Terminal, GateDerivedStoreDiagnostics StoreDiagnostics,
         bool LiveCompleted, bool ActiveViewPresent, string TerminalStage,
-        bool ProviderBoundaryReached, bool StoreBoundaryReached, bool RfCopyBoundaryReached);
+        bool ProviderBoundaryReached, bool StoreBoundaryReached, bool RfCopyBoundaryReached,
+        bool EvaluationBoundaryReached);
 
     private sealed record PairwiseExpectation(int Id, string Stage, bool Provider, bool Store, bool RfCopy,
         GateReprocessingLifecycle Lifecycle, GateReprocessingPublicationPolicy Policy, bool View,
-        long New, long Duplicate);
+        long New, long Duplicate, bool Evaluation);
 
     public enum LoadTermination
     {

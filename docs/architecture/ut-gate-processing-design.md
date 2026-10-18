@@ -1,6 +1,7 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-18. Estado: **Fase 5 implementada y validada localmente; sin composición productiva, UI, persistencia ni C-Scan**.
+Fecha: 2026-10-18. Estado: **contrato aceptado; Fase 5 implementada y validada en `feature/ut-gate-reprocessing`,
+con integración en `main` pendiente; sin composición productiva, UI, persistencia ni C-Scan**.
 
 ## 1. Alcance y autoridad
 

@@ -154,14 +154,33 @@ public sealed class GateReprocessingConcurrencyTests
             await stop.WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.AreEqual(GateReprocessingLifecycle.Cancelled, terminal.Lifecycle);
-            Assert.AreEqual(1, terminal.PeakCallbacks);
-            Assert.AreEqual(1L, terminal.ReadTraceCount);
-            Assert.AreEqual(1L, terminal.EvaluatedTraceCount);
-            Assert.AreEqual(1L, terminal.EvaluatedNotPublishedCount);
+            Assert.AreEqual(0, terminal.PeakCallbacks);
+            Assert.AreEqual(0L, terminal.ReadTraceCount);
+            Assert.AreEqual(0L, terminal.EvaluatedTraceCount);
+            Assert.AreEqual(0L, terminal.EvaluatedNotPublishedCount);
             Assert.AreEqual(0L, terminal.CommitProgress!.Attempts);
+            Assert.AreEqual(0L, terminal.CommitProgress.Admitted);
+            Assert.AreEqual(0L, terminal.CommitProgress.Completed);
             Assert.AreEqual(0L, terminal.ScratchRents);
+            Assert.AreEqual(0L, terminal.ScratchReturns);
+            Assert.AreEqual(1L, terminal.BufferRents);
+            Assert.AreEqual(1L, terminal.BufferReturns);
+            Assert.AreEqual(0, terminal.ActiveBuffers);
+            Assert.AreEqual(0L, terminal.ReservedBufferBytes);
+            Assert.AreEqual(0L, terminal.OwnedBufferBytes);
+            Assert.AreEqual(1L, terminal.LeasesAcquired);
+            Assert.AreEqual(1L, terminal.LeasesReleased);
             AssertTerminalBalances(terminal);
-            Assert.AreEqual(derived.Diagnostics.WritersAdmitted, derived.Diagnostics.WritersCompleted);
+            GateDerivedStoreDiagnostics store = derived.Diagnostics;
+            Assert.AreEqual(0, store.BatchCount);
+            Assert.AreEqual(0, store.TerminalEvidenceCount);
+            Assert.AreEqual(0, store.ActiveViewCount);
+            Assert.AreEqual(0, store.ReservedBatchCount);
+            Assert.AreEqual(0, store.ReservedCoverageCount);
+            Assert.AreEqual(0, store.ReservedActivationCount);
+            Assert.AreEqual(store.WritersAdmitted, store.WritersCompleted);
+            Assert.AreEqual(store.CoverageWritersAdmitted, store.CoverageWritersCompleted);
+            Assert.AreEqual(store.ActivationWritersAdmitted, store.ActivationWritersCompleted);
         }
     }
 

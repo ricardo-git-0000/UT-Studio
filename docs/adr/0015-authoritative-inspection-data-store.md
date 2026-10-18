@@ -290,7 +290,8 @@ autoridad.
 Durante Fase 3 B-Scan permaneció temporalmente como proyección derivada alimentada con el frame ya confirmado y
 `BScanTraceStore` no se eliminó. La selección B→A, en cambio, resolvía la `TraceIdentity` autoritativa
 por `AcquisitionIndex` mediante `IUtTraceProvider`; `Sequence` no sustituye al índice. La persistencia
-incremental continúa aplazada a Fase 5.
+incremental permanece fuera de Fase 5 y aplazada a la Fase 8 del plan de procesamiento o a una fase futura
+sujeta a requisitos y aprobación.
 
 ## Refinamiento aceptado de Fase 4: estado neutral y rangos B-Scan
 
@@ -374,7 +375,10 @@ reducciones, renders, candidatos y callbacks admitidos; no fuerza owners ni sust
 El raster congelado conserva selección y navegación sobre el mapa de `TraceIdentity` que se confirmó
 con él.
 
-## Refinamiento implementado de Fase 5 pendiente de aceptación: snapshot RF de run sellada
+## Refinamiento aceptado e implementado de Fase 5: snapshot RF de run sellada
+
+El contrato y la implementación están completados y validados en `feature/ut-gate-reprocessing`; su integración
+en `main` permanece pendiente de superar auditoría y merge. Este refinamiento no añade almacenamiento persistente.
 
 El reprocesado histórico no infiere estabilidad a partir de que el store sea append-only. Un puerto neutral
 independiente, `IInspectionSealedRunSnapshotProvider`, abre un lease contractual para una inspección y run

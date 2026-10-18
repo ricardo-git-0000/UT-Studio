@@ -53,6 +53,7 @@ public sealed class GateReprocessingPaginationFaultTests
         Assert.AreEqual(0, terminal.ActiveLeases); Assert.AreEqual(0, terminal.ActiveBuffers);
         Assert.AreEqual(0, terminal.ActiveScratch); Assert.IsTrue(terminal.CleanupConfirmed);
         Assert.AreEqual(terminal.LeasesAcquired, terminal.LeasesReleased);
+        if (mode == Mode.NotAvailable) Assert.AreEqual(0L, terminal.LeasesAcquired);
         Assert.AreEqual(terminal.BufferRents, terminal.BufferReturns);
         Assert.AreEqual(terminal.ScratchRents, terminal.ScratchReturns);
         Assert.AreEqual(0, terminal.CoverageProgress!.Attempts);

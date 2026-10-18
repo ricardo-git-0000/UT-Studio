@@ -1,6 +1,8 @@
 # Plan aprobado por fases — procesamiento neutral de puertas UT
 
-Fecha: 2026-10-18. Estado: **Fase 5 implementada y validada localmente, sobre Fase 4 implementada y Fase 3 aceptada; sin composición productiva**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
+Fecha: 2026-10-18. Estado: **contrato aceptado; Fase 5 implementada y validada en
+`feature/ut-gate-reprocessing`, sobre Fase 4 implementada y Fase 3 aceptada; integración en `main` pendiente y
+sin composición productiva**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
 Diseño: [procesamiento neutral](../architecture/ut-gate-processing-design.md).
 
 ## Propiedad y alcance
@@ -72,14 +74,14 @@ lotes que mezclen inspección, run o revisión RF final. Evidencia terminal y to
 
 ## Fase 5 — reprocesado
 
-Implementar un snapshot contractual de run sellada fijado a `SourceFinalRevision`, selección canónica de
+Se implementó un snapshot contractual de run sellada fijado a `SourceFinalRevision`, selección canónica de
 streams/rangos dispersos, enumeración paginada y reprocesado por bloques con plan fijado. El scheduler histórico
 usa admisión, workers, scratch, presupuesto y métricas separados de live; cede entre bloques y Stop cancela el
 backlog sin abandonar commits ya admitidos.
 
-Publicar batches mediante el store derivado como `StoreOnly` o `ActivateOnComplete`, sin reintentos automáticos,
+Los batches se publican mediante el store derivado como `StoreOnly` o `ActivateOnComplete`, sin reintentos automáticos,
 sin vista parcial y con manifest formado desde identidades exactas. Un segundo intento distingue batches nuevos
-de `Duplicate`. Comparar live/reproceso con el mismo evaluator y la referencia escalar.
+de `Duplicate`. Se compararon live y reproceso con el mismo evaluator y la referencia escalar.
 
 Gate: igualdad reproducible, memoria acotada, no cargar inspección completa y no privar Stop/cierre.
 
