@@ -1,28 +1,42 @@
 using UTStudio.Contracts.Inspection;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace UTStudio.Inspection.Core;
+
+public sealed class InspectionSealedIndexCapacityException(string errorCode) : Exception(errorCode)
+{
+    public string ErrorCode { get; } = errorCode;
+}
 
 public sealed record InMemoryInspectionStoreOptions
 {
     public InMemoryInspectionStoreOptions(long sampleCapacityBudgetBytes, int maximumEntries,
-        int targetChunkBytes = 4 * 1024 * 1024)
+        int targetChunkBytes = 4 * 1024 * 1024, long sealedIndexCapacityBudgetBytes = 64 * 1024 * 1024,
+        long preparedQueryCapacityBudgetBytes = 16 * 1024 * 1024)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(sampleCapacityBudgetBytes, 2);
         ArgumentOutOfRangeException.ThrowIfLessThan(maximumEntries, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(targetChunkBytes, 2);
+        ArgumentOutOfRangeException.ThrowIfLessThan(sealedIndexCapacityBudgetBytes, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(preparedQueryCapacityBudgetBytes, 128);
         SampleCapacityBudgetBytes = sampleCapacityBudgetBytes;
         MaximumEntries = maximumEntries;
         TargetChunkBytes = targetChunkBytes;
+        SealedIndexCapacityBudgetBytes = sealedIndexCapacityBudgetBytes;
+        PreparedQueryCapacityBudgetBytes = preparedQueryCapacityBudgetBytes;
     }
     public long SampleCapacityBudgetBytes { get; }
     public int MaximumEntries { get; }
     public int TargetChunkBytes { get; }
+    public long SealedIndexCapacityBudgetBytes { get; }
+    public long PreparedQueryCapacityBudgetBytes { get; }
 }
 
 /// <summary>Authoritative, append-only in-memory store. It has no durable backing.</summary>
-public sealed class InMemoryInspectionDataStore : IInspectionDataStore
+public sealed partial class InMemoryInspectionDataStore : IInspectionDataStore
 {
     private readonly object _gate = new();
     private readonly InspectionId _inspectionId;
@@ -43,6 +57,8 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
     private bool _accepting = true, _leasesAllowed = true, _closing, _closed;
     private int _admittedWriters, _maximumWriters, _activeLeases, _maximumLeases;
     private long _logicalBytes, _reservedSampleBytes, _ownedSampleBytes, _maximumOwnedSampleBytes;
+    private long _reservedSealedIndexBytes, _ownedSealedIndexBytes, _peakSealedIndexBytes;
+    private long _reservedPreparedQueryBytes, _ownedPreparedQueryBytes, _peakPreparedQueryBytes;
     private ulong _revision, _committedTraces, _cancelledAppends, _preAdmissionRejections, _duplicates, _conflicts,
         _capacityRejections;
     private long _streamStateReadsCompleted, _streamStateReadFaults;
@@ -122,7 +138,11 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                     runs.Count(static run => run.State == InspectionRunState.Sealing),
                     runs.Count(static run => run.State == InspectionRunState.Sealed),
                     runs.Count(static run => run.State == InspectionRunState.Open), _gaps.Count,
-                    runs.Count(static run => run.State == InspectionRunState.Sealing), Array.AsReadOnly(runs));
+                    runs.Count(static run => run.State == InspectionRunState.Sealing), Array.AsReadOnly(runs),
+                    _reservedSealedIndexBytes, _ownedSealedIndexBytes, _peakSealedIndexBytes,
+                    _options.SealedIndexCapacityBudgetBytes, _reservedPreparedQueryBytes,
+                    _ownedPreparedQueryBytes, _peakPreparedQueryBytes,
+                    _options.PreparedQueryCapacityBudgetBytes);
             }
         }
     }
@@ -700,6 +720,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                 InspectionRunSealResult result = _sealResultFactory.Create(run.RunId, revision,
                     run.MinimumIndex, run.MaximumIndex, run.MinimumSequence, run.MaximumSequence,
                     run.TraceCount, run.GapCount);
+                run.SealedIndex = BuildSealedRunIndexUnderLock(run.RunId, revision);
                 run.FinalRevision = revision;
                 run.State = InspectionRunState.Sealed;
                 TestHooks?.AfterSealPublished?.Invoke();
@@ -710,12 +731,51 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
         {
             lock (_gate)
             {
+                if (run.SealedIndex is { } failedIndex)
+                {
+                    _ownedSealedIndexBytes -= failedIndex.CapacityBytes;
+                    run.SealedIndex = null;
+                }
                 if (run.State != InspectionRunState.Sealed)
                 {
                     run.State = InspectionRunState.Faulted;
                     run.FaultCode = InspectionRunFaultCode.SealFailed;
                 }
             }
+            throw;
+        }
+    }
+
+    private SealedRunIndex BuildSealedRunIndexUnderLock(AcquisitionRunId runId, InspectionRevision finalRevision)
+    {
+        var sources = _index.Streams.Where(pair => pair.Key.AcquisitionRunId == runId).ToArray();
+        UtStreamIdentity[] gapOnly = _gapCountsByStream.Keys
+            .Where(stream => stream.AcquisitionRunId == runId && sources.All(pair => pair.Key != stream)).ToArray();
+        long required = SealedRunIndex.RequiredCapacityBytes(sources.Select(pair => pair.Value.Count)
+            .Concat(Enumerable.Repeat(0, gapOnly.Length)));
+        if (required > _options.SealedIndexCapacityBudgetBytes - _ownedSealedIndexBytes - _reservedSealedIndexBytes)
+        { _capacityRejections++; throw new InspectionSealedIndexCapacityException("sealed-index-capacity-exceeded"); }
+        _reservedSealedIndexBytes = checked(_reservedSealedIndexBytes + required);
+        try
+        {
+            var streams = new List<KeyValuePair<UtStreamIdentity, SealedStreamIndex>>(sources.Length + gapOnly.Length);
+            foreach (var pair in sources)
+            {
+                Entry[] entries = pair.Value.Values.ToArray();
+                var identities = new TraceIdentity[entries.Length];
+                for (int i = 0; i < entries.Length; i++) identities[i] = entries[i].Descriptor.Identity;
+                streams.Add(new(pair.Key, new SealedStreamIndex(identities, entries)));
+            }
+            foreach (UtStreamIdentity stream in gapOnly)
+                streams.Add(new(stream, new SealedStreamIndex([], [])));
+            var result = new SealedRunIndex(_inspectionId, runId, finalRevision, streams.ToArray(), required);
+            _reservedSealedIndexBytes -= required; _ownedSealedIndexBytes = checked(_ownedSealedIndexBytes + required);
+            _peakSealedIndexBytes = Math.Max(_peakSealedIndexBytes, _ownedSealedIndexBytes);
+            return result;
+        }
+        catch
+        {
+            _reservedSealedIndexBytes -= required;
             throw;
         }
     }
@@ -764,7 +824,10 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
                 }
             }
             _index.Clear(); _gaps.Clear(); _gapCountsByStream.Clear(); _chunks.Clear(); _activeChunk = null;
+            foreach (RunState run in _runs.Values) run.SealedIndex = null;
             _logicalBytes = 0; _reservedSampleBytes = 0; _ownedSampleBytes = 0;
+            _reservedSealedIndexBytes = 0; _ownedSealedIndexBytes = 0;
+            _reservedPreparedQueryBytes = 0; _ownedPreparedQueryBytes = 0;
             _closing = false; _closed = true;
         }
         if (sealFailure is not null || cleanupFailures.Count != 0)
@@ -777,6 +840,31 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
             throw new InspectionStoreCloseException(primary, secondary, inner);
         }
     }
+
+    private bool TryReservePreparedQueryCapacity(long bytes)
+    {
+        lock (_gate)
+        {
+            if (bytes > _options.PreparedQueryCapacityBudgetBytes - _ownedPreparedQueryBytes - _reservedPreparedQueryBytes)
+            { _capacityRejections++; return false; }
+            _reservedPreparedQueryBytes = checked(_reservedPreparedQueryBytes + bytes); return true;
+        }
+    }
+
+    private void ConfirmPreparedQueryCapacity(long bytes)
+    {
+        lock (_gate)
+        {
+            _reservedPreparedQueryBytes -= bytes; _ownedPreparedQueryBytes = checked(_ownedPreparedQueryBytes + bytes);
+            _peakPreparedQueryBytes = Math.Max(_peakPreparedQueryBytes, _ownedPreparedQueryBytes);
+        }
+    }
+
+    private void RollbackPreparedQueryCapacity(long bytes)
+    { lock (_gate) _reservedPreparedQueryBytes -= bytes; }
+
+    private void ReleasePreparedQueryCapacity(long bytes)
+    { lock (_gate) _ownedPreparedQueryBytes -= bytes; }
 
     private bool TryAdmitWriter()
     {
@@ -955,6 +1043,7 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
         internal ulong? MinimumIndex, MaximumIndex, MinimumSequence, MaximumSequence;
         internal TaskCompletionSource? OperationsDrained;
         internal Task<InspectionRunSealResult>? SealTask;
+        internal SealedRunIndex? SealedIndex;
         internal void RecordCommit(TraceDescriptor descriptor, int gapCount, InspectionRevision revision)
         {
             TraceCount++; GapCount += gapCount;
@@ -968,6 +1057,77 @@ public sealed class InMemoryInspectionDataStore : IInspectionDataStore
             State == InspectionRunState.Open ? 1 : 0, PendingOperations, TraceCount, GapCount,
             Duplicates, Conflicts, Cancellations, Rejections, FinalRevision,
             MinimumIndex, MaximumIndex, MinimumSequence, MaximumSequence);
+    }
+
+    private sealed class SealedRunIndex(InspectionId inspectionId, AcquisitionRunId runId,
+        InspectionRevision finalRevision,
+        KeyValuePair<UtStreamIdentity, SealedStreamIndex>[] streams, long capacityBytes)
+    {
+        private const int ArrayHeaderBytes = 24;
+        private const int StreamRecordBytes = 160;
+        private readonly Dictionary<UtStreamIdentity, SealedStreamIndex> _streams =
+            streams.ToDictionary(static pair => pair.Key, static pair => pair.Value);
+        internal InspectionId InspectionId { get; } = inspectionId;
+        internal AcquisitionRunId RunId { get; } = runId;
+        internal InspectionRevision FinalRevision { get; } = finalRevision;
+        internal long CapacityBytes { get; } = capacityBytes;
+        internal bool TryGetStream(UtStreamIdentity stream, out SealedStreamIndex index) =>
+            _streams.TryGetValue(stream, out index!);
+        internal static long RequiredCapacityBytes(IEnumerable<int> counts)
+        {
+            checked
+            {
+                long total = ArrayHeaderBytes;
+                foreach (int count in counts)
+                    total += StreamRecordBytes + 64 + ArrayHeaderBytes + (long)count *
+                        System.Runtime.CompilerServices.Unsafe.SizeOf<TraceIdentity>() +
+                        ArrayHeaderBytes + (long)count * IntPtr.Size;
+                return total;
+            }
+        }
+    }
+
+    private sealed class SealedStreamIndex
+    {
+        internal SealedStreamIndex(TraceIdentity[] identities, Entry[] entries)
+        {
+            if (identities.Length != entries.Length) throw new ArgumentException("Sealed index arrays differ.");
+            for (int i = 0; i < identities.Length; i++)
+                if (entries[i].Descriptor.Identity != identities[i] ||
+                    (i != 0 && identities[i - 1].AcquisitionIndex >= identities[i].AcquisitionIndex))
+                    throw new ArgumentException("The sealed stream index is not strictly ordered and unique.");
+            Identities = identities;
+            Entries = entries;
+            using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            Span<byte> header = stackalloc byte[6];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(header, 1);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(header[2..], identities.Length);
+            hash.AppendData(header);
+            if (identities.Length != 0)
+            {
+                TraceIdentity first = identities[0];
+                byte[] source = Encoding.UTF8.GetBytes(first.Stream.SourceId.Value);
+                Span<byte> prefix = stackalloc byte[48];
+                Span<byte> acquisitionIndex = stackalloc byte[8];
+                first.Stream.InspectionId.Value.TryWriteBytes(prefix[..16]);
+                first.Stream.AcquisitionRunId.Value.TryWriteBytes(prefix[16..32]);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(prefix[32..36], source.Length);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(prefix[36..40], first.Stream.PhysicalChannelId.Value);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(prefix[40..44], first.Stream.BeamId?.Value ?? -1);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(prefix[44..48], first.Stream.FocalLawId?.Value ?? -1);
+                foreach (TraceIdentity identity in identities)
+                {
+                    hash.AppendData(prefix[..40]); hash.AppendData(source); hash.AppendData(prefix[40..48]);
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(acquisitionIndex, identity.AcquisitionIndex);
+                    hash.AppendData(acquisitionIndex);
+                }
+            }
+            Digest = Convert.ToHexString(hash.GetHashAndReset());
+        }
+
+        internal TraceIdentity[] Identities { get; }
+        internal Entry[] Entries { get; }
+        internal string Digest { get; }
     }
 
     internal sealed class Entry(TraceDescriptor descriptor, InspectionRevision revision,
@@ -1042,6 +1202,8 @@ internal interface IInspectionTraceIndex
 {
     int Count { get; }
     IEnumerable<InMemoryInspectionDataStore.Entry> Values { get; }
+    IEnumerable<KeyValuePair<UtStreamIdentity,
+        SortedDictionary<ulong, InMemoryInspectionDataStore.Entry>>> Streams => [];
     bool TryGetPrimary(TraceIdentity identity, out InMemoryInspectionDataStore.Entry? entry);
     void AddPrimary(TraceIdentity identity, InMemoryInspectionDataStore.Entry entry);
     void RemovePrimary(TraceIdentity identity);
@@ -1077,6 +1239,8 @@ internal sealed class DefaultInspectionTraceIndex : IInspectionTraceIndex
         SortedDictionary<ulong, InMemoryInspectionDataStore.Entry>> _streams = [];
     public int Count => _primary.Count;
     public IEnumerable<InMemoryInspectionDataStore.Entry> Values => _primary.Values;
+    public IEnumerable<KeyValuePair<UtStreamIdentity,
+        SortedDictionary<ulong, InMemoryInspectionDataStore.Entry>>> Streams => _streams;
     public bool TryGetPrimary(TraceIdentity identity, out InMemoryInspectionDataStore.Entry? entry) =>
         _primary.TryGetValue(identity, out entry);
     public void AddPrimary(TraceIdentity identity, InMemoryInspectionDataStore.Entry entry) =>

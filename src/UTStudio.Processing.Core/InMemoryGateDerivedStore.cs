@@ -16,16 +16,22 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
     private Dictionary<GateDerivedBatchKey, StoredBatch> _batches = [];
     private Dictionary<DerivedViewId, StoredView> _views = [];
     private HashSet<DerivedViewId> _invalidated = [];
-    private Dictionary<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string, GateSchemaVersion, GateAlgorithmVersion),
+    private Dictionary<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string, GateSchemaVersion, GateAlgorithmVersion, string),
         GateProcessingTerminalCoverage> _terminalCoverage = [];
     private HashSet<DerivedViewId> _usedViewIds = [];
     private ulong _revision, _activationOrder;
+    private long _nextOperationId;
     private long _reservedBytes;
     private int _reservedBatches;
     private long _logicalBytes, _commits, _duplicates, _conflicts, _capacityExceeded,
         _activations, _invalidations, _reclaims;
     private int _writers, _readers, _leases;
     private long _writersAdmitted, _writersCompleted, _readersAdmitted, _readersCompleted;
+    private int _coverageWriters, _activationWriters;
+    private long _coverageWritersAdmitted, _coverageWritersCompleted;
+    private long _activationWritersAdmitted, _activationWritersCompleted;
+    private int _reservedCoverageCount, _reservedActivationCount;
+    private long _reservedCoverageBytes, _reservedActivationBytes;
     private string? _lastErrorCode;
     private readonly Dictionary<DerivedViewId, int> _leaseViews = [];
     private readonly Dictionary<DerivedViewId, HashSet<GateDerivedBatchKey>> _leasedMemberships = [];
@@ -63,7 +69,11 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
             _terminalCoverage.Count, _active is null ? 0 : 1, _views.Count - (_active is null ? 0 : 1) - _invalidated.Count,
             _invalidated.Count, _usedViewIds.Count - _views.Count, _batches.Count,
             _views.Values.Sum(x => x.Membership.Count), invalidatedBatchBytes + invalidatedViewBytes,
-            reclaimableBatchBytes + invalidatedViewBytes, _lastErrorCode);
+            reclaimableBatchBytes + invalidatedViewBytes, _lastErrorCode,
+            _coverageWriters, _coverageWritersAdmitted, _coverageWritersCompleted,
+            _activationWriters, _activationWritersAdmitted, _activationWritersCompleted,
+            _reservedCoverageCount, _reservedCoverageBytes,
+            _reservedActivationCount, _reservedActivationBytes);
             }
         }
     }
@@ -106,57 +116,63 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
         if (batch.Entries.Count == 0) { throw new ArgumentException("A derived batch must contain entries.", nameof(batch)); }
         if (System.Text.Encoding.UTF8.GetByteCount(batch.Trace.ConfirmedIdentity.Stream.SourceId.Value) > 128)
         { throw new ArgumentException("SourceId exceeds the derived-store UTF-8 limit.", nameof(batch)); }
-        if (cancellationToken.IsCancellationRequested)
-        { return ValueTask.FromResult(new GateDerivedMutationResult(GateDerivedMutationStatus.Cancelled, Revision)); }
-        if (!TryAdmitWriter())
-        { return ValueTask.FromResult(new GateDerivedMutationResult(GateDerivedMutationStatus.Closed, Revision)); }
+        WriterAdmission admission;
+        try { admission = TryAdmitWriter(cancellationToken); }
+        catch (Exception error)
+        {
+            return ValueTask.FromResult(new GateDerivedMutationResult(
+                GateDerivedMutationStatus.Faulted, Revision, error.GetType().Name));
+        }
+        if (admission == WriterAdmission.Cancelled)
+            return ValueTask.FromResult(new GateDerivedMutationResult(
+                GateDerivedMutationStatus.Cancelled, Revision));
+        if (admission == WriterAdmission.Closed)
+            return ValueTask.FromResult(new GateDerivedMutationResult(
+                GateDerivedMutationStatus.Closed, Revision));
         bool reserved = false;
         long size = 0;
         try
         {
             GateDerivedBatchKey key = Key(batch);
             try { size = GateDerivedLogicalSize.Batch(batch); }
-            catch (OverflowException) { return ValueTask.FromResult(Result(GateDerivedMutationStatus.CapacityExceeded, "logical-size-overflow")); }
+            catch (OverflowException) { return ValueTask.FromResult(WriterResult(GateDerivedMutationStatus.CapacityExceeded, "logical-size-overflow")); }
             lock (_gate)
             {
                 if (_revision == ulong.MaxValue)
-                { return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Faulted, "revision-overflow")); }
+                { return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.Faulted, "revision-overflow")); }
                 if (_batches.TryGetValue(key, out StoredBatch? existing))
                 {
-                    if (BatchEquivalent(existing.Batch, batch)) { _duplicates++; return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Duplicate)); }
-                    _conflicts++; return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Conflict));
+                    if (BatchEquivalent(existing.Batch, batch)) { _duplicates++; return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.Duplicate)); }
+                    _conflicts++; return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.Conflict));
                 }
                 if (_batches.Count + _reservedBatches >= _options.MaximumBatchCount ||
-                    size > _options.LogicalPayloadBudgetBytes - _logicalBytes - _reservedBytes)
-                { _capacityExceeded++; return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.CapacityExceeded)); }
+                    size > _options.LogicalPayloadBudgetBytes - _logicalBytes - _reservedBytes -
+                        _reservedCoverageBytes - _reservedActivationBytes)
+                { _capacityExceeded++; return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.CapacityExceeded)); }
                 _reservedBatches++; _reservedBytes = checked(_reservedBytes + size); reserved = true;
             }
             try { TestHooks?.AfterReservation?.Invoke(); }
-            catch (Exception error) { return ValueTask.FromResult(Result(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
+            catch (Exception error) { return ValueTask.FromResult(WriterResult(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
             GateEvaluationBatch owned;
             try { owned = Clone(batch); }
-            catch (Exception error) { return ValueTask.FromResult(Result(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
+            catch (Exception error) { return ValueTask.FromResult(WriterResult(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
             try { TestHooks?.AfterCopy?.Invoke(); }
-            catch (Exception error) { return ValueTask.FromResult(Result(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
-            if (cancellationToken.IsCancellationRequested)
-            { return ValueTask.FromResult(Result(GateDerivedMutationStatus.Cancelled)); }
+            catch (Exception error) { return ValueTask.FromResult(WriterResult(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
             lock (_gate)
             {
                 if (_batches.TryGetValue(key, out StoredBatch? raced))
                 {
                     ReleaseReservationUnderLock(size); reserved = false;
-                    if (BatchEquivalent(raced.Batch, owned)) { _duplicates++; return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Duplicate)); }
-                    _conflicts++; return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Conflict));
+                    if (BatchEquivalent(raced.Batch, owned)) { _duplicates++; return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.Duplicate)); }
+                    _conflicts++; return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.Conflict));
                 }
                 try { TestHooks?.BeforePublish?.Invoke(); }
-                catch (Exception error) { return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
-                if (cancellationToken.IsCancellationRequested)
-                { return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Cancelled)); }
+                catch (Exception error) { return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.Faulted, error.GetType().Name)); }
                 long nextBytes = checked(_logicalBytes + size); ulong nextRevision = checked(_revision + 1);
                 _batches.Add(key, new(owned, size, new(nextRevision))); _logicalBytes = nextBytes;
                 ReleaseReservationUnderLock(size); reserved = false;
                 _revision = nextRevision; _commits++;
-                return ValueTask.FromResult(ResultUnderLock(GateDerivedMutationStatus.Committed));
+                return ValueTask.FromResult(WriterResultUnderLock(GateDerivedMutationStatus.Committed));
             }
         }
         finally
@@ -166,7 +182,10 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
         }
     }
 
-    public GateDerivedMutationResult Activate(GateDerivedCoverageManifest manifest, DerivedViewId viewId)
+    public GateDerivedMutationResult Activate(GateDerivedCoverageManifest manifest, DerivedViewId viewId) =>
+        ActivateAsync(manifest, viewId, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+
+    private GateDerivedMutationResult ActivateLegacyUnderLock(GateDerivedCoverageManifest manifest, DerivedViewId viewId)
     {
         ArgumentNullException.ThrowIfNull(manifest);
         if (!viewId.IsValid) { throw new ArgumentException("A valid view identifier is required.", nameof(viewId)); }
@@ -176,7 +195,8 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
             if (_revision == ulong.MaxValue || _activationOrder == ulong.MaxValue)
             { return ResultUnderLock(GateDerivedMutationStatus.Faulted, "revision-overflow"); }
             var terminalKey = (manifest.InspectionId, manifest.RunId, manifest.PlanId,
-                manifest.PlanRevision, manifest.PlanSignature, manifest.SchemaVersion, manifest.AlgorithmVersion);
+                manifest.PlanRevision, manifest.PlanSignature, manifest.SchemaVersion, manifest.AlgorithmVersion,
+                manifest.CoverageScope);
             if (!_terminalCoverage.TryGetValue(terminalKey, out GateProcessingTerminalCoverage? terminal) ||
                 terminal.FinalRevision != manifest.SourceFinalRevision || !TerminalMatchesManifest(terminal, manifest))
             { return ResultUnderLock(GateDerivedMutationStatus.CoverageMismatch, "source-final-revision"); }
@@ -213,6 +233,100 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
             _logicalBytes = checked(_logicalBytes + stored.LogicalBytes);
             _revision = next; _activationOrder = order; _activations++;
             return ResultUnderLock(GateDerivedMutationStatus.Activated);
+        }
+    }
+
+    public async ValueTask<GateDerivedMutationResult> ActivateAsync(GateDerivedCoverageManifest manifest,
+        DerivedViewId viewId, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        if (!viewId.IsValid) throw new ArgumentException("A valid view identifier is required.", nameof(viewId));
+        lock (_gate)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return ResultUnderLock(GateDerivedMutationStatus.Cancelled);
+            if (_admissionClosed)
+                return ResultUnderLock(GateDerivedMutationStatus.Closed);
+            _writers++; _writersAdmitted++; _activationWriters++; _activationWritersAdmitted++;
+            _ = ++_nextOperationId;
+        }
+        await _commitSerial.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        long reserved = 0;
+        bool reservationHeld = false;
+        try
+        {
+            Dictionary<GateDerivedBatchKey, StoredBatch> batches;
+            Dictionary<DerivedViewId, StoredView> views;
+            HashSet<DerivedViewId> usedIds;
+            Dictionary<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string,
+                GateSchemaVersion, GateAlgorithmVersion, string), GateProcessingTerminalCoverage> terminalRoot;
+            ulong revision, activationOrder;
+            lock (_gate)
+            {
+                batches = _batches; views = _views; usedIds = _usedViewIds;
+                terminalRoot = _terminalCoverage; revision = _revision; activationOrder = _activationOrder;
+            }
+            if (revision == ulong.MaxValue || activationOrder == ulong.MaxValue)
+                return WriterResult(GateDerivedMutationStatus.Faulted, "revision-overflow");
+            var terminalKey = (manifest.InspectionId, manifest.RunId, manifest.PlanId,
+                manifest.PlanRevision, manifest.PlanSignature, manifest.SchemaVersion,
+                manifest.AlgorithmVersion, manifest.CoverageScope);
+            if (!terminalRoot.TryGetValue(terminalKey, out GateProcessingTerminalCoverage? terminal) ||
+                terminal.FinalRevision != manifest.SourceFinalRevision || !TerminalMatchesManifest(terminal, manifest))
+                return WriterResult(GateDerivedMutationStatus.CoverageMismatch, "source-final-revision");
+            if (views.TryGetValue(viewId, out StoredView? existingView))
+                return WriterResult(ManifestEquivalent(existingView.Descriptor.Manifest, manifest)
+                    ? GateDerivedMutationStatus.Duplicate : GateDerivedMutationStatus.Conflict);
+            if (usedIds.Contains(viewId)) return WriterResult(GateDerivedMutationStatus.Conflict);
+            if (manifest.CapturedStoreRevision.Value > revision)
+                return WriterResult(GateDerivedMutationStatus.CoverageMismatch, "future-manifest");
+            var membershipBuilder = new List<GateDerivedBatchKey>();
+            foreach (KeyValuePair<GateDerivedBatchKey, StoredBatch> candidate in batches)
+            {
+                if (candidate.Value.Revision.Value <= manifest.CapturedStoreRevision.Value &&
+                    BelongsToManifest(candidate.Key, manifest))
+                    membershipBuilder.Add(candidate.Key);
+            }
+            GateDerivedBatchKey[] membership = membershipBuilder.ToArray();
+            if (!CoverageMatches(manifest, membership))
+                return WriterResult(GateDerivedMutationStatus.CoverageMismatch);
+            long manifestSize = GateDerivedLogicalSize.Manifest(manifest);
+            long viewSize = checked(64 + System.Text.Encoding.UTF8.GetByteCount(viewId.Value));
+            long membershipSize = GateDerivedLogicalSize.Membership(membership.Length);
+            reserved = checked(manifestSize + viewSize + membershipSize);
+            lock (_gate)
+            {
+                if (reserved > _options.LogicalPayloadBudgetBytes - _logicalBytes - _reservedBytes -
+                    _reservedCoverageBytes - _reservedActivationBytes)
+                { _capacityExceeded++; return WriterResultUnderLock(GateDerivedMutationStatus.CapacityExceeded); }
+                _reservedActivationCount++; _reservedActivationBytes += reserved; reservationHeld = true;
+            }
+            ulong next = checked(revision + 1); ulong order = checked(activationOrder + 1);
+            var descriptor = new ActiveDerivedViewDescriptor(viewId, new(next), manifest, order);
+            var stored = new StoredView(descriptor, reserved, viewSize, new HashSet<GateDerivedBatchKey>(membership));
+            var stagedViews = new Dictionary<DerivedViewId, StoredView>(views) { [viewId] = stored };
+            var stagedIds = new HashSet<DerivedViewId>(usedIds) { viewId };
+            lock (_gate)
+            {
+                if (!ReferenceEquals(_batches, batches) || !ReferenceEquals(_views, views) ||
+                    !ReferenceEquals(_usedViewIds, usedIds) || !ReferenceEquals(_terminalCoverage, terminalRoot) ||
+                    _revision != revision || _activationOrder != activationOrder)
+                    return WriterResultUnderLock(GateDerivedMutationStatus.Conflict, "stale-activation");
+                ReleaseActivationReservationUnderLock(reserved); reservationHeld = false;
+                _views = stagedViews; _usedViewIds = stagedIds; _active = stored;
+                _logicalBytes = checked(_logicalBytes + reserved); _revision = next;
+                _activationOrder = order; _activations++;
+                return new GateDerivedMutationResult(GateDerivedMutationStatus.Activated,
+                    new(_revision), wasAccepted: true);
+            }
+        }
+        catch (OverflowException) { return WriterResult(GateDerivedMutationStatus.CapacityExceeded, "logical-size-overflow"); }
+        catch (Exception error) { return WriterResult(GateDerivedMutationStatus.Faulted, error.GetType().Name); }
+        finally
+        {
+            if (reservationHeld) lock (_gate) { ReleaseActivationReservationUnderLock(reserved); }
+            _commitSerial.Release();
+            ReleaseActivationWriter();
         }
     }
 
@@ -291,6 +405,22 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
     public GateProcessingTerminalCoverageStatus ConfirmTerminalCoverage(
         IReadOnlyList<GateProcessingTerminalCoverage> coverage)
     {
+        GateDerivedMutationResult result = ConfirmTerminalCoverageAsync(coverage, CancellationToken.None)
+            .AsTask().GetAwaiter().GetResult();
+        return result.Status switch
+        {
+            GateDerivedMutationStatus.Committed => GateProcessingTerminalCoverageStatus.Accepted,
+            GateDerivedMutationStatus.Duplicate => GateProcessingTerminalCoverageStatus.Duplicate,
+            GateDerivedMutationStatus.Conflict => GateProcessingTerminalCoverageStatus.Conflict,
+            GateDerivedMutationStatus.CapacityExceeded => GateProcessingTerminalCoverageStatus.CapacityExceeded,
+            GateDerivedMutationStatus.Closed => GateProcessingTerminalCoverageStatus.Closed,
+            _ => GateProcessingTerminalCoverageStatus.Faulted
+        };
+    }
+
+    private GateProcessingTerminalCoverageStatus ConfirmTerminalCoverageLegacyUnderLock(
+        IReadOnlyList<GateProcessingTerminalCoverage> coverage)
+    {
         ArgumentNullException.ThrowIfNull(coverage);
         if (coverage.Count == 0) { throw new ArgumentException("Terminal coverage cannot be empty.", nameof(coverage)); }
         lock (_gate)
@@ -306,9 +436,9 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
             if (_admissionClosed) { return Finish(GateProcessingTerminalCoverageStatus.Closed, "terminal-coverage-closed"); }
             try
             {
-                var pending = new List<((InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string, GateSchemaVersion, GateAlgorithmVersion),
+                var pending = new List<((InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string, GateSchemaVersion, GateAlgorithmVersion, string),
                     GateProcessingTerminalCoverage, long)>();
-                var inputKeys = new HashSet<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string, GateSchemaVersion, GateAlgorithmVersion)>();
+                var inputKeys = new HashSet<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string, GateSchemaVersion, GateAlgorithmVersion, string)>();
                 GateProcessingTerminalCoverage basis = coverage[0];
                 int duplicateCount = 0; long totalSize = 0;
                 foreach (GateProcessingTerminalCoverage item in coverage)
@@ -317,7 +447,7 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
                         item.FinalRevision != basis.FinalRevision)
                     { return Finish(GateProcessingTerminalCoverageStatus.Conflict, "terminal-coverage-conflict"); }
                     var key = (item.InspectionId, item.RunId, item.PlanId, item.PlanRevision, item.PlanSignature,
-                        item.SchemaVersion, item.AlgorithmVersion);
+                        item.SchemaVersion, item.AlgorithmVersion, item.CoverageScope);
                     if (!inputKeys.Add(key)) { return Finish(GateProcessingTerminalCoverageStatus.Conflict, "terminal-coverage-conflict"); }
                     if (_terminalCoverage.TryGetValue(key, out GateProcessingTerminalCoverage? existing))
                     {
@@ -334,14 +464,95 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
                 { return Finish(GateProcessingTerminalCoverageStatus.CapacityExceeded, "terminal-coverage-capacity"); }
                 long nextBytes = checked(_logicalBytes + totalSize);
                 var staged = new Dictionary<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string,
-                    GateSchemaVersion, GateAlgorithmVersion), GateProcessingTerminalCoverage>(_terminalCoverage);
+                    GateSchemaVersion, GateAlgorithmVersion, string), GateProcessingTerminalCoverage>(_terminalCoverage);
                 foreach (var item in pending) { staged.Add(item.Item1, item.Item2); }
-                TestHooks?.AfterTerminalCoverageStaging?.Invoke();
                 _terminalCoverage = staged; _logicalBytes = nextBytes;
             }
             catch (OverflowException) { return Finish(GateProcessingTerminalCoverageStatus.CapacityExceeded, "terminal-coverage-overflow"); }
             catch { return Finish(GateProcessingTerminalCoverageStatus.Faulted, "terminal-coverage-faulted"); }
             return GateProcessingTerminalCoverageStatus.Accepted;
+        }
+    }
+
+    public async ValueTask<GateDerivedMutationResult> ConfirmTerminalCoverageAsync(
+        IReadOnlyList<GateProcessingTerminalCoverage> coverage,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(coverage);
+        if (coverage.Count == 0) throw new ArgumentException("Terminal coverage cannot be empty.", nameof(coverage));
+        lock (_gate)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return ResultUnderLock(GateDerivedMutationStatus.Cancelled);
+            if (_admissionClosed)
+                return ResultUnderLock(GateDerivedMutationStatus.Closed);
+            _writers++; _writersAdmitted++; _coverageWriters++; _coverageWritersAdmitted++;
+            _ = ++_nextOperationId;
+        }
+        await _commitSerial.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        long reservationSize = 0;
+        bool reservationHeld = false;
+        try
+        {
+            Dictionary<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string,
+                GateSchemaVersion, GateAlgorithmVersion, string), GateProcessingTerminalCoverage> root;
+            long logicalBytes;
+            lock (_gate) { root = _terminalCoverage; logicalBytes = _logicalBytes; }
+            var staged = new Dictionary<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string,
+                GateSchemaVersion, GateAlgorithmVersion, string), GateProcessingTerminalCoverage>(root);
+            var inputKeys = new HashSet<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision, string,
+                GateSchemaVersion, GateAlgorithmVersion, string)>();
+            GateProcessingTerminalCoverage basis = coverage[0];
+            int duplicates = 0; long totalSize = 0;
+            foreach (GateProcessingTerminalCoverage item in coverage)
+                try
+                {
+                    if (item.InspectionId != basis.InspectionId || item.RunId != basis.RunId ||
+                        item.FinalRevision != basis.FinalRevision)
+                        return WriterResult(GateDerivedMutationStatus.Conflict, "terminal-coverage-conflict");
+                    var key = (item.InspectionId, item.RunId, item.PlanId, item.PlanRevision,
+                        item.PlanSignature, item.SchemaVersion, item.AlgorithmVersion, item.CoverageScope);
+                    if (!inputKeys.Add(key))
+                        return WriterResult(GateDerivedMutationStatus.Conflict, "terminal-coverage-conflict");
+                    if (root.TryGetValue(key, out GateProcessingTerminalCoverage? existing))
+                    {
+                        if (existing.FinalRevision != item.FinalRevision || !TerminalEquivalent(existing, item))
+                            return WriterResult(GateDerivedMutationStatus.Conflict, "terminal-coverage-conflict");
+                        duplicates++; continue;
+                    }
+                    totalSize = checked(totalSize + GateDerivedLogicalSize.TerminalCoverage(item));
+                    staged.Add(key, item);
+                }
+                catch (Exception error) when (error is not OverflowException)
+                { return WriterResult(GateDerivedMutationStatus.Faulted, error.GetType().Name); }
+            if (duplicates != 0 && duplicates != coverage.Count)
+                return WriterResult(GateDerivedMutationStatus.Conflict, "terminal-coverage-conflict");
+            if (duplicates == coverage.Count) return WriterResult(GateDerivedMutationStatus.Duplicate);
+            reservationSize = totalSize;
+            lock (_gate)
+            {
+                if (reservationSize > _options.LogicalPayloadBudgetBytes - _logicalBytes - _reservedBytes -
+                    _reservedCoverageBytes - _reservedActivationBytes)
+                { _capacityExceeded++; return WriterResultUnderLock(GateDerivedMutationStatus.CapacityExceeded); }
+                _reservedCoverageCount++; _reservedCoverageBytes += reservationSize; reservationHeld = true;
+            }
+            lock (_gate)
+            {
+                if (!ReferenceEquals(_terminalCoverage, root) || _logicalBytes != logicalBytes)
+                    return WriterResultUnderLock(GateDerivedMutationStatus.Conflict, "stale-terminal-coverage");
+                ReleaseCoverageReservationUnderLock(reservationSize); reservationHeld = false;
+                _terminalCoverage = staged; _logicalBytes = checked(_logicalBytes + totalSize);
+                return new GateDerivedMutationResult(GateDerivedMutationStatus.Committed,
+                    new(_revision), wasAccepted: true);
+            }
+        }
+        catch (OverflowException) { return WriterResult(GateDerivedMutationStatus.CapacityExceeded, "terminal-coverage-overflow"); }
+        catch (Exception error) { return WriterResult(GateDerivedMutationStatus.Faulted, error.GetType().Name); }
+        finally
+        {
+            if (reservationHeld) lock (_gate) { ReleaseCoverageReservationUnderLock(reservationSize); }
+            _commitSerial.Release();
+            ReleaseCoverageWriter();
         }
     }
 
@@ -390,18 +601,47 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
             byStream.Values.Sum(x => x.Length) == manifest.TotalEligibleTraceCount;
     }
 
-    private static bool BelongsToManifest(GateDerivedBatchKey key, GateDerivedCoverageManifest manifest) =>
-        key.TraceIdentity.Stream.InspectionId == manifest.InspectionId &&
-        key.TraceIdentity.Stream.AcquisitionRunId == manifest.RunId &&
-        manifest.Streams.Any(x => x.Stream == key.TraceIdentity.Stream) &&
-        key.SourceInspectionRevision.Value <= manifest.SourceFinalRevision.Value && key.PlanId == manifest.PlanId &&
-        key.PlanRevision == manifest.PlanRevision && key.PlanSignature == manifest.PlanSignature &&
-        key.SchemaVersion == manifest.SchemaVersion && key.AlgorithmVersion == manifest.AlgorithmVersion;
+    private static bool BelongsToManifest(GateDerivedBatchKey key, GateDerivedCoverageManifest manifest)
+    {
+        GateDerivedStreamCoverage? stream = manifest.Streams.SingleOrDefault(x => x.Stream == key.TraceIdentity.Stream);
+        return key.TraceIdentity.Stream.InspectionId == manifest.InspectionId &&
+            key.TraceIdentity.Stream.AcquisitionRunId == manifest.RunId && stream is not null &&
+            (stream.SelectedRanges is null || stream.SelectedRanges.Any(range => range.Contains(key.TraceIdentity.AcquisitionIndex))) &&
+            key.SourceInspectionRevision.Value <= manifest.SourceFinalRevision.Value && key.PlanId == manifest.PlanId &&
+            key.PlanRevision == manifest.PlanRevision && key.PlanSignature == manifest.PlanSignature &&
+            key.SchemaVersion == manifest.SchemaVersion && key.AlgorithmVersion == manifest.AlgorithmVersion;
+    }
 
-    private bool TryAdmitWriter()
-    { lock (_gate) { if (_admissionClosed) return false; _writers++; _writersAdmitted++; return true; } }
+    private WriterAdmission TryAdmitWriter(CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (cancellationToken.IsCancellationRequested) return WriterAdmission.Cancelled;
+            if (_admissionClosed) return WriterAdmission.Closed;
+            _writers++; _writersAdmitted++;
+            return WriterAdmission.Admitted;
+        }
+    }
     private void ReleaseWriter()
     { lock (_gate) { _writers--; _writersCompleted++; if (_writers == 0) _writersDrained?.TrySetResult(); } }
+    private void ReleaseCoverageWriter()
+    {
+        lock (_gate)
+        {
+            _coverageWriters--; _coverageWritersCompleted++;
+            _writers--; _writersCompleted++;
+            if (_writers == 0) _writersDrained?.TrySetResult();
+        }
+    }
+    private void ReleaseActivationWriter()
+    {
+        lock (_gate)
+        {
+            _activationWriters--; _activationWritersCompleted++;
+            _writers--; _writersCompleted++;
+            if (_writers == 0) _writersDrained?.TrySetResult();
+        }
+    }
     private void ReleaseLease(DerivedViewId viewId)
     { lock (_gate) { _leases--; if (--_leaseViews[viewId] == 0) { _leaseViews.Remove(viewId); _leasedMemberships.Remove(viewId); } if (_leases == 0) _leasesDrained?.TrySetResult(); } }
     private static Task WaitUnderLock(int count, ref TaskCompletionSource? source)
@@ -410,7 +650,17 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
     { lock (_gate) return ResultUnderLock(status, error); }
     private GateDerivedMutationResult ResultUnderLock(GateDerivedMutationStatus status, string? error = null)
     { if (error is not null) _lastErrorCode = error.Length <= 128 ? error : error[..128]; return new(status, new(_revision), error); }
+    private GateDerivedMutationResult WriterResult(GateDerivedMutationStatus status, string? error = null)
+    { lock (_gate) return WriterResultUnderLock(status, error); }
+    private GateDerivedMutationResult WriterResultUnderLock(GateDerivedMutationStatus status, string? error = null)
+    { if (error is not null) _lastErrorCode = error.Length <= 128 ? error : error[..128]; return new(status, new(_revision), error, wasAccepted: true); }
     private void ReleaseReservationUnderLock(long size) { _reservedBatches--; _reservedBytes -= size; }
+    private void ReleaseCoverageReservationUnderLock(long size)
+    { _reservedCoverageCount--; _reservedCoverageBytes -= size; }
+    private void ReleaseActivationReservationUnderLock(long size)
+    { _reservedActivationCount--; _reservedActivationBytes -= size; }
+
+    private enum WriterAdmission { Admitted, Cancelled, Closed }
 
     private static bool ManifestEquivalent(GateDerivedCoverageManifest left, GateDerivedCoverageManifest right) =>
         left.InspectionId == right.InspectionId && left.RunId == right.RunId &&
@@ -418,16 +668,19 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
         left.PlanRevision == right.PlanRevision && left.PlanSignature == right.PlanSignature &&
         left.SchemaVersion == right.SchemaVersion && left.AlgorithmVersion == right.AlgorithmVersion &&
         left.TotalEligibleTraceCount == right.TotalEligibleTraceCount &&
-        left.CapturedStoreRevision == right.CapturedStoreRevision && CoveragesEquivalent(left.Streams, right.Streams);
+        left.CapturedStoreRevision == right.CapturedStoreRevision && left.CoverageScope == right.CoverageScope &&
+        CoveragesEquivalent(left.Streams, right.Streams);
 
     private static bool TerminalMatchesManifest(GateProcessingTerminalCoverage terminal,
         GateDerivedCoverageManifest manifest) => terminal.SchemaVersion == manifest.SchemaVersion &&
-        terminal.AlgorithmVersion == manifest.AlgorithmVersion && CoveragesEquivalent(terminal.Streams, manifest.Streams);
+        terminal.AlgorithmVersion == manifest.AlgorithmVersion && terminal.CoverageScope == manifest.CoverageScope &&
+        CoveragesEquivalent(terminal.Streams, manifest.Streams);
 
     private static bool TerminalEquivalent(GateProcessingTerminalCoverage left,
         GateProcessingTerminalCoverage right) => left.PlanId == right.PlanId &&
         left.PlanRevision == right.PlanRevision && left.PlanSignature == right.PlanSignature &&
         left.SchemaVersion == right.SchemaVersion && left.AlgorithmVersion == right.AlgorithmVersion &&
+        left.CoverageScope == right.CoverageScope &&
         CoveragesEquivalent(left.Streams, right.Streams);
 
     private static bool CoveragesEquivalent(IReadOnlyList<GateDerivedStreamCoverage> left,
@@ -438,7 +691,10 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
     private static bool CoverageEquivalent(GateDerivedStreamCoverage left, GateDerivedStreamCoverage right) =>
         left.Stream == right.Stream && left.MinimumAcquisitionIndex == right.MinimumAcquisitionIndex &&
         left.MaximumAcquisitionIndex == right.MaximumAcquisitionIndex &&
-        left.EligibleTraceCount == right.EligibleTraceCount && left.IdentityDigest == right.IdentityDigest;
+        left.EligibleTraceCount == right.EligibleTraceCount && left.IdentityDigest == right.IdentityDigest &&
+        ((left.SelectedRanges is null && right.SelectedRanges is null) ||
+        (left.SelectedRanges is not null && right.SelectedRanges is not null &&
+        left.SelectedRanges.SequenceEqual(right.SelectedRanges)));
 
     private static GateDerivedBatchKey Key(GateEvaluationBatch batch)
     {
@@ -642,7 +898,6 @@ internal sealed class GateDerivedStoreTestHooks
     internal Action? BeforeActivation { get; init; }
     internal Action? BeforeInvalidation { get; init; }
     internal Action? BeforeReclaim { get; init; }
-    internal Action? AfterTerminalCoverageStaging { get; init; }
     internal Action? AfterActivationStaging { get; init; }
     internal Action? AfterInvalidationStaging { get; init; }
     internal Action? AfterReclaimStaging { get; init; }

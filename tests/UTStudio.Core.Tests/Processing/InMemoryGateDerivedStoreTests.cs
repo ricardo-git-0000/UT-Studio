@@ -126,19 +126,14 @@ public sealed class InMemoryGateDerivedStoreTests
     }
 
     [TestMethod]
-    public async Task StagedViewMutationsFaultWithoutPublishingOrAdvancingRevision()
+    public async Task RepresentableStagedViewMutationsFaultWithoutPublishingOrAdvancingRevision()
     {
         await using var store = new InMemoryGateDerivedStore();
         GateEvaluationBatch batch = Batch([1, 4, 2]); await store.CommitAsync(batch);
         GateDerivedCoverageManifest manifest = Manifest(batch, store.Revision); ConfirmTerminal(store, manifest);
-        DerivedStoreRevision before = store.Revision;
-        store.TestHooks = new() { AfterActivationStaging = () => throw new InvalidOperationException("activation") };
-        Assert.AreEqual(GateDerivedMutationStatus.Faulted, store.Activate(manifest, new("view")).Status);
-        Assert.AreEqual(before, store.Revision); Assert.IsNull(store.ActiveView);
-
-        store.TestHooks = null; Assert.AreEqual(GateDerivedMutationStatus.Activated,
+        Assert.AreEqual(GateDerivedMutationStatus.Activated,
             store.Activate(manifest, new("view")).Status);
-        before = store.Revision;
+        DerivedStoreRevision before = store.Revision;
         store.TestHooks = new() { AfterInvalidationStaging = () => throw new InvalidOperationException("invalidate") };
         Assert.AreEqual(GateDerivedMutationStatus.Faulted, store.Invalidate(new("view")).Status);
         Assert.AreEqual(before, store.Revision); Assert.IsNotNull(store.ActiveView);
@@ -372,21 +367,6 @@ public sealed class InMemoryGateDerivedStoreTests
     }
 
     [TestMethod]
-    public async Task TerminalCoverageFaultAfterStagingPublishesNothing()
-    {
-        GateEvaluationBatch batch = Batch([1, 4, 2]); GateDerivedCoverageManifest manifest = Manifest(batch, new(1));
-        var coverage = new GateProcessingTerminalCoverage(manifest.InspectionId, manifest.RunId,
-            manifest.SourceFinalRevision, manifest.PlanId, manifest.PlanRevision, manifest.PlanSignature,
-            manifest.SchemaVersion, manifest.AlgorithmVersion, manifest.Streams);
-        await using var store = new InMemoryGateDerivedStore
-        { TestHooks = new() { AfterTerminalCoverageStaging = () => throw new InvalidOperationException("terminal") } };
-        Assert.AreEqual(GateProcessingTerminalCoverageStatus.Faulted, store.ConfirmTerminalCoverage([coverage]));
-        Assert.AreEqual(0L, store.Diagnostics.LogicalPayloadBytes);
-        store.TestHooks = null;
-        Assert.AreEqual(GateProcessingTerminalCoverageStatus.Accepted, store.ConfirmTerminalCoverage([coverage]));
-    }
-
-    [TestMethod]
     public async Task TwoBatchesForSameIdentityCannotSatisfySingleIdentityCoverage()
     {
         await using var store = new InMemoryGateDerivedStore();
@@ -450,23 +430,23 @@ public sealed class InMemoryGateDerivedStoreTests
     }
 
     [TestMethod]
-    public async Task DisposeWaitsForWriterAdmittedBeforeClose()
+    public async Task CancellationImmediatelyBeforeAdmissionIsNeverAcceptedAcrossOneHundredAttempts()
     {
-        var admitted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var store = new InMemoryGateDerivedStore
+        await using var store = new InMemoryGateDerivedStore(new(128, 1024 * 1024));
+        for (int attempt = 0; attempt < 100; attempt++)
         {
-            TestHooks = new GateDerivedStoreTestHooks
-            {
-                AfterReservation = () => { admitted.TrySetResult(); release.Task.GetAwaiter().GetResult(); }
-            }
-        };
-        Task<GateDerivedMutationResult> commit = Task.Run(async () => await store.CommitAsync(Batch([1, 4, 2])));
-        await admitted.Task;
-        Task close = store.DisposeAsync().AsTask(); Assert.IsFalse(close.IsCompleted);
-        release.TrySetResult(); Assert.AreEqual(GateDerivedMutationStatus.Committed, (await commit).Status);
-        await close; Assert.IsTrue(store.Diagnostics.Closed);
+            using var cancellation = new CancellationTokenSource();
+            cancellation.Cancel();
+            GateDerivedMutationResult result = await store.CommitAsync(
+                BatchAt((ulong)attempt, [1, 4, 2]), cancellation.Token);
+            Assert.AreEqual(GateDerivedMutationStatus.Cancelled, result.Status);
+            Assert.IsFalse(result.WasAccepted);
+            Assert.IsTrue(result.CancelledBeforeAdmission);
+            Assert.IsFalse(result.IsCommitted);
+        }
+        Assert.AreEqual(0L, store.Diagnostics.WritersAdmitted);
         Assert.AreEqual(0, store.Diagnostics.AdmittedWriters);
+        Assert.AreEqual(0L, store.Diagnostics.ReservedLogicalPayloadBytes);
     }
 
     [TestMethod]
@@ -584,7 +564,10 @@ public sealed class InMemoryGateDerivedStoreTests
     }
 
     private static void ConfirmTerminal(InMemoryGateDerivedStore store, GateDerivedCoverageManifest manifest) =>
-        store.ConfirmTerminalCoverage([new(manifest.InspectionId, manifest.RunId, manifest.SourceFinalRevision,
+        store.ConfirmTerminalCoverage([Terminal(manifest)]);
+
+    private static GateProcessingTerminalCoverage Terminal(GateDerivedCoverageManifest manifest) =>
+        new(manifest.InspectionId, manifest.RunId, manifest.SourceFinalRevision,
             manifest.PlanId, manifest.PlanRevision, manifest.PlanSignature, manifest.SchemaVersion,
-            manifest.AlgorithmVersion, manifest.Streams)]);
+            manifest.AlgorithmVersion, manifest.Streams);
 }

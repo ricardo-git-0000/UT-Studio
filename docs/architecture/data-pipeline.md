@@ -94,6 +94,23 @@ siempre de forma sample-free y aislando sus fallos. `BScanVisualDelivery` public
 `BScanViewModel` conserva el owner y App.Wpf copia por filas al `WriteableBitmap`. Cerrar una ventana B
 retira sólo su consumidor.
 
+El reprocesado histórico de Fase 5 comienza exclusivamente desde un snapshot contractual de una run sellada:
+
+```text
+snapshot RF fijado a SourceFinalRevision
+  -> identidades confirmadas paginadas (máximo 256)
+  -> intersección con selección canónica y bloques acotados
+  -> lease RF de una identidad
+  -> GateEvaluator compartido, scratch exclusivo de reprocesado
+  -> commit esperado en store derivado
+  -> liberar lease y ceder entre bloques
+  -> evidencia terminal y activación opcional solo con cobertura exacta
+```
+
+Esta rama tiene admisión, workers, scratch y métricas propios; no consume capacidad reservada para live ni
+bloquea `ApplicationSession`. Stop histórico cancela el backlog, pero espera cualquier commit ya admitido y no
+cancela el pipeline live. Los huecos de `AcquisitionIndex` no generan trazas ni trabajo sintético.
+
 El remuestreo B-Scan propuesto no altera ese flujo ni el store. Tras la formación B específica se
 separarán intensidad neutral, máscara `NoData` autoritativa y procedencia; un servicio 2D neutral podrá
 remuestrear antes de la LUT. Modo, parámetros, geometría fuente/destino y política de máscara formarán

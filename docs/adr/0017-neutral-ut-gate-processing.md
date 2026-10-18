@@ -149,6 +149,40 @@ por fuerza. El store copia/proyecta el batch prestado por el sink antes de respo
 referencias al almacenamiento del evaluator. Persistencia, reprocesado general, UI y geometría C-Scan siguen
 fuera de Fase 4.
 
+## Refinamiento implementado de Fase 5 pendiente de aceptación: reprocesado histórico
+
+Un trabajo fija al admitirse `JobId`, `AttemptId`, snapshot RF sellado y su `SourceFinalRevision`, selección
+canónica de streams e intervalos inclusivos, `CompiledGatePlan` completo, epoch, firma, schema, algoritmo,
+política de publicación, bloque y presupuesto. Los intervalos se ordenan por stream, eliminan duplicados y
+fusionan solapes o adyacencias sin desbordar; la cobertura efectiva es la intersección con las identidades
+exactas enumeradas por el snapshot, nunca la longitud numérica del rango.
+
+El scheduler histórico tiene admisión, workers, métricas y `GateScratchPool` separados del pipeline live. No
+existe préstamo automático. Cada presupuesto es acotado y la composición documenta su suma; no se promete un
+límite global si se permiten pools adicionales. Live conserva prioridad por aislamiento. Reprocesado procesa
+un bloque, cede antes del siguiente y comprueba cancelación entre trazas y bloques, sin retener RF o scratch
+durante esperas externas innecesarias.
+
+Las políticas son `StoreOnly` y `ActivateOnComplete`. Ambas confirman batches completos y publican evidencia
+terminal solo cuando todas las identidades exactas resultaron `Committed` o `Duplicate`; la segunda exige
+`DerivedViewId` y activa atómicamente después. Cancelación o fallo no publican cobertura completa, no activan
+una vista parcial y preservan la vista activa anterior.
+
+La admisión del commit derivado es la frontera con cancelación. Antes de ella, cancelar descarta el batch sin
+contabilizarlo. Después, el commit se espera sin el token del trabajo y su resultado terminal se contabiliza.
+`Duplicate` satisface cobertura como reutilizado; no hay reintentos automáticos. `Conflict`,
+`CapacityExceeded`, `Closed`, `Faulted`, `CoverageMismatch`, excepciones y cancelación espuria terminan el
+trabajo como `Faulted`. El fallo principal y los fallos secundarios de cleanup permanecen diferenciados.
+
+Stop bloquea admisión, cancela trabajos no terminales, no inicia nuevas identidades y espera exclusivamente
+evaluaciones, callbacks, commits y leases ya admitidos. No drena todo el backlog histórico. Stop y
+`DisposeAsync` comparten una operación idempotente; la cancelación de un caller solo cancela su espera. Al
+terminar quedan workers, callbacks, leases y scratch en cero, sin afectar por sí misma al pipeline live.
+
+Un segundo intento usa otro `AttemptId`, vuelve a enumerar el mismo contrato de snapshot y distingue batches
+nuevos de `Duplicate`; esto no constituye reanudación durable. La equivalencia live/reprocesado se verifica
+usando el mismo `GateEvaluator` y comparando todos los campos contractuales frente a la referencia escalar.
+
 ## Consecuencias
 
 - La autoridad RF, identidades y leases de ADR 0015 se conservan.
@@ -174,3 +208,46 @@ fuera de Fase 4.
 Q19 queda resuelta para el primer incremento. Permanecen separadas únicamente el encoding persistente de
 señal rectificada, el presupuesto final después de benchmarks, la persistencia del store derivado y los
 requisitos PA reales. Ninguna reabre las quince decisiones de este ADR.
+
+## Refinamiento de Fase 5: admisión derivada y buffers históricos
+
+`CommitAsync` decide cancelación y admisión del writer bajo el mismo gate. Antes de admitir devuelve
+`CancelledBeforeAdmission`; una vez admitido ignora cancelaciones posteriores, alcanza un resultado terminal y
+balancea writer y reserva. El resultado expone `WasAccepted`, `IsCommitted`, `IsDuplicate`, revisión confirmada
+y cancelación previa. El scheduler entrega su token al store y no simula esta frontera externamente.
+
+Los buffers RF temporales del scheduler usan buckets exactos de 65.536 muestras/131.072 bytes y un presupuesto
+privado en bytes. Se reserva antes de asignar, no existe fallback y cada lease se devuelve antes de publicar el
+snapshot terminal del trabajo. El presupuesto live no se comparte.
+
+El conteo de trabajo procede de los spans regionales preparados. Durante el único recorrido de identidades se
+acumulan conteo observado, watermarks y digest canónico por stream; la cobertura finaliza esos acumuladores y
+no vuelve a enumerar el snapshot. Un acumulador parcial se descarta al cancelar o fallar.
+
+Cobertura terminal y activación disponen de operaciones cancelables con `WasAccepted`. El punto de
+linealización de admisión es el incremento del writer bajo el mismo gate que observa token y cierre. Antes de
+ese punto una cancelación no publica; después se espera el resultado terminal. La visibilidad de cobertura se
+linealiza al sustituir el ledger terminal, y la activación al publicar conjuntamente vista, membresía e
+identificador usado. `Completing` conserva el CTS cancelable y comprueba cancelación antes de formar evidencia,
+antes de admitir cobertura y antes de admitir activación.
+
+El camino asíncrono de cobertura y activación admite el writer bajo el gate, serializa la preparación con las
+otras mutaciones derivadas y sale del monitor antes de recorrer membresía, validar cobertura o clonar raíces.
+El commit vuelve a tomar el gate únicamente para revalidar referencias/revisión y sustituir las raíces staged.
+Una revalidación fallida devuelve `Conflict` tipado y no publica parcialmente.
+
+Scratch y buffers históricos conservan pools físicos compartidos y acotados, pero cada trabajo recibe un facade
+propio que observa directamente intentos, éxitos, rechazos, devoluciones, fallos, activos, picos y ownership.
+El buffer RF se renta después de obtener y validar descriptor/calidad y se devuelve tras evaluar, antes de
+esperar el commit. Las leases RF separan adquisición, intento de liberación, liberación confirmada y fallo; un
+fallo de cleanup mantiene `CleanupConfirmed=false` en el diagnóstico terminal.
+
+Cobertura terminal y activación mantienen reservas lógicas tipadas mientras una raíz staged espera publicación.
+El diagnóstico separa writers admitidos/completados y reservas activas de cobertura y activación. Las pruebas de
+fronteras usan stores/providers que implementan los puertos públicos; no existen hooks de prueba en el scheduler.
+La decisión token/cierre y el incremento del writer permanecen atómicos bajo el monitor. `StopAsync` devuelve la tarea compartida a callers no cancelables; una espera cancelable
+solo envuelve esa tarea. `DisposeAsync` memoiza un único cierre que reutiliza Stop y libera sus recursos una vez.
+
+La captura diagnóstica y la liberación del snapshot son intentos independientes. Si ambos fallan, el primero se
+conserva como error principal, el segundo queda ordenado como cleanup secundario y `CleanupConfirmed=false`
+expresa que el ownership no quedó confirmado.

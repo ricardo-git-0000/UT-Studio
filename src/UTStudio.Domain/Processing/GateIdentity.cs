@@ -78,6 +78,22 @@ public readonly record struct DerivedViewId
     public override string ToString() => IsValid ? Value : "-";
 }
 
+public readonly record struct GateReprocessingJobId
+{
+    public GateReprocessingJobId(Guid value) { if (value == Guid.Empty) throw new ArgumentException("A non-empty job identifier is required.", nameof(value)); Value = value; }
+    public Guid Value { get; }
+    public bool IsValid => Value != Guid.Empty;
+    public override string ToString() => IsValid ? Value.ToString("D") : "-";
+}
+
+public readonly record struct GateReprocessingAttemptId
+{
+    public GateReprocessingAttemptId(Guid value) { if (value == Guid.Empty) throw new ArgumentException("A non-empty attempt identifier is required.", nameof(value)); Value = value; }
+    public Guid Value { get; }
+    public bool IsValid => Value != Guid.Empty;
+    public override string ToString() => IsValid ? Value.ToString("D") : "-";
+}
+
 internal static class StableHash
 {
     internal static int Ordinal(string value)

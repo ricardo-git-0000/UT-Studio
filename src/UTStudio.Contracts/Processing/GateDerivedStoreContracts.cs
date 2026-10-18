@@ -104,12 +104,14 @@ public sealed class GateDerivedStreamCoverage
 {
     public const ushort DigestCanonicalVersion = 1;
     public GateDerivedStreamCoverage(UtStreamIdentity stream, ulong? minimumAcquisitionIndex,
-        ulong? maximumAcquisitionIndex, int eligibleTraceCount, ReadOnlySpan<byte> identityDigest)
+        ulong? maximumAcquisitionIndex, int eligibleTraceCount, ReadOnlySpan<byte> identityDigest,
+        IReadOnlyList<AcquisitionIndexRange>? selectedRanges = null)
         : this(stream, minimumAcquisitionIndex, maximumAcquisitionIndex, eligibleTraceCount,
-            new GateSha256Digest(identityDigest))
+            new GateSha256Digest(identityDigest), selectedRanges)
     { }
     public GateDerivedStreamCoverage(UtStreamIdentity stream, ulong? minimumAcquisitionIndex,
-        ulong? maximumAcquisitionIndex, int eligibleTraceCount, GateSha256Digest identityDigest)
+        ulong? maximumAcquisitionIndex, int eligibleTraceCount, GateSha256Digest identityDigest,
+        IReadOnlyList<AcquisitionIndexRange>? selectedRanges = null)
     {
         if (!stream.IsValid || Encoding.UTF8.GetByteCount(stream.SourceId.Value) > 128)
         { throw new ArgumentException("A valid bounded stream is required.", nameof(stream)); }
@@ -121,12 +123,18 @@ public sealed class GateDerivedStreamCoverage
         Stream = stream; MinimumAcquisitionIndex = minimumAcquisitionIndex;
         MaximumAcquisitionIndex = maximumAcquisitionIndex; EligibleTraceCount = eligibleTraceCount;
         IdentityDigest = identityDigest;
+        SelectedRanges = selectedRanges is null ? null : Array.AsReadOnly(selectedRanges.ToArray());
+        if (SelectedRanges is { Count: 0 } || SelectedRanges is not null &&
+            SelectedRanges.Zip(SelectedRanges.Skip(1), (left, right) =>
+                left.LastInclusive == ulong.MaxValue || right.FirstInclusive <= left.LastInclusive + 1).Any(x => x))
+        { throw new ArgumentException("Selected ranges must be nonempty, ordered, and disjoint.", nameof(selectedRanges)); }
     }
     public UtStreamIdentity Stream { get; }
     public ulong? MinimumAcquisitionIndex { get; }
     public ulong? MaximumAcquisitionIndex { get; }
     public int EligibleTraceCount { get; }
     public GateSha256Digest IdentityDigest { get; }
+    public IReadOnlyList<AcquisitionIndexRange>? SelectedRanges { get; }
 
     public static GateSha256Digest ComputeIdentityDigest(IEnumerable<TraceIdentity> identities)
     {
@@ -135,11 +143,27 @@ public sealed class GateDerivedStreamCoverage
             .ThenBy(x => x.Stream.AcquisitionRunId.Value).ThenBy(x => x.Stream.SourceId.Value, StringComparer.Ordinal)
             .ThenBy(x => x.Stream.PhysicalChannelId.Value).ThenBy(x => x.Stream.BeamId?.Value ?? -1)
             .ThenBy(x => x.Stream.FocalLawId?.Value ?? -1).ThenBy(x => x.AcquisitionIndex).ToArray();
-        using var payload = new MemoryStream();
-        using (var writer = new BinaryWriter(payload, Encoding.UTF8, leaveOpen: true))
+        return ComputeOrderedIdentityDigest(ordered.Length, ordered);
+    }
+
+    public static GateSha256Digest ComputeOrderedIdentityDigest(int identityCount,
+        IEnumerable<TraceIdentity> canonicallyOrderedIdentities)
+    {
+        ArgumentNullException.ThrowIfNull(canonicallyOrderedIdentities);
+        ArgumentOutOfRangeException.ThrowIfNegative(identityCount);
+        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using (var header = new MemoryStream())
+        using (var writer = new BinaryWriter(header, Encoding.UTF8, leaveOpen: true))
         {
-            writer.Write(DigestCanonicalVersion); writer.Write(ordered.Length);
-            foreach (TraceIdentity identity in ordered)
+            writer.Write(DigestCanonicalVersion); writer.Write(identityCount);
+            hash.AppendData(header.GetBuffer().AsSpan(0, checked((int)header.Length)));
+        }
+        int observed = 0;
+        foreach (TraceIdentity identity in canonicallyOrderedIdentities)
+        {
+            if (!identity.IsValid) throw new ArgumentException("Every identity must be valid.", nameof(canonicallyOrderedIdentities));
+            using var payload = new MemoryStream();
+            using (var writer = new BinaryWriter(payload, Encoding.UTF8, leaveOpen: true))
             {
                 writer.Write(identity.Stream.InspectionId.Value.ToByteArray());
                 writer.Write(identity.Stream.AcquisitionRunId.Value.ToByteArray());
@@ -150,8 +174,11 @@ public sealed class GateDerivedStreamCoverage
                 writer.Write(identity.Stream.FocalLawId?.Value ?? -1);
                 writer.Write(identity.AcquisitionIndex);
             }
+            hash.AppendData(payload.GetBuffer().AsSpan(0, checked((int)payload.Length)));
+            observed = checked(observed + 1);
         }
-        return new(SHA256.HashData(payload.GetBuffer().AsSpan(0, checked((int)payload.Length))));
+        if (observed != identityCount) throw new ArgumentException("Identity count does not match the sequence.", nameof(identityCount));
+        return new(hash.GetHashAndReset());
     }
 }
 
@@ -162,13 +189,15 @@ public sealed class GateDerivedCoverageManifest
         IEnumerable<GateDerivedStreamCoverage> streams, InspectionRevision sourceFinalRevision,
         GatePlanId planId, GatePlanRevision planRevision, string planSignature,
         GateSchemaVersion schemaVersion, GateAlgorithmVersion algorithmVersion,
-        int totalEligibleTraceCount, DerivedStoreRevision capturedStoreRevision)
+        int totalEligibleTraceCount, DerivedStoreRevision capturedStoreRevision,
+        string coverageScope = "full")
     {
         ArgumentNullException.ThrowIfNull(streams);
         GateDerivedStreamCoverage[] captured = streams.ToArray();
         if (!inspectionId.IsValid || !runId.IsValid || sourceFinalRevision == InspectionRevision.Initial ||
             !planId.IsValid || !planRevision.IsValid || !IsSha256Hex(planSignature) ||
-            !schemaVersion.IsValid || !algorithmVersion.IsValid ||
+            !schemaVersion.IsValid || !algorithmVersion.IsValid || string.IsNullOrWhiteSpace(coverageScope) ||
+            Encoding.UTF8.GetByteCount(coverageScope) > 128 ||
             captured.Length == 0 || captured.Any(x => x.Stream.InspectionId != inspectionId ||
                 x.Stream.AcquisitionRunId != runId) || captured.Select(x => x.Stream).Distinct().Count() != captured.Length)
         { throw new ArgumentException("The coverage manifest is invalid."); }
@@ -178,6 +207,7 @@ public sealed class GateDerivedCoverageManifest
         SourceFinalRevision = sourceFinalRevision; PlanId = planId; PlanRevision = planRevision;
         PlanSignature = planSignature; SchemaVersion = schemaVersion; AlgorithmVersion = algorithmVersion;
         TotalEligibleTraceCount = totalEligibleTraceCount; CapturedStoreRevision = capturedStoreRevision;
+        CoverageScope = coverageScope;
     }
     public InspectionId InspectionId { get; }
     public AcquisitionRunId RunId { get; }
@@ -190,6 +220,7 @@ public sealed class GateDerivedCoverageManifest
     public GateAlgorithmVersion AlgorithmVersion { get; }
     public int TotalEligibleTraceCount { get; }
     public DerivedStoreRevision CapturedStoreRevision { get; }
+    public string CoverageScope { get; }
     private static bool IsSha256Hex(string value) => value is { Length: 64 } && value.All(Uri.IsHexDigit);
 }
 
@@ -213,16 +244,23 @@ public sealed class ActiveDerivedViewDescriptor
 public readonly struct GateDerivedMutationResult
 {
     public GateDerivedMutationResult(GateDerivedMutationStatus status, DerivedStoreRevision revision,
-        string? errorCode = null)
+        string? errorCode = null, bool wasAccepted = false)
     {
         if (!Enum.IsDefined(status) || status == GateDerivedMutationStatus.Unknown)
             throw new ArgumentOutOfRangeException(nameof(status));
         if (errorCode is { Length: > 128 }) throw new ArgumentOutOfRangeException(nameof(errorCode));
-        Status = status; Revision = revision; ErrorCode = errorCode;
+        if (wasAccepted && status is GateDerivedMutationStatus.Cancelled or GateDerivedMutationStatus.Closed)
+            throw new ArgumentException("An admitted mutation cannot be cancelled before admission or closed.");
+        Status = status; Revision = revision; ErrorCode = errorCode; WasAccepted = wasAccepted;
     }
     public GateDerivedMutationStatus Status { get; }
     public DerivedStoreRevision Revision { get; }
     public string? ErrorCode { get; }
+    public bool WasAccepted { get; }
+    public bool IsCommitted => Status == GateDerivedMutationStatus.Committed;
+    public bool IsDuplicate => Status == GateDerivedMutationStatus.Duplicate;
+    public bool CancelledBeforeAdmission => Status == GateDerivedMutationStatus.Cancelled && !WasAccepted;
+    public DerivedStoreRevision ConfirmedRevision => Revision;
 }
 
 public sealed record GateDerivedStoreOptions
@@ -248,7 +286,11 @@ public sealed class GateDerivedStoreDiagnostics
         int reclaimableBatchCount = 0, int manifestCount = 0, int terminalEvidenceCount = 0,
         int activeViewCount = 0, int inactiveViewCount = 0, int invalidatedViewCount = 0,
         int tombstoneCount = 0, int indexCount = 0, int membershipCount = 0,
-        long invalidatedLogicalBytes = 0, long reclaimableLogicalBytes = 0, string? lastErrorCode = null)
+        long invalidatedLogicalBytes = 0, long reclaimableLogicalBytes = 0, string? lastErrorCode = null,
+        int activeCoverageWriters = 0, long coverageWritersAdmitted = 0, long coverageWritersCompleted = 0,
+        int activeActivationWriters = 0, long activationWritersAdmitted = 0, long activationWritersCompleted = 0,
+        int reservedCoverageCount = 0, long reservedCoverageBytes = 0,
+        int reservedActivationCount = 0, long reservedActivationBytes = 0)
     {
         if (batchCount < 0 || logicalPayloadBytes < 0 || reservedBatchCount < 0 ||
             reservedLogicalPayloadBytes < 0 || activeLeases < 0 || admittedWriters < 0 ||
@@ -258,7 +300,15 @@ public sealed class GateDerivedStoreDiagnostics
             reclaimableBatchCount < 0 || manifestCount < 0 || terminalEvidenceCount < 0 || activeViewCount < 0 ||
             inactiveViewCount < 0 || invalidatedViewCount < 0 || tombstoneCount < 0 || indexCount < 0 ||
             membershipCount < 0 || invalidatedLogicalBytes < 0 || reclaimableLogicalBytes < 0 ||
+            activeCoverageWriters < 0 || coverageWritersAdmitted < 0 || coverageWritersCompleted < 0 ||
+            activeActivationWriters < 0 || activationWritersAdmitted < 0 || activationWritersCompleted < 0 ||
+            reservedCoverageCount < 0 || reservedCoverageBytes < 0 ||
+            reservedActivationCount < 0 || reservedActivationBytes < 0 ||
             writersCompleted > writersAdmitted || readersCompleted > readersAdmitted ||
+            coverageWritersCompleted > coverageWritersAdmitted ||
+            activationWritersCompleted > activationWritersAdmitted ||
+            coverageWritersAdmitted - coverageWritersCompleted != activeCoverageWriters ||
+            activationWritersAdmitted - activationWritersCompleted != activeActivationWriters ||
             writersAdmitted - writersCompleted != admittedWriters || readersAdmitted - readersCompleted != activeReaders ||
             lastErrorCode is { Length: > 128 })
             throw new ArgumentOutOfRangeException(nameof(batchCount), "Derived-store diagnostics are inconsistent.");
@@ -277,6 +327,14 @@ public sealed class GateDerivedStoreDiagnostics
         IndexCount = indexCount; MembershipCount = membershipCount;
         InvalidatedLogicalBytes = invalidatedLogicalBytes; ReclaimableLogicalBytes = reclaimableLogicalBytes;
         LastErrorCode = lastErrorCode;
+        ActiveCoverageWriters = activeCoverageWriters;
+        CoverageWritersAdmitted = coverageWritersAdmitted;
+        CoverageWritersCompleted = coverageWritersCompleted;
+        ActiveActivationWriters = activeActivationWriters;
+        ActivationWritersAdmitted = activationWritersAdmitted;
+        ActivationWritersCompleted = activationWritersCompleted;
+        ReservedCoverageCount = reservedCoverageCount; ReservedCoverageBytes = reservedCoverageBytes;
+        ReservedActivationCount = reservedActivationCount; ReservedActivationBytes = reservedActivationBytes;
     }
     public DerivedStoreRevision Revision { get; }
     public int BatchCount { get; }
@@ -312,6 +370,16 @@ public sealed class GateDerivedStoreDiagnostics
     public long InvalidatedLogicalBytes { get; }
     public long ReclaimableLogicalBytes { get; }
     public string? LastErrorCode { get; }
+    public int ActiveCoverageWriters { get; }
+    public long CoverageWritersAdmitted { get; }
+    public long CoverageWritersCompleted { get; }
+    public int ActiveActivationWriters { get; }
+    public long ActivationWritersAdmitted { get; }
+    public long ActivationWritersCompleted { get; }
+    public int ReservedCoverageCount { get; }
+    public long ReservedCoverageBytes { get; }
+    public int ReservedActivationCount { get; }
+    public long ReservedActivationBytes { get; }
 }
 
 public sealed class GateDerivedRangeQuery
@@ -438,6 +506,10 @@ public interface IGateDerivedStore : IGateEvaluationBatchSink, IAsyncDisposable
     GateDerivedStoreDiagnostics Diagnostics { get; }
     ValueTask<GateDerivedMutationResult> CommitAsync(GateEvaluationBatch batch, CancellationToken cancellationToken = default);
     GateDerivedMutationResult Activate(GateDerivedCoverageManifest manifest, DerivedViewId viewId);
+    ValueTask<GateDerivedMutationResult> ActivateAsync(GateDerivedCoverageManifest manifest,
+        DerivedViewId viewId, CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult(new GateDerivedMutationResult(GateDerivedMutationStatus.Faulted,
+            Revision, "cancel-aware-activation-unsupported"));
     GateDerivedMutationResult Invalidate(DerivedViewId viewId);
     ValueTask<GateDerivedMutationResult> ReclaimInvalidatedAsync(CancellationToken cancellationToken = default);
     IGateDerivedReadLease OpenActiveView();
@@ -447,6 +519,11 @@ public interface IGateProcessingTerminalCoverageSink
 {
     GateProcessingTerminalCoverageStatus ConfirmTerminalCoverage(
         IReadOnlyList<GateProcessingTerminalCoverage> coverage);
+    ValueTask<GateDerivedMutationResult> ConfirmTerminalCoverageAsync(
+        IReadOnlyList<GateProcessingTerminalCoverage> coverage,
+        CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult(new GateDerivedMutationResult(GateDerivedMutationStatus.Faulted,
+            default, "cancel-aware-coverage-unsupported"));
 }
 
 public enum GateProcessingTerminalCoverageStatus
@@ -457,12 +534,13 @@ public sealed class GateProcessingTerminalCoverage
     public GateProcessingTerminalCoverage(InspectionId inspectionId, AcquisitionRunId runId,
         InspectionRevision finalRevision, GatePlanId planId, GatePlanRevision planRevision,
         string planSignature, GateSchemaVersion schemaVersion, GateAlgorithmVersion algorithmVersion,
-        IReadOnlyList<GateDerivedStreamCoverage> streams)
+        IReadOnlyList<GateDerivedStreamCoverage> streams, string coverageScope = "full")
     {
         ArgumentNullException.ThrowIfNull(planSignature); ArgumentNullException.ThrowIfNull(streams);
         GateDerivedStreamCoverage[] captured = streams.ToArray();
         if (!inspectionId.IsValid || !runId.IsValid || finalRevision == InspectionRevision.Initial ||
             !planId.IsValid || !planRevision.IsValid || planSignature is not { Length: 64 } || !planSignature.All(Uri.IsHexDigit) ||
+            string.IsNullOrWhiteSpace(coverageScope) || Encoding.UTF8.GetByteCount(coverageScope) > 128 ||
             !schemaVersion.IsValid || !algorithmVersion.IsValid || captured.Length == 0 ||
             captured.Any(x => x.Stream.InspectionId != inspectionId || x.Stream.AcquisitionRunId != runId) ||
             captured.Select(x => x.Stream).Distinct().Count() != captured.Length)
@@ -470,6 +548,7 @@ public sealed class GateProcessingTerminalCoverage
         InspectionId = inspectionId; RunId = runId; FinalRevision = finalRevision; PlanId = planId;
         PlanRevision = planRevision; PlanSignature = planSignature; SchemaVersion = schemaVersion;
         AlgorithmVersion = algorithmVersion; Streams = Array.AsReadOnly(captured);
+        CoverageScope = coverageScope;
     }
     public InspectionId InspectionId { get; }
     public AcquisitionRunId RunId { get; }
@@ -480,6 +559,7 @@ public sealed class GateProcessingTerminalCoverage
     public GateSchemaVersion SchemaVersion { get; }
     public GateAlgorithmVersion AlgorithmVersion { get; }
     public IReadOnlyList<GateDerivedStreamCoverage> Streams { get; }
+    public string CoverageScope { get; }
 }
 
 public static class GateDerivedLogicalSize
@@ -504,7 +584,7 @@ public static class GateDerivedLogicalSize
         ArgumentNullException.ThrowIfNull(manifest);
         checked
         {
-            return 128 + Utf8(manifest.PlanId.Value) + Utf8(manifest.PlanSignature) +
+            return 128 + Utf8(manifest.PlanId.Value) + Utf8(manifest.PlanSignature) + Utf8(manifest.CoverageScope) +
             manifest.Streams.Sum(x => 144L + Utf8(x.Stream.SourceId.Value));
         }
     }
@@ -513,7 +593,7 @@ public static class GateDerivedLogicalSize
         ArgumentNullException.ThrowIfNull(coverage);
         checked
         {
-            return 128 + Utf8(coverage.PlanId.Value) + Utf8(coverage.PlanSignature) +
+            return 128 + Utf8(coverage.PlanId.Value) + Utf8(coverage.PlanSignature) + Utf8(coverage.CoverageScope) +
             coverage.Streams.Sum(x => 144L + Utf8(x.Stream.SourceId.Value));
         }
     }

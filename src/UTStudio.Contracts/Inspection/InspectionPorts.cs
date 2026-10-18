@@ -53,8 +53,6 @@ public readonly struct InspectionTraceReadResult
         ArgumentNullException.ThrowIfNull(lease);
         if (revision == InspectionRevision.Initial)
         { throw new ArgumentException("An available trace requires a committed revision.", nameof(revision)); }
-        if (lease.Descriptor is null || !lease.Descriptor.Identity.IsValid)
-        { throw new ArgumentException("The lease must expose a valid trace descriptor.", nameof(lease)); }
         return new(InspectionReadStatus.Available, revision, lease, null);
     }
 
@@ -251,7 +249,8 @@ public interface IInspectionStreamStateProvider
 }
 
 public interface IInspectionDataStore : IInspectionDataWriter, IUtTraceProvider, IInspectionRangeProvider,
-    IInspectionStreamStateProvider, IInspectionChangeProvider, IAsyncDisposable
+    IInspectionStreamStateProvider, IInspectionChangeProvider, IInspectionSealedRunSnapshotProvider,
+    IAsyncDisposable
 {
     InspectionRevision Revision { get; }
     StoreDiagnostics Diagnostics { get; }

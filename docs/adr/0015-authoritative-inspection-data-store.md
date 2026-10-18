@@ -374,6 +374,56 @@ reducciones, renders, candidatos y callbacks admitidos; no fuerza owners ni sust
 El raster congelado conserva selección y navegación sobre el mapa de `TraceIdentity` que se confirmó
 con él.
 
+## Refinamiento implementado de Fase 5 pendiente de aceptación: snapshot RF de run sellada
+
+El reprocesado histórico no infiere estabilidad a partir de que el store sea append-only. Un puerto neutral
+independiente, `IInspectionSealedRunSnapshotProvider`, abre un lease contractual para una inspección y run
+sellada, una `SourceFinalRevision` exacta y no inicial, un conjunto explícito no vacío de streams de esa run y
+un tamaño de página de 1 a 256. No se modifica `IInspectionRangeProvider` ni a sus consumidores existentes.
+
+La apertura distingue `Available`, `NotAvailable`, `RevisionMismatch`, `RunNotSealed`, `Cancelled`, `Closed` y
+`Faulted`; `Unknown` es exclusivamente el valor `default`. `Available` fija durante todo el lease inspección,
+run, revisión final, estado `Sealed`, streams, watermarks, conteos exactos y digest SHA-256 canónico de las
+identidades confirmadas ordenadas. El snapshot es inmutable y seguro para lecturas concurrentes; su cierre es
+idempotente y concurrente, y el cierre del store espera snapshots y leases RF sin forzarlos.
+
+La enumeración devuelve exclusivamente identidades realmente confirmadas en páginas de hasta 256. El cursor
+de Fase 5 es una continuación opaca, inmutable y autenticada que contiene el ordinal absoluto siguiente y la
+última `AcquisitionIndex` confirmada. Queda ligado a la identidad del snapshot, inspección, run, revisión
+final, consulta, stream actual y tamaño de página. La reanudación normal valida en O(1) el ordinal contra el
+span preparado y la clave anterior; no suma uno a la clave y por tanto admite `UInt64.MaxValue`.
+El diagnóstico contabiliza páginas, identidades materializadas, búsquedas y comparaciones. El cursor
+opaco queda ligado a snapshot, stream y posición; no puede usarse en otro snapshot ni después de `Dispose`.
+Una ausencia interior no aparece en la enumeración y no se transforma en `Gap`, cero o trabajo sintético. La
+lectura exacta de una identidad enumerada entrega un único lease RF; que posteriormente no esté disponible es
+una incoherencia de cobertura para el consumidor de reprocesado.
+
+La corrección regional de Fase 5 construye al sellar cada run un único índice inmutable ligado a inspección,
+run y revisión final. Por stream contiene arrays de capacidad exacta con `TraceIdentity` estrictamente
+ordenadas y handles a las entradas RF autoritativas; no duplica muestras. Se comparte entre snapshots.
+`SealedIndexCapacityBudgetBytes` limita por separado cabeceras, almacenamiento inline de identidades,
+referencias de handles y metadata propia. La reserva ocurre antes de asignar; exceso o fallo revierte la
+reserva y no publica `Sealed` ni `FinalRevision`. La capacidad confirmada se libera al cerrar, después de
+drenar snapshots y leases.
+
+Cada consulta normaliza sus intervalos, calcula una vez lower/upper bound por intervalo y conserva spans
+ordinales acotados. El conteo suma longitudes sin enumerar. Las páginas avanzan secuencialmente por esos spans,
+con coste total `O(R log N + K)`, `EntriesVisited == EntriesReturned` y `PrefixRescans == 0`. El cursor v3 liga
+snapshot, inspección, run, revisión, stream, digest SHA-256 de intervalos, ordinal de intervalo, ordinal absoluto
+siguiente, última clave y tamaño de página.
+
+El lookup de streams del índice sellado y del subconjunto pedido por un snapshot usa tablas propias construidas
+una vez, con coste esperado O(1), sin paquete externo. Cada snapshot fija además
+`MaximumPreparedQueries` y `PreparedQueryBudgetBytes`. Antes de crear el array de spans reserva una capacidad
+lógica contractual de `128 + 24 × rangosNormalizados` bytes; fallo, exceso de bytes o exceso de consultas
+revierte la reserva y no expulsa silenciosamente otra consulta. El diagnóstico distingue reservado, owned,
+pico, activas y rechazos, y `Dispose` libera la contabilidad una sola vez. El store aplica además
+`PreparedQueryCapacityBudgetBytes` como techo agregado de capacidad lógica entre todos sus snapshots, con
+reserva anterior a la asignación, confirmación, pico, rollback y liberación al cerrar cada snapshot.
+
+Este snapshot garantiza coherencia en memoria durante el proceso, no durabilidad ni recuperación. El store
+continúa con `Durable=false`; persistencia, formato y reanudación durable permanecen fuera de alcance.
+
 ## Fases
 
 La ejecución se divide en Fase 0 documental y Fases 1–7 del

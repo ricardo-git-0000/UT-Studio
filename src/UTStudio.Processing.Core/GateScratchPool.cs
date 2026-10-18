@@ -119,13 +119,76 @@ public sealed class GateScratchPool : IGateScratchPool
 
 internal sealed class GateScratchLease
 {
-    internal GateScratchLease(GateScratchPool owner, long id, GateScratchBuffer buffer)
+    internal GateScratchLease(IGateScratchPool owner, long id, GateScratchBuffer buffer)
     { Owner = owner; Id = id; Buffer = buffer; }
-    internal GateScratchPool Owner { get; }
+    internal IGateScratchPool Owner { get; }
     internal long Id { get; }
     internal GateScratchBuffer Buffer { get; }
     internal bool IsReturned { get; private set; }
     internal void MarkReturned() => IsReturned = true;
+}
+
+internal readonly record struct JobGateScratchDiagnostics(
+    long RentAttempted, long RentSucceeded, long RentRejected,
+    long ReturnAttempted, long ReturnSucceeded, long ReturnFailed,
+    int ActiveRentals, int PeakActiveRentals, long OwnedElements, long PeakOwnedElements);
+
+internal sealed class JobGateScratchPool : IGateScratchPool
+{
+    private readonly object _gate = new();
+    private readonly GateScratchPool _shared;
+    private readonly HashSet<GateScratchLease> _active = new(ReferenceEqualityComparer.Instance);
+    private long _rentAttempted, _rentSucceeded, _rentRejected;
+    private long _returnAttempted, _returnSucceeded, _returnFailed, _ownedElements, _peakOwnedElements;
+    private int _peak;
+
+    internal JobGateScratchPool(GateScratchPool shared) => _shared = shared;
+
+    public bool TryRent(int sampleCount, out GateScratchLease? lease)
+    {
+        lock (_gate) _rentAttempted++;
+        if (!_shared.TryRent(sampleCount, out GateScratchLease? physical) || physical is null)
+        { lock (_gate) _rentRejected++; lease = null; return false; }
+        lease = new GateScratchLease(this, physical.Id, physical.Buffer);
+        lock (_gate)
+        {
+            _active.Add(lease); _rentSucceeded++;
+            _ownedElements = checked(_ownedElements + lease.Buffer.ElementCapacity);
+            _peakOwnedElements = Math.Max(_peakOwnedElements, _ownedElements);
+            _peak = Math.Max(_peak, _active.Count);
+        }
+        return true;
+    }
+
+    public void Return(GateScratchLease lease)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        lock (_gate)
+        {
+            _returnAttempted++;
+            if (!ReferenceEquals(lease.Owner, this) || !_active.Contains(lease))
+            { _returnFailed++; throw new InvalidOperationException("The job scratch lease is foreign or already returned."); }
+        }
+        var physical = new GateScratchLease(_shared, lease.Id, lease.Buffer);
+        try { _shared.Return(physical); }
+        catch { lock (_gate) _returnFailed++; throw; }
+        lock (_gate)
+        {
+            _active.Remove(lease); lease.MarkReturned(); _returnSucceeded++;
+            _ownedElements -= lease.Buffer.ElementCapacity;
+        }
+    }
+
+    public GateScratchDiagnostics Snapshot => _shared.Snapshot;
+    internal JobGateScratchDiagnostics JobSnapshot
+    {
+        get
+        {
+            lock (_gate) return new(_rentAttempted, _rentSucceeded, _rentRejected,
+            _returnAttempted, _returnSucceeded, _returnFailed, _active.Count, _peak,
+            _ownedElements, _peakOwnedElements);
+        }
+    }
 }
 
 internal sealed class GateScratchBuffer

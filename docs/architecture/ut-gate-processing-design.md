@@ -1,6 +1,6 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-16. Estado: **Fase 4 implementada sobre la matriz P1/P2/P3 cerrada de Fase 3; ADR 0017 aceptado**.
+Fecha: 2026-10-18. Estado: **Fase 5 implementada y validada localmente; sin composición productiva, UI, persistencia ni C-Scan**.
 
 ## 1. Alcance y autoridad
 
@@ -358,6 +358,28 @@ dentro de un batch cancelado. Se comprueba antes de adquirir lease,
 entre puertas y por bloques largos con stride medido/documentado.
 
 ## 10. Store derivado, invalidación y reprocesado
+
+### Reprocesado por bloques de Fase 5
+
+`IInspectionSealedRunSnapshotProvider` abre una vista contractual de una run sellada ligada a su
+`SourceFinalRevision`. Enumera identidades confirmadas mediante cursores opacos y páginas de hasta 256; el
+scheduler cruza esa membresía con streams e intervalos inclusivos normalizados y forma bloques sobre las
+identidades resultantes. Cada lease RF se mantiene solo durante la evaluación de su traza y se libera antes de
+esperar el bloque siguiente. Los huecos numéricos no generan trabajo.
+
+El scheduler histórico no reutiliza `CommittedGateProcessingOrchestrator`: posee admisión y workers acotados,
+round-robin cooperativo entre trabajos y un pool de scratch exclusivo. El pipeline live conserva su propio pool
+y workers. La composición debe sumar ambos presupuestos configurados; instancias adicionales quedan fuera de
+esa suma y no permiten afirmar un límite global.
+
+El lifecycle monotónico es `Created → Admitted → Running → Completing → Completed`, con la rama
+`Cancelling → Cancelled` y fallo terminal `Faulted`. El commit admitido al store derivado se completa aun si
+se solicita cancelación. El prefijo cancelado contiene solo `Committed` y `Duplicate`; evaluaciones no admitidas
+se contabilizan aparte. Stop cancela el backlog histórico, espera ownership ya admitido y no cancela live.
+
+`StoreOnly` publica evidencia terminal sin cambiar la vista activa. `ActivateOnComplete` exige un view ID,
+publica el mismo manifest exacto y activa una vez, atómicamente. Cualquier fallo o cancelación conserva la vista
+anterior. El diagnóstico separa nuevos/reutilizados y no contiene RF.
 
 El store derivado inicial es en memoria y acotado. Su implementación reside en `UTStudio.Processing.Core`,
 separada del núcleo algorítmico y del commit RF. Los datos

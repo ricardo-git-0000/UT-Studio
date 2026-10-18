@@ -446,7 +446,11 @@ public readonly record struct StoreDiagnostics(long LogicalSampleBytes, long Res
     ulong CapacityRejections, int ActiveChunks, int SealedChunks, bool IsClosed,
     int OpenRuns = 0, int SealingRuns = 0, int SealedRuns = 0, int ActiveRunWriters = 0,
     int ConfirmedGaps = 0, int PendingSealOperations = 0,
-    IReadOnlyList<RunStoreDiagnostics>? Runs = null)
+    IReadOnlyList<RunStoreDiagnostics>? Runs = null,
+    long ReservedSealedIndexCapacityBytes = 0, long OwnedSealedIndexCapacityBytes = 0,
+    long PeakSealedIndexCapacityBytes = 0, long SealedIndexCapacityBudgetBytes = 0,
+    long ReservedPreparedQueryCapacityBytes = 0, long OwnedPreparedQueryCapacityBytes = 0,
+    long PeakPreparedQueryCapacityBytes = 0, long PreparedQueryCapacityBudgetBytes = 0)
 {
     public bool Durable => false;
 }
