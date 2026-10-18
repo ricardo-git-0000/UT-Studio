@@ -48,41 +48,119 @@ public sealed class GateReprocessingDiagnosticsContractTests
         int[] parameterizedIds = [11, 21, 24, 25, 26, 27, 28];
         foreach (string row in rows)
         {
-            MatchCollection references = Regex.Matches(row,
-                @"(?:prueba(?: [A-D])?|caso): `([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)(?:\(([^`]*)\))?`");
-            Assert.IsGreaterThanOrEqualTo(1, references.Count, row);
-            var citedDataRows = new HashSet<string>(StringComparer.Ordinal);
-            foreach (Match reference in references)
-            {
-                Type testClass = testAssembly.GetTypes().Single(type => type.Name == reference.Groups[1].Value);
-                MethodInfo testMethod = testClass.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
-                    BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly)
-                    .Single(method => method.Name == reference.Groups[2].Value);
-                Assert.IsTrue(testMethod.GetCustomAttributes(inherit: true).Any(attribute =>
-                    attribute is TestMethodAttribute || attribute is DataTestMethodAttribute), reference.Value);
-
-                if (reference.Groups[3].Success)
-                {
-                    string signature = NormalizeCitationArguments(reference.Groups[3].Value,
-                        testMethod.GetParameters());
-                    Assert.IsTrue(citedDataRows.Add($"{testClass.FullName}.{testMethod.Name}({signature})"),
-                        $"Duplicate cited DataRow: {reference.Value}");
-                    Assert.IsTrue(testMethod.GetCustomAttributes<DataRowAttribute>()
-                        .Select(attribute => NormalizeDataRow(attribute.Data))
-                        .Contains(signature, StringComparer.Ordinal), $"Missing DataRow: {reference.Value}");
-                }
-            }
+            int citedDataRows = ValidateTraceabilityReferences(row, testAssembly);
 
             int id = int.Parse(Regex.Match(row, @"^\| (\d{2}) \|").Groups[1].Value,
                 CultureInfo.InvariantCulture);
             if (parameterizedIds.Contains(id))
-                Assert.IsGreaterThanOrEqualTo(1, citedDataRows.Count, row);
+                Assert.IsGreaterThanOrEqualTo(1, citedDataRows, row);
             Match assertions = Regex.Match(row, @"Aserciones:\s*([^|.][^|]*)\|\s*Verde\s*\|");
             Assert.IsTrue(assertions.Success && !string.IsNullOrWhiteSpace(assertions.Groups[1].Value), row);
         }
 
         CollectionAssert.AreEquivalent(new[] { "A", "B", "C", "D" }, Regex.Matches(rows[12], @"prueba ([A-D]):")
             .Select(match => match.Groups[1].Value).ToArray());
+    }
+
+    [TestMethod]
+    public void DuplicateNonParameterizedReferenceIsRejected()
+    {
+        const string references =
+            "prueba: `GateReprocessingDiagnosticsContractTests.AdmissionResultRejectsImpossibleStatesAndCopiesSecondaryErrors`; " +
+            "prueba: `GateReprocessingDiagnosticsContractTests.AdmissionResultRejectsImpossibleStatesAndCopiesSecondaryErrors`";
+
+        Assert.ThrowsExactly<AssertFailedException>(() => ValidateTraceabilityReferences(references,
+            typeof(GateReprocessingDiagnosticsContractTests).Assembly));
+    }
+
+    [TestMethod]
+    public void DuplicateParameterizedReferenceIsRejected()
+    {
+        const string references =
+            "caso: `GateReprocessingSchedulerTests.TypedCommitFailureBecomesExactSchedulerTerminalResult(GateDerivedMutationStatus.Closed)`; " +
+            "caso: `GateReprocessingSchedulerTests.TypedCommitFailureBecomesExactSchedulerTerminalResult(GateDerivedMutationStatus.Closed)`";
+
+        Assert.ThrowsExactly<AssertFailedException>(() => ValidateTraceabilityReferences(references,
+            typeof(GateReprocessingDiagnosticsContractTests).Assembly));
+    }
+
+    [TestMethod]
+    public void EquivalentWhitespaceNormalizedDuplicateIsRejected()
+    {
+        const string references =
+            "caso: `GateReprocessingSchedulerTests.ProviderTerminalResultsAreClassifiedBeforeEvaluation(InspectionReadStatus.Closed,\"provider-fault\")`; " +
+            "caso: `GateReprocessingSchedulerTests.ProviderTerminalResultsAreClassifiedBeforeEvaluation( InspectionReadStatus.Closed , \"provider-fault\" )`";
+
+        Assert.ThrowsExactly<AssertFailedException>(() => ValidateTraceabilityReferences(references,
+            typeof(GateReprocessingDiagnosticsContractTests).Assembly));
+    }
+
+    [TestMethod]
+    public void DistinctDataRowsForSameMethodAreAccepted()
+    {
+        const string references =
+            "caso: `GateReprocessingSchedulerTests.TypedCommitFailureBecomesExactSchedulerTerminalResult(GateDerivedMutationStatus.Closed)`; " +
+            "caso: `GateReprocessingSchedulerTests.TypedCommitFailureBecomesExactSchedulerTerminalResult(GateDerivedMutationStatus.Faulted)`";
+
+        Assert.AreEqual(2, ValidateTraceabilityReferences(references,
+            typeof(GateReprocessingDiagnosticsContractTests).Assembly));
+    }
+
+    [TestMethod]
+    public void GeneralAndParameterizedReferencesForSameMethodAreRejected()
+    {
+        const string references =
+            "prueba: `GateReprocessingSchedulerTests.TypedCommitFailureBecomesExactSchedulerTerminalResult`; " +
+            "caso: `GateReprocessingSchedulerTests.TypedCommitFailureBecomesExactSchedulerTerminalResult(GateDerivedMutationStatus.Closed)`";
+
+        Assert.ThrowsExactly<AssertFailedException>(() => ValidateTraceabilityReferences(references,
+            typeof(GateReprocessingDiagnosticsContractTests).Assembly));
+    }
+
+    private static int ValidateTraceabilityReferences(string text, Assembly testAssembly)
+    {
+        MatchCollection references = Regex.Matches(text,
+            @"(?:prueba(?: [A-D])?|caso): `([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)(?:\(([^`]*)\))?`");
+        Assert.IsGreaterThanOrEqualTo(1, references.Count, text);
+        var normalizedReferences = new HashSet<string>(StringComparer.Ordinal);
+        var generalMethods = new HashSet<string>(StringComparer.Ordinal);
+        var parameterizedMethods = new HashSet<string>(StringComparer.Ordinal);
+        int citedDataRows = 0;
+
+        foreach (Match reference in references)
+        {
+            Type testClass = testAssembly.GetTypes().Single(type => type.Name == reference.Groups[1].Value);
+            MethodInfo testMethod = testClass.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                .Single(method => method.Name == reference.Groups[2].Value);
+            string methodKey = $"{testClass.FullName}.{testMethod.Name}";
+            bool isParameterized = reference.Groups[3].Success;
+            string? signature = isParameterized
+                ? NormalizeCitationArguments(reference.Groups[3].Value, testMethod.GetParameters())
+                : null;
+            string normalizedReference = isParameterized
+                ? $"{methodKey}#DataRow({signature})"
+                : $"{methodKey}#Method";
+
+            Assert.IsTrue(normalizedReferences.Add(normalizedReference),
+                $"Duplicate test reference: {reference.Value}");
+            Assert.IsFalse(isParameterized ? generalMethods.Contains(methodKey) : parameterizedMethods.Contains(methodKey),
+                $"Ambiguous general and parameterized references: {methodKey}");
+            (isParameterized ? parameterizedMethods : generalMethods).Add(methodKey);
+
+            Assert.IsTrue(testMethod.GetCustomAttributes(inherit: true).Any(attribute =>
+                attribute is TestMethodAttribute || attribute is DataTestMethodAttribute), reference.Value);
+
+            if (isParameterized)
+            {
+                Assert.IsTrue(testMethod.GetCustomAttributes<DataRowAttribute>()
+                    .Select(attribute => NormalizeDataRow(attribute.Data))
+                    .Contains(signature, StringComparer.Ordinal), $"Missing DataRow: {reference.Value}");
+                citedDataRows++;
+            }
+        }
+
+        return citedDataRows;
     }
 
     private static string NormalizeCitationArguments(string arguments, ParameterInfo[] parameters)
