@@ -101,6 +101,9 @@ Epoch, store y transición de run usan la misma máquina tipada de reserva:
 | owner o generación distintos de los reservados | `OwnerOrGenerationMismatch` |
 | Dispose con reserva `Prepared` | Abort/reconciliación obligatoria |
 
+La clasificación valida primero reserva default, después owner/generación, después estado y finalmente operación;
+así una identidad ajena no permite inferir ni operar sobre el estado terminal observado.
+
 Estos resultados no lanzan por flujo de control ordinario. Commit no asigna memoria, no hace I/O, no espera,
 no invoca callbacks ni revalida condiciones externas: consume una reserva ya validada y devuelve únicamente el
 resultado determinista de su estado. Cancelación antes de Prepare no muta; después de preparar obliga a Commit o
@@ -198,8 +201,13 @@ de candidata, `InspectionId`, `RunId`, `GatePlanId`, `GatePlanRevision`, token/g
 generación vigente de run, ownership exactamente `Available`, candidata no abandonada/reclamada/dispuesta,
 predecesora todavía activa y capacidad de activación vigente. Sus resultados mínimos son `Activated`,
 `TokenSuperseded`, `RunSuperseded`, `PredecessorMismatch`, `CandidateMismatch`,
-`CandidateNotAvailable`, `AlreadyActivated`, `CandidateAbandoned` y `Disposed`. Ningún rechazo modifica
-`ActiveView`.
+`CandidateNotAvailable`, `AlreadyActivated`, `CandidateAbandoned` y `Disposed`. `AlreadyActivated` es éxito
+idempotente de la misma candidata ya activa: no repite activación ni retirada de predecesora y el ledger conserva
+`Activation=Activated`, ownership `Activated` y `CandidateRetirement=Activated`. Ningún rechazo modifica `ActiveView`.
+La clasificación usa una única precedencia: Dispose, run, token/generación deseada, replay idempotente de la
+misma candidata ya activa, predecesora, candidata, ownership, capacidad y éxito. El replay se adelanta porque,
+tras la activación, la antigua predecesora ya no es `ActiveView`; fuera de esa excepción cada diferencia queda
+asignada a un solo resultado.
 
 ### Máquina de ownership de candidatas
 
@@ -213,11 +221,17 @@ predecesora todavía activa y capacidad de activación vigente. Sus resultados m
 | `Abandoning` | store; CAS excluido |
 | `LogicallyAbandoned` | terminal para Application; si reclaim da `Busy`, store/tombstone posee la reclamación física |
 | `Reclaimed` | terminal físico; recursos liberados exactamente una vez |
-| `Disposed` | terminal global durante Dispose |
+
+El lifecycle global es un eje ortogonal: `Active → Disposing → Disposed`. `Disposing` impide nuevas
+admisiones, pero conserva el ownership material observado mientras se cancelan o terminan trabajos y se drenan
+observer, leases y tombstones. `Disposed` solo se alcanza sin recursos pendientes ni operaciones materiales
+activas; es terminal y no reescribe los ocho subestados ni el ownership final. Por tanto `Activated` permanece
+`Activated`, `Reclaimed` permanece `Reclaimed` y `LogicallyAbandoned` debe completar el reclaim físico antes del
+cierre global. La causa tipada de Dispose se añade al historial sin sustituir causas anteriores.
 
 CAS y abandono/reclaim usan la misma exclusión. Abandonar primero impide activar; activar primero impide
 reclamar; una vista activa nunca se reclama; no hay doble liberación ni candidata perdida.
-`CandidateRetirement=Applied` significa que se aceptó el abandono lógico. Ante `Busy`, Application no vuelve a
+`CandidateRetirement=LogicallyAbandoned` significa que se aceptó el abandono lógico. Ante `Busy`, Application no vuelve a
 competir: el tombstone del store completa después la reclamación. `PreviousViewRetirement` ocurre exactamente
 una vez y solo después de activar el reemplazo.
 

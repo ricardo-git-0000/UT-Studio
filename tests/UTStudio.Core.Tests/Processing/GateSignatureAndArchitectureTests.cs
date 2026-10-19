@@ -1,4 +1,5 @@
 using System.Xml.Linq;
+using System.Reflection;
 using UTStudio.Contracts.Processing;
 using UTStudio.Processing.Core;
 
@@ -111,10 +112,56 @@ public sealed class GateSignatureAndArchitectureTests
             foreach (string file in Directory.GetFiles(Path.Combine(root, relative), "*.cs", SearchOption.AllDirectories))
             {
                 string text = File.ReadAllText(file);
-                foreach (string forbidden in new[] { "System.Windows", "UTStudio.Application", "Acquisition.Simulator", "Inspection.Core", "Dispatcher", "BitmapSource" })
+                foreach (string forbidden in new[] { "System.Windows", "UTStudio.Application", "UTStudio.Presentation",
+                    "Acquisition.Simulator", "Inspection.Core", "Dispatcher", "BitmapSource" })
                 { Assert.IsFalse(text.Contains(forbidden, StringComparison.Ordinal), $"{file} contains {forbidden}."); }
+                if (relative.Contains("Contracts", StringComparison.Ordinal))
+                    Assert.IsFalse(text.Contains("SemaphoreSlim", StringComparison.Ordinal), $"{file} contains threading state.");
             }
         }
+    }
+
+    [TestMethod]
+    public void ContractsClrReferencesAndPublicSurfaceRemainNeutral()
+    {
+        Assembly contracts = typeof(GatePlanEditIntent).Assembly;
+        string[] allowedAssemblies = ["System.Collections", "System.Linq", "System.Memory", "System.Runtime",
+            "System.Security.Cryptography", "System.Threading", "System.Threading.Channels", "UTStudio.Domain"];
+        string[] actualAssemblies = contracts.GetReferencedAssemblies().Select(x => x.Name!)
+            .Order(StringComparer.Ordinal).ToArray();
+        CollectionAssert.AreEqual(allowedAssemblies, actualAssemblies,
+            "Every Contracts CLR dependency requires explicit architectural review.");
+        string[] forbiddenAssemblies = ["UTStudio.Application", "UTStudio.Presentation", "UTStudio.Processing.Core",
+            "PresentationFramework", "PresentationCore", "WindowsBase", "System.Xaml"];
+        Assert.IsFalse(contracts.GetReferencedAssemblies().Any(x => forbiddenAssemblies.Contains(x.Name, StringComparer.Ordinal)));
+        HashSet<Type> stepOneContracts = StepOneContracts().ToHashSet();
+        foreach (Type owner in contracts.GetExportedTypes().Where(x => x.Namespace == "UTStudio.Contracts.Processing"))
+        {
+            foreach (Type used in PublicSignatureTypes(owner))
+            {
+                string assembly = used.Assembly.GetName().Name ?? string.Empty;
+                string name = used.FullName ?? used.Name;
+                bool forbidden = forbiddenAssemblies.Contains(assembly, StringComparer.Ordinal) ||
+                    name.StartsWith("System.Windows.", StringComparison.Ordinal) ||
+                    name is "System.Threading.SemaphoreSlim" or "System.Threading.Tasks.TaskCompletionSource" ||
+                    name.StartsWith("System.Threading.Tasks.TaskCompletionSource`", StringComparison.Ordinal);
+                Assert.IsFalse(forbidden, $"{owner.FullName} exposes forbidden type {name} from {assembly}.");
+                if (stepOneContracts.Contains(owner))
+                    Assert.IsFalse(IsOperationalType(used), $"{owner.FullName} exposes operational type {name}.");
+            }
+            if (stepOneContracts.Contains(owner)) AssertStepOneContractShape(owner);
+        }
+        string root = FindRepositoryRoot();
+        string[] files = ["GateEditingContracts.cs", "GatePreparedOperationContracts.cs",
+            "GateReplacementContracts.cs", "GateApplyLedgerContracts.cs"];
+        HashSet<string> declared = files.SelectMany(file => File.ReadLines(Path.Combine(root, "src",
+                "UTStudio.Contracts", "Processing", file)))
+            .Select(line => System.Text.RegularExpressions.Regex.Match(line,
+                @"^public\s+(?:(?:sealed|static)\s+class|readonly\s+record\s+struct|enum|interface)\s+(\w+)"))
+            .Where(match => match.Success).Select(match => match.Groups[1].Value).ToHashSet(StringComparer.Ordinal);
+        CollectionAssert.AreEquivalent(declared.Order(StringComparer.Ordinal).ToArray(),
+            stepOneContracts.Select(type => type.Name).Order(StringComparer.Ordinal).ToArray(),
+            "Every public Step 1 declaration requires deliberate architectural classification.");
     }
 
     [TestMethod]
@@ -141,5 +188,117 @@ public sealed class GateSignatureAndArchitectureTests
             .Order(StringComparer.Ordinal).ToArray();
         CollectionAssert.AreEqual(expected, references);
         Assert.AreEqual(0, project.Descendants("PackageReference").Count(), $"{projectName} must not add packages.");
+    }
+
+    private static IReadOnlyCollection<Type> PublicSignatureTypes(Type owner)
+    {
+        HashSet<Type> found = []; void Visit(Type? type)
+        {
+            if (type is null) return;
+            while (type.HasElementType) type = type.GetElementType()!;
+            if (!found.Add(type)) return;
+            if (type.IsGenericType) { Visit(type.GetGenericTypeDefinition()); foreach (Type argument in type.GetGenericArguments()) Visit(argument); }
+            if (type.IsGenericParameter) foreach (Type constraint in type.GetGenericParameterConstraints()) Visit(constraint);
+        }
+        void VisitAttribute(CustomAttributeData attribute)
+        {
+            Visit(attribute.AttributeType); Visit(attribute.Constructor.DeclaringType);
+            foreach (ParameterInfo parameter in attribute.Constructor.GetParameters()) Visit(parameter.ParameterType);
+            foreach (CustomAttributeTypedArgument argument in attribute.ConstructorArguments) VisitAttributeArgument(argument);
+            foreach (CustomAttributeNamedArgument argument in attribute.NamedArguments)
+            { Visit(argument.MemberInfo.DeclaringType); VisitAttributeArgument(argument.TypedValue); }
+        }
+        void VisitAttributeArgument(CustomAttributeTypedArgument argument)
+        {
+            Visit(argument.ArgumentType);
+            if (argument.Value is IReadOnlyCollection<CustomAttributeTypedArgument> items)
+                foreach (CustomAttributeTypedArgument item in items) VisitAttributeArgument(item);
+        }
+        void VisitMember(MemberInfo member) { foreach (CustomAttributeData attribute in member.CustomAttributes) VisitAttribute(attribute); }
+        VisitMember(owner);
+        foreach (Type argument in owner.GetGenericArguments())
+            if (argument.IsGenericParameter) foreach (Type constraint in argument.GetGenericParameterConstraints()) Visit(constraint);
+        Visit(owner.BaseType); foreach (Type item in owner.GetInterfaces()) Visit(item);
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+        foreach (ConstructorInfo constructor in owner.GetConstructors(flags))
+        { VisitMember(constructor); foreach (ParameterInfo parameter in constructor.GetParameters()) { Visit(parameter.ParameterType); foreach (CustomAttributeData attribute in parameter.CustomAttributes) VisitAttribute(attribute); } }
+        foreach (MethodInfo method in owner.GetMethods(flags))
+        {
+            VisitMember(method); Visit(method.ReturnType); foreach (CustomAttributeData attribute in method.ReturnParameter.CustomAttributes) VisitAttribute(attribute);
+            foreach (Type argument in method.GetGenericArguments())
+                if (argument.IsGenericParameter) foreach (Type constraint in argument.GetGenericParameterConstraints()) Visit(constraint);
+            foreach (ParameterInfo parameter in method.GetParameters()) { Visit(parameter.ParameterType); foreach (CustomAttributeData attribute in parameter.CustomAttributes) VisitAttribute(attribute); }
+        }
+        foreach (PropertyInfo property in owner.GetProperties(flags))
+        { VisitMember(property); Visit(property.PropertyType); foreach (ParameterInfo parameter in property.GetIndexParameters()) Visit(parameter.ParameterType); }
+        foreach (FieldInfo field in owner.GetFields(flags)) { VisitMember(field); Visit(field.FieldType); }
+        foreach (EventInfo item in owner.GetEvents(flags)) { VisitMember(item); Visit(item.EventHandlerType); }
+        return found;
+    }
+
+    private static Type[] StepOneContracts() =>
+    [
+        typeof(GatePlanEditIntentKind), typeof(GatePlanEditOutcome), typeof(GatePlanCapacityResource),
+        typeof(GatePlanAuthorityKey), typeof(CommittedGatePlanSnapshot), typeof(GatePlanDraft),
+        typeof(GatePlanEditIntent), typeof(GatePlanEditorSnapshot), typeof(GatePlanEditResult),
+        typeof(GatePreparedReservationState), typeof(GatePreparedReservationOperation),
+        typeof(GatePreparedReservationResultStatus), typeof(GatePreparedReservationId),
+        typeof(GateAuthorityGeneration), typeof(GatePreparedOperationGeneration),
+        typeof(GateReplacementGeneration), typeof(GateRunGeneration), typeof(GatePreparedReservationOwner),
+        typeof(GatePreparedReservation), typeof(GatePreparedReservationResult),
+        typeof(GateCandidateOwnershipState), typeof(GateCandidateActivationStatus),
+        typeof(GateCandidateAbandonStatus), typeof(GateCandidateReclaimStatus), typeof(GateReplacementToken),
+        typeof(GateStoreOnlyCandidateDescriptor), typeof(GateCandidateActivationRequest),
+        typeof(GateObservedPredecessorKind), typeof(GateReplacementCasObservedState),
+        typeof(GateCandidateActivationResult), typeof(GateCandidateAbandonResult), typeof(GateCandidateReclaimResult),
+        typeof(GateApplyCommitState), typeof(GateLiveEpochState), typeof(GateHistoricalAdmissionState),
+        typeof(GateHistoricalExecutionState), typeof(GateCandidateCoverageState), typeof(GateActivationState),
+        typeof(GateCandidateRetirementState), typeof(GatePreviousViewRetirementState), typeof(GateLedgerStage),
+        typeof(GateLedgerCauseKind), typeof(GateApplyLedgerTransitionStatus),
+        typeof(GateApplyLedgerLifecycleState), typeof(GateApplyLedgerPendingResource), typeof(GateLedgerCause),
+        typeof(GateApplyLedgerTransitionResult), typeof(GateApplyLedgerSnapshot)
+    ];
+
+    private static bool IsOperationalType(Type type)
+    {
+        Type definition = type.IsGenericType ? type.GetGenericTypeDefinition() : type;
+        string fullName = definition.FullName ?? definition.Name;
+        return typeof(Delegate).IsAssignableFrom(type) || typeof(IDisposable).IsAssignableFrom(type) ||
+            typeof(IAsyncDisposable).IsAssignableFrom(type) || typeof(System.IO.Stream).IsAssignableFrom(type) ||
+            typeof(System.IO.TextReader).IsAssignableFrom(type) || typeof(System.IO.TextWriter).IsAssignableFrom(type) ||
+            typeof(System.Runtime.InteropServices.SafeHandle).IsAssignableFrom(type) ||
+            typeof(System.Threading.WaitHandle).IsAssignableFrom(type) ||
+            definition == typeof(Task) || definition == typeof(Task<>) || definition == typeof(ValueTask) ||
+            definition == typeof(ValueTask<>) || fullName.StartsWith("System.Reflection.", StringComparison.Ordinal) ||
+            fullName.StartsWith("System.Threading.Channels.", StringComparison.Ordinal) ||
+            fullName.StartsWith("System.Collections.Concurrent.", StringComparison.Ordinal) ||
+            fullName is "System.Threading.Thread" or "System.Threading.Timer" or "System.Timers.Timer" or
+                "System.Threading.SemaphoreSlim" or "System.Threading.Mutex" or "System.Threading.Monitor" ||
+            definition == typeof(List<>) || definition == typeof(Dictionary<,>) || definition == typeof(HashSet<>) ||
+            definition == typeof(Queue<>) || definition == typeof(Stack<>);
+    }
+
+    private static void AssertStepOneContractShape(Type type)
+    {
+        if (type.IsEnum) return;
+        if (type.IsValueType)
+        {
+            Assert.IsTrue(type.IsDefined(typeof(System.Runtime.CompilerServices.IsReadOnlyAttribute), inherit: false),
+                $"{type.FullName} must be a readonly value object.");
+            return;
+        }
+        if (type.IsClass && !type.IsAbstract) Assert.IsTrue(type.IsSealed, $"{type.FullName} must be sealed and immutable.");
+        Assert.IsFalse(typeof(IDisposable).IsAssignableFrom(type) || typeof(IAsyncDisposable).IsAssignableFrom(type),
+            $"{type.FullName} must not own operational lifetime.");
+        Assert.IsFalse(new[] { "Store", "Scheduler", "Coordinator", "Worker", "Service" }
+            .Any(suffix => type.Name.EndsWith(suffix, StringComparison.Ordinal)),
+            $"{type.FullName} looks like a concrete operational component.");
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        Assert.IsFalse(type.GetFields(flags).Any(x => !x.IsInitOnly && !x.IsLiteral), $"{type.FullName} has mutable public fields.");
+        Assert.IsFalse(type.GetProperties(flags).Any(x => x.SetMethod?.IsPublic == true), $"{type.FullName} has public setters.");
+        Assert.IsFalse(type.GetMethods(flags).Any(x => x.ReturnType == typeof(Task) ||
+            x.ReturnType == typeof(ValueTask) || x.ReturnType.IsGenericType &&
+            (x.ReturnType.GetGenericTypeDefinition() == typeof(Task<>) || x.ReturnType.GetGenericTypeDefinition() == typeof(ValueTask<>))),
+            $"{type.FullName} exposes operational asynchronous behavior.");
     }
 }

@@ -62,7 +62,8 @@ cero pins. Primero se caracterizará `ActivatePlan` actual.
 Epoch, store y transición de run comparten resultados deterministas:
 `InvalidReservation`, `Committed`, `AlreadyCommitted`, `Aborted`, `AlreadyAborted` y
 `OwnerOrGenerationMismatch`. Commit tras Abort devuelve `AlreadyAborted`; Abort tras Commit devuelve
-`AlreadyCommitted`. No lanzan por control ordinario. Commit no asigna, espera, hace I/O, callbacks ni
+`AlreadyCommitted`. La clasificación aplica reserva default, owner/generación, estado y operación, en ese orden,
+para no inferir estado mediante credenciales ajenas. No lanzan por control ordinario. Commit no asigna, espera, hace I/O, callbacks ni
 revalidación externa. Dispose aborta/reconcilia toda reserva Prepared.
 
 La preparación agregada del store incluye capacidad de ledger, slot/token, committed, geometría, predecesora,
@@ -123,10 +124,15 @@ pueden cerrar sin reclamación inmediata y callbacks tardíos no restauran token
 | Abandoning | store; CAS excluido |
 | LogicallyAbandoned | terminal Application; store/tombstone asume reclaim diferido si Busy |
 | Reclaimed | terminal físico, liberación única |
-| Disposed | terminal global |
+
+El lifecycle global se modela por separado como `Active → Disposing → Disposed`. Al entrar en `Disposing` no se
+admiten operaciones nuevas, pero el ownership material se conserva mientras terminan o se cancelan trabajos y se
+drenan observer, leases y tombstones. `Disposed` exige cero recursos pendientes y ningún trabajo material activo;
+no reabre ni reescribe terminales: `Activated` y `Reclaimed` permanecen visibles, y `LogicallyAbandoned` debe
+alcanzar reclaim físico antes del cierre global. La causa de Dispose es tipada y append-only.
 
 CAS y abandono comparten exclusión. Abandono primero impide activar; activación primero impide reclamar; nunca se
-reclama una vista activa. `CandidateRetirement=Applied` confirma abandono lógico: si reclaim fue Busy,
+reclama una vista activa. `CandidateRetirement=LogicallyAbandoned` confirma abandono lógico: si reclaim fue Busy,
 Application no reintenta y el tombstone termina la liberación. La predecesora se retira una sola vez después de
 activar el reemplazo.
 
@@ -134,8 +140,11 @@ CAS compara conjuntamente descriptores completos de predecesora/candidata, Inspe
 GatePlanRevision, token/generación deseada y generación vigente de run; exige ownership `Available`, candidata
 no abandonada/reclamada/dispuesta, predecesora activa y capacidad vigente. Devuelve `Activated`,
 `TokenSuperseded`, `RunSuperseded`, `PredecessorMismatch`, `CandidateMismatch`,
-`CandidateNotAvailable`, `AlreadyActivated`, `CandidateAbandoned` o `Disposed`; rechazar no altera
-`ActiveView`.
+`CandidateNotAvailable`, `AlreadyActivated`, `CandidateAbandoned` o `Disposed`. `AlreadyActivated` es éxito
+idempotente de la misma candidata ya activa y no repite activación ni retirada; rechazar no altera `ActiveView`.
+La clasificación es única y ordena Dispose, run, token/generación deseada, replay idempotente de la misma
+candidata ya activa, predecesora, candidata, ownership, capacidad y éxito. El replay se adelanta porque la
+predecesora anterior ya no es `ActiveView`; no existen factories de rechazo alternativas.
 
 ### 2.6 Ledger
 

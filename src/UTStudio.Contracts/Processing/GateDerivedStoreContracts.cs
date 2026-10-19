@@ -100,7 +100,7 @@ public readonly record struct GateDerivedLayerKey
     };
 }
 
-public sealed class GateDerivedStreamCoverage
+public sealed class GateDerivedStreamCoverage : IEquatable<GateDerivedStreamCoverage>
 {
     public const ushort DigestCanonicalVersion = 1;
     public GateDerivedStreamCoverage(UtStreamIdentity stream, ulong? minimumAcquisitionIndex,
@@ -135,6 +135,20 @@ public sealed class GateDerivedStreamCoverage
     public int EligibleTraceCount { get; }
     public GateSha256Digest IdentityDigest { get; }
     public IReadOnlyList<AcquisitionIndexRange>? SelectedRanges { get; }
+
+    public bool Equals(GateDerivedStreamCoverage? other) => other is not null && Stream == other.Stream &&
+        MinimumAcquisitionIndex == other.MinimumAcquisitionIndex && MaximumAcquisitionIndex == other.MaximumAcquisitionIndex &&
+        EligibleTraceCount == other.EligibleTraceCount && IdentityDigest == other.IdentityDigest &&
+        ((SelectedRanges is null && other.SelectedRanges is null) ||
+         (SelectedRanges is not null && other.SelectedRanges is not null && SelectedRanges.SequenceEqual(other.SelectedRanges)));
+    public override bool Equals(object? obj) => Equals(obj as GateDerivedStreamCoverage);
+    public override int GetHashCode()
+    {
+        HashCode hash = new(); hash.Add(Stream); hash.Add(MinimumAcquisitionIndex); hash.Add(MaximumAcquisitionIndex);
+        hash.Add(EligibleTraceCount); hash.Add(IdentityDigest);
+        if (SelectedRanges is null) hash.Add(0); else { hash.Add(1); foreach (AcquisitionIndexRange range in SelectedRanges) hash.Add(range); }
+        return hash.ToHashCode();
+    }
 
     public static GateSha256Digest ComputeIdentityDigest(IEnumerable<TraceIdentity> identities)
     {
@@ -182,7 +196,7 @@ public sealed class GateDerivedStreamCoverage
     }
 }
 
-public sealed class GateDerivedCoverageManifest
+public sealed class GateDerivedCoverageManifest : IEquatable<GateDerivedCoverageManifest>
 {
     private readonly ReadOnlyCollection<GateDerivedStreamCoverage> _streams;
     public GateDerivedCoverageManifest(InspectionId inspectionId, AcquisitionRunId runId,
@@ -193,7 +207,14 @@ public sealed class GateDerivedCoverageManifest
         string coverageScope = "full")
     {
         ArgumentNullException.ThrowIfNull(streams);
-        GateDerivedStreamCoverage[] captured = streams.ToArray();
+        GateDerivedStreamCoverage[] captured = streams
+            .OrderBy(x => x.Stream.InspectionId.Value)
+            .ThenBy(x => x.Stream.AcquisitionRunId.Value)
+            .ThenBy(x => x.Stream.SourceId.Value, StringComparer.Ordinal)
+            .ThenBy(x => x.Stream.PhysicalChannelId.Value)
+            .ThenBy(x => x.Stream.BeamId?.Value ?? -1)
+            .ThenBy(x => x.Stream.FocalLawId?.Value ?? -1)
+            .ToArray();
         if (!inspectionId.IsValid || !runId.IsValid || sourceFinalRevision == InspectionRevision.Initial ||
             !planId.IsValid || !planRevision.IsValid || !IsSha256Hex(planSignature) ||
             !schemaVersion.IsValid || !algorithmVersion.IsValid || string.IsNullOrWhiteSpace(coverageScope) ||
@@ -221,10 +242,25 @@ public sealed class GateDerivedCoverageManifest
     public int TotalEligibleTraceCount { get; }
     public DerivedStoreRevision CapturedStoreRevision { get; }
     public string CoverageScope { get; }
+    public bool Equals(GateDerivedCoverageManifest? other) => other is not null &&
+        InspectionId == other.InspectionId && RunId == other.RunId && SourceFinalRevision == other.SourceFinalRevision &&
+        PlanId == other.PlanId && PlanRevision == other.PlanRevision &&
+        string.Equals(PlanSignature, other.PlanSignature, StringComparison.Ordinal) && SchemaVersion == other.SchemaVersion &&
+        AlgorithmVersion == other.AlgorithmVersion && TotalEligibleTraceCount == other.TotalEligibleTraceCount &&
+        CapturedStoreRevision == other.CapturedStoreRevision &&
+        string.Equals(CoverageScope, other.CoverageScope, StringComparison.Ordinal) && Streams.SequenceEqual(other.Streams);
+    public override bool Equals(object? obj) => Equals(obj as GateDerivedCoverageManifest);
+    public override int GetHashCode()
+    {
+        HashCode hash = new(); hash.Add(InspectionId); hash.Add(RunId); hash.Add(SourceFinalRevision); hash.Add(PlanId);
+        hash.Add(PlanRevision); hash.Add(PlanSignature, StringComparer.Ordinal); hash.Add(SchemaVersion); hash.Add(AlgorithmVersion);
+        hash.Add(TotalEligibleTraceCount); hash.Add(CapturedStoreRevision); hash.Add(CoverageScope, StringComparer.Ordinal);
+        foreach (GateDerivedStreamCoverage stream in Streams) hash.Add(stream); return hash.ToHashCode();
+    }
     private static bool IsSha256Hex(string value) => value is { Length: 64 } && value.All(Uri.IsHexDigit);
 }
 
-public sealed class ActiveDerivedViewDescriptor
+public sealed class ActiveDerivedViewDescriptor : IEquatable<ActiveDerivedViewDescriptor>
 {
     public ActiveDerivedViewDescriptor(DerivedViewId viewId, DerivedStoreRevision activationRevision,
         GateDerivedCoverageManifest manifest, ulong logicalActivationOrder)
@@ -239,6 +275,11 @@ public sealed class ActiveDerivedViewDescriptor
     public DerivedStoreRevision ActivationRevision { get; }
     public GateDerivedCoverageManifest Manifest { get; }
     public ulong LogicalActivationOrder { get; }
+    public bool Equals(ActiveDerivedViewDescriptor? other) => other is not null && ViewId == other.ViewId &&
+        ActivationRevision == other.ActivationRevision && Manifest.Equals(other.Manifest) &&
+        LogicalActivationOrder == other.LogicalActivationOrder;
+    public override bool Equals(object? obj) => Equals(obj as ActiveDerivedViewDescriptor);
+    public override int GetHashCode() => HashCode.Combine(ViewId, ActivationRevision, Manifest, LogicalActivationOrder);
 }
 
 public readonly struct GateDerivedMutationResult
