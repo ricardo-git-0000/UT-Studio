@@ -99,6 +99,14 @@ Añadir modelo de presentación neutral con Preview + Apply/Cancel, comandos ver
 umbral, sombreado, selección, teclado y publicación coherente de revisión. A-Scan no posee/evalúa el plan ni
 usa puntos reducidos para detectar. Cursores A/B siguen separados.
 
+Plan ejecutable aceptado: [editor y overlay de gates en A-Scan](2026-10-19-ut-gate-ascan-editor.md). El
+[ADR 0018 aceptado](../adr/0018-editable-gate-plan-authority.md) exige para Fase 6 un coordinador serial
+asíncrono Application distinto del `_gate` actual de sesión, epoch/publicación preparados, owner terminal de
+`Completion`, transición de run confirmada bajo el gate store compartido con CAS, ledger acotado normativo,
+reservas tipadas, snapshot WPF indivisible y saturación `LiveEpochs` visible para Apply. Mantiene reprocesado
+`StoreOnly` y CAS/abandono completo. Ha sido auditado y aceptado; Fase 6 y esos contratos nuevos continúan no
+implementados.
+
 Gate: accesibilidad, reentrada, Preview + Apply/Cancel, precisión basada en eje original y regresiones WPF;
 undo queda fuera del primer incremento.
 

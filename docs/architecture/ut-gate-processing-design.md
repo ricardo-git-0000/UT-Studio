@@ -517,6 +517,14 @@ Los cursores A/B actuales permanecen como overlay y comandos separados: no se co
 no cambian el plan y conservan su advertencia de medida aproximada sobre puntos visuales reducidos. La edición
 de puerta usa el eje original/contratos neutrales, no los puntos reducidos como precisión de detector.
 
+El [plan ejecutable aceptado de Fase 6](../plans/2026-10-19-ut-gate-ascan-editor.md) concreta incrementos,
+fronteras y matriz de pruebas. El [ADR 0018 aceptado](../adr/0018-editable-gate-plan-authority.md) exige un
+coordinador serial asíncrono Application distinto del `_gate` actual de sesión, epochs y publicación
+preparados, owner terminal de `Completion`, transición de run confirmada bajo el gate store común con CAS,
+ledger normativo acotado, reservas tipadas, snapshot WPF indivisible y rechazo visible por capacidad
+`LiveEpochs`. Mantiene reemplazo `StoreOnly` + CAS/abandono completo. Ha sido auditado y aceptado; Fase 6
+continúa no implementada y esos contratos preparados todavía no existen.
+
 C-Scan consumirá capas derivadas por región/identidad, no invocará el evaluator desde la View. Su máscara
 distingue valor detectado, ausencia válida (`BelowThreshold`/`NoEvent`) y causas no disponibles o terminales;
 no los colapsa en un único bit opaco. Geometría,
