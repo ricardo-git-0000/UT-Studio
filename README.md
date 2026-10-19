@@ -2,7 +2,11 @@
 
 Aplicación de escritorio para adquirir, procesar, almacenar y visualizar datos ultrasónicos para NDT. Objetivo tecnológico: C#/.NET 10, WPF y MVVM, con núcleo y ViewModels portables para una futura interfaz Avalonia.
 
-Estado: fase inicial de diseño e infraestructura. No hay código funcional, proyectos C#, paquetes instalados ni instrucciones de compilación todavía. La primera versión del producto incluirá A/B/C/S/D-Scan, varias ventanas e informes PDF; esta entrega prepara ese trabajo.
+Estado: existe una solución .NET 10 organizada por capas neutrales, contratos y adaptadores WPF. Están
+implementadas la adquisición simulada y la sesión, la visualización reutilizable A-Scan/B-Scan y las Fases 1–5
+del procesamiento neutral de puertas UT, incluido el reprocesado histórico. Permanecen pendientes la
+persistencia durable, C-Scan, formatos externos, informes PDF y control de movimiento; 3D continúa fuera del
+alcance de v1.
 
 ## Lectura
 1. [Contexto inicial](UT-STUDIO-CONTEXT.md).

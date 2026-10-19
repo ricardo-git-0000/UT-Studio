@@ -1,7 +1,7 @@
 # Arquitectura inicial
 
-Estado: estructura aprobada el 2026-09-09, A/B implementados y almacén autoritativo diseñado en Fase 0
-el 2026-10-05. Trazabilidad: R01–R14; ADR 0001–0015.
+Estado: estructura aprobada el 2026-09-09, A/B implementados, almacén autoritativo en RAM y Fases 1–5 del
+procesamiento neutral de puertas integradas en `main`. Trazabilidad: R01–R14; ADR 0001–0017.
 
 ## Estructura inicial aprobada
 
@@ -72,7 +72,7 @@ Dependencias prohibidas: Domain hacia cualquier otro proyecto; Contracts hacia i
 Los casos de uso operan mediante interfaces inyectadas. Los ViewModels no acceden al hardware ni se referencian entre sí; reciben servicios y snapshots de stores mediante IObservable<T> o equivalente. Messenger sirve solo para notificaciones ocasionales de presentación. Frames circulan por ChannelReader<T> de canales acotados.
 La sesión pertenece a Application. Cerrar MainWindow solicita salir: cancelar productor mientras el único lector drena, esperar buffers devueltos, desconectar y detener/liberar Host antes del cierre definitivo. MainWindow permanece abierta durante limpieza y diagnóstico tras cinco segundos. Sin bandeja, OnExplicitShutdown ni ejecución sin ventanas. La secundaria B-Scan puede cerrarse sin detener la sesión. Véase [ADR 0006 revisado](../adr/0006-session-window-lifecycle.md).
 
-El [ADR 0007](../adr/0007-frame-source-ownership.md) concreta frame RF `ReadOnlyMemory<short>` y ownership exclusivo; el [ADR 0008](../adr/0008-latest-only-visual-delivery.md) concreta la entrega A-Scan latest-only. El [ADR 0010](../adr/0010-ascan-manual-cursor-measurements.md) añade medidas manuales aproximadas. Los [ADR 0011](../adr/0011-shared-physical-time-viewport.md) y [ADR 0012](../adr/0012-shared-scan-time-navigation.md) definen el viewport temporal neutral. El [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md), refinado por el [ADR 0015](../adr/0015-authoritative-inspection-data-store.md), concreta la proyección B sample-free desde rangos autoritativos, selección exacta emparejada con el raster y ventana secundaria. Cada ViewModel expone binding local; A y B comparten intervalo, no versión visual. No se comparte un ChannelReader entre consumidores. Procesamiento y almacenamiento futuros conservan ramas lossless distintas.
+El [ADR 0007](../adr/0007-frame-source-ownership.md) concreta frame RF `ReadOnlyMemory<short>` y ownership exclusivo; el [ADR 0008](../adr/0008-latest-only-visual-delivery.md) concreta la entrega A-Scan latest-only. El [ADR 0010](../adr/0010-ascan-manual-cursor-measurements.md) añade medidas manuales aproximadas. Los [ADR 0011](../adr/0011-shared-physical-time-viewport.md) y [ADR 0012](../adr/0012-shared-scan-time-navigation.md) definen el viewport temporal neutral. El [ADR 0013](../adr/0013-bscan-bounded-live-visualization.md), refinado por el [ADR 0015](../adr/0015-authoritative-inspection-data-store.md), concreta la proyección B sample-free desde rangos autoritativos, selección exacta emparejada con el raster y ventana secundaria. Cada ViewModel expone binding local; A y B comparten intervalo, no versión visual. No se comparte un ChannelReader entre consumidores. El [ADR 0017](../adr/0017-neutral-ut-gate-processing.md) concreta la rama lossless de procesamiento de puertas, separada de la entrega visual; la futura persistencia durable conservará su propia admisión y backpressure.
 
 ## Frontera WPF/Avalonia
 Presentation no importa WPF ni Avalonia. Los servicios UI abstractos permanecen en App.Wpf, separados por carpetas de composición, vistas y servicios. El renderizador A-Scan se extrae a Visualization.Wpf conforme al ADR 0009; no contiene servicios de aplicación ni se inyecta en hardware.
@@ -124,11 +124,16 @@ frío: al agotar presupuesto hay backpressure o `CapacityExceeded`. El rango con
 el residente caliente, el representado y la región dirty son conceptos distintos. Cerrar una ventana
 libera su consumidor, no los datos; cierre global drena admisión, commits y leases antes de liberar.
 
-## Decisiones abiertas y siguiente incremento
+## Decisiones cerradas y abiertas
 
-Q12: propiedad de la primera secundaria B-Scan resuelta por ADR 0013 y refinada por ADR 0015;
-concurrencia de otras inspecciones sigue abierta. Q13: A/B notifican identidad y revisión tras el commit
-y consultan la autoridad sin fan-out RF; procesamiento, persistencia y su ownership continúan abiertos.
-Q06 conserva datos crudos/procesados y durabilidad.
+Los ADR 0007, 0015 y 0017 cierran para el alcance implementado la autoridad RF única, el ownership de frames,
+leases y buffers, los contratos neutrales, la compilación/evaluación de puertas, el store derivado en RAM y el
+reprocesado histórico. A/B notifican identidad y revisión tras el commit y consultan la autoridad sin fan-out
+RF. El [plan vigente](../plans/2026-10-16-ut-gate-processing.md) registra las Fases 1–5 integradas.
+
+Continúan abiertos el ownership y lifetime del plan comprometido para el futuro editor, el caso de uso
+Apply/Cancel, su composición productiva y los presupuestos combinados. También siguen abiertos la persistencia
+durable de Q06/Q15/Q21 y la geometría C-Scan, celdas, tiles y encoder de Q05/Q17/Q18. La concurrencia de otras
+inspecciones de Q12 permanece separada.
 
 Pendientes mocking/CI y paquetes adicionales (Q10), renderizadores de otros scans, gates de rendimiento sobre hardware acordado (Q09/Q14) y futuras integraciones. Los modos `None`, `NearestNeighbor`, `Bilinear`, `Bicubic` y `Lanczos`, el selector y la preferencia versionada están implementados conforme al ADR 0014; `None` es predeterminado y Lanczos es alta calidad con cadencia reducida. GP/Kriging permanece como reconstrucción futura separada. ChannelCapacity=4 y BufferCount=8 son internos configurables del simulador sujetos a benchmarks, no del contrato general. Véanse el [plan del primer incremento](../plans/2026-09-09-first-vertical-increment.md), [almacenamiento](storage.md) y [pruebas](testing.md).

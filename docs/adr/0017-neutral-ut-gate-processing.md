@@ -154,6 +154,13 @@ fuera de Fase 4.
 El contrato está aceptado y la implementación completada y validada en `feature/ut-gate-reprocessing`; su
 integración en `main` permanece pendiente de superar auditoría y merge.
 
+### Nota posterior de integración — 19 de octubre de 2026
+
+El texto anterior conserva el estado histórico de este refinamiento. Fase 5 quedó integrada en `main` en
+`eb3eb2e`, con la secuencia `aee0bc1` → `91091a1` → `f29748a` → `eb3eb2e`; la antigua rama
+`feature/ut-gate-reprocessing` fue eliminada. El árbol estaba limpio en la comprobación previa a esta nota.
+Fase 6 todavía no está implementada.
+
 Un trabajo fija al admitirse `JobId`, `AttemptId`, snapshot RF sellado y su `SourceFinalRevision`, selección
 canónica de streams e intervalos inclusivos, `CompiledGatePlan` completo, epoch, firma, schema, algoritmo,
 política de publicación, bloque y presupuesto. Los intervalos se ordenan por stream, eliminan duplicados y

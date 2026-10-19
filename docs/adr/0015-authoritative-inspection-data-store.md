@@ -380,6 +380,13 @@ con él.
 El contrato y la implementación están completados y validados en `feature/ut-gate-reprocessing`; su integración
 en `main` permanece pendiente de superar auditoría y merge. Este refinamiento no añade almacenamiento persistente.
 
+### Nota posterior de integración — 19 de octubre de 2026
+
+El texto anterior conserva el estado histórico de este refinamiento. Fase 5 quedó integrada en `main` en
+`eb3eb2e`, con la secuencia `aee0bc1` → `91091a1` → `f29748a` → `eb3eb2e`; la antigua rama
+`feature/ut-gate-reprocessing` fue eliminada. El árbol estaba limpio en la comprobación previa a esta nota.
+Fase 6 todavía no está implementada y la persistencia durable continúa fuera de alcance.
+
 El reprocesado histórico no infiere estabilidad a partir de que el store sea append-only. Un puerto neutral
 independiente, `IInspectionSealedRunSnapshotProvider`, abre un lease contractual para una inspección y run
 sellada, una `SourceFinalRevision` exacta y no inicial, un conjunto explícito no vacío de streams de esa run y

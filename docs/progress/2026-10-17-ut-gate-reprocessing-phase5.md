@@ -54,3 +54,10 @@ La implementación está confirmada en `aee0bc1e8493192430274b1f248dba17a9cf29ff
 en `91091a1c328d1e9ffe8cd519debda04df1b12a9d`, ambas en `feature/ut-gate-reprocessing`. La integración en
 `main` continúa pendiente; no se afirma que esos commits formen parte de `main`. El working tree estaba limpio
 en el momento de esta actualización.
+
+### Nota posterior de integración — 19 de octubre de 2026
+
+Los párrafos anteriores conservan los estados históricos de sus fechas. Fase 5 quedó integrada en `main` en
+`eb3eb2e`, con la secuencia `aee0bc1` → `91091a1` → `f29748a` → `eb3eb2e`; la antigua rama
+`feature/ut-gate-reprocessing` fue eliminada. El árbol estaba limpio en la comprobación previa a esta nota.
+Fase 6 todavía no está implementada.

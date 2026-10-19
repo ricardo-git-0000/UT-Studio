@@ -1,9 +1,11 @@
 # Trazabilidad canónica de Fase 5
 
-Estado vigente: 2026-10-18. Contrato aceptado e implementación de Fase 5 completada y validada en
-`feature/ut-gate-reprocessing`; integración en `main` pendiente de auditoría y merge. Sustituye todos los
-inventarios anteriores. `NotRepresentableByContract` significa verificación estructural y por invariantes
-alcanzables, nunca fallo inyectado.
+Estado vigente: 2026-10-19. Contrato aceptado e implementación de Fase 5 completada, validada e integrada en
+`main`. La integración finalizó en `eb3eb2e` mediante `aee0bc1` → `91091a1` → `f29748a` → `eb3eb2e`; la antigua
+rama `feature/ut-gate-reprocessing` fue eliminada y el árbol estaba limpio en la comprobación previa a esta
+actualización. Fase 6 todavía no está implementada. Esta matriz sustituye todos los inventarios anteriores.
+`NotRepresentableByContract` significa verificación estructural y por invariantes alcanzables, nunca fallo
+inyectado.
 
 | ID | Frontera | Clasificación | Propietario | Prueba/evidencia | Resultado | Repeticiones | Justificación contractual |
 | ---: | --- | --- | --- | --- | --- | ---: | --- |

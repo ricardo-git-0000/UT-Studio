@@ -1,7 +1,10 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-18. Estado: **contrato aceptado; Fase 5 implementada y validada en `feature/ut-gate-reprocessing`,
-con integración en `main` pendiente; sin composición productiva, UI, persistencia ni C-Scan**.
+Fecha: 2026-10-19. Estado: **contrato aceptado; Fases 1–5 implementadas, validadas e integradas en `main`;
+Fase 6 todavía no implementada; sin composición productiva, UI de puertas, persistencia ni C-Scan**. La
+integración de Fase 5 finalizó en `eb3eb2e` mediante `aee0bc1` → `91091a1` → `f29748a` → `eb3eb2e`; la antigua
+rama `feature/ut-gate-reprocessing` fue eliminada. El árbol estaba limpio en la comprobación previa a esta
+actualización.
 
 ## 1. Alcance y autoridad
 

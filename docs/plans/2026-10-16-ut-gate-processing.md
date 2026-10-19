@@ -1,8 +1,10 @@
 # Plan aprobado por fases — procesamiento neutral de puertas UT
 
-Fecha: 2026-10-18. Estado: **contrato aceptado; Fase 5 implementada y validada en
-`feature/ut-gate-reprocessing`, sobre Fase 4 implementada y Fase 3 aceptada; integración en `main` pendiente y
-sin composición productiva**. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
+Fecha: 2026-10-19. Estado: **contrato aceptado; Fases 1–5 implementadas, validadas e integradas en `main`;
+Fase 6 todavía no implementada y sin composición productiva**. La integración de Fase 5 finalizó en `eb3eb2e`
+mediante `aee0bc1` → `91091a1` → `f29748a` → `eb3eb2e`; la antigua rama
+`feature/ut-gate-reprocessing` fue eliminada. El árbol estaba limpio en la comprobación previa a esta
+actualización. ADR: [0017](../adr/0017-neutral-ut-gate-processing.md).
 Diseño: [procesamiento neutral](../architecture/ut-gate-processing-design.md).
 
 ## Propiedad y alcance
