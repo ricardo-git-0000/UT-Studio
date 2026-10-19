@@ -207,6 +207,32 @@ public sealed class CommittedGateProcessingOrchestratorTests
     }
 
     [TestMethod]
+    public async Task Phase6Step1_ActivatePlanMutatesImmediatelyAndInitialEpochConsumesCapacity()
+    {
+        await using var fixture = new Fixture(new(maximumPlanEpochsPerRun: 2));
+        InspectionAppendResult first = await fixture.CommitAsync(0, [1, 5]);
+        fixture.Orchestrator.NotifyCommitted(new(fixture.Identity(0), first.Revision));
+        await fixture.Sink.Next.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        CompiledGatePlan accepted = CompilePlan(2, "accepted");
+        CompiledGatePlan rejected = CompilePlan(3, "rejected");
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            fixture.Orchestrator.ActivatePlan(fixture.Run, accepted, new(2)));
+        Assert.AreEqual(GateProcessingAdmissionStatus.Rejected,
+            fixture.Orchestrator.ActivatePlan(fixture.Run, rejected, new(3)));
+        Assert.HasCount(2, fixture.Orchestrator.Diagnostics.ActiveRuns.Single().Plans);
+
+        InspectionAppendResult second = await fixture.CommitAsync(1, [7, 2]);
+        fixture.Orchestrator.NotifyCommitted(new(fixture.Identity(1), second.Revision));
+        await fixture.SealAndDrainAsync();
+
+        CollectionAssert.AreEqual(new uint[] { 1, 2 }, fixture.Sink.Batches
+            .Select(batch => batch.Entries.Single().PlanRevision.Value).ToArray());
+        Assert.IsFalse(fixture.Sink.Batches.Any(batch =>
+            batch.Entries.Single().PlanRevision == rejected.Source.Revision));
+    }
+
+    [TestMethod]
     [DataRow(GateBatchDeliveryStatus.Accepted)]
     [DataRow(GateBatchDeliveryStatus.Rejected)]
     [DataRow(GateBatchDeliveryStatus.Failed)]

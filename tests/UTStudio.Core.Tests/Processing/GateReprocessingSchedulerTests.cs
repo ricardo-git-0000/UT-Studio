@@ -206,6 +206,39 @@ public sealed class GateReprocessingSchedulerTests
     }
 
     [TestMethod]
+    public async Task Phase6Step1_StoreOnlyCompletionPreservesExistingSingularActiveViewAndBalancesOwnership()
+    {
+        await using var rf = new InMemoryInspectionDataStore(Inspection, new(32_000, 64));
+        IInspectionRunWriter writer = await rf.OpenRunAsync(Run);
+        await CommitAsync(writer, 2);
+        await CommitAsync(writer, 6);
+        InspectionRunSealResult seal = await writer.SealRunAsync();
+        await using var derived = new InMemoryGateDerivedStore(new(32, 1_000_000));
+        await using var scheduler = new GateReprocessingScheduler(rf, derived,
+            new(maximumWorkers: 1, maximumAdmittedJobs: 2), new GateScratchPool(1, 300_000));
+        CompiledGatePlan plan = Compile();
+
+        IGateReprocessingJob activating = (await scheduler.AdmitAsync(Descriptor(plan, seal.FinalRevision,
+            Guid.NewGuid(), Guid.NewGuid(), GateReprocessingPublicationPolicy.ActivateOnComplete))).Job!;
+        _ = await activating.Completion;
+        ActiveDerivedViewDescriptor activeBeforeStoreOnly = derived.ActiveView!;
+
+        IGateReprocessingJob storeOnly = (await scheduler.AdmitAsync(Descriptor(plan, seal.FinalRevision,
+            Guid.NewGuid(), Guid.NewGuid(), GateReprocessingPublicationPolicy.StoreOnly))).Job!;
+        Assert.AreSame(storeOnly.Completion, storeOnly.Completion);
+        GateReprocessingProgressSnapshot completed = await storeOnly.Completion;
+
+        Assert.AreEqual(GateReprocessingLifecycle.Completed, completed.Lifecycle, completed.PrimaryError);
+        Assert.IsTrue(completed.CleanupConfirmed);
+        Assert.AreEqual(0, completed.ActiveWorkers);
+        Assert.AreEqual(0, completed.ActiveCallbacks);
+        Assert.AreEqual(completed.BufferRents, completed.BufferReturns);
+        Assert.AreEqual(completed.LeasesAcquired, completed.LeasesReleased);
+        Assert.AreEqual(activeBeforeStoreOnly, derived.ActiveView);
+        Assert.AreEqual(new DerivedViewId("reprocessed"), derived.ActiveView!.ViewId);
+    }
+
+    [TestMethod]
     public async Task TwoRegionalViewsWithSamePlanUseIndependentCoverageScopes()
     {
         await using var rf = new InMemoryInspectionDataStore(Inspection, new(32_000, 64));
