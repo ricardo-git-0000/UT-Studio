@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Xml.Linq;
 using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Inspection;
+using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Presentation;
 
@@ -71,7 +72,8 @@ public sealed class PresentationArchitectureTests
     public void PresentationAssemblyHasNoApplicationOrPlatformDependency()
     {
         var references = typeof(AScanViewModel).Assembly.GetReferencedAssemblies().Select(reference => reference.Name!).ToArray();
-        string[] forbidden = ["UTStudio.Application", "UTStudio.Acquisition.Simulator", "PresentationFramework", "PresentationCore", "WindowsBase", "System.Xaml"];
+        string[] forbidden = ["UTStudio.Application", "UTStudio.Acquisition.Simulator", "UTStudio.Processing.Core",
+            "PresentationFramework", "PresentationCore", "WindowsBase", "System.Xaml"];
         Assert.IsFalse(references.Any(reference => forbidden.Contains(reference) || reference.StartsWith("Avalonia", StringComparison.Ordinal)));
         Assert.IsTrue(references.Contains("CommunityToolkit.Mvvm"));
         Assert.AreEqual("UTStudio.Contracts", typeof(IApplicationSession).Assembly.GetName().Name);
@@ -105,6 +107,38 @@ public sealed class PresentationArchitectureTests
         Assert.IsNotNull(directory);
         string source = File.ReadAllText(Path.Combine(directory.FullName, "src", "UTStudio.Presentation", "UiAsyncCommand.cs"));
         Assert.DoesNotContain("Task.Run(", source, StringComparison.Ordinal);
+    }
+
+    [TestMethod]
+    public void GateEditorRemainsHeadlessAndApplicationAddsNoWpfDependency()
+    {
+        string[] presentationReferences = typeof(GatePlanEditorSession).Assembly.GetReferencedAssemblies()
+            .Select(reference => reference.Name!).ToArray();
+        Assert.DoesNotContain("UTStudio.Processing.Core", presentationReferences);
+        Assert.IsFalse(presentationReferences.Any(reference => reference is "PresentationFramework" or
+            "PresentationCore" or "WindowsBase" or "System.Xaml"));
+
+        string[] applicationReferences = typeof(UTStudio.Application.InMemoryGatePlanAuthorityOwner).Assembly
+            .GetReferencedAssemblies().Select(reference => reference.Name!).ToArray();
+        Assert.IsFalse(applicationReferences.Any(reference => reference is "PresentationFramework" or
+            "PresentationCore" or "WindowsBase" or "System.Xaml"));
+
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "UTStudio.sln")))
+            directory = directory.Parent;
+        Assert.IsNotNull(directory);
+        string editor = File.ReadAllText(Path.Combine(directory.FullName, "src", "UTStudio.Presentation",
+            "GatePlanEditorSession.cs"));
+        string preview = File.ReadAllText(Path.Combine(directory.FullName, "src", "UTStudio.Application",
+            "GatePlanPreviewCompiler.cs"));
+        foreach (string forbidden in new[] { "GateEvaluator", "IGateDerivedStore", "IGateReprocessingScheduler",
+                     "CommitAsync", "CommitGapAsync", "System.Windows", "SemaphoreSlim", "TaskCompletionSource" })
+        {
+            Assert.DoesNotContain(forbidden, editor, StringComparison.Ordinal);
+            Assert.DoesNotContain(forbidden, preview, StringComparison.Ordinal);
+        }
+        Assert.AreEqual(typeof(Task<GateReprocessingProgressSnapshot>), typeof(IGateReprocessingJob)
+            .GetProperty(nameof(IGateReprocessingJob.Completion))!.PropertyType);
     }
 
     [TestMethod]

@@ -16,18 +16,20 @@ public sealed class GateEditorContractTests
     [TestMethod]
     public void GenerationTypesAreDistinctSafeValues()
     {
-        Type[] types = [typeof(GateAuthorityGeneration), typeof(GatePreparedOperationGeneration),
+        Type[] types = [typeof(GateAuthorityGeneration), typeof(GateAuthorityPublicationSequence), typeof(GatePreparedOperationGeneration),
             typeof(GateReplacementGeneration), typeof(GateRunGeneration)];
-        object[] one = [new GateAuthorityGeneration(1), new GatePreparedOperationGeneration(1),
+        object[] one = [new GateAuthorityGeneration(1), new GateAuthorityPublicationSequence(1), new GatePreparedOperationGeneration(1),
             new GateReplacementGeneration(1), new GateRunGeneration(1)];
-        object[] maximum = [new GateAuthorityGeneration(ulong.MaxValue),
+        object[] maximum = [new GateAuthorityGeneration(ulong.MaxValue), new GateAuthorityPublicationSequence(ulong.MaxValue),
             new GatePreparedOperationGeneration(ulong.MaxValue), new GateReplacementGeneration(ulong.MaxValue),
             new GateRunGeneration(ulong.MaxValue)];
         Assert.IsFalse(default(GateAuthorityGeneration).IsValid);
+        Assert.IsFalse(default(GateAuthorityPublicationSequence).IsValid);
         Assert.IsFalse(default(GatePreparedOperationGeneration).IsValid);
         Assert.IsFalse(default(GateReplacementGeneration).IsValid);
         Assert.IsFalse(default(GateRunGeneration).IsValid);
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateAuthorityGeneration(0));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateAuthorityPublicationSequence(0));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GatePreparedOperationGeneration(0));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateReplacementGeneration(0));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateRunGeneration(0));
@@ -51,6 +53,24 @@ public sealed class GateEditorContractTests
     }
 
     [TestMethod]
+    public void ReadStampAndRecoveryResultsRejectContradictoryPayloads()
+    {
+        CommittedGatePlanSnapshot committed = Committed(1);
+        var snapshot = new GatePlanAuthoritySnapshot(committed, new(1), new(1));
+        var stamp = new GatePlanAuthorityReadStamp(committed.AuthorityKey, snapshot, new(1), new(1));
+        var acquired = new GatePlanAuthorityReadStampResult(GatePlanAuthorityReadStampStatus.Acquired, snapshot, stamp);
+        Assert.AreSame(snapshot, acquired.Stamp.Snapshot);
+        Assert.ThrowsExactly<ArgumentException>(() => new GatePlanAuthorityReadStampResult(
+            GatePlanAuthorityReadStampStatus.Acquired));
+        Assert.ThrowsExactly<ArgumentException>(() => new GatePlanAuthorityReadStamp(
+            new(Inspection, new("other")), snapshot, new(1), new(1)));
+        Assert.AreEqual(GatePlanRecoveryInstallStatus.Installed,
+            new GatePlanRecoveryInstallResult(GatePlanRecoveryInstallStatus.Installed, snapshot).Status);
+        Assert.ThrowsExactly<ArgumentException>(() => new GatePlanRecoveryInstallResult(
+            GatePlanRecoveryInstallStatus.CapabilityDisposed, snapshot));
+    }
+
+    [TestMethod]
     public void DraftHasBaseRevisionAndDefensivelyCopiesGates()
     {
         List<GateDefinition> gates = [GateTestPlan.Gate("A")]; GatePlanDraft draft = Draft(new(1), gates);
@@ -64,11 +84,10 @@ public sealed class GateEditorContractTests
     public void PreviewAndCancelFactoriesEnforceEditorialState()
     {
         CommittedGatePlanSnapshot committed = Committed(1); GatePlanDraft draft = Draft(new(1));
-        var preview = GatePlanEditResult.Previewed(new(committed, draft,
-            [new(GateCompilationErrorCode.InvalidThreshold, "preview")]));
+        var preview = GatePlanEditResult.Previewed(new(committed, draft, state: GatePlanEditorState.Previewed));
         Assert.AreEqual(GatePlanEditOutcome.Previewed, preview.Outcome); Assert.IsNull(preview.ResultingRevision);
         Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.Previewed(new(committed)));
-        var cancelled = GatePlanEditResult.Cancelled(new(committed));
+        var cancelled = GatePlanEditResult.Cancelled(new(committed, state: GatePlanEditorState.Cancelled));
         Assert.AreEqual(GatePlanEditOutcome.Cancelled, cancelled.Outcome); Assert.IsNull(cancelled.Snapshot.Draft);
         Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.Cancelled(new(committed, draft)));
     }
@@ -93,15 +112,17 @@ public sealed class GateEditorContractTests
     [TestMethod]
     public void RejectionFactoriesPreserveCurrentRevisionAndValidatePayloads()
     {
-        GatePlanEditorSnapshot current = new(Committed(1), Draft(new(1)));
         var error = new GateCompilationError(GateCompilationErrorCode.InvalidDuration, "invalid");
+        GatePlanEditorSnapshot current = new(Committed(1), Draft(new(1)), [error],
+            GatePlanEditorState.ValidationFailed);
         GatePlanEditResult validation = GatePlanEditResult.ValidationFailed(current, [error]);
         Assert.IsNull(validation.ResultingRevision); Assert.AreEqual(validation.ExpectedRevision, validation.CurrentRevision);
         Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.ValidationFailed(current, []));
         Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.ValidationFailed(current, [null!]));
-        var capacity = GatePlanEditResult.CapacityExceeded(current, GatePlanCapacityResource.LiveEpochs);
+        GatePlanEditorSnapshot validCurrent = new(Committed(1), Draft(new(1)));
+        var capacity = GatePlanEditResult.CapacityExceeded(validCurrent, GatePlanCapacityResource.LiveEpochs);
         Assert.IsNull(capacity.ResultingRevision); Assert.AreEqual(new GatePlanRevision(1), capacity.CurrentRevision);
-        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => GatePlanEditResult.CapacityExceeded(current, default));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => GatePlanEditResult.CapacityExceeded(validCurrent, default));
         Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.CapacityExceeded(new(Committed(1)),
             GatePlanCapacityResource.LiveEpochs));
         GatePlanEditorSnapshot invalidDraft = new(Committed(1), Draft(new(1)),
@@ -109,16 +130,16 @@ public sealed class GateEditorContractTests
         Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.CapacityExceeded(invalidDraft,
             GatePlanCapacityResource.LiveEpochs));
         Assert.AreEqual(GatePlanEditOutcome.CancelledBeforeCommit,
-            GatePlanEditResult.CancelledBeforeCommit(current).Outcome);
+            GatePlanEditResult.CancelledBeforeCommit(validCurrent).Outcome);
         Assert.AreEqual(GatePlanEditOutcome.FaultedBeforeCommit,
-            GatePlanEditResult.FaultedBeforeCommit(current).Outcome);
+            GatePlanEditResult.FaultedBeforeCommit(validCurrent).Outcome);
         Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.CancelledBeforeCommit(new(Committed(1))));
     }
 
     [TestMethod]
     public void ConflictRequiresStaleExpectedAndCarriesCurrentRevision()
     {
-        GatePlanEditorSnapshot stale = new(Committed(2), Draft(new(1)));
+        GatePlanEditorSnapshot stale = new(Committed(2), Draft(new(1)), state: GatePlanEditorState.Stale);
         GatePlanEditResult conflict = GatePlanEditResult.Conflict(new(1), stale);
         Assert.AreEqual(1u, conflict.ExpectedRevision.Value);
         Assert.AreEqual(new GatePlanRevision(2), conflict.CurrentRevision); Assert.IsNull(conflict.ResultingRevision);
@@ -148,6 +169,41 @@ public sealed class GateEditorContractTests
         Assert.ThrowsExactly<ArgumentException>(() => new GatePlanEditorSnapshot(Committed(1), Draft(new(1)), [null!]));
         Assert.ThrowsExactly<NotSupportedException>(() => ((IList<GateCompilationError>)snapshot.DraftErrors)
             .Add(new(GateCompilationErrorCode.InvalidThreshold, "other")));
+    }
+
+    [TestMethod]
+    public void EditorialStateRejectsHybridSnapshots()
+    {
+        CommittedGatePlanSnapshot committed = Committed(1);
+        GatePlanDraft draft = Draft(new(1));
+        var error = new GateCompilationError(GateCompilationErrorCode.InvalidThreshold, "invalid");
+        Assert.AreEqual(GatePlanEditorState.Committed, new GatePlanEditorSnapshot(committed).State);
+        Assert.AreEqual(GatePlanEditorState.Editing, new GatePlanEditorSnapshot(committed, draft).State);
+        Assert.AreEqual(GatePlanEditorState.ValidationFailed,
+            new GatePlanEditorSnapshot(committed, draft, [error]).State);
+        Assert.ThrowsExactly<ArgumentException>(() => new GatePlanEditorSnapshot(committed, null, null,
+            GatePlanEditorState.Previewed));
+        Assert.ThrowsExactly<ArgumentException>(() => new GatePlanEditorSnapshot(committed, draft, [error],
+            GatePlanEditorState.Previewed));
+        Assert.ThrowsExactly<ArgumentException>(() => new GatePlanEditorSnapshot(committed, draft, null,
+            GatePlanEditorState.ValidationFailed));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GatePlanEditorSnapshot(committed, state:
+            (GatePlanEditorState)99));
+    }
+
+    [TestMethod]
+    public void LatePreviewFactoriesCarryTypedTerminalAndSupersededOutcomes()
+    {
+        CommittedGatePlanSnapshot committed = Committed(1);
+        var editing = new GatePlanEditorSnapshot(committed, Draft(new(1)));
+        GatePlanEditResult superseded = GatePlanEditResult.Superseded(editing, new(1));
+        Assert.AreEqual(GatePlanEditOutcome.Superseded, superseded.Outcome);
+        var closed = new GatePlanEditorSnapshot(committed, state: GatePlanEditorState.Closed);
+        GatePlanEditResult closedResult = GatePlanEditResult.Closed(closed, new(1));
+        Assert.AreEqual(GatePlanEditOutcome.Closed, closedResult.Outcome);
+        Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.Superseded(editing, default));
+        Assert.ThrowsExactly<ArgumentException>(() => GatePlanEditResult.Closed(new(committed), new(1)));
+        Assert.ThrowsExactly<ArgumentException>(() => new GatePlanAuthoritySnapshot(committed, default));
     }
 
     [TestMethod]

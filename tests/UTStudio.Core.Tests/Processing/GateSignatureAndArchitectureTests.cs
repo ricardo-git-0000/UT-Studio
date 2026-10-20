@@ -147,7 +147,10 @@ public sealed class GateSignatureAndArchitectureTests
                     name.StartsWith("System.Threading.Tasks.TaskCompletionSource`", StringComparison.Ordinal);
                 Assert.IsFalse(forbidden, $"{owner.FullName} exposes forbidden type {name} from {assembly}.");
                 if (stepOneContracts.Contains(owner))
-                    Assert.IsFalse(IsOperationalType(used), $"{owner.FullName} exposes operational type {name}.");
+                {
+                    Assert.IsFalse(IsOperationalType(used),
+                        $"{owner.FullName} exposes operational type {name}.");
+                }
             }
             if (stepOneContracts.Contains(owner)) AssertStepOneContractShape(owner);
         }
@@ -239,8 +242,13 @@ public sealed class GateSignatureAndArchitectureTests
     private static Type[] StepOneContracts() =>
     [
         typeof(GatePlanEditIntentKind), typeof(GatePlanEditOutcome), typeof(GatePlanCapacityResource),
-        typeof(GatePlanAuthorityKey), typeof(CommittedGatePlanSnapshot), typeof(GatePlanDraft),
+        typeof(GatePlanEditorState),
+        typeof(GatePlanAuthorityKey), typeof(CommittedGatePlanSnapshot), typeof(GatePlanAuthoritySnapshot),
+        typeof(GateAuthorityPublicationSequence), typeof(GatePlanAuthorityReadStamp),
+        typeof(GatePlanAuthorityReadStampStatus), typeof(GatePlanAuthorityReadStampResult),
+        typeof(GatePlanRecoveryInstallStatus), typeof(GatePlanRecoveryInstallResult), typeof(GatePlanDraft),
         typeof(GatePlanEditIntent), typeof(GatePlanEditorSnapshot), typeof(GatePlanEditResult),
+        typeof(IGatePlanAuthorityReader), typeof(IGatePlanPreviewCompiler),
         typeof(GatePreparedReservationState), typeof(GatePreparedReservationOperation),
         typeof(GatePreparedReservationResultStatus), typeof(GatePreparedReservationId),
         typeof(GateAuthorityGeneration), typeof(GatePreparedOperationGeneration),
