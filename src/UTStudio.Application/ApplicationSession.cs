@@ -16,6 +16,10 @@ namespace UTStudio.Application;
 /// </remarks>
 public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 {
+    // Capacity counts one runner plus at most 63 queued operations. The current sole reader can own only one RF/gap
+    // admission, so this route retains at most one pending frame. Any future concurrent Application consumer must
+    // budget its captured buffers and closures explicitly; cancelling a waiter never releases an admitted slot.
+    private const int CommitCoordinatorCapacity = 64;
     private readonly object _gate = new();
     private readonly IUtFrameSource _source;
     private readonly InspectionId _inspectionId;
@@ -251,7 +255,10 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                     catch (Exception error)
                     {
                         drainOnly = true;
-                        lock (_gate) { RecordError(operation, error, "session.frame"); RequestCleanup(operation, true); }
+                        lock (_gate)
+                        {
+                            RecordError(operation, error, "session.frame"); RequestCleanup(operation, true);
+                        }
                     }
                     finally
                     {
@@ -373,14 +380,16 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             configuration.PhysicalChannelId);
         IInspectionRunWriter writer = operation.InspectionWriter ??
             throw new InvalidOperationException("The inspection writer is unavailable.");
-        InspectionAppendResult result = await writer.CommitGapAsync(ToGapRecord(stream, gap)).ConfigureAwait(false);
-        if (result.Status is not (InspectionAppendStatus.Committed or InspectionAppendStatus.Duplicate))
-        { throw new InspectionAppendException(result.Status, result.ErrorCode); }
+        ApplicationCommitAdmission admission = operation.CommitCoordinator.AdmitCommit(operation.RunId,
+            ApplicationCommitKind.Gap, () => writer.CommitGapAsync(ToGapRecord(stream, gap)));
+        ApplicationCommitTerminalResult terminal = await admission.Completion.ConfigureAwait(false);
+        _ = CompleteCommitAdmission(operation, admission, terminal);
         lock (_gate)
         {
             operation.LastObservedSequence = frame.Sequence;
-            ApplyConfirmedGap(operation, gap);
+            ApplyConfirmedGapState(operation, gap);
         }
+        lock (_gate) { Publish(operation, _snapshot.Phase); }
     }
 
     private static bool SameConfiguration(ConventionalAcquisitionConfiguration actual,
@@ -446,16 +455,41 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         IInspectionRunWriter writer = operation.InspectionWriter ??
             throw new InvalidOperationException("The inspection writer is unavailable.");
         IReadOnlyList<GapRecord> gaps = gap is { } confirmed ? [ToGapRecord(stream, confirmed)] : [];
-        InspectionAppendResult result = await writer.CommitAsync(
-            new InspectionCommitInput(new InspectionTraceInput(descriptor, frame.Samples), gaps))
-            .ConfigureAwait(false);
-        if (result.Status == InspectionAppendStatus.Duplicate) { return result; }
-        if (!result.IsCommitted)
-        {
-            throw new InspectionAppendException(result.Status, result.ErrorCode);
-        }
-        ApplyCommittedFrame(operation, frame, gap);
+        ApplicationCommitAdmission admission = operation.CommitCoordinator.AdmitCommit(operation.RunId,
+            ApplicationCommitKind.Rf,
+            () => writer.CommitAsync(new InspectionCommitInput(new InspectionTraceInput(descriptor, frame.Samples), gaps)));
+        ApplicationCommitTerminalResult terminal = await admission.Completion.ConfigureAwait(false);
+        InspectionAppendResult result = CompleteCommitAdmission(operation, admission, terminal);
+        if (result.Status != InspectionAppendStatus.Duplicate) ApplyCommittedFrame(operation, frame, gap);
+        if (result.IsCommitted && gap is not null) { lock (_gate) { Publish(operation, _snapshot.Phase); } }
         return result;
+    }
+
+    private InspectionAppendResult CompleteCommitAdmission(Operation operation, ApplicationCommitAdmission admission,
+        ApplicationCommitTerminalResult terminal)
+    {
+        if (terminal.AdmissionOrdinal != admission.AdmissionOrdinal || terminal.Kind != admission.Kind ||
+            terminal.RunId != admission.RunId)
+            throw new InvalidOperationException("The terminal commit identity does not match its admission.");
+
+        lock (_gate)
+        {
+            ulong expected = checked(operation.LastReconciledCommitOrdinal + 1);
+            if (admission.AdmissionOrdinal != expected)
+                throw new InvalidOperationException("Commit reconciliation did not preserve admission order.");
+        }
+
+        if (terminal.IsSuccessful && terminal.AppendResult is { } successful)
+        {
+            lock (_gate) { operation.LastReconciledCommitOrdinal = admission.AdmissionOrdinal; }
+            return successful;
+        }
+        if (terminal.Error is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(terminal.Error).Throw();
+        if (terminal.AppendResult is { } rejected && terminal.Status == ApplicationCommitTerminalStatus.WriterRejected)
+            throw new InspectionAppendException(rejected.Status, rejected.ErrorCode);
+        throw new InvalidOperationException($"Commit admission {terminal.AdmissionOrdinal} ended as {terminal.Status}; " +
+            $"previous revision {terminal.PreviousRevision.Value}, observed revision {terminal.ObservedRevision.Value}.");
     }
 
     private void DeliverCommittedAScan(Operation operation, ConventionalUtFrame frame, InspectionRevision revision)
@@ -486,7 +520,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             operation.LastSequence = frame.Sequence;
             operation.LastElapsed = frame.ElapsedSinceRunStart;
             operation.LastMetadata = frame.Metadata;
-            if (gap is { } confirmed) { ApplyConfirmedGap(operation, confirmed); }
+            if (gap is { } confirmed) { ApplyConfirmedGapState(operation, confirmed); }
         }
     }
 
@@ -494,11 +528,10 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         new(stream, gap.FirstMissing, gap.LastMissing, gap.PreviousAdmitted,
             gap.SubsequentObserved, InspectionGapCause.SourceSequenceDiscontinuity);
 
-    private void ApplyConfirmedGap(Operation operation, PendingGap gap)
+    private static void ApplyConfirmedGapState(Operation operation, PendingGap gap)
     {
         ulong missingCount = checked(gap.LastMissing - gap.FirstMissing + 1);
         operation.AcquisitionMissingFrames = checked(operation.AcquisitionMissingFrames + missingCount);
-        Publish(operation, _snapshot.Phase);
     }
 
     private void CloseVisual(Operation operation)
@@ -577,6 +610,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 await ObserveAsync(operation, () => run.ProducerCompletion, "session.producer").ConfigureAwait(false);
                 await operation.Supervisor.ConfigureAwait(false);
                 await ObserveAsync(operation, () => operation.Consumer, "session.reader").ConfigureAwait(false);
+                operation.CommitCoordinator.CloseAdmission();
                 lock (_gate) { Publish(operation, SessionPhase.AwaitingFramesReleased); }
                 operation.ResourcesReleased = await ObserveAsync(operation, () => run.AllFramesReleased, "session.barrier").ConfigureAwait(false);
             }
@@ -584,9 +618,11 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             {
                 // A source that has not returned a run owns and has completed startup rollback.
                 operation.ResourcesReleased = true;
+                operation.CommitCoordinator.CloseAdmission();
             }
 
             InspectionRunSealResult? sealedRun = null;
+            await operation.CommitCoordinator.DisposeAsync().ConfigureAwait(false);
             if (operation.InspectionWriter is not null)
             {
                 try
@@ -847,6 +883,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal UtSourceError? AScanError;
         internal UtSourceError? VisualError;
         internal IInspectionRunWriter? InspectionWriter;
+        internal ApplicationCommitCoordinator CommitCoordinator { get; } = new(CommitCoordinatorCapacity);
+        internal ulong LastReconciledCommitOrdinal;
         internal ulong AcquisitionMissingFrames;
         internal ulong DuplicateFramesRejected;
         internal ulong OutOfOrderFramesRejected;
