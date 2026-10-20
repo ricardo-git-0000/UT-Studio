@@ -11,9 +11,9 @@ internal enum ApplicationCommitKind { Rf, Gap }
 internal enum ApplicationCommitTerminalStatus
 {
     Confirmed, DuplicateUnverifiable, WriterRejected, WriterFaulted, RevisionRegression,
-    NonAdvancingRevision, CoordinatorFaulted
+    NonAdvancingRevision
 }
-internal enum ApplicationCommitCoordinatorLifecycle { Accepting, Running, Closing, Draining, Closed, Faulted }
+internal enum ApplicationCommitCoordinatorLifecycle { Accepting, Running, Closing, Draining, Closed }
 
 internal sealed record ApplicationCommitTerminalResult(ulong AdmissionOrdinal, ApplicationCommitKind Kind,
     AcquisitionRunId RunId, ApplicationCommitTerminalStatus Status, InspectionAppendResult? AppendResult,
@@ -25,7 +25,7 @@ internal sealed record ApplicationCommitTerminalResult(ulong AdmissionOrdinal, A
 internal sealed record ApplicationCommitCoordinatorSnapshot(ApplicationCommitCoordinatorLifecycle Lifecycle,
     int Capacity, int Occupancy, int Queued, ulong? RunningOrdinal, ulong LastAdmissionOrdinal,
     ulong LastCompletionOrdinal, ulong CapacityRejections, ulong ClosedRejections, AcquisitionRunId RevisionRun,
-    InspectionRevision LastConfirmedRevision, string? TerminalDrainError);
+    InspectionRevision LastConfirmedRevision);
 
 /// <summary>An admitted commit whose coordinator-owned terminal completion is never caller-cancelled.</summary>
 internal sealed class ApplicationCommitAdmission
@@ -62,7 +62,6 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
     private AcquisitionRunId _admissionRun;
     private AcquisitionRunId _revisionRun;
     private InspectionRevision _lastConfirmedRevision = InspectionRevision.Initial;
-    private Exception? _terminalDrainError;
 
     internal ApplicationCommitCoordinator(int capacity)
     {
@@ -83,8 +82,7 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (_lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
-                ApplicationCommitCoordinatorLifecycle.Draining or ApplicationCommitCoordinatorLifecycle.Closed or
-                ApplicationCommitCoordinatorLifecycle.Faulted)
+                ApplicationCommitCoordinatorLifecycle.Draining or ApplicationCommitCoordinatorLifecycle.Closed)
             {
                 _closedRejections = checked(_closedRejections + 1);
                 throw new ObjectDisposedException(nameof(ApplicationCommitCoordinator));
@@ -112,8 +110,8 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
             else _queue.Enqueue(item);
         }
         // The drain owner is visible before leaving the gate, but no writer/delegate is invoked until after it.
-        // Start executes the uncontended fast path directly and stores the actual loop task; it does not dispatch to
-        // the ThreadPool. Dispose waits the registration completion, which is signalled only by the loop's finally.
+        // The uncontended fast path executes directly without dispatching to the ThreadPool. The registration unwraps
+        // and exposes the actual loop task, so Dispose observes its real terminal state even before Start publishes it.
         if (drainToStart is { } drain)
         {
             Task execution = DrainAsync(item);
@@ -130,7 +128,7 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
             {
                 return new(_lifecycle, _capacity, OccupancyUnderLock(), _queue.Count, _running?.Ordinal,
                     _lastAdmissionOrdinal, _lastCompletionOrdinal, _capacityRejections, _closedRejections,
-                    _revisionRun, _lastConfirmedRevision, Describe(_terminalDrainError));
+                    _revisionRun, _lastConfirmedRevision);
             }
         }
     }
@@ -141,8 +139,8 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
         lock (_gate)
         {
             if (_lifecycle is ApplicationCommitCoordinatorLifecycle.Closed or
-                ApplicationCommitCoordinatorLifecycle.Faulted or ApplicationCommitCoordinatorLifecycle.Closing or
-                ApplicationCommitCoordinatorLifecycle.Draining) return;
+                ApplicationCommitCoordinatorLifecycle.Closing or ApplicationCommitCoordinatorLifecycle.Draining)
+                return;
             if (_running is null) { _lifecycle = ApplicationCommitCoordinatorLifecycle.Closed; complete = true; }
             else _lifecycle = ApplicationCommitCoordinatorLifecycle.Closing;
         }
@@ -152,84 +150,44 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         CloseAdmission();
-        await _completion.Task.ConfigureAwait(false);
-        Exception? terminalError;
         DrainRegistration drain;
-        lock (_gate) { drain = _drain; terminalError = _terminalDrainError; }
+        lock (_gate) { drain = _drain; }
         await drain.Completion.ConfigureAwait(false);
-        if (terminalError is not null)
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(terminalError).Throw();
+        await _completion.Task.ConfigureAwait(false);
     }
 
     private async Task DrainAsync(CommitWorkItem first)
     {
         CommitWorkItem? current = first;
-        try
+        // All supported writer failures are operation results produced by ExecuteAsync; 3A has no global Faulted
+        // lifecycle. An unexpected internal exception faults the registered drain task and is observed by Dispose.
+        while (current is not null)
         {
-            while (current is not null)
+            ApplicationCommitTerminalResult terminal = await ExecuteAsync(current).ConfigureAwait(false);
+            CommitWorkItem completed = current;
+            lock (_gate)
             {
-                ApplicationCommitTerminalResult terminal = await ExecuteAsync(current).ConfigureAwait(false);
-                CommitWorkItem completed = current;
-                lock (_gate)
+                _lastCompletionOrdinal = completed.Ordinal;
+                if (_queue.TryDequeue(out current))
                 {
-                    _lastCompletionOrdinal = completed.Ordinal;
-                    if (_queue.TryDequeue(out current))
-                    {
-                        _running = current;
-                        if (_lifecycle == ApplicationCommitCoordinatorLifecycle.Closing)
-                            _lifecycle = ApplicationCommitCoordinatorLifecycle.Draining;
-                    }
-                    else
-                    {
-                        current = null;
-                        _running = null;
-                        bool closing = _lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
-                            ApplicationCommitCoordinatorLifecycle.Draining;
-                        _lifecycle = closing ? ApplicationCommitCoordinatorLifecycle.Closed :
-                            ApplicationCommitCoordinatorLifecycle.Accepting;
-                        if (closing) _completion.TrySetResult();
-                    }
-                    // RunContinuationsAsynchronously makes terminal publication safe under the state gate and keeps
-                    // completion, slot release, diagnostics and selection of the next ordinal atomic to observers.
-                    completed.Complete(terminal);
+                    _running = current;
+                    if (_lifecycle == ApplicationCommitCoordinatorLifecycle.Closing)
+                        _lifecycle = ApplicationCommitCoordinatorLifecycle.Draining;
                 }
-            }
-        }
-        catch (Exception error)
-        {
-            List<CommitWorkItem> orphaned;
-            lock (_gate)
-            {
-                _terminalDrainError = error;
-                _lifecycle = ApplicationCommitCoordinatorLifecycle.Faulted;
-                orphaned = [.. _queue];
-                _queue.Clear();
-                _running = null;
-                _completion.TrySetResult();
-            }
-            if (current is not null && !orphaned.Contains(current)) orphaned.Insert(0, current);
-            foreach (CommitWorkItem orphan in orphaned) orphan.Complete(CoordinatorFault(orphan, error));
-        }
-        finally
-        {
-            List<CommitWorkItem>? orphaned = null;
-            Exception? structuralError = null;
-            lock (_gate)
-            {
-                if (_running is not null)
+                else
                 {
-                    structuralError = new InvalidOperationException("The commit drain exited with an active runner.");
-                    _terminalDrainError ??= structuralError;
-                    _lifecycle = ApplicationCommitCoordinatorLifecycle.Faulted;
-                    orphaned = [.. _queue];
-                    _queue.Clear();
-                    orphaned.Insert(0, _running);
+                    current = null;
                     _running = null;
-                    _completion.TrySetResult();
+                    bool closing = _lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
+                        ApplicationCommitCoordinatorLifecycle.Draining;
+                    _lifecycle = closing ? ApplicationCommitCoordinatorLifecycle.Closed :
+                        ApplicationCommitCoordinatorLifecycle.Accepting;
+                    if (closing) _completion.TrySetResult();
                 }
+                // RunContinuationsAsynchronously makes terminal publication safe under the state gate and keeps
+                // completion, slot release, diagnostics and selection of the next ordinal atomic to observers.
+                completed.Complete(terminal);
             }
-            if (orphaned is not null)
-                foreach (CommitWorkItem orphan in orphaned) orphan.Complete(CoordinatorFault(orphan, structuralError!));
         }
     }
 
@@ -272,11 +230,6 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
 
     private InspectionRevision LastRevision() { lock (_gate) { return _lastConfirmedRevision; } }
     private int OccupancyUnderLock() => _queue.Count + (_running is null ? 0 : 1);
-    private static string? Describe(Exception? error) => error is null ? null :
-        $"{error.GetType().FullName}: {error.Message}";
-    private static ApplicationCommitTerminalResult CoordinatorFault(CommitWorkItem item, Exception error) =>
-        new(item.Ordinal, item.Kind, item.RunId, ApplicationCommitTerminalStatus.CoordinatorFaulted, null,
-            InspectionRevision.Initial, InspectionRevision.Initial, error);
 
     private sealed class CommitWorkItem
     {

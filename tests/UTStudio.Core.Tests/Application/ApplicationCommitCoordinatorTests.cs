@@ -87,6 +87,54 @@ public sealed class ApplicationCommitCoordinatorTests
     }
 
     [TestMethod]
+    public async Task CancellationAndAdmissionRaceHasExactlyOneLinearizableOutcome()
+    {
+        var coordinator = new ApplicationCommitCoordinator(1);
+        using var cancellation = new CancellationTokenSource();
+        using var start = new Barrier(3);
+        var release = Signal();
+        int writerInvocations = 0;
+        Task<ApplicationCommitAdmission?> admitting = Task.Run(() =>
+        {
+            start.SignalAndWait();
+            try
+            {
+                return coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+                {
+                    Interlocked.Increment(ref writerInvocations);
+                    await release.Task;
+                    return Committed(1);
+                }, cancellation.Token);
+            }
+            catch (OperationCanceledException) { return null; }
+        });
+        Task cancelling = Task.Run(() => { start.SignalAndWait(); cancellation.Cancel(); });
+        start.SignalAndWait();
+        ApplicationCommitAdmission? admission = await admitting;
+        await cancelling;
+
+        if (admission is null)
+        {
+            Assert.AreEqual(0, Volatile.Read(ref writerInvocations));
+            Assert.AreEqual((ulong)0, coordinator.Snapshot.LastAdmissionOrdinal);
+            Assert.AreEqual(0, coordinator.Snapshot.Occupancy);
+        }
+        else
+        {
+            Assert.AreEqual(1, Volatile.Read(ref writerInvocations));
+            await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => admission.WaitAsync(cancellation.Token));
+            Assert.AreEqual(1, coordinator.Snapshot.Occupancy);
+            release.TrySetResult();
+            Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await admission.Completion).Status);
+            Assert.AreEqual(0, coordinator.Snapshot.Occupancy);
+        }
+
+        release.TrySetResult();
+        await coordinator.DisposeAsync();
+        Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Closed, coordinator.Snapshot.Lifecycle);
+    }
+
+    [TestMethod]
     [Timeout(5000, CooperativeCancellation = true)]
     public async Task SynchronousWriterStartsBeforeAdmissionReturnsButDoesNotHoldCoordinatorGate()
     {
@@ -163,14 +211,37 @@ public sealed class ApplicationCommitCoordinatorTests
     }
 
     [TestMethod]
-    public async Task FailedExternalReconciliationAfterCompletionDoesNotBlockLaterCommit()
+    public async Task ThrowingSessionObserverIsDetachedAndLaterCommitStillProgresses()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(1);
-        ApplicationCommitTerminalResult first = await Commit(coordinator, 1);
-        Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, first.Status);
-        Assert.ThrowsExactly<InvalidOperationException>(() => throw new InvalidOperationException("publication"));
-        ApplicationCommitTerminalResult second = await Commit(coordinator, 2);
-        Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, second.Status);
+        await using var source = new ManualSessionSource();
+        var writer = new ScriptedWriter(Run, Committed(1), Committed(2), Committed(3));
+        await using var session = new ApplicationSession(source, new InspectionId(Guid.NewGuid()), _ => writer);
+        var observerFailed = Signal();
+        int failures = 0;
+        using IDisposable subscription = session.Subscribe(new SnapshotObserver(snapshot =>
+        {
+            if (snapshot.LastSequence != 2 || Interlocked.Exchange(ref failures, 1) != 0) return;
+            observerFailed.TrySetResult();
+            throw new InvalidOperationException("observer-publication");
+        }));
+
+        await session.StartAsync(Configuration, Run);
+        ManualSessionSource.CountingOwner first = source.QueueFrame(0);
+        await first.Returned.Task;
+        ManualSessionSource.CountingOwner publishing = source.QueueFrame(2);
+        await publishing.Returned.Task;
+        await observerFailed.Task;
+        ManualSessionSource.CountingOwner later = source.QueueFrame(3);
+        await later.Returned.Task;
+        await session.StopAsync();
+
+        Assert.AreEqual(1, Volatile.Read(ref failures));
+        Assert.AreEqual((ulong)3, session.Snapshot.LastSequence);
+        Assert.AreEqual(3L, session.Snapshot.ReleasedFrames);
+        Assert.AreEqual(1, first.DisposeCount);
+        Assert.AreEqual(1, publishing.DisposeCount);
+        Assert.AreEqual(1, later.DisposeCount);
+        Assert.AreEqual(InspectionRunState.Sealed, writer.State);
     }
 
     [TestMethod]
@@ -213,6 +284,55 @@ public sealed class ApplicationCommitCoordinatorTests
             () => ValueTask.FromResult(Committed(1))));
         Assert.AreEqual((ulong)1, coordinator.Snapshot.ClosedRejections);
         await coordinator.DisposeAsync(); await coordinator.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task CloseAndEnqueueRaceHasExactlyOneLinearizableOutcome()
+    {
+        var coordinator = new ApplicationCommitCoordinator(1);
+        using var start = new Barrier(3);
+        var release = Signal();
+        int writerInvocations = 0;
+        Task<ApplicationCommitAdmission?> admitting = Task.Run(() =>
+        {
+            start.SignalAndWait();
+            try
+            {
+                return coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+                {
+                    Interlocked.Increment(ref writerInvocations);
+                    await release.Task;
+                    return Committed(1);
+                });
+            }
+            catch (ObjectDisposedException) { return null; }
+        });
+        Task closing = Task.Run(() => { start.SignalAndWait(); coordinator.CloseAdmission(); });
+        start.SignalAndWait();
+        ApplicationCommitAdmission? admission = await admitting;
+        await closing;
+
+        if (admission is null)
+        {
+            Assert.AreEqual(0, Volatile.Read(ref writerInvocations));
+            Assert.AreEqual((ulong)0, coordinator.Snapshot.LastAdmissionOrdinal);
+        }
+        else
+        {
+            Assert.AreEqual(1, Volatile.Read(ref writerInvocations));
+            release.TrySetResult();
+            Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await admission.Completion).Status);
+        }
+
+        release.TrySetResult();
+        await coordinator.DisposeAsync();
+        await coordinator.DisposeAsync();
+        ApplicationCommitCoordinatorSnapshot closed = coordinator.Snapshot;
+        Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Closed, closed.Lifecycle);
+        Assert.AreEqual(0, closed.Occupancy);
+        Assert.AreEqual(0, closed.Queued);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+            () => ValueTask.FromResult(Committed(2))));
     }
 
     [TestMethod]
