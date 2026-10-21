@@ -38,13 +38,214 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
     private bool _admissionClosed, _closed;
     private Task? _disposeTask;
     private TaskCompletionSource? _writersDrained, _readersDrained, _leasesDrained;
+    private readonly DesiredReplacementControlLimits _desiredReplacementLimits;
+    private readonly Dictionary<DesiredReplacementKey, InstalledDesiredReplacement> _desiredReplacements = [];
+    private readonly Dictionary<DesiredReplacementKey, ulong> _replacementGenerations = [];
+    private readonly DesiredReplacementReservationTombstone[] _desiredReplacementTombstones;
+    private PreparedDesiredReplacementState? _preparedDesiredReplacement;
+    private int _desiredReplacementTombstoneStart, _desiredReplacementTombstoneCount;
+    private int _provisionalDesiredReplacementSlots;
+    private ulong _committedReplacementToken, _preparedOperationGeneration;
     internal GateDerivedStoreTestHooks? TestHooks { get; set; }
 
-    public InMemoryGateDerivedStore(GateDerivedStoreOptions? options = null) => _options = options ?? new();
+    public InMemoryGateDerivedStore(GateDerivedStoreOptions? options = null)
+        : this(options, new DesiredReplacementControlLimits()) { }
+
+    internal InMemoryGateDerivedStore(GateDerivedStoreOptions? options,
+        DesiredReplacementControlLimits desiredReplacementLimits)
+    {
+        _options = options ?? new();
+        _desiredReplacementLimits = desiredReplacementLimits ?? throw new ArgumentNullException(nameof(desiredReplacementLimits));
+        _desiredReplacementTombstones = new DesiredReplacementReservationTombstone[
+            desiredReplacementLimits.TerminalReservationTombstoneCapacity];
+        DesiredReplacementControl = new(this);
+    }
+
+    internal PreparedDesiredReplacementOwner DesiredReplacementControl { get; }
 
     public DerivedStoreRevision Revision { get { lock (_gate) { return new(_revision); } } }
     public ActiveDerivedViewDescriptor? ActiveView { get { lock (_gate) { return _active?.Descriptor; } } }
     private StoredView? _active;
+
+    internal DesiredReplacementControlDiagnostics DesiredReplacementDiagnostics
+    {
+        get
+        {
+            lock (_gate)
+                return new(_preparedDesiredReplacement is not null, _desiredReplacements.Count,
+                    _provisionalDesiredReplacementSlots, _desiredReplacementTombstoneCount,
+                    _desiredReplacementLimits.MaximumInstalledDesiredReplacements,
+                    _desiredReplacementLimits.TerminalReservationTombstoneCapacity,
+                    _committedReplacementToken, _preparedOperationGeneration);
+        }
+    }
+
+    internal PrepareDesiredReplacementResult PrepareDesiredReplacement(PrepareDesiredReplacementRequest request)
+    {
+        var speculativeReservationId = new GatePreparedReservationId(Guid.NewGuid());
+        lock (_gate)
+        {
+            if (!request.InspectionId.IsValid || !request.RunId.IsValid || !request.RunGeneration.IsValid ||
+                !request.GatePlanId.IsValid || !request.GatePlanRevision.IsValid || !request.Owner.IsValid)
+                return PrepareDesiredReplacementResult.Rejected(PrepareDesiredReplacementStatus.InvalidIdentity);
+            if (_admissionClosed || _closed)
+                return PrepareDesiredReplacementResult.Rejected(PrepareDesiredReplacementStatus.Closed);
+            if (_preparedDesiredReplacement is not null)
+                return PrepareDesiredReplacementResult.Rejected(PrepareDesiredReplacementStatus.AlreadyPrepared);
+
+            DesiredReplacementKey key = new(request.InspectionId, request.GatePlanId);
+            bool isNewKey = !_desiredReplacements.ContainsKey(key);
+            if (isNewKey && _desiredReplacements.Count >=
+                _desiredReplacementLimits.MaximumInstalledDesiredReplacements)
+                return PrepareDesiredReplacementResult.Rejected(PrepareDesiredReplacementStatus.CapacityExceeded);
+
+            ulong committedGeneration = _replacementGenerations.GetValueOrDefault(key);
+            if (!TryGetNextDesiredReplacementCounter(_committedReplacementToken, out ulong nextToken) ||
+                !TryGetNextDesiredReplacementCounter(committedGeneration, out ulong nextReplacementGeneration) ||
+                !TryGetNextDesiredReplacementCounter(_preparedOperationGeneration, out ulong nextOperationGeneration))
+                return PrepareDesiredReplacementResult.Rejected(PrepareDesiredReplacementStatus.CounterOverflow);
+
+            var token = new GateReplacementToken(nextToken);
+            var replacementGeneration = new GateReplacementGeneration(nextReplacementGeneration);
+            var operationGeneration = new GatePreparedOperationGeneration(nextOperationGeneration);
+            var reservation = new GatePreparedReservation(speculativeReservationId, request.Owner, operationGeneration,
+                GatePreparedReservationState.Prepared);
+            ActiveDerivedViewDescriptor?[] predecessorCell = new ActiveDerivedViewDescriptor?[1];
+            var installation = new InstalledDesiredReplacement(key, request.RunId, request.RunGeneration,
+                request.GatePlanRevision, token, replacementGeneration, predecessorCell);
+            DesiredReplacementControlSlot? provisionalSlot = isNewKey ? new(true) : null;
+            var state = new PreparedDesiredReplacementState(reservation, installation, provisionalSlot,
+                predecessorCell);
+
+            _desiredReplacements.EnsureCapacity(_desiredReplacements.Count + (isNewKey ? 1 : 0));
+            _replacementGenerations.EnsureCapacity(_replacementGenerations.Count +
+                (_replacementGenerations.ContainsKey(key) ? 0 : 1));
+
+            _preparedOperationGeneration = operationGeneration.Value;
+            if (provisionalSlot.HasValue) _provisionalDesiredReplacementSlots++;
+            _preparedDesiredReplacement = state;
+            return PrepareDesiredReplacementResult.Success(new(reservation, key, token, replacementGeneration));
+        }
+    }
+
+    internal GatePreparedReservationResult CommitDesiredReplacement(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation)
+    {
+        lock (_gate)
+            return ConsumeDesiredReplacementUnderLock(reservation, owner, generation,
+                GatePreparedReservationOperation.Commit);
+    }
+
+    internal GatePreparedReservationResult AbortDesiredReplacement(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation)
+    {
+        lock (_gate)
+            return ConsumeDesiredReplacementUnderLock(reservation, owner, generation,
+                GatePreparedReservationOperation.Abort);
+    }
+
+    internal InstalledDesiredReplacement? FindInstalledDesiredReplacement(DesiredReplacementKey key)
+    {
+        lock (_gate) return _desiredReplacements.GetValueOrDefault(key);
+    }
+
+    private GatePreparedReservationResult ConsumeDesiredReplacementUnderLock(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation,
+        GatePreparedReservationOperation operation)
+    {
+        if (!reservation.IsValid)
+            return GatePreparedReservationResult.Classify(default, owner, generation, operation);
+
+        PreparedDesiredReplacementState? prepared = _preparedDesiredReplacement;
+        if (prepared is null || prepared.Reservation.Id != reservation.Id)
+        {
+            GatePreparedReservation terminal = FindDesiredReplacementTombstoneUnderLock(reservation.Id);
+            if (!terminal.IsValid)
+                return GatePreparedReservationResult.Classify(default, owner, generation, operation);
+            GatePreparedReservationResult replay = GatePreparedReservationResult.Classify(
+                terminal, owner, generation, operation);
+            if (replay.Status == GatePreparedReservationResultStatus.OwnerOrGenerationMismatch)
+                return replay;
+            if (reservation.Owner != terminal.Owner || reservation.Generation != terminal.Generation)
+                return GatePreparedReservationResult.Classify(
+                    terminal, reservation.Owner, reservation.Generation, operation);
+            return replay;
+        }
+
+        GatePreparedReservation current = prepared.Reservation;
+        GatePreparedReservationResult classified = GatePreparedReservationResult.Classify(
+            current, owner, generation, operation);
+        if (classified.Status == GatePreparedReservationResultStatus.OwnerOrGenerationMismatch)
+            return classified;
+        if (reservation.Owner != current.Owner || reservation.Generation != current.Generation)
+            return GatePreparedReservationResult.Classify(current,
+                reservation.Owner, reservation.Generation, operation);
+
+        if (classified.Status == GatePreparedReservationResultStatus.Committed)
+        {
+            InstalledDesiredReplacement installation = prepared.Installation;
+            prepared.PredecessorCell[0] = _active?.Descriptor;
+            _desiredReplacements[installation.Key] = installation;
+            _replacementGenerations[installation.Key] = installation.Generation.Value;
+            _committedReplacementToken = installation.Token.Value;
+            if (prepared.ProvisionalSlot.HasValue) _provisionalDesiredReplacementSlots--;
+            StoreDesiredReplacementTombstoneUnderLock(current, GatePreparedReservationState.Committed);
+            _preparedDesiredReplacement = null;
+        }
+        else if (classified.Status == GatePreparedReservationResultStatus.Aborted)
+        {
+            if (prepared.ProvisionalSlot.HasValue) _provisionalDesiredReplacementSlots--;
+            StoreDesiredReplacementTombstoneUnderLock(current, GatePreparedReservationState.Aborted);
+            _preparedDesiredReplacement = null;
+        }
+        return classified;
+    }
+
+    private void StoreDesiredReplacementTombstoneUnderLock(GatePreparedReservation reservation,
+        GatePreparedReservationState state)
+    {
+        int capacity = _desiredReplacementTombstones.Length;
+        int index;
+        if (_desiredReplacementTombstoneCount < capacity)
+        {
+            index = (_desiredReplacementTombstoneStart + _desiredReplacementTombstoneCount) % capacity;
+            _desiredReplacementTombstoneCount++;
+        }
+        else
+        {
+            index = _desiredReplacementTombstoneStart;
+            _desiredReplacementTombstoneStart = (_desiredReplacementTombstoneStart + 1) % capacity;
+        }
+        _desiredReplacementTombstones[index] = new(reservation.Id, reservation.Owner,
+            reservation.Generation, state);
+    }
+
+    private GatePreparedReservation FindDesiredReplacementTombstoneUnderLock(GatePreparedReservationId id)
+    {
+        for (int offset = 0; offset < _desiredReplacementTombstoneCount; offset++)
+        {
+            int index = (_desiredReplacementTombstoneStart + offset) % _desiredReplacementTombstones.Length;
+            if (_desiredReplacementTombstones[index].ReservationId == id)
+                return _desiredReplacementTombstones[index].Snapshot();
+        }
+        return default;
+    }
+
+    private void AbortPreparedDesiredReplacementUnderLock()
+    {
+        PreparedDesiredReplacementState? prepared = _preparedDesiredReplacement;
+        if (prepared is null) return;
+        if (prepared.ProvisionalSlot.HasValue) _provisionalDesiredReplacementSlots--;
+        StoreDesiredReplacementTombstoneUnderLock(prepared.Reservation, GatePreparedReservationState.Aborted);
+        _preparedDesiredReplacement = null;
+    }
+
+    internal static bool TryGetNextDesiredReplacementCounter(ulong committed, out ulong next)
+    {
+        if (committed == ulong.MaxValue) { next = 0; return false; }
+        next = committed + 1;
+        return true;
+    }
 
     public GateDerivedStoreDiagnostics Diagnostics
     {
@@ -562,6 +763,11 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
         {
             if (_disposeTask is not null) { return new(_disposeTask); }
             _admissionClosed = true;
+            AbortPreparedDesiredReplacementUnderLock();
+            _desiredReplacements.Clear();
+            _replacementGenerations.Clear();
+            _provisionalDesiredReplacementSlots = 0;
+            _committedReplacementToken = 0;
             Task writers = WaitUnderLock(_writers, ref _writersDrained);
             Task readers = WaitUnderLock(_readers, ref _readersDrained);
             Task leases = WaitUnderLock(_leases, ref _leasesDrained);
@@ -735,6 +941,37 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
     private sealed record StoredBatch(GateEvaluationBatch Batch, long LogicalBytes, DerivedStoreRevision Revision);
     private sealed record StoredView(ActiveDerivedViewDescriptor Descriptor, long LogicalBytes, long TombstoneBytes,
         HashSet<GateDerivedBatchKey> Membership);
+
+    /// <summary>
+    /// Immutable once published in the desired-replacement root. RunId and RunGeneration are structurally
+    /// validated payload only: before an Apply path can use this type, the store must add run authority, a prepared
+    /// run transition, outgoing-state invalidation, and serialization with CAS under the store gate. The containing
+    /// store alone assigns the predecessor immediately before publication while holding that gate.
+    /// </summary>
+    internal sealed class InstalledDesiredReplacement
+    {
+        internal InstalledDesiredReplacement(DesiredReplacementKey key, AcquisitionRunId runId,
+            GateRunGeneration runGeneration, GatePlanRevision planRevision, GateReplacementToken token,
+            GateReplacementGeneration generation, ActiveDerivedViewDescriptor?[] predecessorCell)
+        {
+            Key = key;
+            RunId = runId;
+            RunGeneration = runGeneration;
+            PlanRevision = planRevision;
+            Token = token;
+            Generation = generation;
+            _predecessorCell = predecessorCell;
+        }
+
+        internal DesiredReplacementKey Key { get; }
+        internal AcquisitionRunId RunId { get; }
+        internal GateRunGeneration RunGeneration { get; }
+        internal GatePlanRevision PlanRevision { get; }
+        internal GateReplacementToken Token { get; }
+        internal GateReplacementGeneration Generation { get; }
+        private readonly ActiveDerivedViewDescriptor?[] _predecessorCell;
+        internal ActiveDerivedViewDescriptor? Predecessor => _predecessorCell[0];
+    }
 
     private sealed class ReadLease : IGateDerivedReadLease
     {
