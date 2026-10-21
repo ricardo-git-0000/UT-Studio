@@ -295,16 +295,20 @@ public sealed class InMemoryGateDerivedStorePreparedReplacementTests
     }
 
     [TestMethod]
-    public async Task RunPayloadIsValidatedStructurallyButNotAuthorized()
+    public async Task RunPayloadMustMatchOpenAuthority()
     {
         await using var store = Store();
-        PrepareDesiredReplacementRequest validButUnknownRun = Request("A");
-        PrepareDesiredReplacementResult accepted = store.DesiredReplacementControl.Prepare(validButUnknownRun);
+        PrepareDesiredReplacementRequest authorized = Request("A");
+        PrepareDesiredReplacementResult accepted = store.DesiredReplacementControl.Prepare(authorized);
         Assert.AreEqual(PrepareDesiredReplacementStatus.Prepared, accepted.Status);
         Abort(store, accepted.Prepared);
 
         await using var invalidStore = Store();
-        PrepareDesiredReplacementRequest invalid = validButUnknownRun with { RunId = default };
+        PrepareDesiredReplacementRequest wrongRun = authorized with { RunId = new(Guid.NewGuid()) };
+        Assert.AreEqual(PrepareDesiredReplacementStatus.RunNotOpen,
+            invalidStore.DesiredReplacementControl.Prepare(wrongRun).Status);
+
+        PrepareDesiredReplacementRequest invalid = authorized with { RunId = default };
         Assert.AreEqual(PrepareDesiredReplacementStatus.InvalidIdentity,
             invalidStore.DesiredReplacementControl.Prepare(invalid).Status);
     }
@@ -325,9 +329,11 @@ public sealed class InMemoryGateDerivedStorePreparedReplacementTests
         foreach (PrepareDesiredReplacementRequest request in invalid)
         {
             await using var store = Store();
+            ulong operationGeneration = store.DesiredReplacementControl.Diagnostics.PreparedOperationGeneration;
             Assert.AreEqual(PrepareDesiredReplacementStatus.InvalidIdentity,
                 store.DesiredReplacementControl.Prepare(request).Status);
-            Assert.AreEqual(0UL, store.DesiredReplacementControl.Diagnostics.PreparedOperationGeneration);
+            Assert.AreEqual(operationGeneration,
+                store.DesiredReplacementControl.Diagnostics.PreparedOperationGeneration);
             Assert.IsFalse(store.DesiredReplacementControl.Diagnostics.HasPreparedReservation);
         }
     }
@@ -346,15 +352,29 @@ public sealed class InMemoryGateDerivedStorePreparedReplacementTests
         Assert.AreEqual(ulong.MaxValue, maximum);
     }
 
-    private static InMemoryGateDerivedStore Store(int maximumInstalled = 4, int tombstones = 4) =>
-        new(null, new(maximumInstalled, tombstones));
+    private static InMemoryGateDerivedStore Store(int maximumInstalled = 4, int tombstones = 4)
+    {
+        var store = new InMemoryGateDerivedStore(null, new(maximumInstalled, tombstones));
+        PrepareGateRunTransitionResult prepared = store.DesiredReplacementControl.PrepareRunTransition(new(null,
+            InspectionId(), RunId(), new(Guid.Parse("dddddddd-dddd-dddd-dddd-dddddddddddd"))));
+        Assert.AreEqual(PrepareGateRunTransitionStatus.Prepared, prepared.Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.Committed,
+            store.DesiredReplacementControl.CommitRunTransition(prepared.Prepared.Reservation,
+                prepared.Prepared.Reservation.Owner, prepared.Prepared.Reservation.Generation).Status);
+        return store;
+    }
 
     private static PrepareDesiredReplacementRequest Request(string plan,
         GatePreparedReservationOwner? owner = null) => new(
-        new InspectionId(Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
-        new AcquisitionRunId(Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
-        new GateRunGeneration(17), new GatePlanId(plan), new GatePlanRevision(3),
+        InspectionId(), RunId(),
+        new GateRunGeneration(1), new GatePlanId(plan), new GatePlanRevision(3),
         owner ?? new GatePreparedReservationOwner(Guid.Parse("cccccccc-cccc-cccc-cccc-cccccccccccc")));
+
+    private static InspectionId InspectionId() =>
+        new(Guid.Parse("10000000-0000-0000-0000-000000000001"));
+
+    private static AcquisitionRunId RunId() =>
+        new(Guid.Parse("20000000-0000-0000-0000-000000000002"));
 
     private static PreparedGateReplacement Prepare(InMemoryGateDerivedStore store, string plan)
     {

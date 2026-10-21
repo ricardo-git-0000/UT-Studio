@@ -16,22 +16,28 @@ internal sealed record DesiredReplacementControlLimits
 {
     internal const int DefaultMaximumInstalledDesiredReplacements = 64;
     internal const int DefaultTerminalReservationTombstoneCapacity = 64;
+    internal const int DefaultTerminalRunTransitionTombstoneCapacity = 64;
     internal const int MaximumControlEntries = 4096;
 
     internal DesiredReplacementControlLimits(
         int maximumInstalledDesiredReplacements = DefaultMaximumInstalledDesiredReplacements,
-        int terminalReservationTombstoneCapacity = DefaultTerminalReservationTombstoneCapacity)
+        int terminalReservationTombstoneCapacity = DefaultTerminalReservationTombstoneCapacity,
+        int terminalRunTransitionTombstoneCapacity = DefaultTerminalRunTransitionTombstoneCapacity)
     {
         if (maximumInstalledDesiredReplacements is <= 0 or > MaximumControlEntries)
             throw new ArgumentOutOfRangeException(nameof(maximumInstalledDesiredReplacements));
         if (terminalReservationTombstoneCapacity is <= 0 or > MaximumControlEntries)
             throw new ArgumentOutOfRangeException(nameof(terminalReservationTombstoneCapacity));
+        if (terminalRunTransitionTombstoneCapacity is <= 0 or > MaximumControlEntries)
+            throw new ArgumentOutOfRangeException(nameof(terminalRunTransitionTombstoneCapacity));
         MaximumInstalledDesiredReplacements = maximumInstalledDesiredReplacements;
         TerminalReservationTombstoneCapacity = terminalReservationTombstoneCapacity;
+        TerminalRunTransitionTombstoneCapacity = terminalRunTransitionTombstoneCapacity;
     }
 
     internal int MaximumInstalledDesiredReplacements { get; }
     internal int TerminalReservationTombstoneCapacity { get; }
+    internal int TerminalRunTransitionTombstoneCapacity { get; }
 }
 
 internal readonly record struct PrepareDesiredReplacementRequest(
@@ -49,6 +55,7 @@ internal enum PrepareDesiredReplacementStatus
     InvalidIdentity,
     Closed,
     AlreadyPrepared,
+    RunNotOpen,
     CapacityExceeded,
     CounterOverflow
 }
@@ -106,7 +113,7 @@ internal readonly record struct DesiredReplacementControlDiagnostics(
     ulong CommittedToken,
     ulong PreparedOperationGeneration);
 
-internal sealed class PreparedDesiredReplacementOwner
+internal sealed class PreparedDesiredReplacementOwner : IPreparedGateStoreControl
 {
     private readonly InMemoryGateDerivedStore _store;
 
@@ -127,6 +134,26 @@ internal sealed class PreparedDesiredReplacementOwner
         _store.FindInstalledDesiredReplacement(key);
 
     internal DesiredReplacementControlDiagnostics Diagnostics => _store.DesiredReplacementDiagnostics;
+    internal GateStoreRunControlDiagnostics RunDiagnostics => _store.RunControlDiagnostics;
+
+    public PrepareDesiredReplacementResult PrepareDesiredReplacement(PrepareDesiredReplacementRequest request) =>
+        Prepare(request);
+    public GatePreparedReservationResult CommitDesiredReplacement(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) =>
+        Commit(reservation, owner, generation);
+    public GatePreparedReservationResult AbortDesiredReplacement(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) =>
+        Abort(reservation, owner, generation);
+    public PrepareGateRunTransitionResult PrepareRunTransition(PrepareGateRunTransitionRequest request) =>
+        _store.PrepareRunTransition(request);
+    public GatePreparedReservationResult CommitRunTransition(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) =>
+        _store.CommitRunTransition(reservation, owner, generation);
+    public GatePreparedReservationResult AbortRunTransition(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) =>
+        _store.AbortRunTransition(reservation, owner, generation);
+    public GateStoreRunStopResult StopCurrentRun(GateStoreRunAuthoritySnapshot expected) =>
+        _store.StopCurrentRun(expected);
 }
 
 internal sealed class PreparedDesiredReplacementState
