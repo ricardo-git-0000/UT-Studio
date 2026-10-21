@@ -34,7 +34,8 @@ public sealed record GateProcessingOptions
 }
 
 /// <summary>Bounded, sample-free post-commit reconciler. One worker preserves revision order.</summary>
-public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessingIngress, IAsyncDisposable
+public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessingIngress,
+    IPreparedGatePlanEpochPort, IAsyncDisposable
 {
     private readonly object _gate = new();
     private readonly IInspectionChangeProvider _catalog;
@@ -43,6 +44,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
     private readonly GateEvaluator _evaluator;
     private readonly GateProcessingOptions _options;
     private readonly Dictionary<AcquisitionRunId, RunState> _runs = [];
+    private readonly Dictionary<GatePreparedReservationId, PreparedEpoch> _preparedEpochs = [];
     private readonly Queue<GateProcessingRunDiagnostics> _terminalRuns = [];
     private readonly SemaphoreSlim _wake = new(0, 1);
     private readonly CancellationTokenSource _exceptionalCancellation = new();
@@ -94,16 +96,137 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         ArgumentNullException.ThrowIfNull(plan);
         lock (_gate)
         {
-            if (!_runs.TryGetValue(runId, out RunState? run) || run.AdmissionClosed)
-            { _rejected++; return GateProcessingAdmissionStatus.Closed; }
-            if (run.Epochs.Count >= run.MaximumEpochs || effectiveFromInclusive.Value <= run.Epochs[^1].From.Value ||
-                run.Epochs.Any(x => x.Plan.Source.Id == plan.Source.Id &&
-                    x.Plan.Source.Revision == plan.Source.Revision && x.Plan.Signature == plan.Signature) ||
-                effectiveFromInclusive.Value <= run.Target.Value)
-            { _rejected++; _saturations++; return GateProcessingAdmissionStatus.Rejected; }
-            run.Epochs.Add(new(effectiveFromInclusive, plan, new()));
-            return GateProcessingAdmissionStatus.Accepted;
+            GatePreparedReservationOwner owner = new(Guid.NewGuid());
+            var generation = new GatePreparedOperationGeneration(1);
+            InspectionId inspectionId = _runs.TryGetValue(runId, out RunState? run)
+                ? run.Registration.InspectionId
+                : default;
+            GatePlanEpochPrepareResult prepared = PrepareEpochUnderGate(inspectionId, runId, plan,
+                effectiveFromInclusive, owner, generation);
+            if (!prepared.IsPrepared)
+            {
+                _rejected++;
+                if (prepared.Status is GatePlanEpochPrepareStatus.InvalidBoundary or
+                    GatePlanEpochPrepareStatus.DuplicatePlan)
+                    _saturations++;
+                return GateProcessingAdmissionStatus.Rejected;
+            }
+            GatePreparedReservationResult committed = ConsumeEpochUnderGate(prepared.Reservation,
+                owner, generation, GatePreparedReservationOperation.Commit);
+            if (committed.Status == GatePreparedReservationResultStatus.Committed)
+                return GateProcessingAdmissionStatus.Accepted;
+            _rejected++;
+            return GateProcessingAdmissionStatus.Rejected;
         }
+    }
+
+    public GatePlanEpochPrepareResult PrepareEpoch(InspectionId inspectionId, AcquisitionRunId runId,
+        CompiledGatePlan plan, InspectionRevision effectiveFromInclusive,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation)
+    {
+        lock (_gate)
+            return PrepareEpochUnderGate(inspectionId, runId, plan, effectiveFromInclusive, owner, generation);
+    }
+
+    private GatePlanEpochPrepareResult PrepareEpochUnderGate(InspectionId inspectionId, AcquisitionRunId runId,
+        CompiledGatePlan plan, InspectionRevision effectiveFromInclusive,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation)
+    {
+        if (!inspectionId.IsValid || !runId.IsValid || !owner.IsValid || !generation.IsValid)
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.InvalidIdentity);
+        if (plan is null || !plan.Source.Id.IsValid || !plan.Source.Revision.IsValid)
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.InvalidPlan);
+        if (effectiveFromInclusive == InspectionRevision.Initial)
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.InvalidBoundary);
+
+        if (_disposing)
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.Disposed);
+        if (!_runs.TryGetValue(runId, out RunState? run))
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.RunNotFound);
+        if (run.Registration.InspectionId != inspectionId)
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.InvalidIdentity);
+        if (run.AdmissionClosed || run.FinalRevision is not null || run.Failed)
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.RunClosed);
+        if (run.PreparedEpoch is not null)
+        {
+            _saturations++;
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.ProvisionalCapacityExceeded);
+        }
+        if (run.Epochs.Count >= run.MaximumEpochs)
+        {
+            _saturations++;
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.LiveEpochLimitReached);
+        }
+        if (effectiveFromInclusive.Value <= run.Epochs[^1].From.Value ||
+            effectiveFromInclusive.Value <= run.Target.Value)
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.InvalidBoundary);
+        if (run.Epochs.Any(x => x.Plan.Source.Id == plan.Source.Id &&
+            x.Plan.Source.Revision == plan.Source.Revision && x.Plan.Signature == plan.Signature))
+            return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.DuplicatePlan);
+
+        run.Epochs.EnsureCapacity(run.Epochs.Count + 1);
+        run.Reservations.EnsureCapacity(2);
+        _preparedEpochs.EnsureCapacity(_preparedEpochs.Count + 1);
+        var epoch = new PlanEpoch(effectiveFromInclusive, plan, new());
+        var id = new GatePreparedReservationId(Guid.NewGuid());
+        var prepared = new PreparedEpoch(id, owner, generation, run, epoch);
+        if (!run.Reservations.Add(id))
+            throw new InvalidOperationException("The prepared epoch reservation identifier collided.");
+        try { _preparedEpochs.Add(id, prepared); }
+        catch
+        {
+            run.Reservations.Remove(id);
+            throw;
+        }
+        run.PreparedEpoch = prepared;
+        RetirePreviousTerminal(run, except: id);
+        return GatePlanEpochPrepareResult.Prepared(prepared.Snapshot());
+    }
+
+    public GatePreparedReservationResult CommitEpoch(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation)
+    {
+        lock (_gate)
+            return ConsumeEpochUnderGate(reservation, owner, generation, GatePreparedReservationOperation.Commit);
+    }
+
+    public GatePreparedReservationResult AbortEpoch(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation)
+    {
+        lock (_gate)
+            return ConsumeEpochUnderGate(reservation, owner, generation, GatePreparedReservationOperation.Abort);
+    }
+
+    private GatePreparedReservationResult ConsumeEpochUnderGate(GatePreparedReservation reservation,
+        GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation,
+        GatePreparedReservationOperation operation)
+    {
+        if (!reservation.IsValid)
+            return GatePreparedReservationResult.Classify(default, owner, generation, operation);
+        if (!_preparedEpochs.TryGetValue(reservation.Id, out PreparedEpoch? prepared))
+            return GatePreparedReservationResult.Classify(default, owner, generation, operation);
+        GatePreparedReservation current = prepared.Snapshot();
+        GatePreparedReservationResult classified = GatePreparedReservationResult.Classify(
+            current, owner, generation, operation);
+        if (classified.Status == GatePreparedReservationResultStatus.OwnerOrGenerationMismatch)
+            return classified;
+        if (reservation.Owner != current.Owner || reservation.Generation != current.Generation)
+            return GatePreparedReservationResult.Classify(current,
+                reservation.Owner, reservation.Generation, operation);
+        if (classified.Status == GatePreparedReservationResultStatus.Committed)
+        {
+            prepared.Run.Epochs.Add(prepared.Epoch);
+            prepared.State = GatePreparedReservationState.Committed;
+            prepared.Run.PreparedEpoch = null;
+            prepared.Run.TerminalReservation = prepared.Id;
+        }
+        else if (classified.Status == GatePreparedReservationResultStatus.Aborted)
+        {
+            prepared.State = GatePreparedReservationState.Aborted;
+            prepared.Run.PreparedEpoch = null;
+            prepared.Run.TerminalReservation = prepared.Id;
+        }
+        return classified;
     }
 
     public GateProcessingAdmissionStatus NotifyCommitted(GateProcessingSignal signal)
@@ -145,6 +268,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
             if (finalRevision.Value < run.Cursor.Value ||
                 finalRevision.Value < run.Target.Value)
             { throw new ArgumentException("FinalRevision cannot precede admitted or reconciled work.", nameof(finalRevision)); }
+            AbortPreparedEpoch(run);
             run.FinalRevision = finalRevision; run.Target = finalRevision;
             run.Observed = new(Math.Max(run.Observed.Value, finalRevision.Value));
             run.Lifecycle = GateProcessingLifecycleState.FinalReconciling;
@@ -164,6 +288,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         lock (_gate)
         {
             if (!_runs.TryGetValue(runId, out RunState? run)) { return; }
+            AbortPreparedEpoch(run);
             run.AdmissionClosed = true;
             run.Lifecycle = GateProcessingLifecycleState.AdmissionClosed;
             _state = GateProcessingLifecycleState.AdmissionClosed;
@@ -192,6 +317,8 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                 {
                     GateProcessingRunDiagnostics terminal = SnapshotRun(run);
                     _runs.Remove(runId);
+                    foreach (GatePreparedReservationId reservation in run.Reservations)
+                        _preparedEpochs.Remove(reservation);
                     if (_options.MaximumTerminalRunSummaries > 0)
                     {
                         while (_terminalRuns.Count >= _options.MaximumTerminalRunSummaries) { _terminalRuns.Dequeue(); }
@@ -435,6 +562,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
             return;
         }
         if (!run.AdmissionClosed || run.FinalRevision is not { } final || run.Cursor.Value < final.Value ||
+            run.PreparedEpoch is not null ||
             run.ActiveWorkers != 0 || run.ActiveLeases != 0 || run.ActiveCallbacks != 0 ||
             run.WorkAdmitted != run.WorkTerminal) { return; }
         run.Lifecycle = GateProcessingLifecycleState.Stopped;
@@ -502,7 +630,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         return GateProcessingLifecycleState.Stopped;
     }
 
-    private static GateProcessingRunDiagnostics SnapshotRun(RunState run)
+    private GateProcessingRunDiagnostics SnapshotRun(RunState run)
     {
         InspectionRevision activeAt = run.PendingRevision != InspectionRevision.Initial
             ? run.PendingRevision
@@ -517,6 +645,12 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                 x.Balance.ExplicitlyRejectedBeforeAdmission, x.Balance.TerminallyFailed,
                 x.Balance.ExplicitlyUnprocessedByPlanTransition)).ToArray(),
             run.WorkAdmitted, run.WorkTerminal, run.ActiveWorkers, run.ActiveCallbacks, run.ActiveLeases,
+            epochAdmissionOpen: !run.AdmissionClosed && run.FinalRevision is null && !run.Failed && !_disposing,
+            hasPreparedEpoch: run.PreparedEpoch is not null,
+            provisionalEpochSlots: run.PreparedEpoch is null ? 0 : 1,
+            preparedEpochPins: run.PreparedEpoch is null ? 0 : 1,
+            terminalReservationTombstones: run.TerminalReservation.HasValue ? 1 : 0,
+            structuralEpochSlots: run.Epochs.Count, maximumEpochSlots: run.MaximumEpochs,
             run.LastError);
     }
 
@@ -557,7 +691,10 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                 _disposeTask = completion.Task; _disposing = true;
                 _state = GateProcessingLifecycleState.Disposing;
                 foreach (RunState run in _runs.Values)
-                { FailRun(run, new OperationCanceledException("Processing was disposed exceptionally.")); }
+                {
+                    AbortPreparedEpoch(run);
+                    FailRun(run, new OperationCanceledException("Processing was disposed exceptionally."));
+                }
             }
             task = _disposeTask;
         }
@@ -584,6 +721,12 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                     cleanupFailure = new InvalidOperationException("Processing cleanup could not be confirmed.");
                 }
                 else { _state = GateProcessingLifecycleState.Closed; }
+                _preparedEpochs.Clear();
+                foreach (RunState run in _runs.Values)
+                {
+                    run.Reservations.Clear();
+                    run.TerminalReservation = null;
+                }
             }
             _exceptionalCancellation.Dispose(); _wake.Dispose();
             if (cleanupFailure is null) { completion.TrySetResult(); }
@@ -599,6 +742,9 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         internal Dictionary<UtStreamIdentity, InspectionRevision> Watermarks { get; } =
             registration.Streams.ToDictionary(x => x, _ => InspectionRevision.Initial);
         internal List<PlanEpoch> Epochs { get; } = [new(InspectionRevision.Initial, registration.Plan, new())];
+        internal HashSet<GatePreparedReservationId> Reservations { get; } = [];
+        internal PreparedEpoch? PreparedEpoch;
+        internal GatePreparedReservationId? TerminalReservation;
         internal int MaximumEpochs { get; } = maximumEpochs;
         internal InspectionRevision Cursor, Target, Observed;
         internal InspectionRevision PendingRevision;
@@ -616,6 +762,35 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
     private sealed record PlanEpoch(InspectionRevision From, CompiledGatePlan Plan, MutablePlanBalance Balance)
     {
         internal HashSet<TraceIdentity> EligibleIdentities { get; } = [];
+    }
+
+    private void AbortPreparedEpoch(RunState run)
+    {
+        PreparedEpoch? prepared = run.PreparedEpoch;
+        if (prepared is null) return;
+        prepared.State = GatePreparedReservationState.Aborted;
+        run.PreparedEpoch = null;
+        run.TerminalReservation = prepared.Id;
+    }
+
+    private void RetirePreviousTerminal(RunState run, GatePreparedReservationId except)
+    {
+        if (run.TerminalReservation is not { } terminal || terminal == except) return;
+        _preparedEpochs.Remove(terminal);
+        run.Reservations.Remove(terminal);
+        run.TerminalReservation = null;
+    }
+
+    private sealed class PreparedEpoch(GatePreparedReservationId id, GatePreparedReservationOwner owner,
+        GatePreparedOperationGeneration generation, RunState run, PlanEpoch epoch)
+    {
+        internal GatePreparedReservationId Id { get; } = id;
+        internal GatePreparedReservationOwner Owner { get; } = owner;
+        internal GatePreparedOperationGeneration Generation { get; } = generation;
+        internal RunState Run { get; } = run;
+        internal PlanEpoch Epoch { get; } = epoch;
+        internal GatePreparedReservationState State = GatePreparedReservationState.Prepared;
+        internal GatePreparedReservation Snapshot() => new(Id, Owner, Generation, State);
     }
     private sealed class MutablePlanBalance
     {

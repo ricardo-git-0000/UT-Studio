@@ -621,22 +621,9 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 operation.CommitCoordinator.CloseAdmission();
             }
 
-            InspectionRunSealResult? sealedRun = null;
             await operation.CommitCoordinator.DisposeAsync().ConfigureAwait(false);
-            if (operation.InspectionWriter is not null)
-            {
-                try
-                {
-                    sealedRun = await operation.InspectionWriter.SealRunAsync().ConfigureAwait(false);
-                }
-                catch (Exception error)
-                {
-                    lock (_gate) { RecordError(operation, error, "session.seal"); }
-                }
-            }
-
-            await FinalizeProcessingAsync(operation, sealedRun).ConfigureAwait(false);
-            await FinalizeBScanAsync(operation, sealedRun).ConfigureAwait(false);
+            await FinalizeProcessingAsync(operation).ConfigureAwait(false);
+            await FinalizeBScanAsync(operation, operation.SealedRun).ConfigureAwait(false);
 
             lock (_gate) { CloseAScan(operation); }
             await WaitForAScanCloseAsync(operation).ConfigureAwait(false);
@@ -699,32 +686,76 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         operation.VisualRunRequiresDrain = false;
     }
 
-    private async Task FinalizeProcessingAsync(Operation operation, InspectionRunSealResult? sealedRun)
+    private async Task FinalizeProcessingAsync(Operation operation)
     {
-        if (!operation.ProcessingOpened || _processingIngress is null) { return; }
-        try { _processingIngress.StopAdmission(operation.RunId); }
-        catch (Exception error)
-        { lock (_gate) { AddBranchError(operation, Describe("session.processing.stop", error)); } }
+        if (!operation.ProcessingAdmissionClosed)
+        {
+            List<Exception>? failures = null;
+            for (int attempt = 0; attempt < 2 && !operation.ProcessingAdmissionClosed; attempt++)
+            {
+                try
+                {
+                    if (operation.ProcessingOpened && _processingIngress is not null)
+                    { _processingIngress.StopAdmission(operation.RunId); }
+                    operation.ProcessingAdmissionClosed = true;
+                }
+                catch (Exception error) { (failures ??= []).Add(error); }
+            }
+            if (!operation.ProcessingAdmissionClosed)
+            {
+                RecordStageFailures(operation, failures!, "session.processing.stop");
+                return;
+            }
+        }
 
-        if (sealedRun is { } final)
+        if (!operation.WriterSealed)
+        {
+            if (operation.InspectionWriter is null) { return; }
+            try
+            {
+                operation.SealedRun = await operation.InspectionWriter.SealRunAsync().ConfigureAwait(false);
+                operation.WriterSealed = true;
+            }
+            catch (Exception error)
+            {
+                lock (_gate) { RecordError(operation, error, "session.seal"); }
+                return;
+            }
+        }
+
+        if (!operation.ProcessingOpened || _processingIngress is null) { return; }
+        if (!operation.FinalRevisionPublished)
         {
             try
             {
-                _processingIngress.RequestFinalReconciliation(operation.RunId, final.FinalRevision);
+                _processingIngress.RequestFinalReconciliation(
+                    operation.RunId, operation.SealedRun!.Value.FinalRevision);
+                operation.FinalRevisionPublished = true;
             }
             catch (Exception error)
-            { lock (_gate) { AddBranchError(operation, Describe("session.processing.final", error)); } }
+            {
+                lock (_gate) { RecordError(operation, error, "session.processing.final"); }
+                return;
+            }
         }
-        else
-        { lock (_gate) { AddBranchError(operation, new("session.processing.final", "Processing cannot drain without FinalRevision.")); } }
 
+        if (operation.ProcessingDrained) { return; }
         try
         {
             await _processingIngress.WaitForDrainAsync(operation.RunId).ConfigureAwait(false);
+            operation.ProcessingDrained = true;
             operation.ProcessingOpened = false;
         }
         catch (Exception error)
-        { lock (_gate) { AddBranchError(operation, Describe("session.processing.drain", error)); } }
+        { lock (_gate) { RecordError(operation, error, "session.processing.drain"); } }
+    }
+
+    private void RecordStageFailures(Operation operation, IReadOnlyList<Exception> failures, string code)
+    {
+        lock (_gate)
+        {
+            foreach (Exception failure in failures) { RecordError(operation, failure, code); }
+        }
     }
 
     private static void AddBranchError(Operation operation, UtSourceError error)
@@ -739,6 +770,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         Exception? failure = null;
         try { await cleanup.ConfigureAwait(false); }
         catch (Exception error) { failure = error; }
+        if (operation is { WriterSealed: true, FinalRevisionPublished: false, ProcessingOpened: true })
+        { await FinalizeProcessingAsync(operation).ConfigureAwait(false); }
         if (operation is { ResourcesReleased: false })
         {
             throw failure ?? new InvalidOperationException("Frame release has not been confirmed.");
@@ -879,6 +912,11 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal bool VisualRunRequiresDrain;
         internal bool AScanOpened;
         internal bool ProcessingOpened;
+        internal bool ProcessingAdmissionClosed;
+        internal bool WriterSealed;
+        internal bool FinalRevisionPublished;
+        internal bool ProcessingDrained;
+        internal InspectionRunSealResult? SealedRun;
         internal UtSourceError? BScanError;
         internal UtSourceError? AScanError;
         internal UtSourceError? VisualError;

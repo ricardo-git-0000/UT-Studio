@@ -115,7 +115,10 @@ public sealed class GateProcessingRunDiagnostics
         InspectionRevision observedRevision, InspectionRevision reconciledRevision, InspectionRevision? finalRevision,
         bool finalityConfirmed, IReadOnlyList<GateProcessingStreamWatermark> watermarks,
         IReadOnlyList<GateProcessingPlanBalance> plans, long workAdmitted, long workTerminal,
-        int activeWorkers, int activeCallbacks, int activeLeases, GateProcessingError? lastError)
+        int activeWorkers, int activeCallbacks, int activeLeases, bool epochAdmissionOpen,
+        bool hasPreparedEpoch, int provisionalEpochSlots, int preparedEpochPins,
+        int terminalReservationTombstones, int structuralEpochSlots, int maximumEpochSlots,
+        GateProcessingError? lastError)
     {
         RunId = runId; Lifecycle = lifecycle; PlanRevision = planRevision;
         PlanSignature = planSignature ?? throw new ArgumentNullException(nameof(planSignature));
@@ -125,6 +128,17 @@ public sealed class GateProcessingRunDiagnostics
         Plans = Array.AsReadOnly((plans ?? throw new ArgumentNullException(nameof(plans))).ToArray());
         WorkAdmitted = workAdmitted; WorkTerminal = workTerminal; ActiveWorkers = activeWorkers;
         ActiveCallbacks = activeCallbacks; ActiveLeases = activeLeases; LastError = lastError;
+        if (provisionalEpochSlots is < 0 or > 1 || preparedEpochPins is < 0 or > 1 ||
+            terminalReservationTombstones is < 0 or > 1 || structuralEpochSlots < 1 ||
+            maximumEpochSlots < structuralEpochSlots ||
+            structuralEpochSlots > maximumEpochSlots - provisionalEpochSlots ||
+            hasPreparedEpoch != (provisionalEpochSlots == 1) ||
+            hasPreparedEpoch != (preparedEpochPins == 1))
+            throw new ArgumentException("Prepared epoch diagnostics are inconsistent.");
+        EpochAdmissionOpen = epochAdmissionOpen; HasPreparedEpoch = hasPreparedEpoch;
+        ProvisionalEpochSlots = provisionalEpochSlots; PreparedEpochPins = preparedEpochPins;
+        TerminalReservationTombstones = terminalReservationTombstones;
+        StructuralEpochSlots = structuralEpochSlots; MaximumEpochSlots = maximumEpochSlots;
     }
     public AcquisitionRunId RunId { get; }
     public GateProcessingLifecycleState Lifecycle { get; }
@@ -143,6 +157,13 @@ public sealed class GateProcessingRunDiagnostics
     public int ActiveWorkers { get; }
     public int ActiveCallbacks { get; }
     public int ActiveLeases { get; }
+    public bool EpochAdmissionOpen { get; }
+    public bool HasPreparedEpoch { get; }
+    public int ProvisionalEpochSlots { get; }
+    public int PreparedEpochPins { get; }
+    public int TerminalReservationTombstones { get; }
+    public int StructuralEpochSlots { get; }
+    public int MaximumEpochSlots { get; }
     public GateProcessingError? LastError { get; }
 }
 

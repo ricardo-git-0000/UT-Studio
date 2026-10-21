@@ -1,4 +1,5 @@
 using UTStudio.Application;
+using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Inspection;
 using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
@@ -351,17 +352,53 @@ public sealed class ApplicationSessionInspectionStoreTests
     }
 
     [TestMethod]
-    public async Task ProcessingCleanupAttemptsDrainAfterFinalReconciliationFails()
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task ProcessingFinalPublicationFailureDefersDrainAndDisposeRetriesWithoutResealing(
+        bool retrySucceeds)
     {
         await using var source = new ManualSessionSource(); var inspection = new InspectionId(Guid.NewGuid());
         await using var stores = new InspectionDataStoreRegistry(inspection, new(1024, 10));
-        var processing = new FinalFailureProbe();
-        await using var session = new ApplicationSession(source, inspection, stores.OpenRun,
+        var processing = new FinalFailureProbe(retrySucceeds ? 1 : int.MaxValue);
+        CountingSealWriter? writer = null;
+        var session = new ApplicationSession(source, inspection, runId =>
+        {
+            writer = new(stores.OpenRun(runId));
+            return writer;
+        },
             new CountingSink(), new CountingSink(), processing, ProcessingPlan());
         await session.StartAsync(Configuration, new(Guid.NewGuid())).WaitAsync(TimeSpan.FromSeconds(10));
-        await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.IsTrue(processing.DrainAttempted);
-        Assert.IsTrue(session.Snapshot.CleanupErrors.Any(x => x.Code == "session.processing.final"));
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => session.StopAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+
+        Assert.AreEqual(1, processing.StopCalls);
+        Assert.AreEqual(1, writer!.SealCalls);
+        Assert.AreEqual(1, processing.FinalCalls);
+        Assert.AreEqual(0, processing.DrainCalls);
+        Assert.AreEqual("session.processing.final", session.Snapshot.PrimaryError!.Code);
+        Assert.AreEqual("final-1", session.Snapshot.PrimaryError.Message);
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => session.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10)));
+
+        Assert.AreEqual(1, processing.StopCalls);
+        Assert.AreEqual(1, writer.SealCalls);
+        Assert.AreEqual(2, processing.FinalCalls);
+        Assert.AreEqual(retrySucceeds ? 1 : 0, processing.DrainCalls);
+        Assert.AreEqual(SessionPhase.Disposed, session.Snapshot.Phase);
+        Assert.AreEqual("session.processing.final", session.Snapshot.PrimaryError!.Code);
+        Assert.AreEqual("final-1", session.Snapshot.PrimaryError.Message);
+        CollectionAssert.AreEqual(
+            processing.FinalRevisions.Select(x => x.Value).Take(1).ToArray(),
+            processing.FinalRevisions.Select(x => x.Value).Skip(1).ToArray());
+        if (retrySucceeds)
+            Assert.IsFalse(session.Snapshot.CleanupErrors.Any(x => x.Code == "session.processing.final"));
+        else
+        {
+            UtSourceError secondary = session.Snapshot.CleanupErrors
+                .Single(x => x.Code == "session.processing.final");
+            Assert.AreEqual("final-2", secondary.Message);
+        }
     }
 
     private sealed class StoreCheckingSink(IInspectionDataStore store, InspectionId inspectionId,
@@ -417,16 +454,50 @@ public sealed class ApplicationSessionInspectionStoreTests
         public ValueTask WaitForDrainAsync(AcquisitionRunId runId) => ValueTask.CompletedTask;
     }
 
-    private sealed class FinalFailureProbe : ICommittedGateProcessingIngress
+    private sealed class FinalFailureProbe(int failuresBeforeSuccess) : ICommittedGateProcessingIngress
     {
-        internal bool DrainAttempted;
+        private int _stopCalls;
+        private int _finalCalls;
+        private int _drainCalls;
+        internal int StopCalls => Volatile.Read(ref _stopCalls);
+        internal int FinalCalls => Volatile.Read(ref _finalCalls);
+        internal int DrainCalls => Volatile.Read(ref _drainCalls);
+        internal List<InspectionRevision> FinalRevisions { get; } = [];
         public GateProcessingAdmissionStatus OpenRun(GateProcessingRunRegistration registration) => GateProcessingAdmissionStatus.Accepted;
         public GateProcessingAdmissionStatus NotifyCommitted(GateProcessingSignal signal) => GateProcessingAdmissionStatus.Accepted;
         public void NotifyProviderProgress(AcquisitionRunId runId) { }
-        public void RequestFinalReconciliation(AcquisitionRunId runId, InspectionRevision finalRevision) =>
-            throw new InvalidOperationException("final");
-        public void StopAdmission(AcquisitionRunId runId) { }
-        public ValueTask WaitForDrainAsync(AcquisitionRunId runId) { DrainAttempted = true; return ValueTask.CompletedTask; }
+        public void RequestFinalReconciliation(AcquisitionRunId runId, InspectionRevision finalRevision)
+        {
+            FinalRevisions.Add(finalRevision);
+            int call = Interlocked.Increment(ref _finalCalls);
+            if (call <= failuresBeforeSuccess) { throw new InvalidOperationException($"final-{call}"); }
+        }
+        public void StopAdmission(AcquisitionRunId runId) => Interlocked.Increment(ref _stopCalls);
+        public ValueTask WaitForDrainAsync(AcquisitionRunId runId)
+        {
+            Interlocked.Increment(ref _drainCalls);
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class CountingSealWriter(IInspectionRunWriter inner) : IInspectionRunWriter
+    {
+        private int _sealCalls;
+        internal int SealCalls => Volatile.Read(ref _sealCalls);
+        public AcquisitionRunId RunId => inner.RunId;
+        public InspectionRunState State => inner.State;
+        public ValueTask<InspectionAppendResult> CommitAsync(
+            InspectionCommitInput commit, CancellationToken cancellationToken = default) =>
+            inner.CommitAsync(commit, cancellationToken);
+        public ValueTask<InspectionAppendResult> CommitGapAsync(
+            GapRecord gap, CancellationToken cancellationToken = default) =>
+            inner.CommitGapAsync(gap, cancellationToken);
+        public ValueTask<InspectionRunSealResult> SealRunAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _sealCalls);
+            return inner.SealRunAsync(cancellationToken);
+        }
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 
     private static CompiledGatePlan ProcessingPlan() => new GatePlanCompiler().Compile(

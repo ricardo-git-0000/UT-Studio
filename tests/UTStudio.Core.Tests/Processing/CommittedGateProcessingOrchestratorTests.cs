@@ -233,6 +233,388 @@ public sealed class CommittedGateProcessingOrchestratorTests
     }
 
     [TestMethod]
+    public async Task PreparedEpochIsInvisibleUntilCommitAndThenSelectsThePrebuiltPlan()
+    {
+        await using var fixture = new Fixture();
+        CompiledGatePlan plan = CompilePlan(2, "prepared");
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+
+        GatePlanEpochPrepareResult prepared = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            plan, new(2), owner, generation);
+
+        Assert.AreEqual(GatePlanEpochPrepareStatus.Prepared, prepared.Status);
+        Assert.AreEqual(GatePreparedReservationState.Prepared, prepared.Reservation.State);
+        GateProcessingRunDiagnostics during = fixture.Orchestrator.Diagnostics.ActiveRuns.Single();
+        Assert.HasCount(1, during.Plans); Assert.IsTrue(during.EpochAdmissionOpen);
+        Assert.IsTrue(during.HasPreparedEpoch); Assert.AreEqual(1, during.ProvisionalEpochSlots);
+        Assert.AreEqual(1, during.PreparedEpochPins); Assert.AreEqual(0, during.TerminalReservationTombstones);
+        Assert.AreEqual(1, during.StructuralEpochSlots); Assert.AreEqual(8, during.MaximumEpochSlots);
+        Assert.AreEqual(GatePreparedReservationResultStatus.Committed,
+            fixture.Orchestrator.CommitEpoch(prepared.Reservation, owner, generation).Status);
+        GateProcessingRunDiagnostics committed = fixture.Orchestrator.Diagnostics.ActiveRuns.Single();
+        Assert.HasCount(2, committed.Plans); Assert.IsFalse(committed.HasPreparedEpoch);
+        Assert.AreEqual(0, committed.ProvisionalEpochSlots); Assert.AreEqual(0, committed.PreparedEpochPins);
+        Assert.AreEqual(1, committed.TerminalReservationTombstones);
+        Assert.AreEqual(2, committed.StructuralEpochSlots);
+
+        _ = await fixture.CommitAsync(0, [1, 4]);
+        InspectionAppendResult second = await fixture.CommitAsync(1, [7, 2]);
+        fixture.Orchestrator.NotifyCommitted(new(fixture.Identity(1), second.Revision));
+        await fixture.SealAndDrainAsync();
+        CollectionAssert.AreEqual(new uint[] { 1, 2 }, fixture.Sink.Batches
+            .Select(x => x.Entries.Single().PlanRevision.Value).ToArray());
+    }
+
+    [TestMethod]
+    public async Task AbortIsInvisibleReturnsProvisionalCapacityAndAllReplaysAreTyped()
+    {
+        await using var fixture = new Fixture(new(maximumPlanEpochsPerRun: 2));
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+        GatePlanEpochPrepareResult first = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            CompilePlan(2, "aborted"), new(2), owner, generation);
+
+        Assert.AreEqual(GatePlanEpochPrepareStatus.ProvisionalCapacityExceeded,
+            fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run, CompilePlan(3, "blocked"),
+                new(3), owner, new(2)).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.Aborted,
+            fixture.Orchestrator.AbortEpoch(first.Reservation, owner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+            fixture.Orchestrator.AbortEpoch(first.Reservation, owner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+            fixture.Orchestrator.CommitEpoch(first.Reservation, owner, generation).Status);
+        GateProcessingRunDiagnostics aborted = fixture.Orchestrator.Diagnostics.ActiveRuns.Single();
+        Assert.HasCount(1, aborted.Plans); Assert.IsFalse(aborted.HasPreparedEpoch);
+        Assert.AreEqual(0, aborted.PreparedEpochPins); Assert.AreEqual(1, aborted.TerminalReservationTombstones);
+
+        GatePlanEpochPrepareResult retry = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            CompilePlan(3, "retry"), new(2), owner, new(2));
+        Assert.IsTrue(retry.IsPrepared);
+        Assert.AreEqual(GatePreparedReservationResultStatus.Committed,
+            fixture.Orchestrator.CommitEpoch(retry.Reservation, owner, new(2)).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyCommitted,
+            fixture.Orchestrator.CommitEpoch(retry.Reservation, owner, new(2)).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyCommitted,
+            fixture.Orchestrator.AbortEpoch(retry.Reservation, owner, new(2)).Status);
+        Assert.AreEqual(GatePlanEpochPrepareStatus.LiveEpochLimitReached,
+            fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run, CompilePlan(4, "over"),
+                new(3), owner, new(3)).Status);
+    }
+
+    [TestMethod]
+    public async Task ReservationValidationPrecedesStateAndRejectsInvalidCredentialsAndBoundaries()
+    {
+        await using var fixture = new Fixture();
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+        GatePlanEpochPrepareResult prepared = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            CompilePlan(2, "credentials"), new(2), owner, generation);
+        var otherOwner = new GatePreparedReservationOwner(Guid.NewGuid());
+
+        Assert.AreEqual(GatePreparedReservationResultStatus.InvalidReservation,
+            fixture.Orchestrator.CommitEpoch(default, owner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.OwnerOrGenerationMismatch,
+            fixture.Orchestrator.CommitEpoch(prepared.Reservation, otherOwner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.OwnerOrGenerationMismatch,
+            fixture.Orchestrator.CommitEpoch(prepared.Reservation, owner, new(2)).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.Aborted,
+            fixture.Orchestrator.AbortEpoch(prepared.Reservation, owner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.OwnerOrGenerationMismatch,
+            fixture.Orchestrator.CommitEpoch(prepared.Reservation, otherOwner, generation).Status);
+
+        Assert.AreEqual(GatePlanEpochPrepareStatus.InvalidIdentity,
+            fixture.Orchestrator.PrepareEpoch(new(Guid.NewGuid()), fixture.Run, CompilePlan(3, "identity"),
+                new(2), owner, new(3)).Status);
+        Assert.AreEqual(GatePlanEpochPrepareStatus.InvalidBoundary,
+            fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run, CompilePlan(3, "zero"),
+                InspectionRevision.Initial, owner, new(3)).Status);
+        GatePlanEpochPrepareResult maximum = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            CompilePlan(3, "maximum"), new(ulong.MaxValue), owner, new(3));
+        Assert.AreEqual(GatePlanEpochPrepareStatus.Prepared, maximum.Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.Aborted,
+            fixture.Orchestrator.AbortEpoch(maximum.Reservation, owner, new(3)).Status);
+    }
+
+    [TestMethod]
+    public async Task ConcurrentCommitAndAbortHaveExactlyOneFirstConsumption()
+    {
+        await using var fixture = new Fixture();
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+        GatePlanEpochPrepareResult prepared = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            CompilePlan(2, "race"), new(2), owner, generation);
+        using var start = new Barrier(3);
+        Task<GatePreparedReservationResult> commit = Task.Run(() =>
+        { start.SignalAndWait(); return fixture.Orchestrator.CommitEpoch(prepared.Reservation, owner, generation); });
+        Task<GatePreparedReservationResult> abort = Task.Run(() =>
+        { start.SignalAndWait(); return fixture.Orchestrator.AbortEpoch(prepared.Reservation, owner, generation); });
+
+        start.SignalAndWait();
+        GatePreparedReservationResult[] results = await Task.WhenAll(commit, abort);
+        Assert.AreEqual(1, results.Count(x => x.Status is GatePreparedReservationResultStatus.Committed or
+            GatePreparedReservationResultStatus.Aborted));
+        Assert.AreEqual(1, results.Count(x => x.Status is GatePreparedReservationResultStatus.AlreadyCommitted or
+            GatePreparedReservationResultStatus.AlreadyAborted));
+        Assert.IsTrue(fixture.Orchestrator.Diagnostics.ActiveRuns.Single().Plans.Count is 1 or 2);
+    }
+
+    [TestMethod]
+    public async Task ConcurrentPrepareAllowsOneReservationAndOrdersEveryLaterBoundary()
+    {
+        await using var fixture = new Fixture();
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+        using var start = new Barrier(3);
+        Task<GatePlanEpochPrepareResult> first = Task.Run(() =>
+        {
+            start.SignalAndWait();
+            return fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+                CompilePlan(2, "first"), new(2), owner, generation);
+        });
+        Task<GatePlanEpochPrepareResult> second = Task.Run(() =>
+        {
+            start.SignalAndWait();
+            return fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+                CompilePlan(3, "second"), new(3), owner, new(2));
+        });
+
+        start.SignalAndWait();
+        GatePlanEpochPrepareResult[] results = await Task.WhenAll(first, second);
+        Assert.AreEqual(1, results.Count(x => x.Status == GatePlanEpochPrepareStatus.Prepared));
+        Assert.AreEqual(1, results.Count(x =>
+            x.Status == GatePlanEpochPrepareStatus.ProvisionalCapacityExceeded));
+        GatePlanEpochPrepareResult winner = results.Single(x => x.IsPrepared);
+        GatePreparedReservationOwner winnerOwner = winner.Reservation.Owner;
+        GatePreparedOperationGeneration winnerGeneration = winner.Reservation.Generation;
+        Assert.AreEqual(GatePreparedReservationResultStatus.Committed,
+            fixture.Orchestrator.CommitEpoch(winner.Reservation, winnerOwner, winnerGeneration).Status);
+
+        ulong installedBoundary = winner.Reservation.Generation == generation ? 2UL : 3UL;
+        Assert.AreEqual(GatePlanEpochPrepareStatus.InvalidBoundary,
+            fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+                CompilePlan(4, "equal"), new(installedBoundary), owner, new(3)).Status);
+        Assert.AreEqual(GatePlanEpochPrepareStatus.InvalidBoundary,
+            fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+                CompilePlan(4, "regressive"), new(installedBoundary - 1), owner, new(3)).Status);
+    }
+
+    [TestMethod]
+    public async Task CommitRacingStopEitherInstallsFullyOrIsAbortedBeforeVisibility()
+    {
+        await using var fixture = new Fixture();
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+        GatePlanEpochPrepareResult prepared = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            CompilePlan(2, "close-race"), new(2), owner, generation);
+        using var start = new Barrier(3);
+        Task<GatePreparedReservationResult> commit = Task.Run(() =>
+        { start.SignalAndWait(); return fixture.Orchestrator.CommitEpoch(prepared.Reservation, owner, generation); });
+        Task close = Task.Run(() => { start.SignalAndWait(); fixture.Orchestrator.StopAdmission(fixture.Run); });
+
+        start.SignalAndWait();
+        GatePreparedReservationResult result = await commit;
+        await close;
+        Assert.IsTrue(result.Status is GatePreparedReservationResultStatus.Committed or
+            GatePreparedReservationResultStatus.AlreadyAborted);
+        Assert.HasCount(result.Status == GatePreparedReservationResultStatus.Committed ? 2 : 1,
+            fixture.Orchestrator.Diagnostics.ActiveRuns.Single().Plans);
+        Assert.AreEqual(GatePlanEpochPrepareStatus.RunClosed,
+            fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run, CompilePlan(3, "late"),
+                new(3), owner, new(2)).Status);
+    }
+
+    [TestMethod]
+    public async Task StopAndDisposeAbortPreparedPinsWithoutPublishingPartialEpochs()
+    {
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+        await using (var fixture = new Fixture())
+        {
+            GatePlanEpochPrepareResult prepared = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+                CompilePlan(2, "stop"), new(2), owner, generation);
+            fixture.Orchestrator.StopAdmission(fixture.Run);
+            Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+                fixture.Orchestrator.CommitEpoch(prepared.Reservation, owner, generation).Status);
+            GateProcessingRunDiagnostics closed = fixture.Orchestrator.Diagnostics.ActiveRuns.Single();
+            Assert.HasCount(1, closed.Plans); Assert.IsFalse(closed.EpochAdmissionOpen);
+            Assert.IsFalse(closed.HasPreparedEpoch); Assert.AreEqual(0, closed.PreparedEpochPins);
+            Assert.AreEqual(1, closed.TerminalReservationTombstones);
+        }
+
+        var disposable = new Fixture();
+        GatePlanEpochPrepareResult pending = disposable.Orchestrator.PrepareEpoch(disposable.Inspection,
+            disposable.Run, CompilePlan(2, "dispose"), new(2), owner, generation);
+        await disposable.Orchestrator.DisposeAsync();
+        Assert.AreEqual(GatePreparedReservationResultStatus.InvalidReservation,
+            disposable.Orchestrator.AbortEpoch(pending.Reservation, owner, generation).Status);
+        GateProcessingRunDiagnostics disposed = disposable.Orchestrator.Diagnostics.ActiveRuns.Single();
+        Assert.HasCount(1, disposed.Plans); Assert.IsFalse(disposed.EpochAdmissionOpen);
+        Assert.IsFalse(disposed.HasPreparedEpoch); Assert.AreEqual(0, disposed.PreparedEpochPins);
+        Assert.AreEqual(0, disposed.TerminalReservationTombstones);
+        _ = await disposable.Writer.SealRunAsync(); disposable.MarkSealed();
+        await disposable.Writer.DisposeAsync();
+        await disposable.Registry.DisposeAsync();
+    }
+
+    private static (GatePreparedReservationOwner Owner, GatePreparedOperationGeneration Generation) Credentials() =>
+        (new(Guid.NewGuid()), new(1));
+
+    [TestMethod]
+    public async Task TerminalReservationRetentionIsExactlyOnePerRun()
+    {
+        await using var fixture = new Fixture();
+        (GatePreparedReservationOwner owner, _) = Credentials();
+        GatePreparedReservation previous = default;
+        for (ulong value = 1; value <= 128; value++)
+        {
+            var generation = new GatePreparedOperationGeneration(value);
+            GatePlanEpochPrepareResult prepared = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+                CompilePlan((uint)(value + 1), $"abort-{value}"), new(2), owner, generation);
+            Assert.IsTrue(prepared.IsPrepared);
+            if (previous.IsValid)
+                Assert.AreEqual(GatePreparedReservationResultStatus.InvalidReservation,
+                    fixture.Orchestrator.AbortEpoch(previous, previous.Owner, previous.Generation).Status);
+            Assert.AreEqual(GatePreparedReservationResultStatus.Aborted,
+                fixture.Orchestrator.AbortEpoch(prepared.Reservation, owner, generation).Status);
+            GateProcessingRunDiagnostics snapshot = fixture.Orchestrator.Diagnostics.ActiveRuns.Single();
+            Assert.AreEqual(1, snapshot.TerminalReservationTombstones);
+            Assert.AreEqual(0, snapshot.ProvisionalEpochSlots);
+            previous = prepared.Reservation;
+        }
+    }
+
+    [TestMethod]
+    public async Task OneEpochCapacityAndMaximumBoundaryPreserveLegacyActivatePlanSemantics()
+    {
+        await using (var one = new Fixture(new(maximumPlanEpochsPerRun: 1)))
+        {
+            GateProcessingRunDiagnostics initial = one.Orchestrator.Diagnostics.ActiveRuns.Single();
+            Assert.AreEqual(1, initial.StructuralEpochSlots); Assert.AreEqual(1, initial.MaximumEpochSlots);
+            Assert.AreEqual(GatePlanEpochPrepareStatus.LiveEpochLimitReached,
+                one.Orchestrator.PrepareEpoch(one.Inspection, one.Run, CompilePlan(2, "over-one"), new(2),
+                    new(Guid.NewGuid()), new(1)).Status);
+        }
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateProcessingOptions(maximumPlanEpochsPerRun: 0));
+
+        await using var maximum = new Fixture();
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            maximum.Orchestrator.ActivatePlan(maximum.Run, CompilePlan(2, "maximum"), new(ulong.MaxValue)));
+        Assert.HasCount(2, maximum.Orchestrator.Diagnostics.ActiveRuns.Single().Plans);
+    }
+
+    [TestMethod]
+    public async Task ActivatePlanAndStopAdmissionAreAtomicInBothDeterministicOrders()
+    {
+        await using (var activateWins = new Fixture())
+        {
+            var releaseActivate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var activateCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<GateProcessingAdmissionStatus> activate = Task.Run(async () =>
+            {
+                await releaseActivate.Task;
+                GateProcessingAdmissionStatus status = activateWins.Orchestrator.ActivatePlan(
+                    activateWins.Run, CompilePlan(2, "activate-wins"), new(2));
+                activateCompleted.TrySetResult();
+                return status;
+            });
+            Task close = Task.Run(async () =>
+            {
+                await activateCompleted.Task;
+                activateWins.Orchestrator.StopAdmission(activateWins.Run);
+            });
+
+            releaseActivate.TrySetResult();
+            Assert.AreEqual(GateProcessingAdmissionStatus.Accepted, await activate);
+            await close;
+            GateProcessingRunDiagnostics snapshot = activateWins.Orchestrator.Diagnostics.ActiveRuns.Single();
+            Assert.HasCount(2, snapshot.Plans);
+            Assert.IsFalse(snapshot.HasPreparedEpoch);
+            Assert.AreEqual(0, snapshot.ProvisionalEpochSlots);
+            Assert.AreEqual(0, snapshot.PreparedEpochPins);
+        }
+
+        await using (var stopWins = new Fixture())
+        {
+            GateProcessingDiagnostics before = stopWins.Orchestrator.Diagnostics;
+            var releaseStop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var stopCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task close = Task.Run(async () =>
+            {
+                await releaseStop.Task;
+                stopWins.Orchestrator.StopAdmission(stopWins.Run);
+                stopCompleted.TrySetResult();
+            });
+            Task<GateProcessingAdmissionStatus> activate = Task.Run(async () =>
+            {
+                await stopCompleted.Task;
+                return stopWins.Orchestrator.ActivatePlan(
+                    stopWins.Run, CompilePlan(2, "stop-wins"), new(2));
+            });
+
+            releaseStop.TrySetResult();
+            await close;
+            Assert.AreEqual(GateProcessingAdmissionStatus.Rejected, await activate);
+            GateProcessingDiagnostics after = stopWins.Orchestrator.Diagnostics;
+            GateProcessingRunDiagnostics snapshot = after.ActiveRuns.Single();
+            Assert.AreEqual(before.UnitsRejected + 1, after.UnitsRejected);
+            Assert.AreEqual(before.Saturations, after.Saturations);
+            Assert.HasCount(1, snapshot.Plans);
+            Assert.IsFalse(snapshot.HasPreparedEpoch);
+            Assert.AreEqual(0, snapshot.ProvisionalEpochSlots);
+            Assert.AreEqual(0, snapshot.PreparedEpochPins);
+            Assert.AreEqual(0, snapshot.TerminalReservationTombstones);
+        }
+    }
+
+    [TestMethod]
+    public async Task RunDiagnosticsRejectCombinedEpochCapacityOverflowAndInconsistentPreparedState()
+    {
+        await using var fixture = new Fixture();
+        GateProcessingRunDiagnostics source = fixture.Orchestrator.Diagnostics.ActiveRuns.Single();
+
+        _ = CopyDiagnostics(source, hasPrepared: false, provisional: 0, pins: 0,
+            structural: int.MaxValue, maximum: int.MaxValue);
+        _ = CopyDiagnostics(source, hasPrepared: true, provisional: 1, pins: 1,
+            structural: int.MaxValue - 1, maximum: int.MaxValue);
+        Assert.ThrowsExactly<ArgumentException>(() => CopyDiagnostics(source, hasPrepared: true,
+            provisional: 1, pins: 1, structural: int.MaxValue, maximum: int.MaxValue));
+        Assert.ThrowsExactly<ArgumentException>(() => CopyDiagnostics(source, hasPrepared: false,
+            provisional: 0, pins: 0, structural: 0, maximum: 1));
+        Assert.ThrowsExactly<ArgumentException>(() => CopyDiagnostics(source, hasPrepared: true,
+            provisional: 0, pins: 1, structural: 1, maximum: 2));
+        Assert.ThrowsExactly<ArgumentException>(() => CopyDiagnostics(source, hasPrepared: false,
+            provisional: 1, pins: 1, structural: 1, maximum: 2));
+        Assert.ThrowsExactly<ArgumentException>(() => CopyDiagnostics(source, hasPrepared: true,
+            provisional: 1, pins: 0, structural: 1, maximum: 2));
+    }
+
+    [TestMethod]
+    public async Task ActivatePlanRejectionsPreserveHistoricalCountersAndNeverLeaveReservations()
+    {
+        await using var fixture = new Fixture(new(maximumPlanEpochsPerRun: 3));
+        CompiledGatePlan accepted = CompilePlan(2, "accepted");
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            fixture.Orchestrator.ActivatePlan(fixture.Run, accepted, new(2)));
+        GateProcessingDiagnostics before = fixture.Orchestrator.Diagnostics;
+        Assert.AreEqual(GateProcessingAdmissionStatus.Rejected,
+            fixture.Orchestrator.ActivatePlan(fixture.Run, CompilePlan(3, "boundary"), new(2)));
+        Assert.AreEqual(GateProcessingAdmissionStatus.Rejected,
+            fixture.Orchestrator.ActivatePlan(fixture.Run, accepted, new(3)));
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            fixture.Orchestrator.ActivatePlan(fixture.Run, CompilePlan(4, "full"), new(4)));
+        Assert.AreEqual(GateProcessingAdmissionStatus.Rejected,
+            fixture.Orchestrator.ActivatePlan(fixture.Run, CompilePlan(5, "over"), new(5)));
+        GateProcessingDiagnostics after = fixture.Orchestrator.Diagnostics;
+        Assert.AreEqual(before.UnitsRejected + 3, after.UnitsRejected);
+        Assert.AreEqual(before.Saturations + 3, after.Saturations);
+        GateProcessingRunDiagnostics run = after.ActiveRuns.Single();
+        Assert.IsFalse(run.HasPreparedEpoch); Assert.AreEqual(0, run.PreparedEpochPins);
+    }
+
+    private static GateProcessingRunDiagnostics CopyDiagnostics(GateProcessingRunDiagnostics source,
+        bool hasPrepared, int provisional, int pins, int structural, int maximum) =>
+        new(source.RunId, source.Lifecycle, source.PlanRevision, source.PlanSignature,
+            source.TargetRevision, source.ObservedRevision, source.ReconciledRevision, source.FinalRevision,
+            source.FinalityConfirmed, source.Watermarks, source.Plans, source.WorkAdmitted, source.WorkTerminal,
+            source.ActiveWorkers, source.ActiveCallbacks, source.ActiveLeases, source.EpochAdmissionOpen,
+            hasPrepared, provisional, pins, source.TerminalReservationTombstones, structural, maximum,
+            source.LastError);
+
+    [TestMethod]
     [DataRow(GateBatchDeliveryStatus.Accepted)]
     [DataRow(GateBatchDeliveryStatus.Rejected)]
     [DataRow(GateBatchDeliveryStatus.Failed)]
