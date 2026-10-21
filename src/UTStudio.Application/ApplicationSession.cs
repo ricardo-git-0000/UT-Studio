@@ -78,7 +78,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         {
             ObjectDisposedException.ThrowIf(_disposing, this);
             if (_active is not null) { throw new InvalidOperationException("An execution or its cleanup is already active."); }
-            var operation = new Operation(runId, configuration, cancellationToken);
+            var operation = new Operation(_inspectionId, runId, configuration, cancellationToken);
             _active = operation;
             _lastOperation = operation;
             Publish(operation, SessionPhase.Connecting);
@@ -381,7 +381,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         IInspectionRunWriter writer = operation.InspectionWriter ??
             throw new InvalidOperationException("The inspection writer is unavailable.");
         ApplicationCommitAdmission admission = operation.CommitCoordinator.AdmitCommit(operation.RunId,
-            ApplicationCommitKind.Gap, () => writer.CommitGapAsync(ToGapRecord(stream, gap)));
+            ApplicationCommitOperationClass.GapCommit, () => writer.CommitGapAsync(ToGapRecord(stream, gap)));
         ApplicationCommitTerminalResult terminal = await admission.Completion.ConfigureAwait(false);
         _ = CompleteCommitAdmission(operation, admission, terminal);
         lock (_gate)
@@ -456,7 +456,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             throw new InvalidOperationException("The inspection writer is unavailable.");
         IReadOnlyList<GapRecord> gaps = gap is { } confirmed ? [ToGapRecord(stream, confirmed)] : [];
         ApplicationCommitAdmission admission = operation.CommitCoordinator.AdmitCommit(operation.RunId,
-            ApplicationCommitKind.Rf,
+            ApplicationCommitOperationClass.RfCommit,
             () => writer.CommitAsync(new InspectionCommitInput(new InspectionTraceInput(descriptor, frame.Samples), gaps)));
         ApplicationCommitTerminalResult terminal = await admission.Completion.ConfigureAwait(false);
         InspectionAppendResult result = CompleteCommitAdmission(operation, admission, terminal);
@@ -468,8 +468,9 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private InspectionAppendResult CompleteCommitAdmission(Operation operation, ApplicationCommitAdmission admission,
         ApplicationCommitTerminalResult terminal)
     {
-        if (terminal.AdmissionOrdinal != admission.AdmissionOrdinal || terminal.Kind != admission.Kind ||
-            terminal.RunId != admission.RunId)
+        if (terminal.AdmissionOrdinal != admission.AdmissionOrdinal ||
+            terminal.OperationClass != admission.OperationClass || terminal.InspectionId != admission.InspectionId ||
+            terminal.RunId != admission.RunId || terminal.Identity != admission.Identity)
             throw new InvalidOperationException("The terminal commit identity does not match its admission.");
 
         lock (_gate)
@@ -879,7 +880,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _publisher.Publish(_snapshot, complete);
     }
 
-    private sealed class Operation(AcquisitionRunId runId, ConventionalAcquisitionConfiguration configuration, CancellationToken token)
+    private sealed class Operation(InspectionId inspectionId, AcquisitionRunId runId,
+        ConventionalAcquisitionConfiguration configuration, CancellationToken token)
     {
         internal AcquisitionRunId RunId { get; } = runId;
         internal ConventionalAcquisitionConfiguration Configuration { get; } = configuration;
@@ -921,7 +923,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal UtSourceError? AScanError;
         internal UtSourceError? VisualError;
         internal IInspectionRunWriter? InspectionWriter;
-        internal ApplicationCommitCoordinator CommitCoordinator { get; } = new(CommitCoordinatorCapacity);
+        internal ApplicationCommitCoordinator CommitCoordinator { get; } =
+            new(inspectionId, CommitCoordinatorCapacity);
         internal ulong LastReconciledCommitOrdinal;
         internal ulong AcquisitionMissingFrames;
         internal ulong DuplicateFramesRejected;

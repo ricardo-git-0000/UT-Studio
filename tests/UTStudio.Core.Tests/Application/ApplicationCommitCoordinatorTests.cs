@@ -10,6 +10,7 @@ namespace UTStudio.Core.Tests.Application;
 [TestClass]
 public sealed class ApplicationCommitCoordinatorTests
 {
+    private static readonly InspectionId Inspection = new(Guid.Parse("82000000-0000-0000-0000-000000000001"));
     private static readonly AcquisitionRunId Run = new(Guid.Parse("83000000-0000-0000-0000-000000000001"));
     private static readonly ConventionalAcquisitionConfiguration Configuration =
         new(new PhysicalChannelId(0), 8, 50_000_000, firstSampleOffsetSeconds: 0.000_001);
@@ -17,9 +18,9 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task FourAdmissionsExecuteInOrdinalFifoWithoutBarging()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(4);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 4);
         var entered = Signal(); var release = Signal(); var events = new List<string>();
-        ApplicationCommitAdmission a = coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+        ApplicationCommitAdmission a = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit, async () =>
         { events.Add("A"); entered.TrySetResult(); await release.Task; return Committed(1); });
         await entered.Task;
         ApplicationCommitAdmission b = Admit(coordinator, "B", 2, events);
@@ -33,19 +34,19 @@ public sealed class ApplicationCommitCoordinatorTests
         await Task.WhenAll(a.Completion, b.Completion, c.Completion, d.Completion);
         CollectionAssert.AreEqual(new[] { "A", "B", "C", "D" }, events);
         ApplicationCommitCoordinatorSnapshot snapshot = coordinator.Snapshot;
-        Assert.AreEqual((ulong)4, snapshot.LastCompletionOrdinal);
+        Assert.AreEqual((ulong)4, snapshot.LastTerminalOrdinal);
         Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Accepting, snapshot.Lifecycle);
     }
 
     [TestMethod]
-    [DataRow("Rf", "Gap")]
-    [DataRow("Gap", "Rf")]
+    [DataRow("RfCommit", "GapCommit")]
+    [DataRow("GapCommit", "RfCommit")]
     public async Task RfAndGapPreserveAdmissionOrder(string firstName, string secondName)
     {
-        ApplicationCommitKind firstKind = Enum.Parse<ApplicationCommitKind>(firstName);
-        ApplicationCommitKind secondKind = Enum.Parse<ApplicationCommitKind>(secondName);
-        await using var coordinator = new ApplicationCommitCoordinator(2);
-        var entered = Signal(); var release = Signal(); var events = new List<ApplicationCommitKind>();
+        ApplicationCommitOperationClass firstKind = Enum.Parse<ApplicationCommitOperationClass>(firstName);
+        ApplicationCommitOperationClass secondKind = Enum.Parse<ApplicationCommitOperationClass>(secondName);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 2);
+        var entered = Signal(); var release = Signal(); var events = new List<ApplicationCommitOperationClass>();
         ApplicationCommitAdmission firstAdmission = coordinator.AdmitCommit(Run, firstKind, async () =>
         { events.Add(firstKind); entered.TrySetResult(); await release.Task; return Committed(1); });
         await entered.Task;
@@ -58,10 +59,10 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task CancellationBeforeAdmissionDoesNotAssignOrdinalOrInvokeWriter()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(1);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
         bool invoked = false;
-        Assert.ThrowsExactly<OperationCanceledException>(() => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        Assert.ThrowsExactly<OperationCanceledException>(() => coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => { invoked = true; return ValueTask.FromResult(Committed(1)); }, cancellation.Token));
         Assert.IsFalse(invoked);
         Assert.AreEqual((ulong)0, coordinator.Snapshot.LastAdmissionOrdinal);
@@ -70,15 +71,15 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task CancellationAfterAdmissionCancelsOnlyWaitAndSlotRemainsOwnedUntilTerminal()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(1);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         var entered = Signal(); var release = Signal();
-        ApplicationCommitAdmission admission = coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+        ApplicationCommitAdmission admission = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit, async () =>
         { entered.TrySetResult(); await release.Task; return Committed(1); });
         await entered.Task;
         using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
         await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => admission.WaitAsync(cancellation.Token));
         Assert.AreEqual(1, coordinator.Snapshot.Occupancy);
-        Assert.ThrowsExactly<InvalidOperationException>(() => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        Assert.ThrowsExactly<InvalidOperationException>(() => coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Committed(2))));
         release.TrySetResult();
         ApplicationCommitTerminalResult terminal = await admission.Completion;
@@ -89,7 +90,7 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task CancellationAndAdmissionRaceHasExactlyOneLinearizableOutcome()
     {
-        var coordinator = new ApplicationCommitCoordinator(1);
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         using var cancellation = new CancellationTokenSource();
         using var start = new Barrier(3);
         var release = Signal();
@@ -99,7 +100,7 @@ public sealed class ApplicationCommitCoordinatorTests
             start.SignalAndWait();
             try
             {
-                return coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+                return coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit, async () =>
                 {
                     Interlocked.Increment(ref writerInvocations);
                     await release.Task;
@@ -138,11 +139,11 @@ public sealed class ApplicationCommitCoordinatorTests
     [Timeout(5000, CooperativeCancellation = true)]
     public async Task SynchronousWriterStartsBeforeAdmissionReturnsButDoesNotHoldCoordinatorGate()
     {
-        var coordinator = new ApplicationCommitCoordinator(1);
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         var writerEntered = Signal();
         var closeCompleted = Signal();
         Task<ApplicationCommitAdmission> admitting = Task.Run(() => coordinator.AdmitCommit(Run,
-            ApplicationCommitKind.Rf, () =>
+            ApplicationCommitOperationClass.RfCommit, () =>
             {
                 writerEntered.TrySetResult();
                 closeCompleted.Task.GetAwaiter().GetResult();
@@ -160,13 +161,13 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task WriterFailureIsTerminalAndNextAdmissionStillExecutes()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(2);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 2);
         var entered = Signal(); var release = Signal();
         var error = new InvalidOperationException("writer");
-        ApplicationCommitAdmission first = coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+        ApplicationCommitAdmission first = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit, async () =>
         { entered.TrySetResult(); await release.Task; throw error; });
         await entered.Task;
-        ApplicationCommitAdmission second = coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        ApplicationCommitAdmission second = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Committed(1)));
         release.TrySetResult();
         ApplicationCommitTerminalResult failed = await first.Completion;
@@ -179,7 +180,7 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task RevisionPolicyAcceptsGrowthRejectsRegressionAndThenProgresses()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(1);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await Commit(coordinator, 1)).Status);
         Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await Commit(coordinator, 2)).Status);
         ApplicationCommitTerminalResult regression = await Commit(coordinator, 1);
@@ -193,14 +194,14 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task EveryUnverifiableDuplicateIsRejectedWithoutMovingFrontierAndGrowthStillProgresses()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(1);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         _ = await Commit(coordinator, 2);
         ApplicationCommitTerminalResult equalCommit = await Commit(coordinator, 2);
-        ApplicationCommitTerminalResult lowerDuplicate = await coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        ApplicationCommitTerminalResult lowerDuplicate = await coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Duplicate(1))).Completion;
-        ApplicationCommitTerminalResult equalDuplicate = await coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        ApplicationCommitTerminalResult equalDuplicate = await coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Duplicate(2))).Completion;
-        ApplicationCommitTerminalResult higherDuplicate = await coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        ApplicationCommitTerminalResult higherDuplicate = await coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Duplicate(3))).Completion;
         Assert.AreEqual(ApplicationCommitTerminalStatus.NonAdvancingRevision, equalCommit.Status);
         Assert.AreEqual(ApplicationCommitTerminalStatus.DuplicateUnverifiable, lowerDuplicate.Status);
@@ -247,27 +248,28 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task CapacityIncludesRunnerAndQueueAndRecordsOneOverRejection()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(2);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 2);
         var entered = Signal(); var release = Signal();
-        ApplicationCommitAdmission first = coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+        ApplicationCommitAdmission first = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit, async () =>
         { entered.TrySetResult(); await release.Task; return Committed(1); });
         await entered.Task;
-        ApplicationCommitAdmission second = coordinator.AdmitCommit(Run, ApplicationCommitKind.Gap,
+        ApplicationCommitAdmission second = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.GapCommit,
             () => ValueTask.FromResult(Committed(2)));
-        Assert.ThrowsExactly<InvalidOperationException>(() => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        Assert.ThrowsExactly<InvalidOperationException>(() => coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Committed(3))));
         ApplicationCommitCoordinatorSnapshot full = coordinator.Snapshot;
         Assert.AreEqual(2, full.Occupancy); Assert.AreEqual(1, full.Queued);
-        Assert.AreEqual((ulong)1, full.CapacityRejections);
+        Assert.AreEqual((ulong)1,
+            full.CapacityRejections.For(ApplicationCommitOperationClass.RfCommit));
         release.TrySetResult(); await first.Completion; await second.Completion;
     }
 
     [TestMethod]
     public async Task EnqueueBeforeCloseIsAdmittedAndDrained()
     {
-        var coordinator = new ApplicationCommitCoordinator(1);
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         var entered = Signal(); var release = Signal();
-        ApplicationCommitAdmission admitted = coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+        ApplicationCommitAdmission admitted = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit, async () =>
         { entered.TrySetResult(); await release.Task; return Committed(1); });
         await entered.Task; coordinator.CloseAdmission();
         Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Closing, coordinator.Snapshot.Lifecycle);
@@ -278,18 +280,19 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task CloseBeforeEnqueueRejectsAndCountsStableClosedRejection()
     {
-        var coordinator = new ApplicationCommitCoordinator(1);
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         coordinator.CloseAdmission(); coordinator.CloseAdmission();
-        Assert.ThrowsExactly<ObjectDisposedException>(() => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        Assert.ThrowsExactly<ObjectDisposedException>(() => coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Committed(1))));
-        Assert.AreEqual((ulong)1, coordinator.Snapshot.ClosedRejections);
+        Assert.AreEqual((ulong)1,
+            coordinator.Snapshot.ClosedRejections.For(ApplicationCommitOperationClass.RfCommit));
         await coordinator.DisposeAsync(); await coordinator.DisposeAsync();
     }
 
     [TestMethod]
     public async Task CloseAndEnqueueRaceHasExactlyOneLinearizableOutcome()
     {
-        var coordinator = new ApplicationCommitCoordinator(1);
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         using var start = new Barrier(3);
         var release = Signal();
         int writerInvocations = 0;
@@ -298,7 +301,7 @@ public sealed class ApplicationCommitCoordinatorTests
             start.SignalAndWait();
             try
             {
-                return coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf, async () =>
+                return coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit, async () =>
                 {
                     Interlocked.Increment(ref writerInvocations);
                     await release.Task;
@@ -331,19 +334,19 @@ public sealed class ApplicationCommitCoordinatorTests
         Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Closed, closed.Lifecycle);
         Assert.AreEqual(0, closed.Occupancy);
         Assert.AreEqual(0, closed.Queued);
-        Assert.ThrowsExactly<ObjectDisposedException>(() => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        Assert.ThrowsExactly<ObjectDisposedException>(() => coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Committed(2))));
     }
 
     [TestMethod]
     public async Task RealCallbackAfterCompletionCanAdmitAndSynchronouslyWaitForNextCommit()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(1);
-        ApplicationCommitAdmission first = coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
+        ApplicationCommitAdmission first = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
             () => ValueTask.FromResult(Committed(1)));
         _ = await first.Completion;
         ApplicationCommitTerminalResult second = await Task.Run(() => coordinator.AdmitCommit(Run,
-            ApplicationCommitKind.Rf, () => ValueTask.FromResult(Committed(2))).Completion.GetAwaiter().GetResult());
+            ApplicationCommitOperationClass.RfCommit, () => ValueTask.FromResult(Committed(2))).Completion.GetAwaiter().GetResult());
         Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, second.Status);
         Assert.AreEqual((ulong)2, second.AdmissionOrdinal);
     }
@@ -351,11 +354,11 @@ public sealed class ApplicationCommitCoordinatorTests
     [TestMethod]
     public async Task DifferentRunIsRejectedBeforeWriterAndBeforeOrdinalAssignment()
     {
-        await using var coordinator = new ApplicationCommitCoordinator(1);
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
         _ = await Commit(coordinator, 1);
         bool invoked = false;
         var other = new AcquisitionRunId(Guid.Parse("83000000-0000-0000-0000-000000000002"));
-        Assert.ThrowsExactly<InvalidOperationException>(() => coordinator.AdmitCommit(other, ApplicationCommitKind.Rf,
+        Assert.ThrowsExactly<InvalidOperationException>(() => coordinator.AdmitCommit(other, ApplicationCommitOperationClass.RfCommit,
             () => { invoked = true; return ValueTask.FromResult(Committed(2)); }));
         Assert.IsFalse(invoked); Assert.AreEqual((ulong)1, coordinator.Snapshot.LastAdmissionOrdinal);
     }
@@ -368,7 +371,9 @@ public sealed class ApplicationCommitCoordinatorTests
             typeof(ApplicationCommitCoordinator), typeof(ApplicationCommitAdmission),
             typeof(ApplicationCommitCoordinatorLifecycle), typeof(ApplicationCommitCoordinatorSnapshot),
             typeof(ApplicationCommitTerminalResult), typeof(ApplicationCommitTerminalStatus),
-            typeof(ApplicationCommitKind)
+            typeof(ApplicationCommitOperationClass), typeof(ApplicationCommitOperationIdentity),
+            typeof(ApplicationCommitOperationDescriptor), typeof(ApplicationCommitClassCounters),
+            typeof(ApplicationCommitCoordinatorTestSynchronization)
         ];
         Assert.IsTrue(internalTypes.All(type => !type.IsPublic && !type.IsNestedPublic));
     }
@@ -427,12 +432,381 @@ public sealed class ApplicationCommitCoordinatorTests
         Assert.AreEqual(3L, session.Snapshot.ReleasedFrames);
     }
 
+    [TestMethod]
+    public async Task FiveMixedOperationsUseOneGlobalFifoAndOrdinalSequence()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 5);
+        var entered = Signal(); var release = Signal(); var events = new List<string>();
+        ApplicationCommitAdmission a = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            async () => { events.Add("A"); entered.SetResult(); await release.Task; return Committed(1); });
+        await entered.Task;
+        ApplicationCommitAdmission b = Apply(coordinator, "B", events);
+        ApplicationCommitAdmission c = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.GapCommit,
+            () => { events.Add("C"); return ValueTask.FromResult(Committed(2)); });
+        ApplicationCommitAdmission d = Transition(coordinator, "D", events);
+        ApplicationCommitAdmission e = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            () => { events.Add("E"); return ValueTask.FromResult(Committed(3)); });
+        CollectionAssert.AreEqual(new ulong[] { 1, 2, 3, 4, 5 },
+            new[] { a.AdmissionOrdinal, b.AdmissionOrdinal, c.AdmissionOrdinal, d.AdmissionOrdinal,
+                e.AdmissionOrdinal });
+        release.SetResult();
+        await Task.WhenAll(a.Completion, b.Completion, c.Completion, d.Completion, e.Completion);
+        CollectionAssert.AreEqual(new[] { "A", "B", "C", "D", "E" }, events);
+        Assert.AreEqual(new InspectionRevision(3), coordinator.Snapshot.LastConfirmedRevision);
+    }
+
+    [TestMethod]
+    public async Task ConcurrentSixthAdmissionCannotBargeAheadOfMixedQueue()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 6);
+        var enteredA = Signal(); var releaseA = Signal(); var enteredB = Signal(); var releaseB = Signal();
+        var events = new List<string>();
+        ApplicationCommitAdmission a = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            async () => { events.Add("A"); enteredA.SetResult(); await releaseA.Task; return Committed(1); });
+        await enteredA.Task;
+        ApplicationCommitAdmission b = coordinator.AdmitGatePlanApply(new("B"), async () =>
+        { events.Add("B"); enteredB.SetResult(); await releaseB.Task; });
+        ApplicationCommitAdmission c = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.GapCommit,
+            () => { events.Add("C"); return ValueTask.FromResult(Committed(2)); });
+        ApplicationCommitAdmission d = Transition(coordinator, "D", events);
+        ApplicationCommitAdmission e = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            () => { events.Add("E"); return ValueTask.FromResult(Committed(3)); });
+        releaseA.SetResult(); await enteredB.Task;
+        var sixthTaskStarted = Signal();
+        Task<ApplicationCommitAdmission> admitSixth = Task.Run(() =>
+        {
+            sixthTaskStarted.SetResult();
+            return coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+                () => { events.Add("F"); return ValueTask.FromResult(Committed(4)); });
+        });
+        await sixthTaskStarted.Task;
+        ApplicationCommitAdmission f = await admitSixth;
+        Assert.AreEqual((ulong)6, f.AdmissionOrdinal);
+        CollectionAssert.AreEqual(new[] { "A", "B" }, events);
+        releaseB.SetResult();
+        await Task.WhenAll(a.Completion, b.Completion, c.Completion, d.Completion, e.Completion, f.Completion);
+        CollectionAssert.AreEqual(new[] { "A", "B", "C", "D", "E", "F" }, events);
+    }
+
+    [TestMethod]
+    public async Task IndependentAdmissionClosuresRejectOnlyTheirClasses()
+    {
+        await using var applyClosed = new ApplicationCommitCoordinator(Inspection, 4);
+        applyClosed.CloseApplyAdmission(); applyClosed.CloseApplyAdmission();
+        Assert.ThrowsExactly<InvalidOperationException>(() => Apply(applyClosed, "A", []));
+        _ = await Commit(applyClosed, 1); await Transition(applyClosed, "T", []).Completion;
+        Assert.IsFalse(applyClosed.Snapshot.ApplyAdmissionOpen);
+        Assert.IsTrue(applyClosed.Snapshot.AcquisitionAdmissionOpen);
+
+        await using var acquisitionClosed = new ApplicationCommitCoordinator(Inspection, 3);
+        acquisitionClosed.CloseAcquisitionAdmission();
+        Assert.ThrowsExactly<InvalidOperationException>(() => acquisitionClosed.AdmitCommit(Run,
+            ApplicationCommitOperationClass.RfCommit, () => ValueTask.FromResult(Committed(1))));
+        Assert.ThrowsExactly<InvalidOperationException>(() => acquisitionClosed.AdmitCommit(Run,
+            ApplicationCommitOperationClass.GapCommit, () => ValueTask.FromResult(Committed(1))));
+        await Apply(acquisitionClosed, "A", []).Completion;
+        await Transition(acquisitionClosed, "T", []).Completion;
+
+        await using var transitionClosed = new ApplicationCommitCoordinator(Inspection, 3);
+        transitionClosed.CloseRunTransitionAdmission(); transitionClosed.CloseRunTransitionAdmission();
+        Assert.ThrowsExactly<InvalidOperationException>(() => Transition(transitionClosed, "T", []));
+        _ = await Commit(transitionClosed, 1); await Apply(transitionClosed, "A", []).Completion;
+        Assert.AreEqual((ulong)1, transitionClosed.Snapshot.ClosedRejections.For(
+            ApplicationCommitOperationClass.GateRunTransition));
+    }
+
+    [TestMethod]
+    [DataRow("RfCommit")]
+    [DataRow("GapCommit")]
+    [DataRow("GatePlanApply")]
+    [DataRow("GateRunTransition")]
+    public async Task CancellationWinsBeforeAdmissionForEveryClassWithoutOrdinal(string className)
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
+        using var cancellation = new CancellationTokenSource();
+        var callerReady = Signal(); var attemptAdmission = Signal(); int invoked = 0;
+        Task admitting = Task.Run(async () =>
+        {
+            callerReady.SetResult();
+            await attemptAdmission.Task;
+            Assert.ThrowsExactly<OperationCanceledException>(() => AdmitClass(coordinator,
+                Enum.Parse<ApplicationCommitOperationClass>(className), () => Interlocked.Increment(ref invoked),
+                cancellation.Token));
+        });
+        await callerReady.Task;
+        cancellation.Cancel();
+        attemptAdmission.SetResult();
+        await admitting;
+        Assert.AreEqual(0, invoked); Assert.AreEqual((ulong)0, coordinator.Snapshot.LastAdmissionOrdinal);
+    }
+
+    [TestMethod]
+    [DataRow("RfCommit")]
+    [DataRow("GapCommit")]
+    [DataRow("GatePlanApply")]
+    [DataRow("GateRunTransition")]
+    public async Task AdmissionWinsBeforeCallerCancellationForEveryClass(string className)
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
+        var entered = Signal(); var release = Signal();
+        using var cancellation = new CancellationTokenSource();
+        ApplicationCommitAdmission admission = AdmitBlockedClass(coordinator,
+            Enum.Parse<ApplicationCommitOperationClass>(className), entered, release, cancellation.Token);
+        await entered.Task;
+        cancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => admission.WaitAsync(cancellation.Token));
+        Assert.AreEqual(1, coordinator.Snapshot.Occupancy);
+        release.SetResult();
+        Assert.IsTrue((await admission.Completion).IsSuccessful);
+        Assert.AreEqual(0, coordinator.Snapshot.Occupancy);
+    }
+
+    [TestMethod]
+    public async Task MixedCapacityCountsRunnerAndQueueAndRejectsOneOverByClass()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 3);
+        var entered = Signal(); var release = Signal();
+        ApplicationCommitAdmission a = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            async () => { entered.SetResult(); await release.Task; return Committed(1); });
+        await entered.Task;
+        ApplicationCommitAdmission b = Apply(coordinator, "B", []);
+        ApplicationCommitAdmission c = Transition(coordinator, "C", []);
+        Assert.ThrowsExactly<InvalidOperationException>(() => coordinator.AdmitCommit(Run,
+            ApplicationCommitOperationClass.GapCommit, () => ValueTask.FromResult(Committed(2))));
+        Assert.AreEqual((ulong)1, coordinator.Snapshot.CapacityRejections.For(
+            ApplicationCommitOperationClass.GapCommit));
+        Assert.AreEqual((ulong)3, coordinator.Snapshot.LastAdmissionOrdinal);
+        release.SetResult(); await Task.WhenAll(a.Completion, b.Completion, c.Completion);
+    }
+
+    [TestMethod]
+    public async Task DisposeClosesAllAdmissionsAndDrainsMixedOperations()
+    {
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 3);
+        var entered = Signal(); var release = Signal();
+        ApplicationCommitAdmission a = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            async () => { entered.SetResult(); await release.Task; return Committed(1); });
+        await entered.Task;
+        ApplicationCommitAdmission b = Apply(coordinator, "B", []);
+        ApplicationCommitAdmission c = Transition(coordinator, "C", []);
+        Task dispose = coordinator.DisposeAsync().AsTask();
+        Assert.ThrowsExactly<ObjectDisposedException>(() => Apply(coordinator, "late", []));
+        Assert.ThrowsExactly<ObjectDisposedException>(() => coordinator.AdmitCommit(Run,
+            ApplicationCommitOperationClass.GapCommit, () => ValueTask.FromResult(Committed(2))));
+        release.SetResult(); await Task.WhenAll(a.Completion, b.Completion, c.Completion); await dispose;
+        Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Closed, coordinator.Snapshot.Lifecycle);
+        Assert.AreEqual(0, coordinator.Snapshot.Occupancy);
+    }
+
+    [TestMethod]
+    public async Task PlaceholderFailureIsTerminalAndRfFrontierStillProgresses()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 2);
+        var entered = Signal(); var release = Signal(); var error = new InvalidOperationException("apply");
+        ApplicationCommitAdmission apply = coordinator.AdmitGatePlanApply(new("apply"), async () =>
+        { entered.SetResult(); await release.Task; throw error; });
+        await entered.Task;
+        ApplicationCommitAdmission rf = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            () => ValueTask.FromResult(Committed(1)));
+        release.SetResult();
+        Assert.AreEqual(ApplicationCommitTerminalStatus.OperationFaulted, (await apply.Completion).Status);
+        Assert.AreSame(error, (await apply.Completion).Error);
+        Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await rf.Completion).Status);
+    }
+
+    [TestMethod]
+    public async Task GapWriterFailureIsTerminalAndNextOperationStillProgresses()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 2);
+        var entered = Signal(); var release = Signal(); var error = new InvalidOperationException("gap");
+        ApplicationCommitAdmission gap = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.GapCommit,
+            async () => { entered.SetResult(); await release.Task; throw error; });
+        await entered.Task;
+        ApplicationCommitAdmission rf = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            () => ValueTask.FromResult(Committed(1)));
+        release.SetResult();
+        ApplicationCommitTerminalResult failed = await gap.Completion;
+        Assert.AreEqual(ApplicationCommitTerminalStatus.WriterFaulted, failed.Status);
+        Assert.AreSame(error, failed.Error);
+        Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await rf.Completion).Status);
+    }
+
+    [TestMethod]
+    public async Task RunTransitionFailureIsTerminalAndNextOperationStillProgresses()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 2);
+        var entered = Signal(); var release = Signal(); var error = new InvalidOperationException("transition");
+        ApplicationCommitAdmission transition = coordinator.AdmitGateRunTransition(Run, new("transition"),
+            async () => { entered.SetResult(); await release.Task; throw error; });
+        await entered.Task;
+        ApplicationCommitAdmission rf = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            () => ValueTask.FromResult(Committed(1)));
+        release.SetResult();
+        ApplicationCommitTerminalResult failed = await transition.Completion;
+        Assert.AreEqual(ApplicationCommitTerminalStatus.OperationFaulted, failed.Status);
+        Assert.AreSame(error, failed.Error);
+        Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await rf.Completion).Status);
+    }
+
+    [TestMethod]
+    public async Task RfCompletionCanReenterApplyAndWaitWithCapacityOne()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
+        var entered = Signal(); var release = Signal();
+        ApplicationCommitAdmission rf = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            async () => { entered.SetResult(); await release.Task; return Committed(1); });
+        await entered.Task;
+        Task<ApplicationCommitTerminalResult> reentrant = rf.Completion.ContinueWith(_ =>
+            coordinator.AdmitGatePlanApply(new("reentrant"), () => ValueTask.CompletedTask)
+                .Completion.GetAwaiter().GetResult(), TaskScheduler.Default);
+        release.SetResult();
+        ApplicationCommitTerminalResult apply = await reentrant;
+        Assert.AreEqual(ApplicationCommitTerminalStatus.Completed, apply.Status);
+        Assert.AreEqual((ulong)2, apply.AdmissionOrdinal);
+    }
+
+    [TestMethod]
+    public async Task SnapshotDescribesBlockedRunnerAndMixedQueue()
+    {
+        await using var coordinator = new ApplicationCommitCoordinator(Inspection, 4);
+        var entered = Signal(); var release = Signal();
+        ApplicationCommitAdmission a = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
+            async () => { entered.SetResult(); await release.Task; return Committed(1); });
+        await entered.Task;
+        ApplicationCommitAdmission b = Apply(coordinator, "B", []);
+        ApplicationCommitAdmission c = coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.GapCommit,
+            () => ValueTask.FromResult(Committed(2)));
+        ApplicationCommitAdmission d = Transition(coordinator, "D", []);
+        ApplicationCommitCoordinatorSnapshot snapshot = coordinator.Snapshot;
+        Assert.AreEqual(4, snapshot.Occupancy); Assert.AreEqual(3, snapshot.Queued);
+        Assert.AreEqual((ulong)5, snapshot.NextAdmissionOrdinal);
+        Assert.AreEqual((ulong)4, snapshot.LastAdmissionOrdinal);
+        Assert.AreEqual((ulong)0, snapshot.LastTerminalOrdinal);
+        Assert.AreEqual(a.Descriptor, snapshot.RunningOperation);
+        release.SetResult(); await Task.WhenAll(a.Completion, b.Completion, c.Completion, d.Completion);
+        Assert.AreEqual((ulong)4, coordinator.Snapshot.LastTerminalOrdinal);
+    }
+
+    [TestMethod]
+    public async Task PublishingTerminalIsObservableAndCloseDisposesAfterQueuedAdmissionDrains()
+    {
+        var synchronization = new ApplicationCommitCoordinatorTestSynchronization();
+        var nextBodyEntered = Signal();
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 1, synchronization);
+        ApplicationCommitAdmission first = coordinator.AdmitCommit(Run,
+            ApplicationCommitOperationClass.RfCommit, () => ValueTask.FromResult(Committed(1)));
+        await synchronization.PublishingTerminalReached;
+
+        ApplicationCommitCoordinatorSnapshot emptyPublishing = coordinator.Snapshot;
+        Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.PublishingTerminal, emptyPublishing.Lifecycle);
+        Assert.AreEqual(0, emptyPublishing.Occupancy);
+        Assert.AreEqual(0, emptyPublishing.Queued);
+        Assert.IsNull(emptyPublishing.RunningOperation);
+        Assert.AreEqual((ulong)1, emptyPublishing.LastTerminalOrdinal);
+        Assert.IsFalse(first.Completion.IsCompleted);
+
+        ApplicationCommitAdmission next = await Task.Run(() => coordinator.AdmitGatePlanApply(new("queued"),
+            () => { nextBodyEntered.SetResult(); return ValueTask.CompletedTask; }));
+        ApplicationCommitCoordinatorSnapshot queuedPublishing = coordinator.Snapshot;
+        Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.PublishingTerminal, queuedPublishing.Lifecycle);
+        Assert.AreEqual(1, queuedPublishing.Occupancy);
+        Assert.AreEqual(1, queuedPublishing.Queued);
+        Assert.IsNull(queuedPublishing.RunningOperation);
+        Assert.IsFalse(nextBodyEntered.Task.IsCompleted);
+
+        coordinator.CloseAdmission();
+        Task dispose = coordinator.DisposeAsync().AsTask();
+        Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Closing, coordinator.Snapshot.Lifecycle);
+        Assert.IsFalse(dispose.IsCompleted);
+        synchronization.ReleasePublishingTerminal();
+        await Task.WhenAll(first.Completion, next.Completion, dispose);
+        Assert.IsTrue(nextBodyEntered.Task.IsCompleted);
+        ApplicationCommitCoordinatorSnapshot closed = coordinator.Snapshot;
+        Assert.AreEqual(ApplicationCommitCoordinatorLifecycle.Closed, closed.Lifecycle);
+        Assert.AreEqual(0, closed.Occupancy);
+        Assert.AreEqual(0, closed.Queued);
+        Assert.IsNull(closed.RunningOperation);
+    }
+
+    [TestMethod]
+    [DataRow("RfCommit")]
+    [DataRow("GapCommit")]
+    [DataRow("GatePlanApply")]
+    [DataRow("GateRunTransition")]
+    [Timeout(5000, CooperativeCancellation = true)]
+    public async Task EveryBodyRunsOutsideCoordinatorGateAndFastPathIsDirect(string className)
+    {
+        var coordinator = new ApplicationCommitCoordinator(Inspection, 1);
+        var entered = Signal(); var gateOperationCompleted = Signal();
+        Task<ApplicationCommitAdmission> admitting = Task.Run(() => AdmitGateProbe(coordinator,
+            Enum.Parse<ApplicationCommitOperationClass>(className), () =>
+        {
+            entered.SetResult();
+            Task.Run(() => { coordinator.CloseApplyAdmission(); gateOperationCompleted.SetResult(); })
+                .GetAwaiter().GetResult();
+        }));
+        await entered.Task; await gateOperationCompleted.Task;
+        ApplicationCommitAdmission admission = await admitting;
+        Assert.IsTrue((await admission.Completion).IsSuccessful);
+        await coordinator.DisposeAsync();
+    }
+
     private static ApplicationCommitAdmission Admit(ApplicationCommitCoordinator coordinator, string name,
-        ulong revision, List<string> events) => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        ulong revision, List<string> events) => coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
         () => { events.Add(name); return ValueTask.FromResult(Committed(revision)); });
 
+    private static ApplicationCommitAdmission Apply(ApplicationCommitCoordinator coordinator, string name,
+        List<string> events) => coordinator.AdmitGatePlanApply(new(name), () =>
+        { events.Add(name); return ValueTask.CompletedTask; });
+
+    private static ApplicationCommitAdmission Transition(ApplicationCommitCoordinator coordinator, string name,
+        List<string> events) => coordinator.AdmitGateRunTransition(Run, new(name), () =>
+        { events.Add(name); return ValueTask.CompletedTask; });
+
+    private static ApplicationCommitAdmission AdmitClass(ApplicationCommitCoordinator coordinator,
+        ApplicationCommitOperationClass operationClass, Action invoked, CancellationToken cancellationToken) =>
+        operationClass switch
+        {
+            ApplicationCommitOperationClass.RfCommit or ApplicationCommitOperationClass.GapCommit =>
+                coordinator.AdmitCommit(Run, operationClass, () =>
+                { invoked(); return ValueTask.FromResult(Committed(1)); }, cancellationToken),
+            ApplicationCommitOperationClass.GatePlanApply => coordinator.AdmitGatePlanApply(new("apply"), () =>
+            { invoked(); return ValueTask.CompletedTask; }, cancellationToken),
+            ApplicationCommitOperationClass.GateRunTransition => coordinator.AdmitGateRunTransition(Run,
+                new("transition"), () => { invoked(); return ValueTask.CompletedTask; }, cancellationToken),
+            _ => throw new ArgumentOutOfRangeException(nameof(operationClass))
+        };
+
+    private static ApplicationCommitAdmission AdmitBlockedClass(ApplicationCommitCoordinator coordinator,
+        ApplicationCommitOperationClass operationClass, TaskCompletionSource entered, TaskCompletionSource release,
+        CancellationToken cancellationToken = default) =>
+        operationClass switch
+        {
+            ApplicationCommitOperationClass.RfCommit or ApplicationCommitOperationClass.GapCommit =>
+                coordinator.AdmitCommit(Run, operationClass, async () =>
+                { entered.SetResult(); await release.Task; return Committed(1); }, cancellationToken),
+            ApplicationCommitOperationClass.GatePlanApply => coordinator.AdmitGatePlanApply(new("apply"), async () =>
+            { entered.SetResult(); await release.Task; }, cancellationToken),
+            ApplicationCommitOperationClass.GateRunTransition => coordinator.AdmitGateRunTransition(Run,
+                new("transition"), async () => { entered.SetResult(); await release.Task; }, cancellationToken),
+            _ => throw new ArgumentOutOfRangeException(nameof(operationClass))
+        };
+
+    private static ApplicationCommitAdmission AdmitGateProbe(ApplicationCommitCoordinator coordinator,
+        ApplicationCommitOperationClass operationClass, Action body) => operationClass switch
+        {
+            ApplicationCommitOperationClass.RfCommit or ApplicationCommitOperationClass.GapCommit =>
+                coordinator.AdmitCommit(Run, operationClass, () =>
+                { body(); return ValueTask.FromResult(Committed(1)); }),
+            ApplicationCommitOperationClass.GatePlanApply => coordinator.AdmitGatePlanApply(new("apply"), () =>
+            { body(); return ValueTask.CompletedTask; }),
+            ApplicationCommitOperationClass.GateRunTransition => coordinator.AdmitGateRunTransition(Run,
+                new("transition"), () => { body(); return ValueTask.CompletedTask; }),
+            _ => throw new ArgumentOutOfRangeException(nameof(operationClass))
+        };
+
     private static Task<ApplicationCommitTerminalResult> Commit(ApplicationCommitCoordinator coordinator,
-        ulong revision) => coordinator.AdmitCommit(Run, ApplicationCommitKind.Rf,
+        ulong revision) => coordinator.AdmitCommit(Run, ApplicationCommitOperationClass.RfCommit,
         () => ValueTask.FromResult(Committed(revision))).Completion;
 
     private static TaskCompletionSource Signal() =>
