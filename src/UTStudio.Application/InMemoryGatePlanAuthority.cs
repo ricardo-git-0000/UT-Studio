@@ -2,28 +2,42 @@ using UTStudio.Contracts.Processing;
 
 namespace UTStudio.Application;
 
+internal interface IGatePlanAuthorityObservableDiagnostics
+{ bool HasRetainedState { get; } }
+
 /// <summary>
 /// Owns bootstrap and explicitly-capable recovery of a process-local gate-plan authority. Dispose closes event
 /// admission but does not wait for admitted observer callbacks; completion remains FIFO behind admitted values and
 /// may run later. Unsubscribe prevents new admission but cannot cancel a callback already running. Each queued work
 /// item owns its subscription until its single drainer finishes; slow and throwing observers are isolated.
 /// </summary>
-public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
+public sealed partial class InMemoryGatePlanAuthorityOwner : IDisposable
 {
     private readonly AuthorityReader _reader;
+    private readonly InMemoryGatePlanPreparedCommitOwner _preparedCommits;
     private int _recoveryCapabilityTaken;
     private readonly object _lifecycleGate = new();
     private AuthorityLifecycle _lifecycle = AuthorityLifecycle.Recovering;
 
     public InMemoryGatePlanAuthorityOwner(IEnumerable<CommittedGatePlanSnapshot> initial,
         GateAuthorityGeneration initialGeneration = default)
+        : this(initial, initialGeneration, new(), null)
+    { }
+
+    internal InMemoryGatePlanAuthorityOwner(IEnumerable<CommittedGatePlanSnapshot> initial,
+        GateAuthorityGeneration initialGeneration, GatePlanAuthorityPreparedCommitOptions preparedOptions,
+        IEnumerable<GatePlanAuthorityRetainedLedgerSeed>? retainedLedgers)
     {
         ArgumentNullException.ThrowIfNull(initial);
         CommittedGatePlanSnapshot[] captured = initial.ToArray();
         if (captured.Length == 0 || captured.Any(snapshot => snapshot is null))
             throw new ArgumentException("At least one initial committed snapshot is required.", nameof(initial));
-        _reader = new(captured, initialGeneration.IsValid ? initialGeneration.Value : 1, MarkDisposed);
+        _reader = new(captured, initialGeneration.IsValid ? initialGeneration.Value : 1, MarkDisposed,
+            preparedOptions, retainedLedgers);
+        _preparedCommits = new(_reader);
     }
+
+    internal InMemoryGatePlanPreparedCommitOwner PreparedCommits => _preparedCommits;
 
     public IGatePlanAuthorityReader Reader
     {
@@ -45,6 +59,7 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
             if (_lifecycle != AuthorityLifecycle.Recovering)
                 throw new InvalidOperationException("The authority can be sealed exactly once.");
             _lifecycle = AuthorityLifecycle.Operational;
+            _reader.EnablePreparedCommits();
             return _reader;
         }
     }
@@ -116,7 +131,7 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
         public void Dispose() { lock (_gate) _owner = null; }
     }
 
-    internal sealed class AuthorityReader : IGatePlanAuthorityReader, IDisposable
+    internal sealed partial class AuthorityReader : IGatePlanAuthorityReader, IDisposable
     {
         private readonly object _gate = new();
         private readonly Dictionary<GatePlanAuthorityKey, Entry> _entries = [];
@@ -128,7 +143,9 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
 
         internal Task CloseCompletion => _closeCompletion.Task;
 
-        internal AuthorityReader(IEnumerable<CommittedGatePlanSnapshot> initial, ulong firstGeneration, Action closed)
+        internal AuthorityReader(IEnumerable<CommittedGatePlanSnapshot> initial, ulong firstGeneration, Action closed,
+            GatePlanAuthorityPreparedCommitOptions preparedOptions,
+            IEnumerable<GatePlanAuthorityRetainedLedgerSeed>? retainedLedgers)
         {
             _closed = closed;
             _generation = firstGeneration - 1;
@@ -138,6 +155,7 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
                     throw new ArgumentException("Bootstrap cannot contain duplicate authority keys.", nameof(initial));
                 _entries.Add(snapshot.AuthorityKey, new(new(snapshot, NextGeneration())));
             }
+            InitializePreparedCommits(preparedOptions, retainedLedgers);
         }
 
         public GatePlanAuthoritySnapshot Read(GatePlanAuthorityKey authority)
@@ -190,18 +208,25 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
 
         public void Dispose()
         {
+            List<Entry.Subscription> publicationDrains = [];
             List<(Entry.Subscription Subscription, bool Schedule)> drains = [];
             bool completed;
             lock (_gate)
             {
                 if (_closing) return;
                 _closing = true;
+                ClosePreparedCommitsUnderGate();
+                publicationDrains = AdmitConfirmedPublicationsUnderGate();
                 foreach (Entry entry in _entries.Values)
+                {
                     drains.AddRange(entry.EnqueueCompletion(DrainerCompleted));
+                    entry.ClearTerminalState();
+                }
                 _entries.Clear();
                 _closingDrainers = drains.Count;
                 completed = _closingDrainers == 0;
             }
+            foreach (Entry.Subscription drain in publicationDrains) drain.Schedule();
             foreach ((Entry.Subscription drain, bool schedule) in drains)
                 if (schedule) drain.Schedule();
             if (completed) CompleteClose();
@@ -220,6 +245,7 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
 
         private void CompleteClose()
         {
+            lock (_gate) ReleaseRetainedLedgersAfterCloseUnderGate();
             _closed();
             _closeCompletion.TrySetResult();
         }
@@ -242,11 +268,17 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
 
     }
 
-    private sealed class Entry(GatePlanAuthoritySnapshot initial) : IObservable<GatePlanAuthoritySnapshot>
+    internal sealed class Entry(GatePlanAuthoritySnapshot initial) :
+        IObservable<GatePlanAuthoritySnapshot>, IGatePlanAuthorityObservableDiagnostics
     {
         private readonly List<Subscription> _subscriptions = [];
         private bool _completed;
-        internal GatePlanAuthoritySnapshot Current { get; private set; } = initial;
+        private GatePlanAuthoritySnapshot? _current = initial;
+        internal GatePlanAuthoritySnapshot Current => _current ?? throw new ObjectDisposedException(nameof(Entry));
+        public bool HasRetainedState
+        {
+            get { lock (_subscriptions) return _current is not null || Geometry is not null || Ledger is not null; }
+        }
 
         public IDisposable Subscribe(IObserver<GatePlanAuthoritySnapshot> observer)
         {
@@ -257,7 +289,7 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
             {
                 subscription = new(this, observer);
                 if (_completed) drain = subscription.EnqueueCompleted();
-                else { _subscriptions.Add(subscription); drain = subscription.EnqueueNext(Current); }
+                else { _subscriptions.Add(subscription); drain = subscription.EnqueueNext(_current!); }
             }
             if (drain) subscription.Schedule();
             return subscription;
@@ -267,9 +299,29 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
         {
             lock (_subscriptions)
             {
-                Current = snapshot;
+                _current = snapshot;
                 return _subscriptions.Where(subscription => subscription.EnqueueNext(snapshot)).ToList();
             }
+        }
+
+        internal void InstallPrepared(GatePlanAuthoritySnapshot snapshot,
+            GatePlanGeometrySnapshot geometry, GateApplyLedgerSnapshot ledger)
+        {
+            lock (_subscriptions)
+            {
+                _current = snapshot;
+                Geometry = geometry;
+                Ledger = ledger;
+            }
+        }
+
+        internal GatePlanGeometrySnapshot? Geometry { get; private set; }
+        internal GateApplyLedgerSnapshot? Ledger { get; private set; }
+
+        internal List<Subscription> EnqueueDeferred(GatePlanAuthoritySnapshot snapshot)
+        {
+            lock (_subscriptions)
+                return _subscriptions.Where(subscription => subscription.EnqueueNext(snapshot)).ToList();
         }
 
         internal List<(Subscription Subscription, bool Schedule)> EnqueueCompletion(Action drainerCompleted)
@@ -287,22 +339,35 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
             }
         }
 
+        internal void ClearTerminalState()
+        {
+            lock (_subscriptions)
+            {
+                _current = null; Geometry = null; Ledger = null;
+            }
+        }
+
         private void Remove(Subscription subscription) { lock (_subscriptions) _subscriptions.Remove(subscription); }
 
         internal sealed class Subscription(Entry owner, IObserver<GatePlanAuthoritySnapshot> observer) : IDisposable
         {
+            private Entry? _owner = owner;
+            private IObserver<GatePlanAuthoritySnapshot>? _observer = observer;
             private readonly object _gate = new();
             private readonly Queue<GatePlanAuthoritySnapshot> _pending = [];
             private bool _completionPending;
             private bool _draining;
             private bool _disposed;
             private Action? _terminal;
+            private ulong _lastPublicationSequence;
 
             internal bool EnqueueNext(GatePlanAuthoritySnapshot snapshot)
             {
                 lock (_gate)
                 {
                     if (_disposed || _completionPending) return false;
+                    if (snapshot.PublicationSequence.Value <= _lastPublicationSequence) return false;
+                    _lastPublicationSequence = snapshot.PublicationSequence.Value;
                     _pending.Enqueue(snapshot);
                     if (_draining) return false;
                     return _draining = true;
@@ -350,11 +415,11 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
                     {
                         if (complete)
                         {
-                            try { observer.OnCompleted(); }
+                            try { _observer?.OnCompleted(); }
                             finally { CompleteTerminal(); }
                             return;
                         }
-                        observer.OnNext(next!);
+                        _observer?.OnNext(next!);
                     }
                     catch { Dispose(); return; }
                 }
@@ -366,20 +431,26 @@ public sealed class InMemoryGatePlanAuthorityOwner : IDisposable
             public void Dispose()
             {
                 Action? terminal;
+                Entry? owner;
                 lock (_gate)
                 {
                     if (_disposed) return;
                     _disposed = true; _pending.Clear(); _completionPending = false;
                     terminal = _terminal; _terminal = null;
+                    owner = _owner; _owner = null; _observer = null;
                 }
-                owner.Remove(this);
+                owner?.Remove(this);
                 terminal?.Invoke();
             }
 
             private void CompleteTerminal()
             {
                 Action? terminal;
-                lock (_gate) { terminal = _terminal; _terminal = null; }
+                lock (_gate)
+                {
+                    terminal = _terminal; _terminal = null;
+                    _owner = null; _observer = null;
+                }
                 terminal?.Invoke();
             }
         }
