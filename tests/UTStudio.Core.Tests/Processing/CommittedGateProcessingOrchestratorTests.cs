@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using UTStudio.Contracts.Inspection;
 using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
@@ -439,12 +440,17 @@ public sealed class CommittedGateProcessingOrchestratorTests
         GatePlanEpochPrepareResult pending = disposable.Orchestrator.PrepareEpoch(disposable.Inspection,
             disposable.Run, CompilePlan(2, "dispose"), new(2), owner, generation);
         await disposable.Orchestrator.DisposeAsync();
-        Assert.AreEqual(GatePreparedReservationResultStatus.InvalidReservation,
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+            disposable.Orchestrator.CommitEpoch(pending.Reservation, owner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
             disposable.Orchestrator.AbortEpoch(pending.Reservation, owner, generation).Status);
-        GateProcessingRunDiagnostics disposed = disposable.Orchestrator.Diagnostics.ActiveRuns.Single();
-        Assert.HasCount(1, disposed.Plans); Assert.IsFalse(disposed.EpochAdmissionOpen);
-        Assert.IsFalse(disposed.HasPreparedEpoch); Assert.AreEqual(0, disposed.PreparedEpochPins);
-        Assert.AreEqual(0, disposed.TerminalReservationTombstones);
+        GateProcessingDiagnostics disposed = disposable.Orchestrator.Diagnostics;
+        Assert.AreEqual(GateProcessingLifecycleState.Closed, disposed.State);
+        Assert.IsEmpty(disposed.ActiveRuns); Assert.AreEqual(0, disposed.SchedulerDepth);
+        Assert.AreEqual(0, disposed.OpenRuns); Assert.AreEqual(0, disposed.ActiveWorkers);
+        Assert.AreEqual(0, disposed.ActiveCallbacks); Assert.AreEqual(0, disposed.ActiveLeases);
+        Assert.AreEqual(1, disposed.TerminalReservationTombstones);
+        Assert.AreEqual(2, disposed.TerminalReservationTombstoneCapacity);
         _ = await disposable.Writer.SealRunAsync(); disposable.MarkSealed();
         await disposable.Writer.DisposeAsync();
         await disposable.Registry.DisposeAsync();
@@ -475,6 +481,113 @@ public sealed class CommittedGateProcessingOrchestratorTests
             Assert.AreEqual(0, snapshot.ProvisionalEpochSlots);
             previous = prepared.Reservation;
         }
+    }
+
+    [TestMethod]
+    public void TerminalTombstoneIsAReferenceFreeValueObject()
+    {
+        Assert.IsTrue(typeof(GatePlanEpochTerminalTombstone).IsValueType);
+        Assert.IsFalse(RuntimeHelpers.IsReferenceOrContainsReferences<GatePlanEpochTerminalTombstone>());
+    }
+
+    [TestMethod]
+    public async Task DisposePreservesCommittedAndAbortedReplaysWithoutOperationalRuns()
+    {
+        var fixture = new Fixture(new(maximumRuns: 2));
+        var secondRun = new AcquisitionRunId(Guid.NewGuid());
+        var secondStream = new UtStreamIdentity(fixture.Inspection, secondRun, fixture.Source, new(1));
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            fixture.Orchestrator.OpenRun(new(fixture.Inspection, secondRun, [secondStream], CompilePlan())));
+        (GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation) = Credentials();
+        GatePlanEpochPrepareResult committed = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, fixture.Run,
+            CompilePlan(2, "committed-dispose"), new(2), owner, generation);
+        Assert.AreEqual(GatePreparedReservationResultStatus.Committed,
+            fixture.Orchestrator.CommitEpoch(committed.Reservation, owner, generation).Status);
+        GatePlanEpochPrepareResult pending = fixture.Orchestrator.PrepareEpoch(fixture.Inspection, secondRun,
+            CompilePlan(2, "aborted-dispose"), new(2), owner, new(2));
+
+        Task firstDispose = fixture.Orchestrator.DisposeAsync().AsTask();
+        Task repeatedDispose = fixture.Orchestrator.DisposeAsync().AsTask();
+        Assert.AreSame(firstDispose, repeatedDispose);
+        await firstDispose;
+
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyCommitted,
+            fixture.Orchestrator.CommitEpoch(committed.Reservation, owner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyCommitted,
+            fixture.Orchestrator.AbortEpoch(committed.Reservation, owner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+            fixture.Orchestrator.CommitEpoch(pending.Reservation, owner, new(2)).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+            fixture.Orchestrator.AbortEpoch(pending.Reservation, owner, new(2)).Status);
+        var wrongOwner = new GatePreparedReservationOwner(Guid.NewGuid());
+        Assert.AreEqual(GatePreparedReservationResultStatus.OwnerOrGenerationMismatch,
+            fixture.Orchestrator.CommitEpoch(committed.Reservation, wrongOwner, generation).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.OwnerOrGenerationMismatch,
+            fixture.Orchestrator.AbortEpoch(pending.Reservation, wrongOwner, new(2)).Status);
+        GateProcessingDiagnostics closed = fixture.Orchestrator.Diagnostics;
+        Assert.AreEqual(GateProcessingLifecycleState.Closed, closed.State);
+        Assert.IsEmpty(closed.ActiveRuns); Assert.IsEmpty(closed.TerminalRuns);
+        Assert.AreEqual(0, closed.SchedulerDepth); Assert.AreEqual(0, closed.OpenRuns);
+        Assert.AreEqual(0, closed.ActiveWorkers); Assert.AreEqual(0, closed.ActiveCallbacks);
+        Assert.AreEqual(0, closed.ActiveLeases); Assert.AreEqual(2, closed.TerminalReservationTombstones);
+        Assert.AreEqual(2, closed.TerminalReservationTombstoneCapacity);
+        _ = await fixture.Writer.SealRunAsync(); fixture.MarkSealed();
+        await fixture.Writer.DisposeAsync(); await fixture.Registry.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task TerminalTombstoneWindowEvictsOldestAcrossRetiredRuns()
+    {
+        var inspection = new InspectionId(Guid.NewGuid());
+        await using var registry = new InspectionDataStoreRegistry(inspection, new(1024, 10));
+        await using var orchestrator = new CommittedGateProcessingOrchestrator(registry.Store, registry.Store,
+            new CapturingSink(), new GateEvaluator(new GateScratchPool()), new(maximumRuns: 2));
+        var source = new UtSourceId("tombstone-window");
+        var runs = Enumerable.Range(0, 3).Select(_ => new AcquisitionRunId(Guid.NewGuid())).ToArray();
+        UtStreamIdentity Stream(int index) => new(inspection, runs[index], source, new PhysicalChannelId(index));
+        (GatePreparedReservationOwner owner, _) = Credentials();
+
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            orchestrator.OpenRun(new(inspection, runs[0], [Stream(0)], CompilePlan())));
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            orchestrator.OpenRun(new(inspection, runs[1], [Stream(1)], CompilePlan())));
+        GatePreparedReservation[] reservations = new GatePreparedReservation[4];
+        for (int index = 0; index < 2; index++)
+        {
+            var generation = new GatePreparedOperationGeneration((ulong)index + 1);
+            GatePlanEpochPrepareResult prepared = orchestrator.PrepareEpoch(inspection, runs[index],
+                CompilePlan(2, $"window-{index}"), new(2), owner, generation);
+            reservations[index] = prepared.Reservation;
+            Assert.AreEqual(GatePreparedReservationResultStatus.Aborted,
+                orchestrator.AbortEpoch(prepared.Reservation, owner, generation).Status);
+        }
+        var refreshedGeneration = new GatePreparedOperationGeneration(3);
+        GatePlanEpochPrepareResult refreshed = orchestrator.PrepareEpoch(inspection, runs[0],
+            CompilePlan(2, "window-refreshed"), new(2), owner, refreshedGeneration);
+        reservations[2] = refreshed.Reservation;
+        Assert.AreEqual(GatePreparedReservationResultStatus.Aborted,
+            orchestrator.AbortEpoch(refreshed.Reservation, owner, refreshedGeneration).Status);
+        orchestrator.StopAdmission(runs[1]);
+        orchestrator.RequestFinalReconciliation(runs[1], InspectionRevision.Initial);
+        await orchestrator.WaitForDrainAsync(runs[1]);
+        Assert.AreEqual(GateProcessingAdmissionStatus.Accepted,
+            orchestrator.OpenRun(new(inspection, runs[2], [Stream(2)], CompilePlan())));
+        var thirdGeneration = new GatePreparedOperationGeneration(4);
+        GatePlanEpochPrepareResult third = orchestrator.PrepareEpoch(inspection, runs[2],
+            CompilePlan(2, "window-2"), new(2), owner, thirdGeneration);
+        reservations[3] = third.Reservation;
+        Assert.AreEqual(GatePreparedReservationResultStatus.Aborted,
+            orchestrator.AbortEpoch(third.Reservation, owner, thirdGeneration).Status);
+
+        Assert.AreEqual(2, orchestrator.Diagnostics.TerminalReservationTombstones);
+        Assert.AreEqual(GatePreparedReservationResultStatus.InvalidReservation,
+            orchestrator.CommitEpoch(reservations[0], owner, new(1)).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.InvalidReservation,
+            orchestrator.CommitEpoch(reservations[1], owner, new(2)).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+            orchestrator.CommitEpoch(reservations[2], owner, refreshedGeneration).Status);
+        Assert.AreEqual(GatePreparedReservationResultStatus.AlreadyAborted,
+            orchestrator.CommitEpoch(reservations[3], owner, thirdGeneration).Status);
     }
 
     [TestMethod]
@@ -1039,10 +1152,13 @@ public sealed class CommittedGateProcessingOrchestratorTests
         orchestrator.NotifyCommitted(new(fixture.Identity(0), commit.Revision));
         await provider.FirstRead.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await orchestrator.DisposeAsync();
-        GateProcessingRunDiagnostics failed = orchestrator.Diagnostics.ActiveRuns.Single();
-        Assert.AreEqual(0L, failed.WorkPending);
-        Assert.AreEqual(1L, failed.Plans.Single().TerminallyFailed);
-        Assert.IsTrue(failed.Plans.Single().IsLosslessBalanced);
+        GateProcessingDiagnostics closed = orchestrator.Diagnostics;
+        Assert.AreEqual(GateProcessingLifecycleState.Closed, closed.State);
+        Assert.IsEmpty(closed.ActiveRuns); Assert.IsEmpty(closed.TerminalRuns);
+        Assert.AreEqual(0, closed.ActiveWorkers); Assert.AreEqual(0, closed.ActiveCallbacks);
+        Assert.AreEqual(0, closed.ActiveLeases);
+        Assert.AreEqual(1L, closed.UnitsAdmitted); Assert.AreEqual(1L, closed.FailedRuns);
+        Assert.AreEqual(0L, closed.EvaluationsStarted);
         _ = await fixture.Writer.SealRunAsync(); fixture.MarkSealed();
     }
 
@@ -1097,10 +1213,13 @@ public sealed class CommittedGateProcessingOrchestratorTests
         Assert.AreEqual(orchestrator.Diagnostics.LeasesAcquired, orchestrator.Diagnostics.LeasesReleased);
         Assert.AreEqual(0, orchestrator.Diagnostics.ActiveLeases);
         Assert.AreEqual(0, pool.Snapshot.ActiveRentals);
-        GateProcessingRunDiagnostics balance = orchestrator.Diagnostics.ActiveRuns.SingleOrDefault()
-            ?? orchestrator.Diagnostics.TerminalRuns.Single();
-        Assert.AreEqual(balance.WorkAdmitted, balance.WorkTerminal);
-        Assert.IsTrue(balance.Plans.All(x => x.IsLosslessBalanced));
+        Assert.AreEqual(GateProcessingLifecycleState.Closed, orchestrator.Diagnostics.State);
+        Assert.IsEmpty(orchestrator.Diagnostics.ActiveRuns);
+        Assert.IsEmpty(orchestrator.Diagnostics.TerminalRuns);
+        Assert.AreEqual(1L, orchestrator.Diagnostics.UnitsAdmitted);
+        Assert.AreEqual(1L, orchestrator.Diagnostics.EvaluationsStarted);
+        Assert.AreEqual(1L, orchestrator.Diagnostics.EvaluationsCompleted +
+            orchestrator.Diagnostics.EvaluationsCancelled + orchestrator.Diagnostics.EvaluationsFailed);
         if (!fixture.IsSealed) { _ = await fixture.Writer.SealRunAsync(); fixture.MarkSealed(); }
     }
 
@@ -1170,11 +1289,15 @@ public sealed class CommittedGateProcessingOrchestratorTests
         await sink.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Task dispose = orchestrator.DisposeAsync().AsTask(); Assert.IsFalse(dispose.IsCompleted);
         sink.Release.TrySetResult(); await dispose.WaitAsync(TimeSpan.FromSeconds(10));
-        GateProcessingRunDiagnostics failed = orchestrator.Diagnostics.ActiveRuns.Single();
-        Assert.AreEqual(1L, failed.WorkAdmitted); Assert.AreEqual(1L, failed.WorkTerminal);
-        Assert.AreEqual(1L, failed.Plans.Single().TerminallyFailed);
-        Assert.AreEqual(0L, failed.Plans.Single().EvaluatedAndDelivered);
-        Assert.IsTrue(failed.Plans.Single().IsLosslessBalanced);
+        GateProcessingDiagnostics closed = orchestrator.Diagnostics;
+        Assert.AreEqual(GateProcessingLifecycleState.Closed, closed.State);
+        Assert.IsEmpty(closed.ActiveRuns); Assert.IsEmpty(closed.TerminalRuns);
+        Assert.AreEqual(0, closed.ActiveWorkers); Assert.AreEqual(0, closed.ActiveCallbacks);
+        Assert.AreEqual(0, closed.ActiveLeases);
+        Assert.AreEqual(1L, closed.UnitsAdmitted);
+        Assert.AreEqual(1L, closed.BatchesFailed);
+        Assert.AreEqual(1L, closed.CallbacksAdmitted);
+        Assert.AreEqual(closed.CallbacksAdmitted, closed.CallbacksCompleted);
         _ = await fixture.Writer.SealRunAsync(); fixture.MarkSealed();
     }
 

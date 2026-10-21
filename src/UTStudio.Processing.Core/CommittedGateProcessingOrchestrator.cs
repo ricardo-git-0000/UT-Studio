@@ -33,6 +33,16 @@ public sealed record GateProcessingOptions
     public int MaximumMetadataUnits => checked(MaximumRuns * (MaximumStreamsPerRun + MaximumPlanEpochsPerRun));
 }
 
+internal readonly record struct GatePlanEpochTerminalTombstone(
+    GatePreparedReservationId Id,
+    GatePreparedReservationOwner Owner,
+    GatePreparedOperationGeneration Generation,
+    GatePreparedReservationState State,
+    AcquisitionRunId RunId)
+{
+    internal GatePreparedReservation Snapshot() => new(Id, Owner, Generation, State);
+}
+
 /// <summary>Bounded, sample-free post-commit reconciler. One worker preserves revision order.</summary>
 public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessingIngress,
     IPreparedGatePlanEpochPort, IAsyncDisposable
@@ -45,6 +55,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
     private readonly GateProcessingOptions _options;
     private readonly Dictionary<AcquisitionRunId, RunState> _runs = [];
     private readonly Dictionary<GatePreparedReservationId, PreparedEpoch> _preparedEpochs = [];
+    private readonly GatePlanEpochTerminalTombstone[] _terminalEpochTombstones;
     private readonly Queue<GateProcessingRunDiagnostics> _terminalRuns = [];
     private readonly SemaphoreSlim _wake = new(0, 1);
     private readonly CancellationTokenSource _exceptionalCancellation = new();
@@ -59,6 +70,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         _drainedRuns, _failedRuns;
     private int _activeLeases, _activeWorkers, _activeCallbacks;
     private int _peakSchedulerDepth;
+    private int _terminalEpochTombstoneCount;
     private GateProcessingError? _primaryError;
     private readonly List<GateProcessingError> _secondaryErrors = [];
 
@@ -70,6 +82,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _evaluator = evaluator ?? throw new ArgumentNullException(nameof(evaluator));
         _options = options ?? new();
+        _terminalEpochTombstones = new GatePlanEpochTerminalTombstone[_options.MaximumRuns];
         _state = GateProcessingLifecycleState.Running;
         _worker = WorkerLoopAsync();
     }
@@ -165,21 +178,13 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
             return GatePlanEpochPrepareResult.Rejected(GatePlanEpochPrepareStatus.DuplicatePlan);
 
         run.Epochs.EnsureCapacity(run.Epochs.Count + 1);
-        run.Reservations.EnsureCapacity(2);
         _preparedEpochs.EnsureCapacity(_preparedEpochs.Count + 1);
         var epoch = new PlanEpoch(effectiveFromInclusive, plan, new());
         var id = new GatePreparedReservationId(Guid.NewGuid());
         var prepared = new PreparedEpoch(id, owner, generation, run, epoch);
-        if (!run.Reservations.Add(id))
-            throw new InvalidOperationException("The prepared epoch reservation identifier collided.");
-        try { _preparedEpochs.Add(id, prepared); }
-        catch
-        {
-            run.Reservations.Remove(id);
-            throw;
-        }
+        _preparedEpochs.Add(id, prepared);
         run.PreparedEpoch = prepared;
-        RetirePreviousTerminal(run, except: id);
+        RemoveTerminalTombstone(runId);
         return GatePlanEpochPrepareResult.Prepared(prepared.Snapshot());
     }
 
@@ -204,7 +209,19 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         if (!reservation.IsValid)
             return GatePreparedReservationResult.Classify(default, owner, generation, operation);
         if (!_preparedEpochs.TryGetValue(reservation.Id, out PreparedEpoch? prepared))
-            return GatePreparedReservationResult.Classify(default, owner, generation, operation);
+        {
+            GatePreparedReservation terminal = FindTerminalTombstone(reservation.Id);
+            if (!terminal.IsValid)
+                return GatePreparedReservationResult.Classify(default, owner, generation, operation);
+            GatePreparedReservationResult replay = GatePreparedReservationResult.Classify(
+                terminal, owner, generation, operation);
+            if (replay.Status == GatePreparedReservationResultStatus.OwnerOrGenerationMismatch)
+                return replay;
+            if (reservation.Owner != terminal.Owner || reservation.Generation != terminal.Generation)
+                return GatePreparedReservationResult.Classify(
+                    terminal, reservation.Owner, reservation.Generation, operation);
+            return replay;
+        }
         GatePreparedReservation current = prepared.Snapshot();
         GatePreparedReservationResult classified = GatePreparedReservationResult.Classify(
             current, owner, generation, operation);
@@ -216,15 +233,15 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         if (classified.Status == GatePreparedReservationResultStatus.Committed)
         {
             prepared.Run.Epochs.Add(prepared.Epoch);
-            prepared.State = GatePreparedReservationState.Committed;
             prepared.Run.PreparedEpoch = null;
-            prepared.Run.TerminalReservation = prepared.Id;
+            _preparedEpochs.Remove(prepared.Id);
+            StoreTerminalTombstone(prepared, GatePreparedReservationState.Committed);
         }
         else if (classified.Status == GatePreparedReservationResultStatus.Aborted)
         {
-            prepared.State = GatePreparedReservationState.Aborted;
             prepared.Run.PreparedEpoch = null;
-            prepared.Run.TerminalReservation = prepared.Id;
+            _preparedEpochs.Remove(prepared.Id);
+            StoreTerminalTombstone(prepared, GatePreparedReservationState.Aborted);
         }
         return classified;
     }
@@ -317,8 +334,6 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                 {
                     GateProcessingRunDiagnostics terminal = SnapshotRun(run);
                     _runs.Remove(runId);
-                    foreach (GatePreparedReservationId reservation in run.Reservations)
-                        _preparedEpochs.Remove(reservation);
                     if (_options.MaximumTerminalRunSummaries > 0)
                     {
                         while (_terminalRuns.Count >= _options.MaximumTerminalRunSummaries) { _terminalRuns.Dequeue(); }
@@ -345,7 +360,8 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                     _runs.Values.Count(x => !x.AdmissionClosed), _drainedRuns, _failedRuns,
                     Array.AsReadOnly(_runs.Values.Select(SnapshotRun).ToArray()),
                     Array.AsReadOnly(_terminalRuns.ToArray()),
-                    _primaryError, Array.AsReadOnly(_secondaryErrors.ToArray()));
+                    _primaryError, Array.AsReadOnly(_secondaryErrors.ToArray()),
+                    _terminalEpochTombstoneCount, _terminalEpochTombstones.Length);
             }
         }
     }
@@ -649,7 +665,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
             hasPreparedEpoch: run.PreparedEpoch is not null,
             provisionalEpochSlots: run.PreparedEpoch is null ? 0 : 1,
             preparedEpochPins: run.PreparedEpoch is null ? 0 : 1,
-            terminalReservationTombstones: run.TerminalReservation.HasValue ? 1 : 0,
+            terminalReservationTombstones: HasTerminalTombstone(run.Registration.RunId) ? 1 : 0,
             structuralEpochSlots: run.Epochs.Count, maximumEpochSlots: run.MaximumEpochs,
             run.LastError);
     }
@@ -722,11 +738,10 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
                 }
                 else { _state = GateProcessingLifecycleState.Closed; }
                 _preparedEpochs.Clear();
-                foreach (RunState run in _runs.Values)
-                {
-                    run.Reservations.Clear();
-                    run.TerminalReservation = null;
-                }
+                _runs.Clear();
+                _terminalRuns.Clear();
+                _primaryError = null;
+                _secondaryErrors.Clear();
             }
             _exceptionalCancellation.Dispose(); _wake.Dispose();
             if (cleanupFailure is null) { completion.TrySetResult(); }
@@ -742,9 +757,7 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         internal Dictionary<UtStreamIdentity, InspectionRevision> Watermarks { get; } =
             registration.Streams.ToDictionary(x => x, _ => InspectionRevision.Initial);
         internal List<PlanEpoch> Epochs { get; } = [new(InspectionRevision.Initial, registration.Plan, new())];
-        internal HashSet<GatePreparedReservationId> Reservations { get; } = [];
         internal PreparedEpoch? PreparedEpoch;
-        internal GatePreparedReservationId? TerminalReservation;
         internal int MaximumEpochs { get; } = maximumEpochs;
         internal InspectionRevision Cursor, Target, Observed;
         internal InspectionRevision PendingRevision;
@@ -768,17 +781,51 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
     {
         PreparedEpoch? prepared = run.PreparedEpoch;
         if (prepared is null) return;
-        prepared.State = GatePreparedReservationState.Aborted;
         run.PreparedEpoch = null;
-        run.TerminalReservation = prepared.Id;
+        _preparedEpochs.Remove(prepared.Id);
+        StoreTerminalTombstone(prepared, GatePreparedReservationState.Aborted);
     }
 
-    private void RetirePreviousTerminal(RunState run, GatePreparedReservationId except)
+    private void StoreTerminalTombstone(PreparedEpoch prepared, GatePreparedReservationState state)
     {
-        if (run.TerminalReservation is not { } terminal || terminal == except) return;
-        _preparedEpochs.Remove(terminal);
-        run.Reservations.Remove(terminal);
-        run.TerminalReservation = null;
+        AcquisitionRunId runId = prepared.Run.Registration.RunId;
+        RemoveTerminalTombstone(runId);
+        if (_terminalEpochTombstoneCount == _terminalEpochTombstones.Length)
+        {
+            Array.Copy(_terminalEpochTombstones, 1, _terminalEpochTombstones, 0,
+                _terminalEpochTombstones.Length - 1);
+            _terminalEpochTombstoneCount--;
+        }
+        _terminalEpochTombstones[_terminalEpochTombstoneCount++] =
+            new(prepared.Id, prepared.Owner, prepared.Generation, state, runId);
+    }
+
+    private void RemoveTerminalTombstone(AcquisitionRunId runId)
+    {
+        for (int index = 0; index < _terminalEpochTombstoneCount; index++)
+        {
+            if (_terminalEpochTombstones[index].RunId != runId) continue;
+            Array.Copy(_terminalEpochTombstones, index + 1, _terminalEpochTombstones, index,
+                _terminalEpochTombstoneCount - index - 1);
+            _terminalEpochTombstones[_terminalEpochTombstoneCount - 1] = default;
+            _terminalEpochTombstoneCount--;
+            return;
+        }
+    }
+
+    private GatePreparedReservation FindTerminalTombstone(GatePreparedReservationId id)
+    {
+        for (int index = 0; index < _terminalEpochTombstoneCount; index++)
+            if (_terminalEpochTombstones[index].Id == id)
+                return _terminalEpochTombstones[index].Snapshot();
+        return default;
+    }
+
+    private bool HasTerminalTombstone(AcquisitionRunId runId)
+    {
+        for (int index = 0; index < _terminalEpochTombstoneCount; index++)
+            if (_terminalEpochTombstones[index].RunId == runId) return true;
+        return false;
     }
 
     private sealed class PreparedEpoch(GatePreparedReservationId id, GatePreparedReservationOwner owner,
@@ -789,8 +836,8 @@ public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessi
         internal GatePreparedOperationGeneration Generation { get; } = generation;
         internal RunState Run { get; } = run;
         internal PlanEpoch Epoch { get; } = epoch;
-        internal GatePreparedReservationState State = GatePreparedReservationState.Prepared;
-        internal GatePreparedReservation Snapshot() => new(Id, Owner, Generation, State);
+        internal GatePreparedReservation Snapshot() =>
+            new(Id, Owner, Generation, GatePreparedReservationState.Prepared);
     }
     private sealed class MutablePlanBalance
     {

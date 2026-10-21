@@ -179,8 +179,12 @@ public sealed class GateProcessingDiagnostics
         int activeWorkers, int activeCallbacks, int schedulerDepth, int peakSchedulerDepth, int schedulerCapacity,
         int openRuns, long drainedRuns, long failedRuns, IReadOnlyList<GateProcessingRunDiagnostics> activeRuns,
         IReadOnlyList<GateProcessingRunDiagnostics> terminalRuns, GateProcessingError? primaryError,
-        IReadOnlyList<GateProcessingError> secondaryErrors)
+        IReadOnlyList<GateProcessingError> secondaryErrors, int terminalReservationTombstones = 0,
+        int terminalReservationTombstoneCapacity = 0)
     {
+        if (terminalReservationTombstones < 0 || terminalReservationTombstoneCapacity < 0 ||
+            terminalReservationTombstones > terminalReservationTombstoneCapacity)
+            throw new ArgumentException("Terminal reservation tombstone diagnostics are inconsistent.");
         State = state; SignalsReceived = signalsReceived; SignalsCoalesced = signalsCoalesced;
         DuplicateSignals = duplicateSignals; LateSignals = lateSignals; UnitsAdmitted = unitsAdmitted;
         UnitsRejected = unitsRejected; Saturations = saturations; RevisionsObserved = revisionsObserved;
@@ -199,6 +203,8 @@ public sealed class GateProcessingDiagnostics
         TerminalRuns = Array.AsReadOnly((terminalRuns ?? throw new ArgumentNullException(nameof(terminalRuns))).ToArray());
         PrimaryError = primaryError;
         SecondaryErrors = secondaryErrors ?? throw new ArgumentNullException(nameof(secondaryErrors));
+        TerminalReservationTombstones = terminalReservationTombstones;
+        TerminalReservationTombstoneCapacity = terminalReservationTombstoneCapacity;
     }
     public GateProcessingLifecycleState State { get; }
     public long SignalsReceived { get; }
@@ -241,4 +247,6 @@ public sealed class GateProcessingDiagnostics
     public IReadOnlyList<GateProcessingRunDiagnostics> TerminalRuns { get; }
     public GateProcessingError? PrimaryError { get; }
     public IReadOnlyList<GateProcessingError> SecondaryErrors { get; }
+    public int TerminalReservationTombstones { get; }
+    public int TerminalReservationTombstoneCapacity { get; }
 }
