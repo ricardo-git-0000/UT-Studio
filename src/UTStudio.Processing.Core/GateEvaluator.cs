@@ -77,16 +77,7 @@ public sealed class GateEvaluator
     }
 
     public static double ConvertNormalizedThreshold(GateSignalDomain domain, double normalized)
-    {
-        if (!double.IsFinite(normalized) || normalized is < 0 or > 1) { throw new ArgumentOutOfRangeException(nameof(normalized)); }
-        return domain switch
-        {
-            GateSignalDomain.RawSigned => -32768d + 65535d * normalized,
-            GateSignalDomain.Positive => 32767d * normalized,
-            GateSignalDomain.NegativeMagnitude or GateSignalDomain.Absolute => 32768d * normalized,
-            _ => throw new ArgumentOutOfRangeException(nameof(domain))
-        };
-    }
+        => GateThresholdScale.ToSignalCounts(domain, normalized);
 
     private GateEvaluationEntry EvaluateGate(CompiledGatePlan plan, ConfirmedGateTraceDescriptor trace,
         CompiledGate gate, ReadOnlySpan<short> samples, GateScratchBuffer? scratch,
