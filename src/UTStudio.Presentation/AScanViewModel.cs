@@ -388,11 +388,13 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
 
     private bool ReplaceState(AScanViewState state)
     {
+        state = state with { VisualContent = CreateVisualContent(state, _publishedViewportBinding) };
         if (IsClosing || _lifetime.IsClosed || state == _state) { return false; }
         _state = state;
         foreach (string name in new[] { nameof(State), nameof(Session), nameof(AScan), nameof(Points), nameof(Metadata),
             nameof(VisualStatistics), nameof(VisualStatus), nameof(Cursors), nameof(ReceivedFrames),
-            nameof(ReleasedFrames), nameof(Error), nameof(VisualError), nameof(DisplayMode), nameof(Selection) })
+            nameof(ReleasedFrames), nameof(Error), nameof(VisualError), nameof(DisplayMode), nameof(Selection),
+            nameof(CompositeVisual) })
         {
             OnPropertyChanged(name);
         }
@@ -482,7 +484,19 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         ScanTimeViewportBinding? current = ViewportBinding;
         if (EqualityComparer<ScanTimeViewportBinding?>.Default.Equals(_publishedViewportBinding, current)) { return; }
         _publishedViewportBinding = current;
+        _state = _state with { ViewportBinding = current };
+        _state = _state with { VisualContent = CreateVisualContent(_state, current) };
+        OnPropertyChanged(nameof(State));
         OnPropertyChanged(nameof(ViewportBinding));
+    }
+
+    private static AScanVisualContentSnapshot? CreateVisualContent(AScanViewState state,
+        ScanTimeViewportBinding? binding)
+    {
+        if (state.AScan is not { } signal || binding is null ||
+            binding.RunId != signal.Metadata.RunId || binding.SnapshotVersion != signal.Version) return null;
+        var content = new AScanVisualContentSnapshot(signal, state.Cursors, binding);
+        return content.IsCoherent ? content : null;
     }
 
     public ValueTask DisposeAsync()

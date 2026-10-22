@@ -20,8 +20,7 @@
       <Button Content="Restablecer zoom" Command="{Binding ResetViewportCommand}" Padding="16,8" Margin="0,0,8,0" AutomationProperties.HelpText="Atajo Home"/>
       <Button Content="Live" Command="{Binding ReturnToLiveCommand}" Padding="12,8"/>
     </StackPanel>
-    <controls:AScanControl x:Name="Scan" Grid.Row="1" Snapshot="{Binding AScan}" CursorState="{Binding Cursors}"
-      ViewportBinding="{Binding ViewportBinding}" AutomationProperties.Name="Gráfico A-Scan"
+    <controls:AScanControl x:Name="Scan" Grid.Row="1" AutomationProperties.Name="Gráfico A-Scan"
       CursorActivated="OnCursorActivated" CursorMoveRequested="OnCursorMoveRequested"
       TimeZoomRequested="OnTimeZoomRequested" TimePanRequested="OnTimePanRequested" TimeResetRequested="OnTimeResetRequested"/>
     <StackPanel Grid.Row="2" Margin="0,12,0,0">

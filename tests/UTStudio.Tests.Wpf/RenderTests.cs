@@ -44,10 +44,6 @@ public sealed class RenderTests
             window.Arrange(new Rect(0, 0, 1100, 680));
             window.UpdateLayout();
             await Dispatcher.Yield(DispatcherPriority.DataBind);
-            control.Snapshot = frozenSnapshot;
-            control.CursorState = AScanCursorMeasurements.Create(frozenSnapshot);
-            control.ViewportBinding = new(frozenSnapshot.Metadata.RunId, frozenSnapshot.Version,
-                ScanTimeViewportOperations.Create(frozenSnapshot.MinimumTimeSeconds, frozenSnapshot.MaximumTimeSeconds));
             control.RefreshSnapshot();
             clock.Advance(AScanVisualDelivery.MinimumPublicationInterval);
             await DiagnosticWait.Until(() => control.DisplayedCursorSnapshotVersion == frozenSnapshot.Version,
@@ -57,10 +53,10 @@ public sealed class RenderTests
             Assert.AreEqual(frozenSnapshot.Version, control.DisplayedCursorSnapshotVersion);
             var visualVm = window.AScan.ViewModel!;
             Assert.IsNotNull(visualVm.Cursors);
-            Assert.IsNotNull(control.CursorState);
+            Assert.IsNotNull(control.DisplayedVisualSnapshot?.Cursors);
             window.Activate();
             double cursorAX = 64 + Math.Max(0, control.ActualWidth - 84) *
-                (control.CursorState.A.TimeSeconds - frozenSnapshot.MinimumTimeSeconds) /
+                (control.DisplayedVisualSnapshot!.Cursors!.A.TimeSeconds - frozenSnapshot.MinimumTimeSeconds) /
                 (frozenSnapshot.MaximumTimeSeconds - frozenSnapshot.MinimumTimeSeconds);
             Assert.IsTrue(Mouse.Capture(control, CaptureMode.Element));
             Assert.IsTrue(control.BeginCursorDrag(new Point(cursorAX, 120)));

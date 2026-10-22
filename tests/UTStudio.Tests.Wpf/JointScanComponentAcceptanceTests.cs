@@ -91,14 +91,14 @@ public sealed class JointScanComponentAcceptanceTests
             a.ViewModel!.ZoomTime(a.State.AScan.MinimumTimeSeconds, 2);
             await DiagnosticWait.Until(() => fixture.Viewport.Viewport is not null &&
                 fixture.Viewport.Viewport != beforeZoom &&
-                a.Renderer.ViewportBinding?.Viewport == fixture.Viewport.Viewport &&
+                a.Renderer.DisplayedVisualSnapshot?.Transform.TimeViewport == fixture.Viewport.Viewport &&
                 b.State?.TimeViewportBinding?.Viewport == fixture.Viewport.Viewport,
                 "bidirectional shared viewport publication");
             phase = "B initiated viewport";
             ScanTimeViewport fromA = fixture.Viewport.Viewport!;
             b.ViewModel!.ZoomTimeAt(fromA.VisibleMaximumSeconds, 2);
             await DiagnosticWait.Until(() => fixture.Viewport.Viewport is { } fromB && fromB != fromA &&
-                a.Renderer.ViewportBinding?.Viewport == fromB,
+                a.Renderer.DisplayedVisualSnapshot?.Transform.TimeViewport == fromB,
                 "B initiated viewport change is reflected by A");
 
             phase = "return to live";

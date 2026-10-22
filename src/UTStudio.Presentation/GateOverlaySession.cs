@@ -201,7 +201,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
             double clamped = Math.Clamp(value, handle.Minimum, handle.Maximum);
             _capturedHandleState = new(handle.GateId, handle.GateRevision, handle.Kind, handle.X, handle.Y,
                 clamped, handle.Unit, handle.Minimum, handle.Maximum, handle.Step,
-                handle.IsSelected, handle.IsFocused, handle.IsEnabled);
+                handle.IsSelected, handle.IsFocused, handle.IsEnabled, handle.AnchorGateId, handle.AnchorRevision);
             next = ChangeDraft(draft, capture.GateId, capture.Handle, clamped);
         }
         // Draft changes caused by this capture intentionally do not advance the external context or nonce.
@@ -473,21 +473,24 @@ public sealed class GateOverlaySession : IAsyncDisposable
         {
             GateDefinition? definition = draft.Gates.FirstOrDefault(x => x.Id == item.GateId);
             if (definition is null) continue;
+            GateGeometryItemSnapshot? exact = _stableGeometry?.Gates.FirstOrDefault(x => x.GateId == item.GateId);
+            GateId anchorGateId = exact?.Anchor?.GateId ?? default;
+            GateRevision anchorRevision = exact?.Anchor?.GateRevision ?? default;
             bool selected = _selectedGate == item.GateId;
             if (item.StartCoordinate is { } start) handles.Add(new(item.GateId, item.GateRevision,
                 GateHandleKind.Start, start, middleY, definition.Window.StartOffsetSeconds, "s",
                 -relativeLimit, definition.Window.StartOffsetSeconds + definition.Window.DurationSeconds - timeStep,
-                timeStep, selected, selected && _focusedHandle == GateHandleKind.Start, true));
+                timeStep, selected, selected && _focusedHandle == GateHandleKind.Start, true, anchorGateId, anchorRevision));
             if (item.EndCoordinate is { } end) handles.Add(new(item.GateId, item.GateRevision,
                 GateHandleKind.End, end, middleY, definition.Window.StartOffsetSeconds + definition.Window.DurationSeconds, "s",
                 definition.Window.StartOffsetSeconds + timeStep, relativeLimit,
-                timeStep, selected, selected && _focusedHandle == GateHandleKind.End, true));
+                timeStep, selected, selected && _focusedHandle == GateHandleKind.End, true, anchorGateId, anchorRevision));
             if (item.StartCoordinate is { } thresholdStart && item.EndCoordinate is { } thresholdEnd &&
                 item.Thresholds.FirstOrDefault() is { } threshold && definition.Detector.Threshold is { } gateThreshold)
                 handles.Add(new(item.GateId, item.GateRevision, GateHandleKind.Threshold,
                     (thresholdStart + thresholdEnd) / 2d,
                     threshold.Coordinate, gateThreshold.NormalizedValue, "normalized", 0, 1, .01, selected,
-                    selected && _focusedHandle == GateHandleKind.Threshold, true));
+                    selected && _focusedHandle == GateHandleKind.Threshold, true, anchorGateId, anchorRevision));
         }
         return handles;
     }

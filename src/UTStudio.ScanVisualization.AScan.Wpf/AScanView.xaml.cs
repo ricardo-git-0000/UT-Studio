@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.ComponentModel;
+using System.Windows.Media;
 using UTStudio.Presentation;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
@@ -23,8 +24,13 @@ public partial class AScanView : UserControl, IAsyncDisposable
     private AScanViewModel? _viewModel;
     private Task? _close;
     private bool _contextAssigned;
+    private readonly AScanVisualSnapshotAdapter _visualAdapter = new();
 
-    public AScanView() { InitializeComponent(); Loaded += OnLoaded; }
+    public AScanView()
+    {
+        InitializeComponent(); Loaded += OnLoaded; SizeChanged += OnVisualContextChanged;
+        Scan.VisualContextChanged += OnVisualContextChanged;
+    }
     public AScanComponentContext? Context { get => (AScanComponentContext?)GetValue(ContextProperty); set => SetValue(ContextProperty, value); }
     public AScanViewState? State => (AScanViewState?)GetValue(StateProperty);
     public UtSourceError? Error => (UtSourceError?)GetValue(ErrorProperty);
@@ -58,6 +64,7 @@ public partial class AScanView : UserControl, IAsyncDisposable
         Root.DataContext = _viewModel;
         _viewModel.PropertyChanged += OnViewModelChanged;
         PublishState();
+        PublishVisualSnapshot();
         foreach (KeyBinding binding in InputBindings.OfType<KeyBinding>())
         {
             binding.Command = (binding.Key, binding.Modifiers) switch
@@ -92,9 +99,9 @@ public partial class AScanView : UserControl, IAsyncDisposable
         _viewModel = null;
         if (viewModel is not null) { viewModel.PropertyChanged -= OnViewModelChanged; }
         Root.DataContext = null;
-        Scan.Snapshot = null;
-        Scan.CursorState = null;
-        Scan.ViewportBinding = null;
+        Scan.VisualSnapshot = null;
+        Scan.VisualContextChanged -= OnVisualContextChanged;
+        SizeChanged -= OnVisualContextChanged;
         SetValue(StatePropertyKey, null);
         SetValue(ErrorPropertyKey, null);
         if (viewModel is not null)
@@ -108,11 +115,22 @@ public partial class AScanView : UserControl, IAsyncDisposable
         }
     }
 
-    private void OnViewModelChanged(object? sender, PropertyChangedEventArgs args) => PublishState();
+    private void OnViewModelChanged(object? sender, PropertyChangedEventArgs args)
+    { PublishState(); PublishVisualSnapshot(); }
     private void PublishState()
     {
         SetValue(StatePropertyKey, _viewModel?.State);
         SetValue(ErrorPropertyKey, _viewModel?.Error ?? _viewModel?.VisualError ?? _viewModel?.NotificationError);
+    }
+
+    private void OnVisualContextChanged(object? sender, EventArgs args) => PublishVisualSnapshot();
+
+    private void PublishVisualSnapshot()
+    {
+        if (_close is not null || Scan.ActualWidth <= 0 || Scan.ActualHeight <= 0) return;
+        DpiScale dpi = VisualTreeHelper.GetDpi(Scan);
+        Scan.VisualSnapshot = _visualAdapter.Adapt(_viewModel?.State, Scan.ActualWidth, Scan.ActualHeight,
+            dpi.DpiScaleX, dpi.DpiScaleY);
     }
 
     public ValueTask DisposeAsync() => new(CloseAsync());

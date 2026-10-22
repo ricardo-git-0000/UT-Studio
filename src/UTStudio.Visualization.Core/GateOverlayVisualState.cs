@@ -9,6 +9,17 @@ namespace UTStudio.Visualization.Core;
 public enum GateHandleKind { Unknown, Start, End, Threshold }
 public enum GateOverlayGeometryStatus { Unknown, NotRequested, Evaluating, Current, Stale, Unavailable, Closed, Faulted }
 public enum PortablePointerCaptureOwner { None, Cursor, Gate }
+public enum GateOverlayInteractionKind
+{
+    Select, FocusPrevious, FocusNext, BeginCapture, MoveCapture, EndCapture,
+    Decrement, Increment, ConfirmPreview, CancelPreview
+}
+
+public readonly record struct GateHandleLogicalIdentity(
+    GateId GateId, GateRevision GateRevision, GateHandleKind Kind)
+{
+    public bool IsValid => GateId.IsValid && GateRevision.IsValid && Kind != GateHandleKind.Unknown;
+}
 
 public readonly record struct GateVisualTransform
 {
@@ -61,7 +72,8 @@ public sealed class GateHandleVisualState
 {
     public GateHandleVisualState(GateId gateId, GateRevision gateRevision, GateHandleKind kind,
         double x, double y, double value, string unit, double minimum, double maximum, double step,
-        bool isSelected, bool isFocused, bool isEnabled)
+        bool isSelected, bool isFocused, bool isEnabled,
+        GateId anchorGateId = default, GateRevision anchorRevision = default)
     {
         if (!gateId.IsValid || !gateRevision.IsValid || kind == GateHandleKind.Unknown ||
             !double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(value) || string.IsNullOrWhiteSpace(unit) ||
@@ -71,6 +83,7 @@ public sealed class GateHandleVisualState
         GateId = gateId; GateRevision = gateRevision; Kind = kind; X = x; Y = y; Value = value;
         Unit = unit; Minimum = minimum; Maximum = maximum; Step = step; IsSelected = isSelected;
         IsFocused = isFocused; IsEnabled = isEnabled;
+        AnchorGateId = anchorGateId; AnchorRevision = anchorRevision;
     }
     public GateId GateId { get; }
     public GateRevision GateRevision { get; }
@@ -85,6 +98,9 @@ public sealed class GateHandleVisualState
     public bool IsSelected { get; }
     public bool IsFocused { get; }
     public bool IsEnabled { get; }
+    public GateId AnchorGateId { get; }
+    public GateRevision AnchorRevision { get; }
+    public GateHandleLogicalIdentity Identity => new(GateId, GateRevision, Kind);
 }
 
 public sealed class GateOverlayVisualSnapshot
@@ -129,11 +145,13 @@ public sealed class AScanCompositeVisualSnapshot
         GateOverlayVisualSnapshot gates, GateVisualTransform transform)
     {
         ArgumentNullException.ThrowIfNull(signal); ArgumentNullException.ThrowIfNull(gates);
-        if (signal.TraceIdentity is not { IsValid: true } trace ||
-            signal.InspectionRevision == InspectionRevision.Initial ||
-            cursors is not null && (cursors.RunId != signal.Metadata.RunId || cursors.SnapshotVersion != signal.Version) ||
-            gates.Status is GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating &&
-                (gates.TraceIdentity != trace || gates.InspectionRevision != signal.InspectionRevision) ||
+        bool hasAuthority = signal.TraceIdentity is { IsValid: true } &&
+            signal.InspectionRevision != InspectionRevision.Initial;
+        if (cursors is not null && (cursors.RunId != signal.Metadata.RunId || cursors.SnapshotVersion != signal.Version) ||
+            !hasAuthority && (gates.Status != GateOverlayGeometryStatus.NotRequested || gates.Source is not null ||
+                gates.Gates.Count != 0 || gates.Handles.Count != 0 || gates.Capture is not null) ||
+            hasAuthority && gates.Status is GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating &&
+                (gates.TraceIdentity != signal.TraceIdentity || gates.InspectionRevision != signal.InspectionRevision) ||
             gates.Status is not (GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating) &&
                 gates.Gates.Count != 0)
             throw new ArgumentException("Signal, cursors, gates, and transform must describe one coherent visual state.");
@@ -143,6 +161,8 @@ public sealed class AScanCompositeVisualSnapshot
     public AScanCursorState? Cursors { get; }
     public GateOverlayVisualSnapshot Gates { get; }
     public GateVisualTransform Transform { get; }
+    public bool HasAuthoritativeIdentity => Signal.TraceIdentity is { IsValid: true } &&
+        Signal.InspectionRevision != InspectionRevision.Initial;
 }
 
 public static class GateOverlayHitTester
