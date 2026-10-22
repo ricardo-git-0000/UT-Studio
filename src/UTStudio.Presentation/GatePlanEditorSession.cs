@@ -15,6 +15,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
     private readonly IGatePlanAuthorityReader _authority;
     private readonly IGatePlanPreviewCompiler _previewCompiler;
     private readonly SnapshotStream _snapshots;
+    private readonly GatePreviewWorkspace _previewWorkspace = new();
     private readonly IDisposable _authoritySubscription;
     private readonly Queue<GatePlanEditorSnapshot> _publicationQueue = [];
     private GatePlanEditorSnapshot _current;
@@ -39,6 +40,8 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
     }
 
     public GatePlanEditorSnapshot Snapshot { get { lock (_gate) return _current; } }
+    internal event Action? AuthorityInvalidated;
+    internal event Action<GatePlanEditorSnapshot>? EditorialChanged;
     public IDisposable Subscribe(IObserver<GatePlanEditorSnapshot> observer) => _snapshots.Subscribe(observer);
 
     public GatePlanEditorSnapshot BeginEdit()
@@ -50,6 +53,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             ThrowIfDisposed();
             _editorGeneration++;
             _lastInvalidation = EditorialInvalidation.Superseded;
+            _previewWorkspace.Clear();
             CommittedGatePlanSnapshot committed = _current.Committed;
             var draft = new GatePlanDraft(committed.AuthorityKey, committed.Revision,
                 committed.Plan.SchemaVersion, committed.Plan.AlgorithmVersion, committed.Plan.Gates);
@@ -57,6 +61,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             publish = EnqueueUnderLock(next);
         }
         if (publish) DrainPublications();
+        EditorialChanged?.Invoke(next);
         return next;
     }
 
@@ -70,6 +75,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             ThrowIfDisposed();
             _editorGeneration++;
             _lastInvalidation = EditorialInvalidation.Superseded;
+            _previewWorkspace.ClearCandidate();
             GatePlanDraft existing = _current.Draft ??
                 throw new InvalidOperationException("BeginEdit must create a draft before it can be updated.");
             if (draft.Authority != _authorityKey || draft.BaseRevision != existing.BaseRevision)
@@ -83,6 +89,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             publish = EnqueueUnderLock(next);
         }
         if (publish) DrainPublications();
+        EditorialChanged?.Invoke(next);
         return next;
     }
 
@@ -109,7 +116,8 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
                 publish = EnqueueUnderLock(conflictSnapshot);
             }
         }
-        if (conflictResult is not null) { if (publish) DrainPublications(); return conflictResult; }
+        if (conflictResult is not null)
+        { if (publish) DrainPublications(); EditorialChanged?.Invoke(conflictResult.Snapshot); return conflictResult; }
 
         GatePlanCompilationResult compilation = _previewCompiler.Compile(draft);
         GatePlanAuthorityReadStampResult stampResult = _authority.TryReadStamp(_authorityKey, authorityGeneration);
@@ -147,6 +155,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             else if (compilation.IsCompiled)
             {
                 next = new(_current.Committed, draft, state: GatePlanEditorState.Previewed);
+                _previewWorkspace.Install(draft, compilation.CompiledPlan!);
                 result = GatePlanEditResult.Previewed(next);
                 publish = EnqueueUnderLock(next);
             }
@@ -158,6 +167,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             }
         }
         if (publish) DrainPublications();
+        EditorialChanged?.Invoke(result!.Snapshot);
         return result!;
     }
 
@@ -170,10 +180,12 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             ThrowIfDisposed();
             _editorGeneration++;
             _lastInvalidation = EditorialInvalidation.Cancelled;
+            _previewWorkspace.Clear();
             next = new(_current.Committed, state: GatePlanEditorState.Cancelled);
             publish = EnqueueUnderLock(next);
         }
         if (publish) DrainPublications();
+        EditorialChanged?.Invoke(next);
         return GatePlanEditResult.Cancelled(next);
     }
 
@@ -187,12 +199,14 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             _disposed = true;
             _editorGeneration++;
             _lastInvalidation = EditorialInvalidation.Closed;
+            _previewWorkspace.Clear();
             closed = new(_current.Committed, state: GatePlanEditorState.Closed);
             _completeAfterPublish = true;
             publish = EnqueueUnderLock(closed);
         }
         _authoritySubscription.Dispose();
         if (publish) DrainPublications();
+        EditorialChanged?.Invoke(closed);
     }
 
     private static (GatePlanEditorSnapshot Snapshot, GatePlanEditResult Result) CreateConflict(GatePlanDraft draft,
@@ -240,20 +254,27 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
     {
         CommittedGatePlanSnapshot committed = authoritative.Committed;
         GatePlanEditorSnapshot? next = null;
-        bool publish;
+        bool publish = false;
+        bool invalidate;
         lock (_gate)
         {
             if (_disposed || committed.AuthorityKey != _authorityKey ||
                 authoritative.PublicationSequence.Value <= _authorityCurrent.PublicationSequence.Value) return;
             _authorityCurrent = authoritative;
-            if (committed.Equals(_current.Committed)) return;
-            GatePlanDraft? draft = _current.Draft;
-            next = draft is null ? new(committed, state: GatePlanEditorState.Committed) :
-                new(committed, draft, state: draft.BaseRevision == committed.Revision ?
-                    GatePlanEditorState.Editing : GatePlanEditorState.Stale);
-            publish = EnqueueUnderLock(next);
+            _previewWorkspace.Clear();
+            invalidate = true;
+            if (!committed.Equals(_current.Committed))
+            {
+                GatePlanDraft? draft = _current.Draft;
+                next = draft is null ? new(committed, state: GatePlanEditorState.Committed) :
+                    new(committed, draft, state: draft.BaseRevision == committed.Revision ?
+                        GatePlanEditorState.Editing : GatePlanEditorState.Stale);
+                publish = EnqueueUnderLock(next);
+            }
         }
+        if (invalidate) AuthorityInvalidated?.Invoke();
         if (publish) DrainPublications();
+        if (next is not null) EditorialChanged?.Invoke(next);
     }
 
     private bool EnqueueUnderLock(GatePlanEditorSnapshot snapshot)
@@ -281,6 +302,55 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    internal GatePreviewArtifact? BorrowPreviewCandidate()
+    {
+        lock (_gate)
+        {
+            if (_disposed || _current.State != GatePlanEditorState.Previewed ||
+                _previewWorkspace.Candidate is not { } artifact ||
+                !ReferenceEquals(_current.Draft, artifact.Checkpoint)) return null;
+            return artifact;
+        }
+    }
+
+    internal bool IsCurrentPreviewCandidate(GatePreviewArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (_gate) return !_disposed && _previewWorkspace.IsCurrentCandidate(artifact) &&
+            ReferenceEquals(_current.Draft, artifact.Checkpoint);
+    }
+
+    internal bool PromotePreview(GatePreviewArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (_gate) return !_disposed && ReferenceEquals(_current.Draft, artifact.Checkpoint) &&
+            _previewWorkspace.Promote(artifact);
+    }
+
+    internal void DiscardPreviewCandidate(GatePreviewArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (_gate)
+            if (_previewWorkspace.IsCurrentCandidate(artifact)) _previewWorkspace.ClearCandidate();
+    }
+
+    internal bool RestoreStablePreview(GatePreviewArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        GatePlanEditorSnapshot next; bool publish;
+        lock (_gate)
+        {
+            if (_disposed || !ReferenceEquals(_previewWorkspace.Stable, artifact) ||
+                artifact.Checkpoint.BaseRevision != _current.Committed.Revision) return false;
+            _editorGeneration++; _lastInvalidation = EditorialInvalidation.Superseded;
+            _previewWorkspace.ClearCandidate();
+            next = new(_current.Committed, artifact.Checkpoint, state: GatePlanEditorState.Previewed);
+            publish = EnqueueUnderLock(next);
+        }
+        if (publish) DrainPublications();
+        return true;
+    }
 
     private enum EditorialInvalidation { None, Cancelled, Superseded, Closed }
 

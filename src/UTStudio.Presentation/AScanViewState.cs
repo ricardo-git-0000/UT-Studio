@@ -10,4 +10,5 @@ public sealed record AScanViewState(SessionSnapshot Session, AScanSnapshot? ASca
     AScanDeliveryStatus? VisualStatus = null, AScanCursorState? Cursors = null,
     AScanDisplayMode DisplayMode = AScanDisplayMode.NoData,
     AScanSnapshot? LatestCompatibleLive = null,
-    TraceSelectionState? Selection = null);
+    TraceSelectionState? Selection = null,
+    AScanCompositeVisualSnapshot? CompositeVisual = null);

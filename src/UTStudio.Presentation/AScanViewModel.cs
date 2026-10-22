@@ -131,6 +131,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     public AScanCursorState? Cursors => _state.Cursors;
     public AScanDisplayMode DisplayMode => _state.DisplayMode;
     public TraceSelectionState? Selection => _state.Selection;
+    /// <summary>Reserved portable aggregate for B7B; B7A does not activate WPF bindings.</summary>
+    public AScanCompositeVisualSnapshot? CompositeVisual => _state.CompositeVisual;
     public ScanTimeViewport? TimeViewport => _timeViewport.Viewport;
     public ScanTimeViewportBinding? ViewportBinding => _state.AScan is { } snapshot &&
         _timeViewport.RunId == snapshot.Metadata.RunId && _timeViewport.Viewport is { } viewport
