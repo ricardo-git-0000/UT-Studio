@@ -2,6 +2,9 @@ using System.Windows;
 using System.Windows.Threading;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
+using System.Buffers;
+using System.Threading.Channels;
+using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using UTStudio.Acquisition.Simulator;
@@ -27,15 +30,125 @@ namespace UTStudio.Tests.Wpf;
 public sealed class CompositionTests
 {
     [TestMethod]
-    public Task ProductiveGateProcessingFactoryIsRegisteredWithItsSampleFreeIngress() => StaTest.Run(async () =>
+    public Task Productive_gate_vertical_apply_stop_and_close_is_owned_and_repeatable() => StaTest.Run(async () =>
+    {
+        var lifecycle = new List<string>();
+        var source = new GateControlledSource();
+        var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
+        DesktopRuntime runtime = await DesktopRuntimeFactory.CreateAsync(
+            new WpfUiDispatcher(Dispatcher.CurrentDispatcher), source, configuration,
+            new BScanOptions(4_000_000, 8, 2, 2), TimeProvider.System, lifecycleObserver: lifecycle.Add);
+        bool shutdownCompleted = false;
+        try
+        {
+            static async Task ExecuteWhenEnabled(IAsyncRelayCommand command)
+            {
+                if (!command.CanExecute(null))
+                {
+                    var enabled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    void Changed(object? _, EventArgs __)
+                    { if (command.CanExecute(null)) enabled.TrySetResult(); }
+                    command.CanExecuteChanged += Changed;
+                    try { await enabled.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+                    finally { command.CanExecuteChanged -= Changed; }
+                }
+                await command.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            var services = runtime.Host.Services;
+            var window = services.GetRequiredService<MainWindow>();
+            var host = services.GetRequiredService<AScanHostViewModel>();
+            ProductiveGateInspectionScope scope = services.GetRequiredService<ProductiveGateInspectionScope>();
+            window.Show(); window.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, window.AScan));
+            window.UpdateLayout();
+            await runtime.Host.StartAsync();
+            await host.StartCommand.ExecuteAsync(null);
+            GateEditorViewCoordinator editor = window.AScan.ViewModel!.GateEditor!;
+            var visualReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void ObserveEditor(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+            {
+                if (editor.CompositeVisual?.HasAuthoritativeIdentity == true) visualReady.TrySetResult();
+            }
+            editor.PropertyChanged += ObserveEditor;
+            GateControlledSource.FrameOwner frame = source.QueueFrame();
+            await Task.WhenAll(frame.Returned.Task, visualReady.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            editor.PropertyChanged -= ObserveEditor;
+
+            await ExecuteWhenEnabled(editor.BeginEditCommand);
+            await ExecuteWhenEnabled(editor.PreviewCommand);
+            if (editor.State.Phase != GateEditorViewPhase.Previewed)
+            {
+                var previewed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                void PreviewChanged(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+                { if (editor.State.Phase == GateEditorViewPhase.Previewed) previewed.TrySetResult(); }
+                editor.PropertyChanged += PreviewChanged;
+                try
+                {
+                    await previewed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                catch (TimeoutException error)
+                {
+                    throw new TimeoutException($"Preview did not stabilize: phase={editor.State.Phase}; " +
+                        $"editor={editor.State.Editor.State}; overlay={editor.State.Overlay.Status}; " +
+                        $"source={editor.State.Overlay.Source?.Kind}.", error);
+                }
+                finally { editor.PropertyChanged -= PreviewChanged; }
+            }
+            var authorityCommitted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var before = scope.Authority.Read(scope.AuthorityKey).Committed.Revision;
+            using IDisposable authoritySubscription = scope.Authority.Observe(scope.AuthorityKey).Subscribe(
+                new ActionObserver<GatePlanAuthoritySnapshot>(snapshot =>
+                {
+                    if (snapshot.Committed.Revision.Value == before.Value + 1) authorityCommitted.TrySetResult();
+                }));
+            Task applyWaiter = editor.ApplyCommand.ExecuteAsync(null);
+            if (editor.ApplyCommand.IsRunning) editor.ApplyCommand.Cancel();
+            await applyWaiter.WaitAsync(TimeSpan.FromSeconds(5));
+            if (scope.Authority.Read(scope.AuthorityKey).Committed.Revision.Value != before.Value + 1)
+                await authorityCommitted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            if (editor.State.Phase != GateEditorViewPhase.Committed)
+            {
+                var converged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                void Converged(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+                { if (editor.State.Phase == GateEditorViewPhase.Committed) converged.TrySetResult(); }
+                editor.PropertyChanged += Converged;
+                try { await converged.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+                finally { editor.PropertyChanged -= Converged; }
+            }
+            Assert.AreEqual(GateEditorViewPhase.Committed, editor.State.Phase);
+            await host.StopCommand.ExecuteAsync(null);
+            Assert.AreEqual(SessionPhase.Idle, services.GetRequiredService<ApplicationSession>().Snapshot.Phase);
+
+            Task first = runtime.Shutdown.ShutdownAsync();
+            Assert.AreSame(first, runtime.Shutdown.ShutdownAsync());
+            await first.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsTrue(runtime.Shutdown.Status.Completed);
+            shutdownCompleted = true;
+            Assert.AreEqual(1, source.DisposeCount);
+            CollectionAssert.AreEqual(new[]
+            {
+                "phase5.stop", "phase6.wait", "phase6.drain", "phase7.dispose", "host.stop", "host.dispose"
+            }, lifecycle);
+        }
+        finally { if (!shutdownCompleted) await runtime.Shutdown.ShutdownAsync(); }
+    }, TimeSpan.FromSeconds(40));
+
+    [TestMethod]
+    public Task ProductiveGateInspectionScopeIsTheSingleRegisteredGateGraph() => StaTest.Run(async () =>
     {
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
         try
         {
-            ProductiveGateProcessing processing = runtime.Host.Services.GetRequiredService<ProductiveGateProcessing>();
-            ICommittedGateProcessingIngress ingress = runtime.Host.Services.GetRequiredService<ICommittedGateProcessingIngress>();
-            Assert.AreSame(processing.Ingress, ingress);
-            Assert.IsNotNull(processing.Plan);
+            ProductiveGateInspectionScope scope = runtime.Host.Services.GetRequiredService<ProductiveGateInspectionScope>();
+            ApplicationSession session = runtime.Host.Services.GetRequiredService<ApplicationSession>();
+            AScanComponentContext context = runtime.Host.Services.GetRequiredService<AScanComponentContext>();
+            Assert.AreSame(session, runtime.Host.Services.GetRequiredService<IApplicationSession>());
+            Assert.IsNull(runtime.Host.Services.GetService<ICommittedGateProcessingIngress>());
+            Assert.AreSame(scope.Authority, context.GateEditing!.Authority);
+            Assert.AreSame(scope.PreviewCompiler, context.GateEditing.PreviewCompiler);
+            Assert.AreSame(scope.GeometryEvaluator, context.GateEditing.GeometryEvaluator);
+            Assert.AreSame(session, context.GateEditing.Apply);
+            Assert.AreEqual(scope.AuthorityKey, context.GateEditing.AuthorityKey);
+            Assert.IsNull(runtime.Host.Services.GetService<ProductiveGateProcessing>());
         }
         finally { await runtime.Shutdown.ShutdownAsync(); }
     });
@@ -537,6 +650,73 @@ public sealed class CompositionTests
         Assert.IsGreaterThanOrEqualTo(2, cancelled);
         Assert.IsTrue(runtime.Shutdown.Status.Completed);
     });
+
+    private sealed class ActionObserver<T>(Action<T> next) : IObserver<T>
+    {
+        public void OnNext(T value) => next(value);
+        public void OnError(Exception error) => Assert.Fail(error.ToString());
+        public void OnCompleted() { }
+    }
+
+    private sealed class GateControlledSource : IUtFrameSource
+    {
+        private readonly Channel<ConventionalUtFrame> _frames = Channel.CreateBounded<ConventionalUtFrame>(1);
+        private readonly TaskCompletionSource _producer = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private ConventionalUtFrameMetadata? _metadata;
+        private ConventionalAcquisitionConfiguration? _configuration;
+        private FrameOwner? _owner;
+        private bool _stopped;
+        public UtSourceId SourceId { get; } = new("gate-controlled-wpf");
+        public UtSourceCapabilities Capabilities { get; } = new([new PhysicalChannelId(0)], 64, 1_000_000, true);
+        public UtSourceState State { get; private set; } = new(0, UtConnectionState.Disconnected, UtAcquisitionState.Idle);
+        internal int DisposeCount { get; private set; }
+
+        public Task ConnectAsync(CancellationToken cancellationToken = default)
+        { State = new(1, UtConnectionState.Connected, UtAcquisitionState.Idle); return Task.CompletedTask; }
+        public Task ConfigureAsync(ConventionalAcquisitionConfiguration configuration,
+            CancellationToken cancellationToken = default)
+        { _configuration = configuration; return Task.CompletedTask; }
+        public Task<UtAcquisitionRun> StartAsync(AcquisitionRunId runId, CancellationToken cancellationToken = default)
+        {
+            _metadata = new(SourceId, runId, _configuration!, DateTimeOffset.UnixEpoch);
+            State = new(2, UtConnectionState.Connected, UtAcquisitionState.Running);
+            return Task.FromResult(new UtAcquisitionRun(_metadata, _frames.Reader, _producer.Task, _released.Task));
+        }
+        internal FrameOwner QueueFrame()
+        {
+            var owner = _owner = new FrameOwner(_metadata!.Configuration.SampleCount, ReleaseOwner);
+            for (int index = 0; index < owner.Memory.Length; index++) owner.Memory.Span[index] = (short)(index * 100);
+            if (!_frames.Writer.TryWrite(new(_metadata, 0, 0, TimeSpan.Zero, null, owner)))
+                throw new InvalidOperationException("The controlled frame was not admitted.");
+            return owner;
+        }
+        public Task StopAsync(CancellationToken cancellationToken = default)
+        {
+            _stopped = true; _frames.Writer.TryComplete(); _producer.TrySetResult();
+            if (_owner?.IsReturned != false) _released.TrySetResult();
+            State = new(3, UtConnectionState.Connected, UtAcquisitionState.Idle);
+            return Task.CompletedTask;
+        }
+        private void ReleaseOwner()
+        { if (_stopped) _released.TrySetResult(); }
+        public Task DisconnectAsync(CancellationToken cancellationToken = default)
+        { State = new(4, UtConnectionState.Disconnected, UtAcquisitionState.Idle); return Task.CompletedTask; }
+        public ValueTask DisposeAsync() { DisposeCount++; return ValueTask.CompletedTask; }
+
+        internal sealed class FrameOwner(int count, Action returned) : IMemoryOwner<short>
+        {
+            private short[]? _samples = new short[count];
+            internal TaskCompletionSource Returned { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            internal bool IsReturned => _samples is null;
+            public Memory<short> Memory => _samples ?? throw new ObjectDisposedException(nameof(FrameOwner));
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _samples, null) is null) return;
+                returned(); Returned.TrySetResult();
+            }
+        }
+    }
 
     private sealed class ControlledSource : IUtFrameSource
     {

@@ -35,6 +35,7 @@ public sealed class ProductiveGateInspectionScope : IAsyncDisposable
     }
 
     public InspectionId InspectionId { get; }
+    public GatePlanAuthorityKey AuthorityKey => new(InspectionId, InitialPlan.Source.Id);
     internal CompiledGatePlan InitialPlan { get; }
     public IGatePlanAuthorityReader Authority => ApplyServices.AuthorityReader;
     public IGatePlanPreviewCompiler PreviewCompiler { get; }

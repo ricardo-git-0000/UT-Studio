@@ -19,6 +19,17 @@
       <Button Content="Restablecer" Command="{Binding ResetCursorsCommand}" MinWidth="100" Padding="16,8" Margin="0,0,8,0" AutomationProperties.HelpText="Restablece cursores y medidas"/>
       <Button Content="Restablecer zoom" Command="{Binding ResetViewportCommand}" Padding="16,8" Margin="0,0,8,0" AutomationProperties.HelpText="Atajo Home"/>
       <Button Content="Live" Command="{Binding ReturnToLiveCommand}" Padding="12,8"/>
+      <Separator Margin="8,0"/>
+      <Button Content="Editar gates" Command="{Binding GateEditor.BeginEditCommand}" Padding="12,8" Margin="0,0,8,0"
+              AutomationProperties.HelpText="Comienza una edición local del plan de gates"/>
+      <Button Content="Preview" Command="{Binding GateEditor.PreviewCommand}" Padding="12,8" Margin="0,0,8,0"
+              AutomationProperties.HelpText="Valida y muestra el Preview sin aplicar cambios"/>
+      <Button Content="Cancelar" Command="{Binding GateEditor.CancelCommand}" Padding="12,8" Margin="0,0,8,0"
+              AutomationProperties.HelpText="Cancela únicamente la edición local"/>
+      <Button Content="Aplicar" Command="{Binding GateEditor.ApplyCommand}" Padding="12,8" Margin="0,0,8,0"
+              AutomationProperties.HelpText="Aplica explícitamente el Preview confirmado"/>
+      <TextBlock Text="{Binding GateEditor.State.Phase}" Margin="8,0,0,0" VerticalAlignment="Center"
+                 AutomationProperties.Name="Estado del editor de gates" AutomationProperties.LiveSetting="Polite"/>
     </StackPanel>
     <controls:AScanControl x:Name="Scan" Grid.Row="1" AutomationProperties.Name="Gráfico A-Scan"
       CursorActivated="OnCursorActivated" CursorMoveRequested="OnCursorMoveRequested"

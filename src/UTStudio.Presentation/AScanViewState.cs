@@ -22,4 +22,5 @@ public sealed record AScanViewState(SessionSnapshot Session, AScanSnapshot? ASca
     TraceSelectionState? Selection = null,
     AScanCompositeVisualSnapshot? CompositeVisual = null,
     ScanTimeViewportBinding? ViewportBinding = null,
-    AScanVisualContentSnapshot? VisualContent = null);
+    AScanVisualContentSnapshot? VisualContent = null,
+    GateEditorViewState? GateEditor = null);

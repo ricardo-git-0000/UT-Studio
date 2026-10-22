@@ -539,7 +539,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession, 
         var descriptor = new TraceDescriptor(new TraceIdentity(stream, frame.AcquisitionIndex), frame.Sequence,
             frame.ElapsedSinceRunStart, frame.Metadata.RunStartedAtUtc + frame.ElapsedSinceRunStart,
             frame.SpatialCoordinate, configuration.SampleCount, configuration.SampleRateHz,
-            configuration.FirstSampleOffsetSeconds, configuration.SignalMode);
+            configuration.FirstSampleOffsetSeconds, configuration.SignalMode,
+            traceQuality: UtTraceQuality.Good);
         IInspectionRunWriter writer = operation.InspectionWriter ??
             throw new InvalidOperationException("The inspection writer is unavailable.");
         IReadOnlyList<GapRecord> gaps = gap is { } confirmed ? [ToGapRecord(stream, confirmed)] : [];

@@ -3,10 +3,11 @@ using UTStudio.Visualization.Core;
 
 namespace UTStudio.ScanVisualization.AScan.Wpf;
 
-/// <summary>Temporary no-gates adapter. It never creates authority or detector geometry.</summary>
+/// <summary>Admits the coherent productive composite, or a visual-only no-gates fallback.</summary>
 internal sealed class AScanVisualSnapshotAdapter
 {
     private ulong _generation, _transformVersion;
+    private GateVisualTransform? _lastTransform;
 
     internal AScanCompositeVisualSnapshot? Adapt(AScanViewState? state, double widthDip, double heightDip,
         double dpiScaleX, double dpiScaleY)
@@ -15,13 +16,24 @@ internal sealed class AScanVisualSnapshotAdapter
             !double.IsFinite(widthDip) || !double.IsFinite(heightDip) || dpiScaleX <= 0 || dpiScaleY <= 0) return null;
         if (state.CompositeVisual is { } composed && Compatible(composed.Transform, widthDip, heightDip, dpiScaleX, dpiScaleY))
             return composed;
-        _generation = checked(_generation + 1); _transformVersion = checked(_transformVersion + 1);
+        GateVisualTransform transform = CreateTransform(content, widthDip, heightDip, dpiScaleX, dpiScaleY);
+        if (state.GateEditor is { } gateEditor)
+            return new(content.Signal, content.Cursors, gateEditor.Overlay, transform);
+        _generation = checked(_generation + 1);
         var overlay = new GateOverlayVisualSnapshot(GateOverlayGeometryStatus.NotRequested, null, null,
             default, [], [], null, GateHandleKind.Unknown, _generation, 0, null);
-        var transform = new GateVisualTransform(_transformVersion, content.ViewportBinding.Viewport,
-            GateAmplitudePresentationKind.RawRf, 64, widthDip - 84, heightDip - 38, -(heightDip - 54),
-            widthDip, heightDip, dpiScaleX, dpiScaleY);
         return new(content.Signal, content.Cursors, overlay, transform);
+    }
+
+    internal GateVisualTransform CreateTransform(AScanVisualContentSnapshot content, double widthDip,
+        double heightDip, double dpiScaleX, double dpiScaleY)
+    {
+        if (_lastTransform is { } previous && previous.TimeViewport == content.ViewportBinding.Viewport &&
+            Compatible(previous, widthDip, heightDip, dpiScaleX, dpiScaleY)) return previous;
+        _transformVersion = checked(_transformVersion + 1);
+        return (_lastTransform = new(_transformVersion, content.ViewportBinding.Viewport,
+            GateAmplitudePresentationKind.RawRf, 64, widthDip - 84, heightDip - 38, -(heightDip - 54),
+            widthDip, heightDip, dpiScaleX, dpiScaleY)).Value;
     }
 
     private static bool Compatible(GateVisualTransform transform, double width, double height, double dpiX, double dpiY) =>

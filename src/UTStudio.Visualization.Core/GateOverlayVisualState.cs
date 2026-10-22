@@ -148,8 +148,8 @@ public sealed class AScanCompositeVisualSnapshot
         bool hasAuthority = signal.TraceIdentity is { IsValid: true } &&
             signal.InspectionRevision != InspectionRevision.Initial;
         if (cursors is not null && (cursors.RunId != signal.Metadata.RunId || cursors.SnapshotVersion != signal.Version) ||
-            !hasAuthority && (gates.Status != GateOverlayGeometryStatus.NotRequested || gates.Source is not null ||
-                gates.Gates.Count != 0 || gates.Handles.Count != 0 || gates.Capture is not null) ||
+            !hasAuthority && (gates.Status is GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating ||
+                gates.Source is not null || gates.Gates.Count != 0 || gates.Handles.Count != 0 || gates.Capture is not null) ||
             hasAuthority && gates.Status is GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating &&
                 (gates.TraceIdentity != signal.TraceIdentity || gates.InspectionRevision != signal.InspectionRevision) ||
             gates.Status is not (GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating) &&

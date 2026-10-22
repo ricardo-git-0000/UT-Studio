@@ -68,3 +68,11 @@ internal sealed record GatePreviewArtifact(GatePlanPreviewCandidate Candidate, G
     internal GatePlanDraft Checkpoint => Candidate.Draft;
     internal CompiledGatePlan CompiledPlan => Candidate.CompiledPlan;
 }
+
+internal sealed record GateCommittedArtifact(GateGeometrySourceIdentity Source, CompiledGatePlan CompiledPlan);
+
+internal readonly record struct GateEditorApplyTicket(Guid Value, GatePreviewArtifact Artifact,
+    ulong EditorGeneration)
+{
+    internal bool IsValid => Value != Guid.Empty;
+}

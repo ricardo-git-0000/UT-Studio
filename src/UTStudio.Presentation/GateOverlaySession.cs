@@ -61,19 +61,23 @@ public sealed class GateOverlaySession : IAsyncDisposable
     }
     public PortablePointerCaptureOwner GestureOwner { get { lock (_gate) return _gestureOwner; } }
 
-    public void SetVisualContext(AScanSnapshot signal, AScanCursorState? cursors, GateVisualTransform transform)
+    public bool SetVisualContext(AScanSnapshot signal, AScanCursorState? cursors, GateVisualTransform transform)
     {
         ArgumentNullException.ThrowIfNull(signal);
         GateOverlayVisualSnapshot publish;
+        CancellationTokenSource? cancellation = null;
         lock (_gate)
         {
             ThrowIfClosed();
-            bool changed = _signal?.TraceIdentity != signal.TraceIdentity ||
+            bool invalidating = _signal?.TraceIdentity != signal.TraceIdentity ||
                 _signal?.InspectionRevision != signal.InspectionRevision ||
                 _signal?.Metadata.RunId != signal.Metadata.RunId || _signal?.Version != signal.Version ||
                 _transform is null || !_transform.Value.Equals(transform);
+            bool visualChanged = invalidating || !ReferenceEquals(_signal, signal) ||
+                !Equals(_cursors, cursors);
+            if (!visualChanged) return false;
             _signal = signal; _cursors = cursors; _transform = transform;
-            if (!changed)
+            if (!invalidating)
             {
                 publish = BuildOverlayUnderLock(_overlay.Status, _overlay.Source,
                 _overlay.TraceIdentity, _overlay.InspectionRevision, _stableGeometry, _overlay.EvaluationSequence,
@@ -81,7 +85,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
             }
             else
             {
-                AdvanceContextUnderLock();
+                cancellation = AdvanceContextUnderLock();
                 GateOverlayGeometryStatus status = CompatibleGeometryUnderLock(_stableGeometry)
                     ? GateOverlayGeometryStatus.Current : GateOverlayGeometryStatus.Stale;
                 publish = BuildOverlayUnderLock(status, _stableGeometry?.Source,
@@ -91,7 +95,9 @@ public sealed class GateOverlaySession : IAsyncDisposable
             }
             SetSnapshotUnderLock(publish);
         }
+        RequestCancellation(cancellation);
         Publish(publish);
+        return true;
     }
 
     public async ValueTask<GateOverlayRequestOutcome> PreviewAsync(GatePlanDraft draft,
@@ -124,17 +130,29 @@ public sealed class GateOverlaySession : IAsyncDisposable
         return await EnqueueAsync(artifact!, cancellationToken).ConfigureAwait(false);
     }
 
+    public ValueTask<GateOverlayRequestOutcome> RequestCommittedAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        GateCommittedArtifact? artifact = _editor.BorrowCommittedArtifact();
+        if (artifact is null) return ValueTask.FromResult(GateOverlayRequestOutcome.Closed);
+        return EnqueueAsync(artifact, cancellationToken);
+    }
+
     public bool Select(GateId gateId, GateHandleKind handle)
     {
         GateOverlayVisualSnapshot publish;
+        CancellationTokenSource? cancellation = null;
         lock (_gate)
         {
             if (_closed || !gateId.IsValid || handle == GateHandleKind.Unknown ||
                 !_overlay.Handles.Any(x => x.GateId == gateId && x.Kind == handle && x.IsEnabled)) return false;
-            if (_selectedGate != gateId || _focusedHandle != handle) AdvanceContextUnderLock();
+            if (_selectedGate != gateId || _focusedHandle != handle)
+                cancellation = AdvanceContextUnderLock();
             _selectedGate = gateId; _focusedHandle = handle;
             publish = RebuildCurrentUnderLock(); SetSnapshotUnderLock(publish);
         }
+        RequestCancellation(cancellation);
         Publish(publish); return true;
     }
 
@@ -215,6 +233,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
         if (intent is GateOverlayKeyIntent.FocusPrevious or GateOverlayKeyIntent.FocusNext)
         {
             GateOverlayVisualSnapshot? publish = null;
+            CancellationTokenSource? cancellation = null;
             lock (_gate)
             {
                 if (_closed) return GateOverlayRequestOutcome.Closed;
@@ -226,10 +245,11 @@ public sealed class GateOverlaySession : IAsyncDisposable
                 int target = current < 0 ? (delta > 0 ? 0 : ordered.Length - 1) :
                     (current + delta + ordered.Length) % ordered.Length;
                 if (_selectedGate != ordered[target].GateId || _focusedHandle != ordered[target].Kind)
-                    AdvanceContextUnderLock();
+                    cancellation = AdvanceContextUnderLock();
                 _selectedGate = ordered[target].GateId; _focusedHandle = ordered[target].Kind;
                 publish = RebuildCurrentUnderLock(); SetSnapshotUnderLock(publish);
             }
+            RequestCancellation(cancellation);
             Publish(publish); return GateOverlayRequestOutcome.Completed;
         }
         if (intent == GateOverlayKeyIntent.CancelCapture)
@@ -270,6 +290,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         Task? runner; EvaluationRequest? pending;
+        CancellationTokenSource? cancellation = null;
         GateOverlayVisualSnapshot closed;
         lock (_gate)
         {
@@ -278,7 +299,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
             {
                 _closed = true; _capture = null; _capturedHandleState = null;
                 _gestureOwner = PortablePointerCaptureOwner.None;
-                if (_activeCancellation is { } active) _ = active.CancelAsync();
+                cancellation = _activeCancellation;
                 pending = _pending; _pending = null; runner = _runner;
                 closed = BuildOverlayUnderLock(GateOverlayGeometryStatus.Closed, null, null,
                     InspectionRevision.Initial, null, _evaluationSequence, null);
@@ -286,6 +307,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
             }
         }
         pending?.Completion.TrySetResult(GateOverlayRequestOutcome.Closed);
+        RequestCancellation(cancellation);
         if (!_overlay.Equals(default) && _overlay.Status == GateOverlayGeometryStatus.Closed) Publish(_overlay);
         if (runner is not null) await runner.ConfigureAwait(false);
         _editor.AuthorityInvalidated -= ReceiveAuthorityInvalidated;
@@ -309,8 +331,39 @@ public sealed class GateOverlaySession : IAsyncDisposable
             if (_signal?.TraceIdentity is not { IsValid: true } trace ||
                 _signal.InspectionRevision == InspectionRevision.Initial || _transform is null)
                 return ValueTask.FromResult(GateOverlayRequestOutcome.NotAvailable);
-            request = new(checked(++_evaluationSequence), _contextGeneration, artifact,
-                new(artifact.Source, trace, _signal.InspectionRevision, artifact.PreviewGuard), cancellationToken);
+            request = new(checked(++_evaluationSequence), _contextGeneration, artifact, null,
+                new(artifact.Source, trace, _signal.InspectionRevision, artifact.PreviewGuard),
+                artifact.CompiledPlan, cancellationToken);
+            superseded = _pending; _pending = request;
+            if (_runner is null)
+            {
+                runnerCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                _runner = runnerCompletion.Task;
+            }
+            publish = BuildOverlayUnderLock(GateOverlayGeometryStatus.Evaluating, artifact.Source, trace,
+                _signal.InspectionRevision, null, request.Sequence, null);
+            SetSnapshotUnderLock(publish);
+        }
+        superseded?.Completion.TrySetResult(GateOverlayRequestOutcome.Superseded);
+        Publish(publish);
+        if (runnerCompletion is not null) _ = CompleteRunnerAsync(runnerCompletion);
+        return new(request.Completion.Task);
+    }
+
+    private ValueTask<GateOverlayRequestOutcome> EnqueueAsync(GateCommittedArtifact artifact,
+        CancellationToken cancellationToken)
+    {
+        EvaluationRequest request; EvaluationRequest? superseded;
+        TaskCompletionSource? runnerCompletion = null;
+        GateOverlayVisualSnapshot publish;
+        lock (_gate)
+        {
+            if (_closed) return ValueTask.FromResult(GateOverlayRequestOutcome.Closed);
+            if (_signal?.TraceIdentity is not { IsValid: true } trace ||
+                _signal.InspectionRevision == InspectionRevision.Initial || _transform is null)
+                return ValueTask.FromResult(GateOverlayRequestOutcome.NotAvailable);
+            request = new(checked(++_evaluationSequence), _contextGeneration, null, artifact,
+                new(artifact.Source, trace, _signal.InspectionRevision), artifact.CompiledPlan, cancellationToken);
             superseded = _pending; _pending = request;
             if (_runner is null)
             {
@@ -352,7 +405,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
             string? faultCode = null;
             try
             {
-                result = await _evaluator.EvaluateAsync(request.Request, request.Artifact.CompiledPlan,
+                result = await _evaluator.EvaluateAsync(request.Request, request.CompiledPlan,
                 cancellation.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
@@ -362,7 +415,9 @@ public sealed class GateOverlaySession : IAsyncDisposable
             {
                 if (ReferenceEquals(_activeCancellation, cancellation)) _activeCancellation = null;
                 bool current = !_closed && request.ContextGeneration == _contextGeneration &&
-                    request.Sequence == _evaluationSequence && _editor.IsCurrentPreviewCandidate(request.Artifact) &&
+                    request.Sequence == _evaluationSequence && (request.PreviewArtifact is { } preview
+                        ? _editor.IsCurrentPreviewCandidate(preview)
+                        : request.CommittedArtifact is { } committed && _editor.IsCurrentCommittedArtifact(committed)) &&
                     _signal?.TraceIdentity == request.Request.TraceIdentity &&
                     _signal?.InspectionRevision == request.Request.ExpectedInspectionRevision;
                 if (!current) outcome = _closed ? GateOverlayRequestOutcome.Closed :
@@ -370,10 +425,11 @@ public sealed class GateOverlaySession : IAsyncDisposable
                     GateOverlayRequestOutcome.Superseded;
                 else if (result?.Status == GateGeometryEvaluationStatus.Completed)
                 {
-                    if (!_editor.PromotePreview(request.Artifact)) outcome = GateOverlayRequestOutcome.Superseded;
+                    if (request.PreviewArtifact is { } completedPreview && !_editor.PromotePreview(completedPreview))
+                        outcome = GateOverlayRequestOutcome.Superseded;
                     else
                     {
-                        _stableArtifact = request.Artifact; _stableGeometry = result.Snapshot;
+                        _stableArtifact = request.PreviewArtifact; _stableGeometry = result.Snapshot;
                         outcome = GateOverlayRequestOutcome.Completed;
                         publish = BuildOverlayUnderLock(GateOverlayGeometryStatus.Current, result.Snapshot!.Source,
                             result.Snapshot.TraceIdentity, result.Snapshot.InspectionRevision, result.Snapshot,
@@ -391,7 +447,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
                         GateOverlayRequestOutcome.Faulted => GateOverlayGeometryStatus.Faulted,
                         _ => GateOverlayGeometryStatus.Stale
                     };
-                    publish = BuildOverlayUnderLock(status, request.Artifact.Source,
+                    publish = BuildOverlayUnderLock(status, request.Request.Source,
                         request.Request.TraceIdentity, request.Request.ExpectedInspectionRevision,
                         null, request.Sequence, faultCode ?? result?.ErrorCode); SetSnapshotUnderLock(publish);
                 }
@@ -401,18 +457,32 @@ public sealed class GateOverlaySession : IAsyncDisposable
         }
     }
 
-    private void AdvanceContextUnderLock()
+    private CancellationTokenSource? AdvanceContextUnderLock()
     {
         _contextGeneration = checked(_contextGeneration + 1); _capture = null; _capturedHandleState = null;
         if (_gestureOwner == PortablePointerCaptureOwner.Gate) _gestureOwner = PortablePointerCaptureOwner.None;
-        if (_activeCancellation is { } active) _ = active.CancelAsync();
+        CancellationTokenSource? active = _activeCancellation;
         EvaluationRequest? pending = _pending; _pending = null;
         pending?.Completion.TrySetResult(GateOverlayRequestOutcome.Cancelled);
+        return active;
+    }
+
+    private static void RequestCancellation(CancellationTokenSource? cancellation)
+    {
+        if (cancellation is null || cancellation.IsCancellationRequested) return;
+        _ = ObserveCancellationAsync(cancellation);
+    }
+
+    private static async Task ObserveCancellationAsync(CancellationTokenSource cancellation)
+    {
+        try { await cancellation.CancelAsync().ConfigureAwait(false); }
+        catch (ObjectDisposedException) { }
     }
 
     private void ReceiveEditorSnapshot(GatePlanEditorSnapshot snapshot)
     {
         GateOverlayVisualSnapshot? publish = null;
+        CancellationTokenSource? cancellation = null;
         lock (_gate)
         {
             if (_closed || ReferenceEquals(snapshot, _lastEditorSnapshot)) return;
@@ -420,26 +490,29 @@ public sealed class GateOverlaySession : IAsyncDisposable
             bool owned = snapshot.Draft is not null && (ReferenceEquals(snapshot.Draft, _ownedDraft) ||
                 ReferenceEquals(snapshot.Draft, _stableArtifact?.Checkpoint));
             if (owned) return;
-            AdvanceContextUnderLock();
+            cancellation = AdvanceContextUnderLock();
             publish = BuildOverlayUnderLock(GateOverlayGeometryStatus.Stale, null, null,
                 InspectionRevision.Initial, null, _evaluationSequence, null);
             SetSnapshotUnderLock(publish);
         }
+        RequestCancellation(cancellation);
         Publish(publish);
     }
 
     private void ReceiveAuthorityInvalidated()
     {
         GateOverlayVisualSnapshot? publish = null;
+        CancellationTokenSource? cancellation = null;
         lock (_gate)
         {
             if (_closed) return;
             _stableArtifact = null; _stableGeometry = null;
-            AdvanceContextUnderLock();
+            cancellation = AdvanceContextUnderLock();
             publish = BuildOverlayUnderLock(GateOverlayGeometryStatus.Stale, null, null,
                 InspectionRevision.Initial, null, _evaluationSequence, null);
             SetSnapshotUnderLock(publish);
         }
+        RequestCancellation(cancellation);
         Publish(publish);
     }
 
@@ -557,13 +630,17 @@ public sealed class GateOverlaySession : IAsyncDisposable
             generation, 0, null, status == GateOverlayGeometryStatus.Faulted ? "overlay-fault" : null);
     private void ThrowIfClosed() => ObjectDisposedException.ThrowIf(_closed, this);
 
-    private sealed class EvaluationRequest(ulong sequence, ulong contextGeneration, GatePreviewArtifact artifact,
-        GateGeometryEvaluationRequest request, CancellationToken callerToken)
+    private sealed class EvaluationRequest(ulong sequence, ulong contextGeneration,
+        GatePreviewArtifact? previewArtifact, GateCommittedArtifact? committedArtifact,
+        GateGeometryEvaluationRequest request, CompiledGatePlan compiledPlan,
+        CancellationToken callerToken)
     {
         internal ulong Sequence { get; } = sequence;
         internal ulong ContextGeneration { get; } = contextGeneration;
-        internal GatePreviewArtifact Artifact { get; } = artifact;
+        internal GatePreviewArtifact? PreviewArtifact { get; } = previewArtifact;
+        internal GateCommittedArtifact? CommittedArtifact { get; } = committedArtifact;
         internal GateGeometryEvaluationRequest Request { get; } = request;
+        internal CompiledGatePlan CompiledPlan { get; } = compiledPlan;
         internal CancellationToken CallerToken { get; } = callerToken;
         internal TaskCompletionSource<GateOverlayRequestOutcome> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);

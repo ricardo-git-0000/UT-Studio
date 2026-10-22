@@ -222,6 +222,14 @@ Implementar snapshot visual, render, hit-test, captura versionada, teclado y Aut
 
 Componer DI/lifetimes y ejecutar aceptación integral, arquitectura, format y build/test Release.
 
+Estado a 2026-10-22: B8A está cerrado y B8B tiene implementados el coordinador por vista, la composición
+DesktopRuntime, los comandos y la interacción productiva. La autoridad, el store, el lifecycle y el artefacto
+compilado de Preview siguen siendo únicos y propiedad del scope; las vistas solo toman prestados sus puertos.
+Una aceptación vertical STA determinista con la composición real cubre adquisición, edición, Preview, Apply,
+Stop y cierre compartido; la regresión que impedía la quiescencia del overlay está localizada y cubierta. Las
+validaciones pasan y B8B queda pendiente de su punto de control; este documento no declara por sí solo completada
+la Fase 6.
+
 Cada paso debe compilar y pasar sus pruebas sin introducir dos autoridades; Apply no queda parcialmente
 productivo entre pasos.
 

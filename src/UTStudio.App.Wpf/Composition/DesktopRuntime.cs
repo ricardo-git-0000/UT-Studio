@@ -33,7 +33,7 @@ public sealed class DesktopRuntime
     private BScanWindowManager? _bScanWindows;
     private ApplicationSession? _session;
     private InspectionDataStoreRegistry? _inspectionStores;
-    private ProductiveGateProcessing? _processing;
+    private ProductiveGateInspectionScope? _gateScope;
     private AScanHostViewModel? _viewModel;
     private MainWindow? _mainWindow;
     private SharedScanTimeViewport? _timeViewport;
@@ -54,7 +54,7 @@ public sealed class DesktopRuntime
             new("Bloquear nuevas aperturas e interacciones", () => _interactionGate?.BlockAsync() ?? Task.CompletedTask),
             new("Cerrar ventanas B-Scan", () => _bScanWindows?.BlockAndCloseAsync() ?? Task.CompletedTask),
             new("Cerrar A-Scan y sus callbacks", ReleaseAScanAsync, () => _viewModelReleased),
-            new("Parar y disponer ApplicationSession", ReleaseSessionAsync,
+            new("Parar sesión y drenar scope productivo", ReleaseSessionAsync,
                 () => _sessionReleased && (_session is null || _session.Snapshot.Phase == SessionPhase.Disposed)),
             new("Solicitar parada de productor, consumidor y ramas visuales", RequestPipelineStopAsync,
                 () => _pipelineStopRequested),
@@ -79,7 +79,11 @@ public sealed class DesktopRuntime
 
     private async Task ReleaseSessionAsync()
     {
-        try { await (_session?.DisposeAsync().AsTask() ?? Task.CompletedTask).ConfigureAwait(false); }
+        try
+        {
+            await (_gateScope?.DisposeAsync().AsTask() ??
+            _session?.DisposeAsync().AsTask() ?? Task.CompletedTask).ConfigureAwait(false);
+        }
         finally { _sessionReleased = _session is null || _session.Snapshot.Phase == SessionPhase.Disposed; }
     }
 
@@ -118,7 +122,6 @@ public sealed class DesktopRuntime
         await TryDisposeAsync(() => _bScanIngress?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _selection?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _visual?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
-        await TryDisposeAsync(() => _processing?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _inspectionStores?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _timeViewport?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
         await TryDisposeAsync(() => _source?.DisposeAsync().AsTask() ?? Task.CompletedTask, failures).ConfigureAwait(false);
@@ -231,8 +234,8 @@ public sealed class DesktopRuntime
                 builder.Configuration.GetValue<int?>("InspectionStore:TargetChunkBytes") ?? 4 * 1024 * 1024);
             var inspectionStores = runtime._inspectionStores = new InspectionDataStoreRegistry(
                 new InspectionId(Guid.NewGuid()), inspectionOptions);
-            var processing = runtime._processing = ProductiveGateProcessingFactory.Create(
-                inspectionStores.Store, configuration);
+            var gateScope = runtime._gateScope = await ProductiveGateInspectionScope.CreateAsync(
+                inspectionStores.InspectionId, inspectionStores.Store, configuration);
             var visual = runtime._visual = new AScanVisualDelivery(inspectionStores.Store, timeProvider: clock);
             var bScanIngress = runtime._bScanIngress = new BScanIngress(
                 inspectionStores.Store, inspectionStores.Store, bScanOptions, clock);
@@ -240,14 +243,16 @@ public sealed class DesktopRuntime
                 ? new BScanVisualDelivery(bScanIngress, clock)
                 : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
             checkpoint?.Invoke("visual");
-            var session = runtime._session = new ApplicationSession(source, inspectionStores.InspectionId,
-                runId => inspectionStores.OpenRun(runId), bScanIngress, visual, processing.Ingress, processing.Plan);
+            var session = runtime._session = gateScope.CreateSession(source,
+                runId => inspectionStores.OpenRun(runId), bScanIngress, visual);
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
             var selection = runtime._selection = new TraceSelectionScope(dispatcher, selectionResolver);
             var viewModel = runtime._viewModel = new AScanHostViewModel(session, dispatcher, configuration);
             var aScanContext = new AScanComponentContext(session, session.Snapshot, visual, visual.StatusChanges,
-                () => visual.Statistics, timeViewport, selection);
+                () => visual.Statistics, timeViewport, selection,
+                new(gateScope.AuthorityKey, gateScope.Authority, gateScope.PreviewCompiler,
+                    gateScope.GeometryEvaluator, session));
             System.Windows.Threading.Dispatcher windowDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
             var preferenceStore = new BScanResamplingPreferenceStore(BScanResamplingPreferenceStore.DefaultPath);
             await preferenceStore.LoadAsync().ConfigureAwait(false);
@@ -260,8 +265,7 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton<IObservable<AScanSnapshot>>(visual);
             builder.Services.AddSingleton(session);
             builder.Services.AddSingleton(inspectionStores);
-            builder.Services.AddSingleton(processing);
-            builder.Services.AddSingleton<ICommittedGateProcessingIngress>(processing.Ingress);
+            builder.Services.AddSingleton(gateScope);
             builder.Services.AddSingleton<IApplicationSession>(session);
             builder.Services.AddSingleton(viewModel);
             builder.Services.AddSingleton(aScanContext);

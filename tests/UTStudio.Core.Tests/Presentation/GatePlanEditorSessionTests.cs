@@ -326,6 +326,58 @@ public sealed class GatePlanEditorSessionTests
         releaseSlow.TrySetResult();
     }
 
+    [TestMethod]
+    public void AcceptedApplyConvergesForBothAuthorityAndCompletionOrders()
+    {
+        VerifyAcceptedConvergence(authorityFirst: true);
+        VerifyAcceptedConvergence(authorityFirst: false);
+    }
+
+    [TestMethod]
+    public void LateAcceptedApplyCannotReplaceANewerEditorialGeneration()
+    {
+        CommittedGatePlanSnapshot committed = Committed(1);
+        var authority = new TestAuthorityReader(committed);
+        using var editor = new GatePlanEditorSession(committed.AuthorityKey, authority,
+            new GatePlanPreviewCompiler());
+        editor.BeginEdit();
+        GatePlanEditResult preview = editor.Preview();
+        GatePreviewArtifact artifact = editor.BorrowApplicablePreview()!;
+        GateEditorApplyTicket ticket = editor.RegisterApply(artifact);
+        var installed = new CommittedGatePlanSnapshot(Inspection, artifact.CompiledPlan);
+        authority.Install(installed);
+
+        GatePlanEditorSnapshot newer = editor.BeginEdit();
+        GatePlanEditResult accepted = GatePlanEditResult.Accepted(preview.Snapshot,
+            new(installed, state: GatePlanEditorState.Committed));
+        Assert.IsTrue(editor.ReconcileApply(ticket, accepted));
+        Assert.AreSame(newer.Draft, editor.Snapshot.Draft);
+        Assert.AreEqual(installed.Revision, editor.Snapshot.Draft!.BaseRevision);
+    }
+
+    private static void VerifyAcceptedConvergence(bool authorityFirst)
+    {
+        CommittedGatePlanSnapshot committed = Committed(1);
+        var authority = new TestAuthorityReader(committed);
+        using var editor = new GatePlanEditorSession(committed.AuthorityKey, authority,
+            new GatePlanPreviewCompiler());
+        editor.BeginEdit();
+        GatePlanEditResult preview = editor.Preview();
+        GatePreviewArtifact artifact = editor.BorrowApplicablePreview()!;
+        GateEditorApplyTicket ticket = editor.RegisterApply(artifact);
+        var installed = new CommittedGatePlanSnapshot(Inspection, artifact.CompiledPlan);
+        GatePlanEditResult accepted = GatePlanEditResult.Accepted(preview.Snapshot,
+            new(installed, state: GatePlanEditorState.Committed));
+
+        if (authorityFirst) authority.Install(installed);
+        Assert.IsTrue(editor.ReconcileApply(ticket, accepted));
+        if (!authorityFirst) authority.Install(installed);
+
+        Assert.AreEqual(GatePlanEditorState.Committed, editor.Snapshot.State);
+        Assert.AreEqual(installed.Revision, editor.Snapshot.Committed.Revision);
+        Assert.IsNull(editor.Snapshot.Draft);
+    }
+
     private static async Task VerifyLateResultAsync(
         Action<TestAuthorityReader, GatePlanEditorSession, CommittedGatePlanSnapshot> change,
         GatePlanEditOutcome expected)

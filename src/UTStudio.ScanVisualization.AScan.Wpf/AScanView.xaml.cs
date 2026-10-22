@@ -6,6 +6,7 @@ using System.Windows.Media;
 using UTStudio.Presentation;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Controls;
 
 namespace UTStudio.ScanVisualization.AScan.Wpf;
@@ -24,12 +25,15 @@ public partial class AScanView : UserControl, IAsyncDisposable
     private AScanViewModel? _viewModel;
     private Task? _close;
     private bool _contextAssigned;
+    private bool _publishingVisual;
     private readonly AScanVisualSnapshotAdapter _visualAdapter = new();
 
     public AScanView()
     {
         InitializeComponent(); Loaded += OnLoaded; SizeChanged += OnVisualContextChanged;
         Scan.VisualContextChanged += OnVisualContextChanged;
+        Scan.GateBeginCaptureRequested += OnGateBeginCaptureRequested;
+        Scan.GateInteractionRequested += OnGateInteractionRequested;
     }
     public AScanComponentContext? Context { get => (AScanComponentContext?)GetValue(ContextProperty); set => SetValue(ContextProperty, value); }
     public AScanViewState? State => (AScanViewState?)GetValue(StateProperty);
@@ -60,7 +64,7 @@ public partial class AScanView : UserControl, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(context.Visuals);
         _viewModel = new(context.SessionStates, context.InitialSession, context.Visuals,
             new WpfUiDispatcher(Dispatcher), context.ReadStatistics, context.VisualStatus,
-            context.TimeViewport, context.SelectionScope);
+            context.TimeViewport, context.SelectionScope, context.GateEditing);
         Root.DataContext = _viewModel;
         _viewModel.PropertyChanged += OnViewModelChanged;
         PublishState();
@@ -101,6 +105,8 @@ public partial class AScanView : UserControl, IAsyncDisposable
         Root.DataContext = null;
         Scan.VisualSnapshot = null;
         Scan.VisualContextChanged -= OnVisualContextChanged;
+        Scan.GateBeginCaptureRequested -= OnGateBeginCaptureRequested;
+        Scan.GateInteractionRequested -= OnGateInteractionRequested;
         SizeChanged -= OnVisualContextChanged;
         SetValue(StatePropertyKey, null);
         SetValue(ErrorPropertyKey, null);
@@ -127,10 +133,23 @@ public partial class AScanView : UserControl, IAsyncDisposable
 
     private void PublishVisualSnapshot()
     {
-        if (_close is not null || Scan.ActualWidth <= 0 || Scan.ActualHeight <= 0) return;
-        DpiScale dpi = VisualTreeHelper.GetDpi(Scan);
-        Scan.VisualSnapshot = _visualAdapter.Adapt(_viewModel?.State, Scan.ActualWidth, Scan.ActualHeight,
-            dpi.DpiScaleX, dpi.DpiScaleY);
+        if (_publishingVisual || _close is not null || Scan.ActualWidth <= 0 || Scan.ActualHeight <= 0) return;
+        _publishingVisual = true;
+        try
+        {
+            DpiScale dpi = VisualTreeHelper.GetDpi(Scan);
+            AScanViewState? state = _viewModel?.State;
+            if (state?.VisualContent is { IsCoherent: true } content && _viewModel?.GateEditor is not null)
+            {
+                GateVisualTransform transform = _visualAdapter.CreateTransform(content, Scan.ActualWidth,
+                    Scan.ActualHeight, dpi.DpiScaleX, dpi.DpiScaleY);
+                _viewModel.SetGateVisualContext(transform);
+                state = _viewModel.State;
+            }
+            Scan.VisualSnapshot = _visualAdapter.Adapt(state, Scan.ActualWidth, Scan.ActualHeight,
+                dpi.DpiScaleX, dpi.DpiScaleY);
+        }
+        finally { _publishingVisual = false; }
     }
 
     public ValueTask DisposeAsync() => new(CloseAsync());
@@ -141,4 +160,14 @@ public partial class AScanView : UserControl, IAsyncDisposable
     private void OnTimePanRequested(object sender, ScanTimePanRequestedEventArgs args) => _viewModel?.PanTime(args.DeltaSeconds);
     private void OnTimeResetRequested(object? sender, EventArgs args)
     { if (_viewModel?.ResetViewportCommand.CanExecute(null) == true) { _viewModel.ResetViewportCommand.Execute(null); } }
+
+    private void OnGateBeginCaptureRequested(object? sender, GateBeginCaptureRequestedEventArgs args)
+    {
+        if (_viewModel?.GateEditor?.TryBeginCapture(args.Snapshot, args.Handle.Identity, out GateCaptureGeneration capture) == true)
+            args.Accept(capture);
+    }
+
+    private void OnGateInteractionRequested(object? sender, GateInteractionRequestedEventArgs args) =>
+        _viewModel?.GateEditor?.HandleInteraction(new(args.Kind, args.Snapshot, args.Handle,
+            args.Capture, args.Value));
 }

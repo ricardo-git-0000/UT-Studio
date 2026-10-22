@@ -275,6 +275,21 @@ public sealed class GateOverlaySessionTests
     }
 
     [TestMethod]
+    public async Task IdenticalVisualContextDoesNotRepublishOrRequestAnotherCommittedEvaluation()
+    {
+        Fixture fixture = Fixture.Create();
+        await using GateOverlaySession overlay = fixture.Overlay;
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed, await overlay.RequestCommittedAsync());
+        int publications = 0;
+        overlay.SnapshotChanged += _ => publications++;
+
+        Assert.IsFalse(overlay.SetVisualContext(fixture.Signal, null, Fixture.Transform(1)));
+
+        Assert.AreEqual(0, publications);
+        Assert.HasCount(1, fixture.Evaluator.ReceivedPlans);
+    }
+
+    [TestMethod]
     public async Task ConcurrentPreviewCallersKeepTheirOwnCompiledArtifacts()
     {
         var evaluator = new ControlledEvaluator();

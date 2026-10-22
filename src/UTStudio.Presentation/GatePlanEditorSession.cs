@@ -25,6 +25,8 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
     private bool _publishing;
     private bool _completeAfterPublish;
     private bool _disposed;
+    private GateEditorApplyTicket? _activeApply;
+    private bool _activeApplyAccepted;
 
     public GatePlanEditorSession(GatePlanAuthorityKey authorityKey, IGatePlanAuthorityReader authority,
         IGatePlanPreviewCompiler previewCompiler)
@@ -271,7 +273,9 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             _authorityCurrent = authoritative;
             _previewWorkspace.Clear();
             invalidate = true;
-            if (!committed.Equals(_current.Committed))
+            if (TryConvergeAcceptedUnderLock(out next))
+                publish = EnqueueUnderLock(next!);
+            else if (!committed.Equals(_current.Committed))
             {
                 GatePlanDraft? draft = _current.Draft;
                 next = draft is null ? new(committed, state: GatePlanEditorState.Committed) :
@@ -322,6 +326,78 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
         }
     }
 
+    internal GatePreviewArtifact? BorrowApplicablePreview()
+    {
+        lock (_gate)
+        {
+            if (_disposed || _current.State != GatePlanEditorState.Previewed) return null;
+            GatePreviewArtifact? artifact = _previewWorkspace.Stable ?? _previewWorkspace.Candidate;
+            return artifact is not null && ReferenceEquals(_current.Draft, artifact.Checkpoint) ? artifact : null;
+        }
+    }
+
+    internal GateCommittedArtifact? BorrowCommittedArtifact()
+    {
+        lock (_gate) return _disposed ? null : new(
+            GateGeometrySourceIdentity.Committed(_authorityCurrent), _authorityCurrent.Committed.CompiledPlan);
+    }
+
+    internal bool IsCurrentCommittedArtifact(GateCommittedArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (_gate)
+        {
+            if (_disposed) return false;
+            GateGeometrySourceIdentity current = GateGeometrySourceIdentity.Committed(_authorityCurrent);
+            return current.Authority == artifact.Source.Authority &&
+                current.BaseRevision == artifact.Source.BaseRevision &&
+                current.AuthorityGeneration == artifact.Source.AuthorityGeneration &&
+                current.PublicationSequence == artifact.Source.PublicationSequence &&
+                current.Signature.Equals(artifact.Source.Signature) &&
+                ReferenceEquals(_authorityCurrent.Committed.CompiledPlan, artifact.CompiledPlan);
+        }
+    }
+
+    internal GateEditorApplyTicket RegisterApply(GatePreviewArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_activeApply is not null || _current.State != GatePlanEditorState.Previewed ||
+                !ReferenceEquals(_current.Draft, artifact.Checkpoint) ||
+                !ReferenceEquals(_previewWorkspace.Stable ?? _previewWorkspace.Candidate, artifact))
+                throw new InvalidOperationException("Apply requires the exact current stable Preview.");
+            var ticket = new GateEditorApplyTicket(Guid.NewGuid(), artifact, _editorGeneration);
+            _activeApply = ticket; _activeApplyAccepted = false; return ticket;
+        }
+    }
+
+    internal bool ReconcileApply(GateEditorApplyTicket ticket, GatePlanEditResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        GatePlanEditorSnapshot? next = null;
+        bool publish = false;
+        lock (_gate)
+        {
+            if (_disposed || _activeApply is not { } active || active != ticket) return false;
+            if (result.Outcome != GatePlanEditOutcome.Accepted)
+            { _activeApply = null; _activeApplyAccepted = false; return true; }
+            _activeApplyAccepted = true;
+            if (TryConvergeAcceptedUnderLock(out next)) publish = EnqueueUnderLock(next!);
+        }
+        if (publish) DrainPublications();
+        if (next is not null) EditorialChanged?.Invoke(next);
+        return true;
+    }
+
+    internal void AbandonApplyRegistration(GateEditorApplyTicket ticket)
+    {
+        lock (_gate)
+            if (_activeApply is { } active && active == ticket)
+            { _activeApply = null; _activeApplyAccepted = false; }
+    }
+
     internal bool IsCurrentPreviewCandidate(GatePreviewArtifact artifact)
     {
         ArgumentNullException.ThrowIfNull(artifact);
@@ -357,6 +433,22 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             publish = EnqueueUnderLock(next);
         }
         if (publish) DrainPublications();
+        return true;
+    }
+
+    private bool TryConvergeAcceptedUnderLock(out GatePlanEditorSnapshot? next)
+    {
+        next = null;
+        if (!_activeApplyAccepted || _activeApply is not { } apply ||
+            _editorGeneration != apply.EditorGeneration ||
+            !ReferenceEquals(_current.Draft, apply.Artifact.Checkpoint)) return false;
+        GatePlanPreviewCandidate candidate = apply.Artifact.Candidate;
+        CommittedGatePlanSnapshot committed = _authorityCurrent.Committed;
+        if (committed.AuthorityKey != candidate.Draft.Authority ||
+            committed.Revision != candidate.CandidateRevision ||
+            !committed.Signature.Equals(candidate.Signature)) return false;
+        _activeApply = null; _activeApplyAccepted = false; _previewWorkspace.Clear();
+        next = new(committed, state: GatePlanEditorState.Committed);
         return true;
     }
 
