@@ -73,17 +73,19 @@ public sealed class GateHandleVisualState
     public GateHandleVisualState(GateId gateId, GateRevision gateRevision, GateHandleKind kind,
         double x, double y, double value, string unit, double minimum, double maximum, double step,
         bool isSelected, bool isFocused, bool isEnabled,
-        GateId anchorGateId = default, GateRevision anchorRevision = default)
+        GateId anchorGateId = default, GateRevision anchorRevision = default,
+        double dragCoordinateOffset = 0)
     {
         if (!gateId.IsValid || !gateRevision.IsValid || kind == GateHandleKind.Unknown ||
             !double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(value) || string.IsNullOrWhiteSpace(unit) ||
             !double.IsFinite(minimum) || !double.IsFinite(maximum) || maximum < minimum ||
-            !double.IsFinite(step) || step <= 0)
+            !double.IsFinite(step) || step <= 0 || !double.IsFinite(dragCoordinateOffset))
             throw new ArgumentException("A valid immutable gate handle is required.");
         GateId = gateId; GateRevision = gateRevision; Kind = kind; X = x; Y = y; Value = value;
         Unit = unit; Minimum = minimum; Maximum = maximum; Step = step; IsSelected = isSelected;
         IsFocused = isFocused; IsEnabled = isEnabled;
         AnchorGateId = anchorGateId; AnchorRevision = anchorRevision;
+        DragCoordinateOffset = dragCoordinateOffset;
     }
     public GateId GateId { get; }
     public GateRevision GateRevision { get; }
@@ -100,6 +102,11 @@ public sealed class GateHandleVisualState
     public bool IsEnabled { get; }
     public GateId AnchorGateId { get; }
     public GateRevision AnchorRevision { get; }
+    /// <summary>
+    /// Offset from the inset interaction target to the exact projected coordinate. It keeps boundary handles
+    /// fully actionable inside the plot without changing their physical value.
+    /// </summary>
+    public double DragCoordinateOffset { get; }
     public GateHandleLogicalIdentity Identity => new(GateId, GateRevision, Kind);
 }
 

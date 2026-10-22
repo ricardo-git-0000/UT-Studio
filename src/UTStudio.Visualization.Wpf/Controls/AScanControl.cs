@@ -292,11 +292,13 @@ public sealed class AScanControl : FrameworkElement
         else
         {
             ScanTimeViewport viewport = displayed.Transform.TimeViewport;
-            if (!LinearAxisTransform.TryCoordinateToData(position.X, displayed.Transform.TimeOrigin, displayed.Transform.TimeLength,
+            double exactCoordinate = position.X + handle.DragCoordinateOffset;
+            if (!LinearAxisTransform.TryCoordinateToData(exactCoordinate, displayed.Transform.TimeOrigin, displayed.Transform.TimeLength,
                 viewport.VisibleMinimumSeconds, viewport.VisibleMaximumSeconds, out value)) return;
         }
         EmitGateIntent(GateOverlayInteractionKind.MoveCapture, handle, Math.Clamp(value, handle.Minimum, handle.Maximum), token);
     }
+
     private void EndGateCapture()
     {
         GateCaptureGeneration? token = _gateCapture; GateHandleVisualState? handle = CurrentGateHandle();

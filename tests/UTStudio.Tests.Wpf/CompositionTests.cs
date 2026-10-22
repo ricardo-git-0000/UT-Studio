@@ -1,7 +1,9 @@
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Threading;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
+using System.Windows.Automation;
 using System.Buffers;
 using System.Threading.Channels;
 using CommunityToolkit.Mvvm.Input;
@@ -70,6 +72,16 @@ public sealed class CompositionTests
             await runtime.Host.StartAsync();
             await host.StartCommand.ExecuteAsync(null);
             GateEditorViewCoordinator editor = window.AScan.ViewModel!.GateEditor!;
+            async Task WaitForNumericAsync(Func<bool> condition)
+            {
+                if (condition()) return;
+                var changed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                void NumericChanged(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+                { if (condition()) changed.TrySetResult(); }
+                editor.PropertyChanged += NumericChanged;
+                try { await changed.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+                finally { editor.PropertyChanged -= NumericChanged; }
+            }
             var visualReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             void ObserveEditor(object? _, System.ComponentModel.PropertyChangedEventArgs __)
             {
@@ -81,6 +93,144 @@ public sealed class CompositionTests
             editor.PropertyChanged -= ObserveEditor;
 
             await ExecuteWhenEnabled(editor.BeginEditCommand);
+            window.UpdateLayout();
+            await Dispatcher.Yield();
+            if (editor.State.Overlay.Status != GateOverlayGeometryStatus.Current ||
+                editor.State.Overlay.Handles.Count != 2)
+            {
+                var editable = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                void EditingReady(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+                {
+                    if (editor.State.Overlay.Status == GateOverlayGeometryStatus.Current &&
+                        editor.State.Overlay.Handles.Count == 2) editable.TrySetResult();
+                }
+                editor.PropertyChanged += EditingReady;
+                try { await editable.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+                finally { editor.PropertyChanged -= EditingReady; }
+            }
+            GatePlanDraft initialDraft = editor.State.Editor.Draft!;
+            GateDefinition initialGate = initialDraft.Gates.Single();
+            Assert.AreEqual("default-global-maximum", editor.SelectedGateId);
+            Assert.AreEqual(0d, editor.SelectedGateStartMicroseconds);
+            Assert.AreEqual(16d, editor.SelectedGateEndMicroseconds);
+            Assert.IsFalse(editor.SelectedGateHasThreshold);
+            Assert.IsFalse(editor.State.Overlay.Handles.Any(x => x.Kind == GateHandleKind.Threshold));
+            Assert.AreEqual(Visibility.Visible,
+                ((FrameworkElement)window.AScan.FindName("GateEditorPanel")).Visibility);
+            var startEditor = (TextBox)window.AScan.FindName("GateStartValue");
+            var endEditor = (TextBox)window.AScan.FindName("GateEndValue");
+            Assert.AreEqual(Visibility.Visible, startEditor.Visibility);
+            Assert.AreEqual(Visibility.Visible, endEditor.Visibility);
+            Assert.AreEqual(Visibility.Collapsed,
+                ((FrameworkElement)window.AScan.FindName("GateThresholdPanel")).Visibility);
+            GateHandleVisualState startHandle = editor.State.Overlay.Handles.Single(x => x.Kind == GateHandleKind.Start);
+            GateHandleVisualState endHandle = editor.State.Overlay.Handles.Single(x => x.Kind == GateHandleKind.End);
+            AScanControl renderer = window.AScan.Renderer;
+            await Task.Delay(AScanVisualDelivery.MinimumPublicationInterval);
+            renderer.RefreshSnapshot();
+            GateVisualTransform editingTransform = renderer.DisplayedVisualSnapshot!.Transform;
+            Assert.IsGreaterThanOrEqualTo(editingTransform.TimeOrigin, startHandle.X);
+            Assert.IsLessThanOrEqualTo(editingTransform.TimeOrigin + editingTransform.TimeLength,
+                endHandle.X);
+            Assert.AreSame(startHandle, GateOverlayHitTester.HitTest(editor.State.Overlay,
+                startHandle.X, startHandle.Y, 1));
+            Assert.AreSame(endHandle, GateOverlayHitTester.HitTest(editor.State.Overlay,
+                endHandle.X, endHandle.Y, 1));
+            Assert.AreEqual(initialGate.Window.StartOffsetSeconds, startHandle.Value, 1e-15);
+            Assert.AreEqual(initialGate.Window.StartOffsetSeconds + initialGate.Window.DurationSeconds,
+                endHandle.Value, 1e-15);
+            Assert.IsTrue(LinearAxisTransform.TryDataToCoordinate(startHandle.Value,
+                editingTransform.TimeViewport.VisibleMinimumSeconds,
+                editingTransform.TimeViewport.VisibleMaximumSeconds, editingTransform.TimeOrigin,
+                editingTransform.TimeLength, out double exactStart));
+            Assert.IsTrue(LinearAxisTransform.TryDataToCoordinate(endHandle.Value,
+                editingTransform.TimeViewport.VisibleMinimumSeconds,
+                editingTransform.TimeViewport.VisibleMaximumSeconds, editingTransform.TimeOrigin,
+                editingTransform.TimeLength, out double exactEnd));
+            Assert.AreEqual(exactStart, startHandle.X + startHandle.DragCoordinateOffset, 1e-9);
+            Assert.AreEqual(exactEnd, endHandle.X + endHandle.DragCoordinateOffset, 1e-9);
+
+            AScanCompositeVisualSnapshot shown = editor.CompositeVisual!;
+            Assert.IsTrue(editor.TryBeginCapture(shown, startHandle.Identity, out GateCaptureGeneration startCapture));
+            for (int index = 1; index <= 1_000; index++)
+                editor.HandleInteraction(new(GateOverlayInteractionKind.MoveCapture, shown, startHandle.Identity,
+                    startCapture, index * 1e-9));
+            editor.HandleInteraction(new(GateOverlayInteractionKind.EndCapture, shown, startHandle.Identity,
+                startCapture, null));
+            await WaitForNumericAsync(() => Math.Abs(editor.SelectedGateStartMicroseconds!.Value - 1d) < 1e-9);
+            await WaitForNumericAsync(() => editor.State.Overlay.Capture is null &&
+                editor.State.Phase == GateEditorViewPhase.Previewed);
+
+            GateHandleVisualState draggedEndHandle = editor.State.Overlay.Handles
+                .Single(x => x.Kind == GateHandleKind.End);
+            shown = editor.CompositeVisual!;
+            Assert.IsTrue(editor.TryBeginCapture(shown, draggedEndHandle.Identity,
+                out GateCaptureGeneration endCapture));
+            editor.HandleInteraction(new(GateOverlayInteractionKind.MoveCapture, shown, draggedEndHandle.Identity,
+                endCapture, 15e-6));
+            editor.HandleInteraction(new(GateOverlayInteractionKind.EndCapture, shown, draggedEndHandle.Identity,
+                endCapture, null));
+            await WaitForNumericAsync(() => editor.SelectedGateEndMicroseconds < 16d);
+            await WaitForNumericAsync(() => editor.State.Overlay.Capture is null &&
+                editor.State.Phase == GateEditorViewPhase.Previewed);
+
+            GatePlanDraft validBeforeParseError = editor.State.Editor.Draft!;
+            double validStartBeforeParseError = editor.SelectedGateStartMicroseconds!.Value;
+            Assert.IsTrue(editor.ApplyCommand.CanExecute(null));
+            Assert.IsTrue(startEditor.Focus());
+            startEditor.Text = "no-es-un-numero";
+            Assert.IsTrue(endEditor.Focus());
+            await Dispatcher.Yield();
+            var startValidation = (TextBlock)window.AScan.FindName("GateStartValidation");
+            Assert.AreEqual(Visibility.Visible, startValidation.Visibility);
+            Assert.AreEqual("Introduzca un número válido.", startValidation.Text);
+            Assert.AreEqual(AutomationLiveSetting.Assertive,
+                AutomationProperties.GetLiveSetting(startValidation));
+            Assert.Contains("Error", AutomationProperties.GetItemStatus(startEditor));
+            Assert.AreEqual("no-es-un-numero", startEditor.Text);
+            Assert.AreSame(validBeforeParseError, editor.State.Editor.Draft);
+            Assert.AreEqual(validStartBeforeParseError, editor.SelectedGateStartMicroseconds);
+            Assert.IsFalse(editor.ApplyCommand.CanExecute(null));
+            GateControlledSource.FrameOwner invalidTypingFrame = source.QueueFrame();
+            await invalidTypingFrame.Returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Dispatcher.Yield();
+            Assert.AreEqual("no-es-un-numero", startEditor.Text,
+                "A live publication must preserve invalid text so it can be corrected.");
+
+            Assert.IsTrue(startEditor.Focus());
+            startEditor.Text = "2";
+            Assert.IsTrue(endEditor.Focus());
+            await WaitForNumericAsync(() => editor.SelectedGateStartMicroseconds == 2d);
+            Assert.AreEqual(Visibility.Collapsed, startValidation.Visibility);
+            Assert.AreEqual(string.Empty, AutomationProperties.GetItemStatus(startEditor));
+            Assert.IsNull(editor.NumericValidationMessage);
+            Assert.IsTrue(editor.ApplyCommand.CanExecute(null));
+
+            Assert.AreEqual(GateOverlayRequestOutcome.NotAvailable,
+                await editor.PreviewHandleValueAsync(initialGate.Id, GateHandleKind.Start, 1));
+            Assert.AreEqual(GateEditorViewPhase.ValidationFailed, editor.State.Phase);
+            Assert.IsNotNull(editor.NumericValidationMessage);
+            Assert.IsFalse(editor.ApplyCommand.CanExecute(null));
+            Assert.IsTrue(startEditor.Focus());
+            startEditor.Text = "2";
+            GateControlledSource.FrameOwner startTypingFrame = source.QueueFrame();
+            await startTypingFrame.Returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Dispatcher.Yield();
+            Assert.AreEqual("2", startEditor.Text,
+                "A live visual publication must not overwrite an in-progress numeric edit.");
+            Assert.IsTrue(endEditor.Focus());
+            await WaitForNumericAsync(() => editor.SelectedGateStartMicroseconds == 2d);
+
+            endEditor.Text = "12";
+            GateControlledSource.FrameOwner endTypingFrame = source.QueueFrame();
+            await endTypingFrame.Returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Dispatcher.Yield();
+            Assert.AreEqual("12", endEditor.Text,
+                "A live visual publication must not overwrite an in-progress numeric edit.");
+            Keyboard.ClearFocus();
+            await WaitForNumericAsync(() => editor.SelectedGateEndMicroseconds == 12d);
+            Assert.AreEqual(2d, editor.SelectedGateStartMicroseconds);
+            Assert.AreEqual(12d, editor.SelectedGateEndMicroseconds);
             await ExecuteWhenEnabled(editor.PreviewCommand);
             if (editor.State.Phase != GateEditorViewPhase.Previewed)
             {
@@ -122,6 +272,9 @@ public sealed class CompositionTests
                 finally { editor.PropertyChanged -= Converged; }
             }
             Assert.AreEqual(GateEditorViewPhase.Committed, editor.State.Phase);
+            GateDefinition committedGate = scope.Authority.Read(scope.AuthorityKey).Committed.Plan.Gates.Single();
+            Assert.AreEqual(2e-6, committedGate.Window.StartOffsetSeconds, 1e-15);
+            Assert.AreEqual(10e-6, committedGate.Window.DurationSeconds, 1e-15);
             await host.StopCommand.ExecuteAsync(null);
             Assert.AreEqual(SessionPhase.Idle, services.GetRequiredService<ApplicationSession>().Snapshot.Phase);
             GateReprocessingProgressSnapshot historicalTerminal = await historical.Terminal.Task

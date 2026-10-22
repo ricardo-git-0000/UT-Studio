@@ -2,10 +2,13 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.ComponentModel;
+using System.Globalization;
 using System.Windows.Media;
+using System.Windows.Automation;
 using UTStudio.Presentation;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Processing;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Controls;
 
@@ -127,6 +130,78 @@ public partial class AScanView : UserControl, IAsyncDisposable
     {
         SetValue(StatePropertyKey, _viewModel?.State);
         SetValue(ErrorPropertyKey, _viewModel?.Error ?? _viewModel?.VisualError ?? _viewModel?.NotificationError);
+        PublishGateEditorFields();
+    }
+
+    private void PublishGateEditorFields()
+    {
+        GateEditorViewCoordinator? editor = _viewModel?.GateEditor;
+        if (editor?.SelectedGateId is null) ClearAllNumericFieldErrors();
+        PublishNumericField(GateStartValue, editor?.SelectedGateStartMicroseconds, "0.###");
+        PublishNumericField(GateEndValue, editor?.SelectedGateEndMicroseconds, "0.###");
+        PublishNumericField(GateThresholdValue, editor?.SelectedGateThresholdPercent, "0.##");
+    }
+
+    private static void PublishNumericField(TextBox field, double? value, string format)
+    {
+        if (field.IsKeyboardFocusWithin || !string.IsNullOrEmpty(AutomationProperties.GetItemStatus(field))) return;
+        field.Text = value?.ToString(format, CultureInfo.CurrentCulture) ?? string.Empty;
+    }
+
+    private async void OnGateNumericLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs args)
+    {
+        if (sender is not TextBox field || _viewModel?.GateEditor is not { } editor ||
+            editor.SelectedGateId is not { } selected) return;
+        GateHandleKind kind = (field.Tag as string) switch
+        {
+            "Start" => GateHandleKind.Start,
+            "End" => GateHandleKind.End,
+            "Threshold" => GateHandleKind.Threshold,
+            _ => GateHandleKind.Unknown
+        };
+        if (kind == GateHandleKind.Unknown) return;
+        if (!double.TryParse(field.Text, NumberStyles.Float, CultureInfo.CurrentCulture, out double displayed) ||
+            !double.IsFinite(displayed))
+        {
+            SetNumericFieldError(field, kind, "Introduzca un número válido.");
+            editor.SetNumericInputValidity(kind, false);
+            return;
+        }
+        ClearNumericFieldError(field, kind);
+        editor.SetNumericInputValidity(kind, true);
+        double value = kind == GateHandleKind.Threshold ? displayed / 100d : displayed / 1_000_000d;
+        try { await editor.PreviewHandleValueAsync(new GateId(selected), kind, value); }
+        catch (Exception error) { SetNumericFieldError(field, kind, error.Message); editor.SetNumericInputValidity(kind, false); }
+        finally { PublishGateEditorFields(); }
+    }
+
+    private void SetNumericFieldError(TextBox field, GateHandleKind kind, string message)
+    {
+        TextBlock error = NumericError(kind);
+        error.Text = message; error.Visibility = Visibility.Visible;
+        AutomationProperties.SetItemStatus(field, $"Error: {message}");
+    }
+
+    private void ClearNumericFieldError(TextBox field, GateHandleKind kind)
+    {
+        TextBlock error = NumericError(kind);
+        error.Text = string.Empty; error.Visibility = Visibility.Collapsed;
+        AutomationProperties.SetItemStatus(field, string.Empty);
+    }
+
+    private TextBlock NumericError(GateHandleKind kind) => kind switch
+    {
+        GateHandleKind.Start => GateStartValidation,
+        GateHandleKind.End => GateEndValidation,
+        GateHandleKind.Threshold => GateThresholdValidation,
+        _ => throw new ArgumentOutOfRangeException(nameof(kind))
+    };
+
+    private void ClearAllNumericFieldErrors()
+    {
+        ClearNumericFieldError(GateStartValue, GateHandleKind.Start);
+        ClearNumericFieldError(GateEndValue, GateHandleKind.End);
+        ClearNumericFieldError(GateThresholdValue, GateHandleKind.Threshold);
     }
 
     private void OnVisualContextChanged(object? sender, EventArgs args) => PublishVisualSnapshot();

@@ -29,6 +29,7 @@ public sealed record GateEditorViewState(
 public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposable
 {
     private readonly object _gate = new();
+    private readonly object _interactionSync = new();
     private readonly IGatePlanApplyPort _apply;
     private readonly GatePlanEditorSession _editor;
     private readonly GateOverlaySession _overlay;
@@ -36,7 +37,11 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     private readonly IDisposable _editorSubscription;
     private readonly UiAsyncCommand _beginEdit, _preview, _cancel, _applyCommand;
     private GateEditorViewState _state;
+    private GateNumericPresentation? _publishedNumeric;
     private AScanCompositeVisualSnapshot? _composite;
+    private GateInteractionRequestedEventArgsData? _pendingMove, _pendingInteraction;
+    private readonly HashSet<GateHandleKind> _invalidNumericInputs = [];
+    private Task? _interactionRunner;
     private ulong _applySequence;
     private bool _closed;
     private Task? _closeTask;
@@ -65,12 +70,46 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     public IAsyncRelayCommand PreviewCommand => _preview;
     public IAsyncRelayCommand CancelCommand => _cancel;
     public IAsyncRelayCommand ApplyCommand => _applyCommand;
+    public string? SelectedGateId => SelectedGate()?.Id.Value;
+    public double? SelectedGateStartMicroseconds
+    {
+        get => SelectedGate()?.Window.StartOffsetSeconds * 1_000_000d;
+        set => QueueNumericPreview(GateHandleKind.Start, value);
+    }
+    public double? SelectedGateEndMicroseconds
+    {
+        get => SelectedGate() is { } gate
+            ? (gate.Window.StartOffsetSeconds + gate.Window.DurationSeconds) * 1_000_000d : null;
+        set => QueueNumericPreview(GateHandleKind.End, value);
+    }
+    public double? SelectedGateThresholdPercent
+    {
+        get => SelectedGate()?.Detector.Threshold?.NormalizedValue * 100d;
+        set => QueueNumericPreview(GateHandleKind.Threshold, value is null ? null : value / 100d);
+    }
+    public bool SelectedGateHasThreshold => SelectedGate()?.Detector.Threshold is not null;
+    public string? NumericValidationMessage => _invalidNumericInputs.Count != 0
+        ? "Introduzca un número válido." : _state.ErrorCode == "gate.numeric.range"
+            ? "El valor debe permanecer dentro del rango válido de la puerta." : null;
+
+    public void SetNumericInputValidity(GateHandleKind kind, bool isValid)
+    {
+        if (_closed || kind == GateHandleKind.Unknown) return;
+        bool changed = isValid ? _invalidNumericInputs.Remove(kind) : _invalidNumericInputs.Add(kind);
+        if (!changed) return;
+        _publishedNumeric = null;
+        OnPropertyChanged(nameof(NumericValidationMessage));
+        RefreshCommands();
+    }
 
     public void SetVisualContext(AScanSnapshot signal, AScanCursorState? cursors, GateVisualTransform transform)
     {
         if (_closed) return;
         bool changed = _overlay.SetVisualContext(signal, cursors, transform);
-        if (changed && _editor.Snapshot.Draft is null) _ = ObserveVisualAsync(_overlay.RequestCommittedAsync());
+        if (!changed) return;
+        DiscardPendingInteractions();
+        _ = ObserveVisualAsync(_editor.Snapshot.Draft is null
+            ? _overlay.RequestCommittedAsync() : _overlay.RequestEditingAsync());
     }
 
     public bool TryBeginCapture(AScanCompositeVisualSnapshot shown, GateHandleLogicalIdentity handle,
@@ -86,10 +125,61 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
 
     public void HandleInteraction(GateInteractionRequestedEventArgsData intent)
     {
-        if (_closed || !intent.IsValid ||
-            !ReferenceEquals(intent.Snapshot, _composite) &&
-            (intent.Capture is not { } capture || _overlay.Snapshot.Capture != capture)) return;
-        _ = ObserveInteractionAsync(intent);
+        if (!IsCurrentInteraction(intent)) return;
+        lock (_interactionSync)
+        {
+            if (_closed) return;
+            if (intent.Kind == GateOverlayInteractionKind.MoveCapture)
+            {
+                if (_pendingInteraction?.Kind is GateOverlayInteractionKind.EndCapture or
+                    GateOverlayInteractionKind.CancelPreview) return;
+                _pendingMove = intent;
+            }
+            else
+            {
+                bool pendingTerminal = _pendingInteraction?.Kind is GateOverlayInteractionKind.EndCapture or
+                    GateOverlayInteractionKind.CancelPreview;
+                if (pendingTerminal && intent.Kind != GateOverlayInteractionKind.CancelPreview) return;
+                if (intent.Kind == GateOverlayInteractionKind.CancelPreview) _pendingMove = null;
+                _pendingInteraction = intent;
+            }
+            _interactionRunner ??= Task.Run(DrainInteractionsAsync);
+        }
+    }
+
+    private async Task DrainInteractionsAsync()
+    {
+        while (true)
+        {
+            GateInteractionRequestedEventArgsData intent;
+            lock (_interactionSync)
+            {
+                GateInteractionRequestedEventArgsData? next = _pendingMove ?? _pendingInteraction;
+                if (next is null)
+                {
+                    _interactionRunner = null;
+                    return;
+                }
+                intent = next.Value;
+                if (_pendingMove is not null) _pendingMove = null;
+                else _pendingInteraction = null;
+            }
+            if (!IsCurrentInteraction(intent)) continue;
+            await ObserveInteractionAsync(intent).ConfigureAwait(false);
+        }
+    }
+
+    private bool IsCurrentInteraction(GateInteractionRequestedEventArgsData intent) =>
+        !_closed && intent.IsValid && (ReferenceEquals(intent.Snapshot, _composite) ||
+        intent.Capture is { } capture && _overlay.Snapshot.Capture == capture);
+
+    private void DiscardPendingInteractions()
+    {
+        lock (_interactionSync)
+        {
+            _pendingMove = null;
+            _pendingInteraction = null;
+        }
     }
 
     private async Task ObserveInteractionAsync(GateInteractionRequestedEventArgsData intent)
@@ -101,25 +191,16 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
             { _overlay.Select(handle.GateId, handle.Kind); return; }
             switch (intent.Kind)
             {
-                case GateOverlayInteractionKind.MoveCapture:
-                    if (intent.Value is { } value)
-                        await _overlay.MoveCapturedHandleAsync(value).ConfigureAwait(false);
-                    break;
-                case GateOverlayInteractionKind.EndCapture:
-                    _overlay.EndCapture();
-                    break;
-                case GateOverlayInteractionKind.CancelPreview:
-                    _overlay.RestoreStablePreview();
-                    break;
+                case GateOverlayInteractionKind.MoveCapture when intent.Value is { } value:
+                    await _overlay.MoveCapturedHandleAsync(value).ConfigureAwait(false); break;
+                case GateOverlayInteractionKind.EndCapture: _overlay.EndCapture(); break;
+                case GateOverlayInteractionKind.CancelPreview: _overlay.RestoreStablePreview(); break;
                 case GateOverlayInteractionKind.ConfirmPreview:
-                    await _overlay.HandleKeyAsync(GateOverlayKeyIntent.ConfirmPreview).ConfigureAwait(false);
-                    break;
+                    await _overlay.HandleKeyAsync(GateOverlayKeyIntent.ConfirmPreview).ConfigureAwait(false); break;
                 case GateOverlayInteractionKind.Increment:
-                    await _overlay.HandleKeyAsync(GateOverlayKeyIntent.Increment).ConfigureAwait(false);
-                    break;
+                    await _overlay.HandleKeyAsync(GateOverlayKeyIntent.Increment).ConfigureAwait(false); break;
                 case GateOverlayInteractionKind.Decrement:
-                    await _overlay.HandleKeyAsync(GateOverlayKeyIntent.Decrement).ConfigureAwait(false);
-                    break;
+                    await _overlay.HandleKeyAsync(GateOverlayKeyIntent.Decrement).ConfigureAwait(false); break;
             }
         }
         catch (Exception error) { ReportError(error); }
@@ -128,7 +209,9 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     private Task BeginEditAsync(CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        _invalidNumericInputs.Clear();
         GatePlanEditorSnapshot editor = _editor.BeginEdit();
+        bool geometryReady = _overlay.BeginEditing(editor.Draft!);
         Publish(_state with
         {
             Phase = GateEditorViewPhase.Editing,
@@ -138,7 +221,33 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
             WaiterCancelled = false,
             ErrorCode = null
         });
+        if (!geometryReady) _ = ObserveVisualAsync(_overlay.RequestCommittedAsync(token));
         return Task.CompletedTask;
+    }
+
+    public async Task<GateOverlayRequestOutcome> PreviewHandleValueAsync(GateId gateId,
+        GateHandleKind kind, double valueSeconds, CancellationToken token = default)
+    {
+        if (_closed) return GateOverlayRequestOutcome.Closed;
+        Publish(_state with { Phase = GateEditorViewPhase.Previewing, Result = null, ErrorCode = null });
+        GateOverlayRequestOutcome outcome = await _overlay.PreviewHandleValueAsync(gateId, kind,
+            valueSeconds, token).ConfigureAwait(false);
+        await _lifetime.InvokeAsync(() =>
+        {
+            GatePlanEditorSnapshot editor = _editor.Snapshot;
+            GateEditorViewPhase phase = outcome == GateOverlayRequestOutcome.Completed
+                ? GateEditorViewPhase.Previewed : outcome == GateOverlayRequestOutcome.NotAvailable
+                    ? GateEditorViewPhase.ValidationFailed : Map(editor, outcome);
+            Publish(_state with
+            {
+                Phase = phase,
+                Editor = editor,
+                ErrorCode = outcome == GateOverlayRequestOutcome.NotAvailable
+                    ? "gate.numeric.range" : outcome == GateOverlayRequestOutcome.Faulted
+                        ? "gate.preview.faulted" : null
+            });
+        }).ConfigureAwait(false);
+        return outcome;
     }
 
     private async Task PreviewAsync(CancellationToken token)
@@ -163,6 +272,8 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     private async Task CancelAsync(CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        _invalidNumericInputs.Clear();
+        DiscardPendingInteractions();
         GatePlanEditorSnapshot editor = _editor.Cancel().Snapshot;
         GateEditorViewPhase phase = _state.Phase == GateEditorViewPhase.Applying
             ? GateEditorViewPhase.Applying : GateEditorViewPhase.Committed;
@@ -367,9 +478,11 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     private bool CanBeginEdit() => !_closed && _state.Phase is GateEditorViewPhase.Committed or
         GateEditorViewPhase.Conflict or GateEditorViewPhase.ValidationFailed or GateEditorViewPhase.Faulted;
     private bool CanPreview() => !_closed && _editor.Snapshot.Draft is not null &&
-        _state.Phase is GateEditorViewPhase.Editing or GateEditorViewPhase.ValidationFailed;
+        _state.Phase is GateEditorViewPhase.Editing or GateEditorViewPhase.Previewed or
+        GateEditorViewPhase.ValidationFailed;
     private bool CanCancel() => !_closed && _editor.Snapshot.Draft is not null;
-    private bool CanApply() => !_closed && _state.Phase == GateEditorViewPhase.Previewed &&
+    private bool CanApply() => !_closed && _invalidNumericInputs.Count == 0 &&
+        _state.Phase == GateEditorViewPhase.Previewed &&
         _editor.BorrowApplicablePreview() is not null;
     private UiAsyncCommand Command(Func<CancellationToken, Task> execute, Func<bool> canExecute) =>
         new(_lifetime, execute, canExecute, ReportError, RefreshCommands);
@@ -380,8 +493,63 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     {
         if (_closed || state == _state) return;
         _state = state; OnPropertyChanged(nameof(State)); OnPropertyChanged(nameof(CompositeVisual));
+        GateNumericPresentation numeric = ReadNumericPresentation();
+        if (numeric != _publishedNumeric)
+        {
+            _publishedNumeric = numeric;
+            OnPropertyChanged(nameof(SelectedGateId));
+            OnPropertyChanged(nameof(SelectedGateStartMicroseconds));
+            OnPropertyChanged(nameof(SelectedGateEndMicroseconds));
+            OnPropertyChanged(nameof(SelectedGateThresholdPercent));
+            OnPropertyChanged(nameof(SelectedGateHasThreshold));
+            OnPropertyChanged(nameof(NumericValidationMessage));
+        }
         RefreshCommands();
     }
+
+    private GateNumericPresentation ReadNumericPresentation()
+    {
+        GateDefinition? gate = SelectedGate();
+        return new(gate?.Id.Value,
+            gate?.Window.StartOffsetSeconds * 1_000_000d,
+            gate is null ? null : (gate.Window.StartOffsetSeconds + gate.Window.DurationSeconds) * 1_000_000d,
+            gate?.Detector.Threshold?.NormalizedValue * 100d,
+            gate?.Detector.Threshold is not null,
+            NumericValidationMessage);
+    }
+
+    private GateDefinition? SelectedGate()
+    {
+        GatePlanDraft? draft = _editor.Snapshot.Draft;
+        if (draft is null) return null;
+        GateId? selected = _overlay.Snapshot.SelectedGate;
+        return selected is { } gateId ? draft.Gates.FirstOrDefault(x => x.Id == gateId) : draft.Gates.FirstOrDefault();
+    }
+
+    private void QueueNumericPreview(GateHandleKind kind, double? displayedValue)
+    {
+        if (_closed || displayedValue is not { } finite || !double.IsFinite(finite) ||
+            SelectedGate() is not { } gate) return;
+        double value = kind == GateHandleKind.Threshold ? finite : finite / 1_000_000d;
+        double? current = kind switch
+        {
+            GateHandleKind.Start => gate.Window.StartOffsetSeconds,
+            GateHandleKind.End => gate.Window.StartOffsetSeconds + gate.Window.DurationSeconds,
+            GateHandleKind.Threshold => gate.Detector.Threshold?.NormalizedValue,
+            _ => null
+        };
+        if (current is null || Math.Abs(current.Value - value) <= 1e-15) return;
+        _ = ObserveNumericPreviewAsync(gate.Id, kind, value);
+    }
+
+    private async Task ObserveNumericPreviewAsync(GateId gateId, GateHandleKind kind, double value)
+    {
+        try { await PreviewHandleValueAsync(gateId, kind, value).ConfigureAwait(false); }
+        catch (Exception error) { ReportError(error); }
+    }
+
+    private sealed record GateNumericPresentation(string? GateId, double? StartMicroseconds,
+        double? EndMicroseconds, double? ThresholdPercent, bool HasThreshold, string? ValidationMessage);
 
     private void ReportError(Exception error) => _lifetime.Post(() => Publish(_state with
     {
@@ -400,10 +568,19 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     {
         if (_closed) return;
         _closed = true;
+        Task? interactionRunner;
+        lock (_interactionSync)
+        {
+            _pendingMove = null;
+            _pendingInteraction = null;
+            interactionRunner = _interactionRunner;
+        }
         foreach (UiAsyncCommand command in Commands) command.DisableForClose();
         _overlay.SnapshotChanged -= ReceiveOverlay;
         _editorSubscription.Dispose();
-        await _overlay.DisposeAsync().ConfigureAwait(false);
+        ValueTask overlayClose = _overlay.DisposeAsync();
+        if (interactionRunner is not null) await interactionRunner.ConfigureAwait(false);
+        await overlayClose.ConfigureAwait(false);
         _editor.Dispose();
         foreach (UiAsyncCommand command in Commands) await command.FinishForCloseAsync().ConfigureAwait(false);
         _lifetime.Close();

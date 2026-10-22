@@ -12,7 +12,7 @@
     <KeyBinding Key="Right" Modifiers="Alt" Command="{Binding PanRightCommand, ElementName=Root}" />
   </UserControl.InputBindings>
   <Grid x:Name="Root">
-    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <StackPanel Orientation="Horizontal" Margin="0,0,0,12" AutomationProperties.Name="Herramientas A-Scan">
       <TextBlock Text="{Binding ComponentPhase}" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,12,0" AutomationProperties.LiveSetting="Polite"/>
       <Button Content="Cursores" Command="{Binding ToggleCursorsCommand}" MinWidth="90" Padding="16,8" Margin="0,0,8,0" AutomationProperties.HelpText="Muestra u oculta los cursores A y B"/>
@@ -31,10 +31,67 @@
       <TextBlock Text="{Binding GateEditor.State.Phase}" Margin="8,0,0,0" VerticalAlignment="Center"
                  AutomationProperties.Name="Estado del editor de gates" AutomationProperties.LiveSetting="Polite"/>
     </StackPanel>
-    <controls:AScanControl x:Name="Scan" Grid.Row="1" AutomationProperties.Name="Gráfico A-Scan"
+    <StackPanel x:Name="GateEditorPanel" Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10"
+                AutomationProperties.Name="Valores de la puerta seleccionada">
+      <StackPanel.Style>
+        <Style TargetType="StackPanel">
+          <Setter Property="Visibility" Value="Visible"/>
+          <Style.Triggers>
+            <DataTrigger Binding="{Binding GateEditor.SelectedGateId}" Value="{x:Null}">
+              <Setter Property="Visibility" Value="Collapsed"/>
+            </DataTrigger>
+          </Style.Triggers>
+        </Style>
+      </StackPanel.Style>
+      <TextBlock Text="Puerta: " VerticalAlignment="Center" FontWeight="SemiBold"/>
+      <TextBlock Text="{Binding GateEditor.SelectedGateId}" VerticalAlignment="Center" Margin="0,0,16,0"
+                 AutomationProperties.Name="Identificador de puerta"/>
+      <TextBlock Text="Inicio (µs):" VerticalAlignment="Center"/>
+      <StackPanel Margin="6,0,14,0">
+        <TextBox x:Name="GateStartValue" Width="92" VerticalContentAlignment="Center"
+                 Tag="Start" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
+                 AutomationProperties.Name="Inicio de puerta en microsegundos"
+                 AutomationProperties.HelpText="Al salir del campo valida y genera el mismo Preview que el arrastre"/>
+        <TextBlock x:Name="GateStartValidation" Foreground="#FFB4AB" Visibility="Collapsed"
+                   AutomationProperties.LiveSetting="Assertive"/>
+      </StackPanel>
+      <TextBlock Text="Fin (µs):" VerticalAlignment="Center"/>
+      <StackPanel Margin="6,0,14,0">
+        <TextBox x:Name="GateEndValue" Width="92" VerticalContentAlignment="Center"
+                 Tag="End" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
+                 AutomationProperties.Name="Fin de puerta en microsegundos"
+                 AutomationProperties.HelpText="Al salir del campo valida y genera el mismo Preview que el arrastre"/>
+        <TextBlock x:Name="GateEndValidation" Foreground="#FFB4AB" Visibility="Collapsed"
+                   AutomationProperties.LiveSetting="Assertive"/>
+      </StackPanel>
+      <StackPanel x:Name="GateThresholdPanel" Orientation="Horizontal">
+        <StackPanel.Style>
+          <Style TargetType="StackPanel">
+            <Setter Property="Visibility" Value="Collapsed"/>
+            <Style.Triggers>
+              <DataTrigger Binding="{Binding GateEditor.SelectedGateHasThreshold}" Value="True">
+                <Setter Property="Visibility" Value="Visible"/>
+              </DataTrigger>
+            </Style.Triggers>
+          </Style>
+        </StackPanel.Style>
+        <TextBlock Text="Umbral (%):" VerticalAlignment="Center"/>
+        <StackPanel Margin="6,0,14,0">
+          <TextBox x:Name="GateThresholdValue" Width="80" VerticalContentAlignment="Center"
+                   Tag="Threshold" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
+                   AutomationProperties.Name="Umbral de puerta en porcentaje"
+                   AutomationProperties.HelpText="Al salir del campo valida y genera el mismo Preview que el handle gráfico"/>
+          <TextBlock x:Name="GateThresholdValidation" Foreground="#FFB4AB" Visibility="Collapsed"
+                     AutomationProperties.LiveSetting="Assertive"/>
+        </StackPanel>
+      </StackPanel>
+      <TextBlock Text="{Binding GateEditor.NumericValidationMessage}" Foreground="#FFB4AB"
+                 VerticalAlignment="Center" AutomationProperties.LiveSetting="Assertive"/>
+    </StackPanel>
+    <controls:AScanControl x:Name="Scan" Grid.Row="2" AutomationProperties.Name="Gráfico A-Scan"
       CursorActivated="OnCursorActivated" CursorMoveRequested="OnCursorMoveRequested"
       TimeZoomRequested="OnTimeZoomRequested" TimePanRequested="OnTimePanRequested" TimeResetRequested="OnTimeResetRequested"/>
-    <StackPanel Grid.Row="2" Margin="0,12,0,0">
+    <StackPanel Grid.Row="3" Margin="0,12,0,0">
       <TextBlock Text="Zoom temporal: rueda sobre el gráfico · desplazar: botón central o Mayús + arrastre izquierdo." Foreground="#AEBFD4"/>
       <StackPanel Orientation="Horizontal" AutomationProperties.Name="Rango visible A-Scan">
         <TextBlock Text="Vista: " FontWeight="SemiBold"/><TextBlock Text="{Binding TimeViewport.VisibleMinimumSeconds, StringFormat={}{0:0.#########} s, TargetNullValue=—}"/>

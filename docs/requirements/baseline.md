@@ -71,3 +71,19 @@ backpressure o `CapacityExceeded`. Lecturas usan lease inmutable o snapshot inde
 
 ## Aceptación de la fase documental inicial (histórico)
 Configuración y once perfiles presentes; reglas de escritor único; documentación de requisitos, arquitectura y ADR enlazada; cinco áreas revisadas en paralelo por especialistas; pendientes explícitos; sin implementación, proyectos C#, paquetes ni commit.
+
+## Ampliación confirmada del editor de puertas (2026-10-22)
+
+La ampliación aprobada, todavía no implementada, permitirá un perfil estacionario adicional con tres puertas
+estables y cambiar detector/referencia mediante el mismo draft, Preview y Apply; crear/eliminar permanece fuera.
+El perfil móvil actual y su plan vigente se conservan sin migración. Los cruces conservan tiempo interpolado y
+`SampleIndex` izquierdo. Los máximos locales con threshold exigen amplitud estrictamente mayor y filtran threshold
+antes de la supresión por distancia. Máximo y mínimo no conservan un threshold incompatible. Se mantienen los
+dominios RF actuales; `Absolute` no equivale a señal rectificada adquirida y `RectifiedInput` queda fuera.
+
+Una referencia nueva conserva el offset numérico; padre sin evento produce ausencia causal explícita, nunca cero
+ni evento anterior. Los eventos visibles procederán de evaluación sobre muestras originales. El perfil
+estacionario A/B/C está aceptado condicionado a validar límites y resultados exactos; será seleccionable para
+configuraciones nuevas y no está implementado. El wrap móvil es válido; una combinación incompatible se rechazará
+de forma tipada y sin efectos. Véanse [ADR 0019](../adr/0019-configurable-causal-gate-editor.md) y el
+[diseño de ampliación](../architecture/ut-gate-editor-extension-design.md).

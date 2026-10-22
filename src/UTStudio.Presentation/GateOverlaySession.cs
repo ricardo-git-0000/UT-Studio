@@ -14,6 +14,7 @@ public enum GateOverlayKeyIntent { FocusPrevious, FocusNext, Decrement, Incremen
 /// </summary>
 public sealed class GateOverlaySession : IAsyncDisposable
 {
+    private const double BoundaryHandleInsetDip = 8;
     private readonly object _gate = new();
     private readonly object _previewGate = new();
     private readonly GatePlanEditorSession _editor;
@@ -24,7 +25,9 @@ public sealed class GateOverlaySession : IAsyncDisposable
     private GateVisualTransform? _transform;
     private GateOverlayVisualSnapshot _overlay;
     private GatePreviewArtifact? _stableArtifact;
+    private GateCommittedArtifact? _stableCommittedArtifact;
     private GateGeometrySnapshot? _stableGeometry;
+    private GateGeometrySnapshot? _committedGeometry;
     private EvaluationRequest? _pending;
     private CancellationTokenSource? _activeCancellation;
     private Task? _runner;
@@ -139,6 +142,91 @@ public sealed class GateOverlaySession : IAsyncDisposable
         return EnqueueAsync(artifact, cancellationToken);
     }
 
+    public ValueTask<GateOverlayRequestOutcome> RequestEditingAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        GatePreviewArtifact? preview = _editor.BorrowApplicablePreview();
+        if (preview is not null) return EnqueueAsync(preview, cancellationToken);
+        return RequestCommittedAsync(cancellationToken);
+    }
+
+    public bool BeginEditing(GatePlanDraft draft)
+    {
+        ArgumentNullException.ThrowIfNull(draft);
+        GateOverlayVisualSnapshot publish;
+        lock (_gate)
+        {
+            if (_closed || !ReferenceEquals(_editor.Snapshot.Draft, draft)) return false;
+            _ownedDraft = draft;
+            GateDefinition? first = draft.Gates.FirstOrDefault();
+            if (first is not null)
+            {
+                _selectedGate = first.Id;
+                _focusedHandle = GateHandleKind.Start;
+            }
+            GateGeometrySnapshot? committed = CompatibleGeometryUnderLock(_committedGeometry)
+                ? _committedGeometry : null;
+            GateOverlayGeometryStatus status = committed is not null
+                ? GateOverlayGeometryStatus.Current : GateOverlayGeometryStatus.Stale;
+            _stableArtifact = null;
+            _stableGeometry = committed;
+            publish = BuildOverlayUnderLock(status, committed?.Source,
+                committed?.TraceIdentity, committed?.InspectionRevision ?? InspectionRevision.Initial,
+                committed,
+                _evaluationSequence, null);
+            SetSnapshotUnderLock(publish);
+        }
+        Publish(publish);
+        return publish.Handles.Count != 0;
+    }
+
+    public async ValueTask<GateOverlayRequestOutcome> PreviewHandleValueAsync(GateId gateId,
+        GateHandleKind kind, double value, CancellationToken cancellationToken = default)
+    {
+        if (!gateId.IsValid || kind == GateHandleKind.Unknown || !double.IsFinite(value))
+            return GateOverlayRequestOutcome.NotAvailable;
+        GatePlanDraft next;
+        lock (_gate)
+        {
+            if (_closed) return GateOverlayRequestOutcome.Closed;
+            GatePlanDraft? draft = _editor.Snapshot.Draft;
+            GateDefinition? definition = draft?.Gates.FirstOrDefault(x => x.Id == gateId);
+            if (draft is null || definition is null || !TryGetEditRangeUnderLock(definition, kind,
+                out double minimum, out double maximum) || value < minimum || value > maximum)
+                return GateOverlayRequestOutcome.NotAvailable;
+            _selectedGate = gateId; _focusedHandle = kind;
+            next = ChangeDraft(draft, gateId, kind, value);
+        }
+        return await PreviewAsync(next, cancellationToken).ConfigureAwait(false);
+    }
+
+    private bool TryGetEditRangeUnderLock(GateDefinition definition, GateHandleKind kind,
+        out double minimum, out double maximum)
+    {
+        minimum = maximum = default;
+        if (_transform is not { } transform) return false;
+        double step = transform.TimeViewport.VisibleSpanSeconds / 1000d;
+        double limit = transform.TimeViewport.DomainSpanSeconds;
+        bool absolute = definition.Window.StartReference.Kind == GateTimeReferenceKind.TraceOrigin;
+        double start = definition.Window.StartOffsetSeconds;
+        double end = start + definition.Window.DurationSeconds;
+        switch (kind)
+        {
+            case GateHandleKind.Start:
+                minimum = absolute ? transform.TimeViewport.DomainMinimumSeconds : Math.Min(-limit, start);
+                maximum = end - step; return true;
+            case GateHandleKind.End:
+                minimum = start + step;
+                maximum = absolute ? transform.TimeViewport.DomainMaximumSeconds : Math.Max(limit, end);
+                return true;
+            case GateHandleKind.Threshold when definition.Detector.Threshold is not null:
+                minimum = 0; maximum = 1; return true;
+            default:
+                return false;
+        }
+    }
+
     public bool Select(GateId gateId, GateHandleKind handle)
     {
         GateOverlayVisualSnapshot publish;
@@ -165,13 +253,13 @@ public sealed class GateOverlaySession : IAsyncDisposable
             if (_closed || _gestureOwner != PortablePointerCaptureOwner.None ||
                 _selectedGate is not { } selected || _focusedHandle == GateHandleKind.Unknown ||
                 _signal?.TraceIdentity is not { IsValid: true } trace || _transform is not { } transform ||
-                _stableArtifact is not { } artifact) return null;
+                ResolveCaptureSourceUnderLock() is not { } source) return null;
             GateGeometryItemSnapshot? gate = _stableGeometry?.Gates.FirstOrDefault(x => x.GateId == selected);
             GateId anchorId = gate?.Anchor?.GateId ?? default;
             GateRevision anchorRevision = gate?.Anchor?.GateRevision ?? default;
             _captureNonce = checked(_captureNonce + 1);
             capture = new(_contextGeneration, _captureNonce, _signal.Metadata.RunId, trace,
-                artifact.Source.Kind, artifact.Source.Revision, artifact.Identity, selected, _focusedHandle,
+                source.Kind, source.Revision, source.Preview, selected, _focusedHandle,
                 anchorId, anchorRevision, transform.Version);
             if (!capture.Value.IsValid) return null;
             _gestureOwner = PortablePointerCaptureOwner.Gate; _capture = capture;
@@ -312,7 +400,11 @@ public sealed class GateOverlaySession : IAsyncDisposable
         if (runner is not null) await runner.ConfigureAwait(false);
         _editor.AuthorityInvalidated -= ReceiveAuthorityInvalidated;
         _editor.EditorialChanged -= ReceiveEditorSnapshot;
-        lock (_gate) { _activeCancellation?.Dispose(); _activeCancellation = null; _stableArtifact = null; _stableGeometry = null; }
+        lock (_gate)
+        {
+            _activeCancellation?.Dispose(); _activeCancellation = null; _stableArtifact = null;
+            _stableCommittedArtifact = null; _stableGeometry = null; _committedGeometry = null;
+        }
     }
 
     private ValueTask<GateOverlayRequestOutcome> EnqueueAsync(GatePreviewArtifact artifact,
@@ -429,7 +521,13 @@ public sealed class GateOverlaySession : IAsyncDisposable
                         outcome = GateOverlayRequestOutcome.Superseded;
                     else
                     {
-                        _stableArtifact = request.PreviewArtifact; _stableGeometry = result.Snapshot;
+                        _stableArtifact = request.PreviewArtifact;
+                        if (request.CommittedArtifact is { } installedCommitted)
+                        {
+                            _stableCommittedArtifact = installedCommitted;
+                            _committedGeometry = result.Snapshot;
+                        }
+                        _stableGeometry = result.Snapshot;
                         outcome = GateOverlayRequestOutcome.Completed;
                         publish = BuildOverlayUnderLock(GateOverlayGeometryStatus.Current, result.Snapshot!.Source,
                             result.Snapshot.TraceIdentity, result.Snapshot.InspectionRevision, result.Snapshot,
@@ -506,7 +604,8 @@ public sealed class GateOverlaySession : IAsyncDisposable
         lock (_gate)
         {
             if (_closed) return;
-            _stableArtifact = null; _stableGeometry = null;
+            _stableArtifact = null; _stableCommittedArtifact = null; _stableGeometry = null;
+            _committedGeometry = null;
             cancellation = AdvanceContextUnderLock();
             publish = BuildOverlayUnderLock(GateOverlayGeometryStatus.Stale, null, null,
                 InspectionRevision.Initial, null, _evaluationSequence, null);
@@ -550,22 +649,69 @@ public sealed class GateOverlaySession : IAsyncDisposable
             GateId anchorGateId = exact?.Anchor?.GateId ?? default;
             GateRevision anchorRevision = exact?.Anchor?.GateRevision ?? default;
             bool selected = _selectedGate == item.GateId;
-            if (item.StartCoordinate is { } start) handles.Add(new(item.GateId, item.GateRevision,
-                GateHandleKind.Start, start, middleY, definition.Window.StartOffsetSeconds, "s",
-                -relativeLimit, definition.Window.StartOffsetSeconds + definition.Window.DurationSeconds - timeStep,
-                timeStep, selected, selected && _focusedHandle == GateHandleKind.Start, true, anchorGateId, anchorRevision));
-            if (item.EndCoordinate is { } end) handles.Add(new(item.GateId, item.GateRevision,
-                GateHandleKind.End, end, middleY, definition.Window.StartOffsetSeconds + definition.Window.DurationSeconds, "s",
-                definition.Window.StartOffsetSeconds + timeStep, relativeLimit,
-                timeStep, selected, selected && _focusedHandle == GateHandleKind.End, true, anchorGateId, anchorRevision));
+            if (item.StartCoordinate is { } start && IsVisibleTimeHandle(start, GateHandleKind.Start,
+                definition.Window.StartOffsetSeconds, transform))
+            {
+                (double target, double offset) = InsetTimeHandle(start, transform);
+                double startValue = definition.Window.StartOffsetSeconds;
+                handles.Add(new(item.GateId, item.GateRevision,
+                GateHandleKind.Start, target, middleY, startValue, "s",
+                Math.Min(-relativeLimit, startValue), startValue + definition.Window.DurationSeconds - timeStep,
+                timeStep, selected, selected && _focusedHandle == GateHandleKind.Start, true, anchorGateId,
+                anchorRevision, offset));
+            }
+            if (item.EndCoordinate is { } end && IsVisibleTimeHandle(end, GateHandleKind.End,
+                definition.Window.StartOffsetSeconds + definition.Window.DurationSeconds, transform))
+            {
+                (double target, double offset) = InsetTimeHandle(end, transform);
+                double endValue = definition.Window.StartOffsetSeconds + definition.Window.DurationSeconds;
+                handles.Add(new(item.GateId, item.GateRevision,
+                GateHandleKind.End, target, middleY, endValue, "s",
+                definition.Window.StartOffsetSeconds + timeStep, Math.Max(relativeLimit, endValue),
+                timeStep, selected, selected && _focusedHandle == GateHandleKind.End, true, anchorGateId,
+                anchorRevision, offset));
+            }
             if (item.StartCoordinate is { } thresholdStart && item.EndCoordinate is { } thresholdEnd &&
-                item.Thresholds.FirstOrDefault() is { } threshold && definition.Detector.Threshold is { } gateThreshold)
+                item.Thresholds.FirstOrDefault() is { } threshold && definition.Detector.Threshold is { } gateThreshold &&
+                IsInsideTimePlot((thresholdStart + thresholdEnd) / 2d, transform))
                 handles.Add(new(item.GateId, item.GateRevision, GateHandleKind.Threshold,
                     (thresholdStart + thresholdEnd) / 2d,
                     threshold.Coordinate, gateThreshold.NormalizedValue, "normalized", 0, 1, .01, selected,
                     selected && _focusedHandle == GateHandleKind.Threshold, true, anchorGateId, anchorRevision));
         }
         return handles;
+    }
+
+    private GateGeometrySourceIdentity? ResolveCaptureSourceUnderLock()
+    {
+        GatePlanDraft? draft = _editor.Snapshot.Draft;
+        if (_stableArtifact is { } preview && ReferenceEquals(preview.Checkpoint, draft)) return preview.Source;
+        return _stableCommittedArtifact?.Source;
+    }
+
+    private static (double Target, double Offset) InsetTimeHandle(double exact, GateVisualTransform transform)
+    {
+        double minimum = transform.TimeOrigin + BoundaryHandleInsetDip;
+        double maximum = transform.TimeOrigin + transform.TimeLength - BoundaryHandleInsetDip;
+        double target = maximum < minimum ? transform.TimeOrigin + transform.TimeLength / 2d :
+            Math.Clamp(exact, minimum, maximum);
+        return (target, exact - target);
+    }
+
+    private static bool IsInsideTimePlot(double coordinate, GateVisualTransform transform) =>
+        coordinate >= transform.TimeOrigin && coordinate <= transform.TimeOrigin + transform.TimeLength;
+
+    private bool IsVisibleTimeHandle(double coordinate, GateHandleKind kind, double value,
+        GateVisualTransform transform)
+    {
+        if (IsInsideTimePlot(coordinate, transform)) return true;
+        if (kind != GateHandleKind.End || _signal is not { } signal ||
+            transform.TimeViewport.VisibleMaximumSeconds != transform.TimeViewport.DomainMaximumSeconds)
+            return false;
+        double exclusiveTraceEnd = signal.MinimumTimeSeconds +
+            signal.OriginalSampleCount / signal.Metadata.Configuration.SampleRateHz;
+        double tolerance = Math.Max(Math.Abs(exclusiveTraceEnd), 1d) * 1e-12;
+        return Math.Abs(value - exclusiveTraceEnd) <= tolerance;
     }
 
     private static GatePlanDraft ChangeDraft(GatePlanDraft draft, GateId gateId, GateHandleKind handle, double value)

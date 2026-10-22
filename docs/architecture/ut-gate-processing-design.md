@@ -569,3 +569,8 @@ revisiones y procedencia.
 
 Q19 queda resuelta. Permanecen separadas únicamente el encoding persistente de señal rectificada, el
 presupuesto final después de benchmarks, la persistencia del store derivado y los requisitos PA reales.
+
+La ampliación aceptada pero no implementada de semántica editorial y el perfil estacionario A/B/C aceptado de
+forma condicionada se documentan en [Ampliación del editor A-Scan](ut-gate-editor-extension-design.md) y ADR 0019.
+Fase 6 según ADR 0018 permanece implementada; ADR 0019 no forma parte de esa afirmación salvo la corrección de
+usabilidad. Hasta implementar su versionado, este documento continúa describiendo el evaluator v2 vigente.

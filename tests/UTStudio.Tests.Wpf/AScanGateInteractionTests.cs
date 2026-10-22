@@ -120,6 +120,27 @@ public sealed class AScanGateInteractionTests
     });
 
     [TestMethod]
+    public Task OffViewportGateHasNoFalseHitOrAutomationAndRestoresWhenVisible() => StaTest.Run(async () =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        var root = (AScanControlAutomationPeer)(UIElementAutomationPeer.CreatePeerForElement(control) ??
+            new AScanControlAutomationPeer(control));
+        AutomationPeer visiblePeer = root.GetChildren()!.Single();
+
+        control.VisualSnapshot = fixture.Composite(evaluation: 2, includeHandles: false); fixture.Render();
+        Assert.IsNull(GateOverlayHitTester.HitTest(control.DisplayedVisualSnapshot!.Gates,
+            fixture.HandlePoint.X, fixture.HandlePoint.Y, 12));
+        Assert.IsNull(root.GetChildren());
+        await Assert.ThrowsExactlyAsync<System.Windows.Automation.ElementNotAvailableException>(async () =>
+            await Task.Run(visiblePeer.GetName));
+
+        control.VisualSnapshot = fixture.Composite(evaluation: 3); fixture.Render();
+        Assert.IsNotNull(GateOverlayHitTester.HitTest(control.DisplayedVisualSnapshot!.Gates,
+            fixture.HandlePoint.X, fixture.HandlePoint.Y, 12));
+        Assert.HasCount(1, root.GetChildren()!);
+    });
+
+    [TestMethod]
     public Task ResizeAndUnloadInvalidateBeforeLateGestureCanAct() => StaTest.Run(() =>
     {
         using var fixture = Fixture.Create(); AScanControl control = fixture.Control;

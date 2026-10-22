@@ -44,6 +44,86 @@ public sealed class GateOverlaySessionTests
     }
 
     [TestMethod]
+    public async Task BeginEditUsesCommittedGeometryBeforePreviewAndSurvivesTransformChanges()
+    {
+        Fixture fixture = Fixture.Create();
+        await using GateOverlaySession overlay = fixture.Overlay;
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed, await overlay.RequestCommittedAsync());
+        GatePlanDraft draft = fixture.Editor.BeginEdit().Draft!;
+
+        Assert.IsTrue(overlay.BeginEditing(draft));
+        Assert.AreEqual(GateOverlayGeometryStatus.Current, overlay.Snapshot.Status);
+        Assert.AreEqual(GateGeometrySourceKind.Committed, overlay.Snapshot.Source!.Kind);
+        Assert.AreEqual(new GateId("A"), overlay.Snapshot.SelectedGate);
+        Assert.AreEqual(GateHandleKind.Start, overlay.Snapshot.FocusedHandle);
+        Assert.HasCount(3, overlay.Snapshot.Handles);
+        Assert.IsTrue(overlay.Select(new GateId("A"), GateHandleKind.Start));
+        GateCaptureGeneration capture = overlay.BeginGateCapture()!.Value;
+        Assert.AreEqual(GateGeometrySourceKind.Committed, capture.SourceKind);
+        overlay.EndCapture();
+
+        Assert.IsTrue(overlay.SetVisualContext(fixture.Signal, null, Fixture.Transform(2)));
+        Assert.AreSame(draft, fixture.Editor.Snapshot.Draft);
+        Assert.HasCount(3, overlay.Snapshot.Handles);
+        Assert.AreEqual(GateOverlayRequestOutcome.NotAvailable,
+            await overlay.PreviewHandleValueAsync(new("A"), GateHandleKind.Start, 1));
+        Assert.AreSame(draft, fixture.Editor.Snapshot.Draft);
+
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.PreviewHandleValueAsync(new("A"), GateHandleKind.Start, 1e-6));
+        Assert.AreEqual(1e-6, fixture.Editor.Snapshot.Draft!.Gates[0].Window.StartOffsetSeconds, 1e-15);
+        Assert.AreEqual(GateGeometrySourceKind.Preview, overlay.Snapshot.Source!.Kind);
+    }
+
+    [TestMethod]
+    public async Task PanOutsideRemovesHandlesWithoutChangingDraftAndPanBackRestoresExactPositions()
+    {
+        Fixture fixture = Fixture.Create();
+        await using GateOverlaySession overlay = fixture.Overlay;
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed, await overlay.RequestCommittedAsync());
+        GatePlanDraft draft = fixture.Editor.BeginEdit().Draft!;
+        Assert.IsTrue(overlay.BeginEditing(draft));
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.PreviewHandleValueAsync(new("A"), GateHandleKind.End, 5e-6));
+        GateDefinition beforePan = fixture.Editor.Snapshot.Draft!.Gates.Single();
+
+        ScanTimeViewport full = ScanTimeViewportOperations.Create(0, 8e-6);
+        ScanTimeViewport right = ScanTimeViewportOperations.Zoom(full, 8e-6, 4);
+        Assert.AreEqual(6e-6, right.VisibleMinimumSeconds, 1e-15);
+        Assert.IsTrue(overlay.SetVisualContext(fixture.Signal, null, Fixture.Transform(2, right)));
+        Assert.IsEmpty(overlay.Snapshot.Handles);
+        Assert.AreEqual(beforePan.Window, fixture.Editor.Snapshot.Draft!.Gates.Single().Window);
+        Assert.IsNull(GateOverlayHitTester.HitTest(overlay.Snapshot, 8, 200, 12));
+
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.PreviewHandleValueAsync(new("A"), GateHandleKind.Start, 1e-6));
+        Assert.IsEmpty(overlay.Snapshot.Handles,
+            "Numeric editing must not fabricate handles while the gate remains outside the viewport.");
+        GateDefinition editedOutside = fixture.Editor.Snapshot.Draft!.Gates.Single();
+        Assert.AreEqual(1e-6, editedOutside.Window.StartOffsetSeconds, 1e-15);
+        Assert.AreEqual(4e-6, editedOutside.Window.DurationSeconds, 1e-15);
+
+        Assert.IsTrue(overlay.SetVisualContext(fixture.Signal, null, Fixture.Transform(3, full)));
+        GateHandleVisualState start = overlay.Snapshot.Handles.Single(x => x.Kind == GateHandleKind.Start);
+        GateHandleVisualState end = overlay.Snapshot.Handles.Single(x => x.Kind == GateHandleKind.End);
+        Assert.AreEqual(1e-6, start.Value, 1e-15);
+        Assert.AreEqual(5e-6, end.Value, 1e-15);
+        Assert.AreEqual(100d, start.X + start.DragCoordinateOffset, 1e-9);
+        Assert.AreEqual(500d, end.X + end.DragCoordinateOffset, 1e-9);
+
+        ScanTimeViewport boundary = ScanTimeViewportOperations.Zoom(full, 8e-6, 4);
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.PreviewHandleValueAsync(new("A"), GateHandleKind.End, 6e-6));
+        Assert.IsTrue(overlay.SetVisualContext(fixture.Signal, null, Fixture.Transform(4, boundary)));
+        Assert.HasCount(1, overlay.Snapshot.Handles);
+        GateHandleVisualState boundaryEnd = overlay.Snapshot.Handles.Single();
+        Assert.AreEqual(GateHandleKind.End, boundaryEnd.Kind);
+        Assert.AreEqual(6e-6, boundaryEnd.Value, 1e-15);
+        Assert.AreEqual(8d, boundaryEnd.X, 1e-9,
+            "An endpoint exactly on the boundary remains visible through the interior interaction target.");
+    }
+
+    [TestMethod]
     public async Task RunnerCoalescesToOneActiveAndOneLatestPendingWithoutRegressing()
     {
         var evaluator = new ControlledEvaluator();
@@ -355,8 +435,10 @@ public sealed class GateOverlaySessionTests
                 current.AlgorithmVersion, [changed]);
         }
 
-        internal static GateVisualTransform Transform(ulong version) => new(version,
-            ScanTimeViewportOperations.Create(0, 8e-6), GateAmplitudePresentationKind.RawRf,
+        internal static GateVisualTransform Transform(ulong version) =>
+            Transform(version, ScanTimeViewportOperations.Create(0, 8e-6));
+        internal static GateVisualTransform Transform(ulong version, ScanTimeViewport viewport) => new(version,
+            viewport, GateAmplitudePresentationKind.RawRf,
             0, 800, 200, -200, 800, 400, 1, 1);
 
         private static AScanSnapshot SignalSnapshot()
