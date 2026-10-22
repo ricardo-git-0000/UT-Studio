@@ -28,6 +28,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private readonly ICommittedTraceSink? _aScanSink;
     private readonly ICommittedGateProcessingIngress? _processingIngress;
     private readonly CompiledGatePlan? _processingPlan;
+    private readonly GatePlanApplyServices? _gatePlanServices;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
     private Operation? _active;
@@ -40,6 +41,15 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         Func<AcquisitionRunId, IInspectionRunWriter> inspectionWriterFactory,
         ICommittedTraceSink? bScanSink = null, ICommittedTraceSink? aScanSink = null,
         ICommittedGateProcessingIngress? processingIngress = null, CompiledGatePlan? processingPlan = null)
+        : this(source, inspectionId, inspectionWriterFactory, bScanSink, aScanSink,
+            processingIngress, processingPlan, null)
+    { }
+
+    internal ApplicationSession(IUtFrameSource source, InspectionId inspectionId,
+        Func<AcquisitionRunId, IInspectionRunWriter> inspectionWriterFactory,
+        ICommittedTraceSink? bScanSink, ICommittedTraceSink? aScanSink,
+        ICommittedGateProcessingIngress? processingIngress, CompiledGatePlan? processingPlan,
+        GatePlanApplyServices? gatePlanServices)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
@@ -55,6 +65,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         { throw new ArgumentException("Processing ingress and plan must be supplied together."); }
         _processingIngress = processingIngress;
         _processingPlan = processingPlan;
+        _gatePlanServices = gatePlanServices;
         _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0, canStart: true);
         _publisher = new SessionSnapshotPublisher(_snapshot);
     }
@@ -66,6 +77,22 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     /// Observers never execute on acquisition paths. Dispose detaches without waiting for an admitted callback.
     /// </summary>
     public IDisposable Subscribe(IObserver<SessionSnapshot> observer) => _publisher.Subscribe(observer);
+
+    internal GatePlanApplySubmission TryApplyGatePlan(GatePlanEditIntent intent,
+        CancellationToken cancellationToken = default)
+    {
+        GatePlanApplyUseCase? apply;
+        GatePlanApplyRunContext context;
+        lock (_gate)
+        {
+            if (_active is not { } operation || operation.GatePlanApply is null ||
+                operation.GateRunContext is not { } runContext)
+                return new(GatePlanApplySubmissionStatus.AdmissionClosed);
+            apply = operation.GatePlanApply;
+            context = runContext;
+        }
+        return apply.TryApply(intent, context, cancellationToken);
+    }
 
     /// <summary>Rejects overlapping starts. Cancellation applies only to pending preparation, not an established run.</summary>
     public Task StartAsync(ConventionalAcquisitionConfiguration configuration, AcquisitionRunId runId,
@@ -151,6 +178,13 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                     if (!operation.ProcessingOpened)
                     { AddBranchError(operation, new("session.processing.open", $"Processing admission was {admission}.")); }
                 }
+            }
+
+            if (_gatePlanServices is not null)
+                await ConfigureGatePlanRunAsync(operation, token).ConfigureAwait(false);
+
+            lock (_gate)
+            {
                 if (!operation.CleanupRequested && _bScanSink is not null)
                 {
                     operation.VisualOpened = true;
@@ -210,11 +244,48 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         }
     }
 
+    private async Task ConfigureGatePlanRunAsync(Operation operation, CancellationToken cancellationToken)
+    {
+        GatePlanApplyServices services = _gatePlanServices!;
+        GatePlanApplyRunContext context = default;
+        ApplicationCommitAdmission admission = operation.CommitCoordinator.AdmitGateRunTransition(operation.RunId,
+            new($"GateRunOpen:{operation.RunId.Value:D}"), () =>
+            {
+                lock (_gate)
+                {
+                    if (operation.CleanupRequested) throw new OperationCanceledException();
+                }
+                context = services.OpenRun(_inspectionId, operation.RunId);
+                lock (_gate)
+                {
+                    // Cleanup must be able to retire a run as soon as its store transition commits.
+                    // Apply remains unavailable until the transition terminal is reconciled below.
+                    operation.GateRunContext = context;
+                }
+                return ValueTask.CompletedTask;
+            }, cancellationToken);
+        ApplicationCommitTerminalResult terminal = await admission.Completion.ConfigureAwait(false);
+        if (!terminal.IsSuccessful)
+        {
+            if (terminal.Error is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(terminal.Error).Throw();
+            throw new InvalidOperationException($"Gate run transition ended as {terminal.Status}.");
+        }
+        lock (_gate)
+        {
+            if (operation.CleanupRequested) throw new OperationCanceledException();
+            operation.GatePlanApply = new(operation.CommitCoordinator, services.AuthorityReader,
+                services.Authority, services.Epochs, services.Store,
+                new SessionGatePlanApplyLifecycle(this, operation));
+        }
+    }
+
     private Task RequestCleanup(Operation operation, bool disconnect)
     {
         operation.DisconnectRequested |= disconnect;
         if (operation.CleanupRequested) { return operation.Cleanup.Task; }
         operation.CleanupRequested = true;
+        operation.CommitCoordinator.CloseApplyAdmission();
         Publish(operation, SessionPhase.Stopping);
         // Marks cancellation before waiting for lifecycle exclusion; callbacks execute outside _gate.
         operation.CancellationCallbacks = operation.StartCancellation.CancelAsync();
@@ -473,18 +544,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             terminal.RunId != admission.RunId || terminal.Identity != admission.Identity)
             throw new InvalidOperationException("The terminal commit identity does not match its admission.");
 
-        lock (_gate)
-        {
-            ulong expected = checked(operation.LastReconciledCommitOrdinal + 1);
-            if (admission.AdmissionOrdinal != expected)
-                throw new InvalidOperationException("Commit reconciliation did not preserve admission order.");
-        }
-
         if (terminal.IsSuccessful && terminal.AppendResult is { } successful)
-        {
-            lock (_gate) { operation.LastReconciledCommitOrdinal = admission.AdmissionOrdinal; }
             return successful;
-        }
         if (terminal.Error is not null)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(terminal.Error).Throw();
         if (terminal.AppendResult is { } rejected && terminal.Status == ApplicationCommitTerminalStatus.WriterRejected)
@@ -623,6 +684,11 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             }
 
             await operation.CommitCoordinator.DisposeAsync().ConfigureAwait(false);
+            if (_gatePlanServices is not null && operation.GateRunContext is { } gateRun)
+            {
+                try { _gatePlanServices.StopRun(gateRun); }
+                catch (Exception error) { lock (_gate) { RecordError(operation, error, "session.gates.stop"); } }
+            }
             await FinalizeProcessingAsync(operation).ConfigureAwait(false);
             await FinalizeBScanAsync(operation, operation.SealedRun).ConfigureAwait(false);
 
@@ -925,7 +991,9 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal IInspectionRunWriter? InspectionWriter;
         internal ApplicationCommitCoordinator CommitCoordinator { get; } =
             new(inspectionId, CommitCoordinatorCapacity);
-        internal ulong LastReconciledCommitOrdinal;
+        internal GatePlanApplyRunContext? GateRunContext;
+        internal GatePlanApplyUseCase? GatePlanApply;
+        internal bool GateApplyPointOfNoReturn;
         internal ulong AcquisitionMissingFrames;
         internal ulong DuplicateFramesRejected;
         internal ulong OutOfOrderFramesRejected;
@@ -933,6 +1001,29 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         internal ulong InvalidAcquisitionIndexFramesRejected;
         internal SessionIntegrityStatistics Integrity => new(AcquisitionMissingFrames, DuplicateFramesRejected,
             OutOfOrderFramesRejected, TimestampRegressionsRejected, InvalidAcquisitionIndexFramesRejected);
+    }
+
+    private sealed class SessionGatePlanApplyLifecycle(ApplicationSession session, Operation operation) :
+        IGatePlanApplyLifecycle
+    {
+        public bool IsRunning(GatePlanApplyRunContext context)
+        {
+            lock (session._gate)
+                return session._active == operation && !operation.CleanupRequested &&
+                    session._snapshot.Phase == SessionPhase.Running && operation.GateRunContext == context;
+        }
+
+        public bool TryCrossPointOfNoReturn(GatePlanApplyRunContext context)
+        {
+            lock (session._gate)
+            {
+                if (session._active != operation || operation.CleanupRequested ||
+                    session._snapshot.Phase != SessionPhase.Running || operation.GateRunContext != context)
+                    return false;
+                operation.GateApplyPointOfNoReturn = true;
+                return true;
+            }
+        }
     }
 
     private readonly record struct PendingGap(ulong FirstMissing, ulong LastMissing,

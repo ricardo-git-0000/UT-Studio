@@ -11,9 +11,12 @@ internal enum ApplicationCommitOperationClass { RfCommit, GapCommit, GatePlanApp
 internal enum ApplicationCommitTerminalStatus
 {
     Completed, Confirmed, DuplicateUnverifiable, WriterRejected, WriterFaulted, OperationFaulted, RevisionRegression,
-    NonAdvancingRevision
+    NonAdvancingRevision, InvariantFaulted, SkippedAfterInvariantFault
 }
-internal enum ApplicationCommitCoordinatorLifecycle { Accepting, Running, PublishingTerminal, Closing, Draining, Closed }
+internal enum ApplicationCommitCoordinatorLifecycle
+{ Accepting, Running, PublishingTerminal, Closing, Draining, Closed, Faulted }
+internal enum ApplicationCommitAdmissionStatus
+{ Admitted, CancelledBeforeAdmission, AdmissionClosed, CapacityExceeded, OrdinalExhausted }
 
 internal readonly record struct ApplicationCommitOperationIdentity(string Value)
 {
@@ -97,6 +100,23 @@ internal sealed class ApplicationCommitAdmission
         Completion.WaitAsync(token);
 }
 
+internal readonly record struct ApplicationCommitAdmissionResult(
+    ApplicationCommitAdmissionStatus Status, ApplicationCommitAdmission? Admission)
+{
+    internal bool IsAdmitted => Status == ApplicationCommitAdmissionStatus.Admitted && Admission is not null;
+    internal static ApplicationCommitAdmissionResult Admitted(ApplicationCommitAdmission admission) =>
+        new(ApplicationCommitAdmissionStatus.Admitted, admission);
+    internal static ApplicationCommitAdmissionResult Rejected(ApplicationCommitAdmissionStatus status) =>
+        status == ApplicationCommitAdmissionStatus.Admitted ? throw new ArgumentOutOfRangeException(nameof(status)) :
+            new(status, null);
+}
+
+internal sealed class ApplicationCommitInvariantException : Exception
+{
+    internal ApplicationCommitInvariantException(string message) : base(message) { }
+    internal ApplicationCommitInvariantException(string message, Exception innerException) : base(message, innerException) { }
+}
+
 /// <summary>One bounded FIFO and ordering boundary for acquisition and future gate-control operations.</summary>
 internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
 {
@@ -115,6 +135,7 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
     private AcquisitionRunId _admissionRun, _revisionRun;
     private InspectionRevision _lastConfirmedRevision = InspectionRevision.Initial;
     private bool _acquisitionOpen = true, _applyOpen = true, _transitionOpen = true;
+    private Exception? _primaryInvariantError;
 
     internal ApplicationCommitCoordinator(InspectionId inspectionId, int capacity,
         ApplicationCommitCoordinatorTestSynchronization? testSynchronization = null)
@@ -142,6 +163,16 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(operation);
         return Admit(ApplicationCommitOperationClass.GatePlanApply, null, identity, async () =>
         { await operation().ConfigureAwait(false); return default; }, cancellationToken);
+    }
+
+    internal ApplicationCommitAdmissionResult TryAdmitGatePlanApply(AcquisitionRunId runId,
+        ApplicationCommitOperationIdentity identity, Func<ValueTask<Action?>> operation,
+        CancellationToken cancellationToken = default)
+    {
+        if (!runId.IsValid) throw new ArgumentException("A valid run is required.", nameof(runId));
+        ArgumentNullException.ThrowIfNull(operation);
+        return TryAdmit(ApplicationCommitOperationClass.GatePlanApply, runId, identity, async () =>
+            new(null, await operation().ConfigureAwait(false)), cancellationToken);
     }
 
     internal ApplicationCommitAdmission AdmitGateRunTransition(AcquisitionRunId runId,
@@ -200,6 +231,45 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
         return item.Admission;
     }
 
+    private ApplicationCommitAdmissionResult TryAdmit(ApplicationCommitOperationClass operationClass,
+        AcquisitionRunId? runId, ApplicationCommitOperationIdentity identity, Func<ValueTask<BodyResult>> body,
+        CancellationToken cancellationToken)
+    {
+        if (!identity.IsValid) throw new ArgumentException("A valid bounded identity is required.", nameof(identity));
+        if (cancellationToken.IsCancellationRequested)
+            return ApplicationCommitAdmissionResult.Rejected(ApplicationCommitAdmissionStatus.CancelledBeforeAdmission);
+        WorkItem item; DrainRegistration? drainToStart = null;
+        lock (_gate)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return ApplicationCommitAdmissionResult.Rejected(ApplicationCommitAdmissionStatus.CancelledBeforeAdmission);
+            if (IsGloballyClosedUnderLock() || !IsOpenUnderLock(operationClass))
+            {
+                _closedRejections = _closedRejections.Increment(operationClass);
+                return ApplicationCommitAdmissionResult.Rejected(ApplicationCommitAdmissionStatus.AdmissionClosed);
+            }
+            if (OccupancyUnderLock() >= _capacity)
+            {
+                _capacityRejections = _capacityRejections.Increment(operationClass);
+                return ApplicationCommitAdmissionResult.Rejected(ApplicationCommitAdmissionStatus.CapacityExceeded);
+            }
+            if (_lastAdmissionOrdinal == ulong.MaxValue)
+                return ApplicationCommitAdmissionResult.Rejected(ApplicationCommitAdmissionStatus.OrdinalExhausted);
+            var descriptor = new ApplicationCommitOperationDescriptor(++_lastAdmissionOrdinal, operationClass,
+                _inspectionId, runId, identity);
+            item = new(descriptor, body);
+            if (!_runnerRegistered)
+            {
+                _runnerRegistered = true; _running = item;
+                _lifecycle = ApplicationCommitCoordinatorLifecycle.Running;
+                drainToStart = new(); _drain = drainToStart;
+            }
+            else _queue.Enqueue(item);
+        }
+        if (drainToStart is { } drain) { Task execution = DrainAsync(item); drain.Start(execution); }
+        return ApplicationCommitAdmissionResult.Admitted(item.Admission);
+    }
+
     internal ApplicationCommitCoordinatorSnapshot Snapshot
     {
         get
@@ -245,93 +315,110 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
         WorkItem? current = first;
         while (current is not null)
         {
-            ApplicationCommitTerminalResult terminal = await ExecuteAsync(current).ConfigureAwait(false);
+            ExecutionResult execution = _primaryInvariantError is null ?
+                await ExecuteAsync(current).ConfigureAwait(false) :
+                new(Terminal(current, ApplicationCommitTerminalStatus.SkippedAfterInvariantFault, null,
+                    LastRevision(), default, _primaryInvariantError), null);
+            ApplicationCommitTerminalResult terminal = execution.Terminal;
             WorkItem completed = current;
-            bool publishingTerminal;
+            bool publishingTerminal; bool invariantFault = terminal.Status == ApplicationCommitTerminalStatus.InvariantFaulted;
             lock (_gate)
             {
+                ulong expected = checked(_lastTerminalOrdinal + 1);
+                if (completed.Descriptor.AdmissionOrdinal != expected)
+                    throw new InvalidOperationException("Global terminal reconciliation did not preserve admission order.");
                 _lastTerminalOrdinal = completed.Descriptor.AdmissionOrdinal;
-                if (_queue.TryDequeue(out current))
+                if (invariantFault && _primaryInvariantError is null)
                 {
-                    _running = current;
-                    if (_lifecycle == ApplicationCommitCoordinatorLifecycle.Closing)
-                        _lifecycle = ApplicationCommitCoordinatorLifecycle.Draining;
+                    _primaryInvariantError = terminal.Error ?? new ApplicationCommitInvariantException(
+                        "An aggregate commit invariant failed.");
+                    _acquisitionOpen = _applyOpen = _transitionOpen = false;
                 }
-                else
-                {
-                    current = null; _running = null;
-                    bool closing = _lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
-                        ApplicationCommitCoordinatorLifecycle.Draining;
-                    _lifecycle = closing ? ApplicationCommitCoordinatorLifecycle.Draining :
-                        ApplicationCommitCoordinatorLifecycle.PublishingTerminal;
-                }
-                publishingTerminal = current is null &&
-                    _lifecycle == ApplicationCommitCoordinatorLifecycle.PublishingTerminal;
+                current = null; _running = null;
+                bool closing = _lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
+                    ApplicationCommitCoordinatorLifecycle.Draining;
+                _lifecycle = invariantFault ? ApplicationCommitCoordinatorLifecycle.Faulted :
+                    closing ? ApplicationCommitCoordinatorLifecycle.Draining :
+                    ApplicationCommitCoordinatorLifecycle.PublishingTerminal;
+                publishingTerminal = _lifecycle == ApplicationCommitCoordinatorLifecycle.PublishingTerminal;
             }
             if (publishingTerminal && _testSynchronization is { } testSynchronization)
                 await testSynchronization.PausePublishingTerminalAsync().ConfigureAwait(false);
-            completed.Complete(terminal);
-            if (current is null)
+            try { execution.Publish?.Invoke(); }
+            catch (Exception error)
             {
-                bool closeCompleted = false;
+                var invariant = error as ApplicationCommitInvariantException ??
+                    new ApplicationCommitInvariantException("Post-commit publication failed.", error);
+                terminal = Terminal(completed, ApplicationCommitTerminalStatus.InvariantFaulted,
+                    terminal.AppendResult, terminal.PreviousRevision, terminal.ObservedRevision, invariant);
                 lock (_gate)
                 {
-                    if (_queue.TryDequeue(out current))
-                    {
-                        _running = current;
-                        _lifecycle = _lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
-                            ApplicationCommitCoordinatorLifecycle.Draining ?
-                            ApplicationCommitCoordinatorLifecycle.Draining :
-                            ApplicationCommitCoordinatorLifecycle.Running;
-                    }
-                    else
-                    {
-                        _runnerRegistered = false;
-                        if (_lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
-                            ApplicationCommitCoordinatorLifecycle.Draining)
-                        { _lifecycle = ApplicationCommitCoordinatorLifecycle.Closed; closeCompleted = true; }
-                        else _lifecycle = ApplicationCommitCoordinatorLifecycle.Accepting;
-                    }
+                    _primaryInvariantError ??= invariant;
+                    _acquisitionOpen = _applyOpen = _transitionOpen = false;
+                    _lifecycle = ApplicationCommitCoordinatorLifecycle.Faulted;
                 }
-                if (closeCompleted) _completion.TrySetResult();
             }
+            completed.Complete(terminal);
+            bool closeCompleted = false;
+            lock (_gate)
+            {
+                if (_queue.TryDequeue(out current))
+                {
+                    _running = current;
+                    _lifecycle = _primaryInvariantError is not null ? ApplicationCommitCoordinatorLifecycle.Faulted :
+                        _lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
+                        ApplicationCommitCoordinatorLifecycle.Draining ? ApplicationCommitCoordinatorLifecycle.Draining :
+                        ApplicationCommitCoordinatorLifecycle.Running;
+                }
+                else
+                {
+                    _runnerRegistered = false;
+                    if (_primaryInvariantError is not null) { _lifecycle = ApplicationCommitCoordinatorLifecycle.Faulted; closeCompleted = true; }
+                    else if (_lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or ApplicationCommitCoordinatorLifecycle.Draining)
+                    { _lifecycle = ApplicationCommitCoordinatorLifecycle.Closed; closeCompleted = true; }
+                    else _lifecycle = ApplicationCommitCoordinatorLifecycle.Accepting;
+                }
+            }
+            if (closeCompleted) _completion.TrySetResult();
         }
     }
 
-    private async ValueTask<ApplicationCommitTerminalResult> ExecuteAsync(WorkItem item)
+    private async ValueTask<ExecutionResult> ExecuteAsync(WorkItem item)
     {
         BodyResult body;
         try { body = await item.Body().ConfigureAwait(false); }
+        catch (ApplicationCommitInvariantException error)
+        { return new(Terminal(item, ApplicationCommitTerminalStatus.InvariantFaulted, null, LastRevision(), default, error), null); }
         catch (Exception error)
         {
             ApplicationCommitTerminalStatus status = item.Descriptor.OperationClass is
                 ApplicationCommitOperationClass.RfCommit or ApplicationCommitOperationClass.GapCommit ?
                 ApplicationCommitTerminalStatus.WriterFaulted : ApplicationCommitTerminalStatus.OperationFaulted;
-            return Terminal(item, status, null, LastRevision(), default, error);
+            return new(Terminal(item, status, null, LastRevision(), default, error), null);
         }
         if (body.AppendResult is not { } append)
-            return Terminal(item, ApplicationCommitTerminalStatus.Completed, null, LastRevision(), default, null);
+            return new(Terminal(item, ApplicationCommitTerminalStatus.Completed, null, LastRevision(), default, null), body.Publish);
         lock (_gate)
         {
             InspectionRevision previous = _lastConfirmedRevision;
             if (append.Status == InspectionAppendStatus.Duplicate)
-                return Terminal(item, ApplicationCommitTerminalStatus.DuplicateUnverifiable, append, previous,
-                    append.Revision, null);
+                return new(Terminal(item, ApplicationCommitTerminalStatus.DuplicateUnverifiable, append, previous,
+                    append.Revision, null), body.Publish);
             if (append.Status != InspectionAppendStatus.Committed)
-                return Terminal(item, ApplicationCommitTerminalStatus.WriterRejected, append, previous,
-                    append.Revision, null);
+                return new(Terminal(item, ApplicationCommitTerminalStatus.WriterRejected, append, previous,
+                    append.Revision, null), body.Publish);
             AcquisitionRunId runId = item.Descriptor.RunId!.Value;
             if (_revisionRun.IsValid && _revisionRun != runId)
-                return Terminal(item, ApplicationCommitTerminalStatus.WriterRejected, append, previous,
-                    append.Revision, new InvalidOperationException("A commit coordinator cannot mix acquisition runs."));
+                return new(Terminal(item, ApplicationCommitTerminalStatus.WriterRejected, append, previous,
+                    append.Revision, new InvalidOperationException("A commit coordinator cannot mix acquisition runs.")), body.Publish);
             if (append.Revision.Value < previous.Value)
-                return Terminal(item, ApplicationCommitTerminalStatus.RevisionRegression, append, previous,
-                    append.Revision, null);
+                return new(Terminal(item, ApplicationCommitTerminalStatus.RevisionRegression, append, previous,
+                    append.Revision, null), body.Publish);
             if (append.Revision == previous)
-                return Terminal(item, ApplicationCommitTerminalStatus.NonAdvancingRevision, append, previous,
-                    append.Revision, null);
+                return new(Terminal(item, ApplicationCommitTerminalStatus.NonAdvancingRevision, append, previous,
+                    append.Revision, null), body.Publish);
             _revisionRun = runId; _lastConfirmedRevision = append.Revision;
-            return Terminal(item, ApplicationCommitTerminalStatus.Confirmed, append, previous, append.Revision, null);
+            return new(Terminal(item, ApplicationCommitTerminalStatus.Confirmed, append, previous, append.Revision, null), body.Publish);
         }
     }
 
@@ -343,7 +430,8 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
     private InspectionRevision LastRevision() { lock (_gate) return _lastConfirmedRevision; }
     private int OccupancyUnderLock() => _queue.Count + (_running is null ? 0 : 1);
     private bool IsGloballyClosedUnderLock() => _lifecycle is ApplicationCommitCoordinatorLifecycle.Closing or
-        ApplicationCommitCoordinatorLifecycle.Draining or ApplicationCommitCoordinatorLifecycle.Closed;
+        ApplicationCommitCoordinatorLifecycle.Draining or ApplicationCommitCoordinatorLifecycle.Closed or
+        ApplicationCommitCoordinatorLifecycle.Faulted;
     private bool IsOpenUnderLock(ApplicationCommitOperationClass operationClass) => operationClass switch
     {
         ApplicationCommitOperationClass.RfCommit or ApplicationCommitOperationClass.GapCommit => _acquisitionOpen,
@@ -352,7 +440,8 @@ internal sealed class ApplicationCommitCoordinator : IAsyncDisposable
         _ => false
     };
 
-    private readonly record struct BodyResult(InspectionAppendResult? AppendResult);
+    private readonly record struct BodyResult(InspectionAppendResult? AppendResult, Action? Publish = null);
+    private readonly record struct ExecutionResult(ApplicationCommitTerminalResult Terminal, Action? Publish);
     private sealed class WorkItem
     {
         private readonly TaskCompletionSource<ApplicationCommitTerminalResult> _completion =

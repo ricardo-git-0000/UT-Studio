@@ -112,6 +112,13 @@ public sealed class GateSignatureAndArchitectureTests
             foreach (string file in Directory.GetFiles(Path.Combine(root, relative), "*.cs", SearchOption.AllDirectories))
             {
                 string text = File.ReadAllText(file);
+                if (file.EndsWith(Path.Combine("Properties", "AssemblyInfo.cs"), StringComparison.Ordinal))
+                {
+                    const string permittedBridge = "[assembly: InternalsVisibleTo(\"UTStudio.Application\")]";
+                    Assert.AreEqual(1, text.Split(permittedBridge, StringSplitOptions.None).Length - 1,
+                        "Processing exposes exactly one restricted internal bridge to Application.");
+                    text = text.Replace(permittedBridge, string.Empty, StringComparison.Ordinal);
+                }
                 foreach (string forbidden in new[] { "System.Windows", "UTStudio.Application", "UTStudio.Presentation",
                     "Acquisition.Simulator", "Inspection.Core", "Dispatcher", "BitmapSource" })
                 { Assert.IsFalse(text.Contains(forbidden, StringComparison.Ordinal), $"{file} contains {forbidden}."); }

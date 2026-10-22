@@ -127,6 +127,25 @@ public sealed class InMemoryGatePlanAuthorityPreparedCommitTests
     }
 
     [TestMethod]
+    public void SuppliedCompiledPlanMustRepresentTheSameDraftGates()
+    {
+        CommittedGatePlanSnapshot initial = Committed("plan", 1);
+        using var owner = new InMemoryGatePlanAuthorityOwner([initial]);
+        IGatePlanAuthorityReader reader = owner.Seal();
+        GatePlanAuthorityPrepareRequest request = Request(reader, initial.AuthorityKey);
+        GatePlanCompilationResult other = new GatePlanCompiler().Compile(
+            GateTestPlan.Plan([GateTestPlan.Gate("A", threshold: 0.75)], "plan", revision: 2));
+        Assert.IsTrue(other.IsCompiled);
+
+        GatePlanAuthorityPrepareResult result = owner.PreparedCommits.Prepare(
+            request with { CompiledPlan = other.CompiledPlan });
+
+        Assert.AreEqual(GatePlanAuthorityPrepareStatus.InvalidIdentity, result.Status);
+        Assert.AreEqual(0, owner.PreparedCommits.Diagnostics.PreparedReservations);
+        Assert.AreEqual(0, owner.PreparedCommits.Diagnostics.ProvisionalLedgerSlots);
+    }
+
+    [TestMethod]
     public void OnlyOnePreparedReservationIsAcceptedAndValidationFailureConsumesNothing()
     {
         CommittedGatePlanSnapshot initial = Committed("plan", 1);

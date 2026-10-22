@@ -46,7 +46,8 @@ internal sealed record GatePlanAuthorityPrepareRequest(
     AcquisitionRunId RunId,
     GateRunGeneration RunGeneration,
     GatePreparedReservationOwner Owner,
-    GatePreparedOperationGeneration OperationGeneration);
+    GatePreparedOperationGeneration OperationGeneration,
+    CompiledGatePlan? CompiledPlan = null);
 
 internal readonly record struct GatePlanAuthorityPrepareResult
 {
@@ -311,12 +312,25 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
                     return GatePlanAuthorityPrepareResult.Rejected(GatePlanAuthorityPrepareStatus.GenerationExhausted);
 
                 var nextRevision = new GatePlanRevision(request.ExpectedRevision.Value + 1);
-                var source = new GatePlan(request.Authority.PlanId, nextRevision, request.Draft.SchemaVersion,
-                    request.Draft.AlgorithmVersion, request.Draft.Gates);
-                GatePlanCompilationResult compilation = _preparedCompiler.Compile(source);
-                if (!compilation.IsCompiled)
-                    return GatePlanAuthorityPrepareResult.Rejected(GatePlanAuthorityPrepareStatus.ValidationFailed);
-                CompiledGatePlan compiled = compilation.CompiledPlan!;
+                CompiledGatePlan compiled;
+                if (request.CompiledPlan is { } supplied)
+                {
+                    if (supplied.Source.Id != request.Authority.PlanId || supplied.Source.Revision != nextRevision ||
+                        supplied.Source.SchemaVersion != request.Draft.SchemaVersion ||
+                        supplied.Source.AlgorithmVersion != request.Draft.AlgorithmVersion ||
+                        !supplied.Source.Gates.SequenceEqual(request.Draft.Gates))
+                        return GatePlanAuthorityPrepareResult.Rejected(GatePlanAuthorityPrepareStatus.InvalidIdentity);
+                    compiled = supplied;
+                }
+                else
+                {
+                    var source = new GatePlan(request.Authority.PlanId, nextRevision, request.Draft.SchemaVersion,
+                        request.Draft.AlgorithmVersion, request.Draft.Gates);
+                    GatePlanCompilationResult compilation = _preparedCompiler.Compile(source);
+                    if (!compilation.IsCompiled)
+                        return GatePlanAuthorityPrepareResult.Rejected(GatePlanAuthorityPrepareStatus.ValidationFailed);
+                    compiled = compilation.CompiledPlan!;
+                }
                 var committed = new CommittedGatePlanSnapshot(request.Authority.InspectionId, compiled);
                 // GateAuthorityGeneration is global to this owner. The single global Prepared reservation mirrors
                 // the future ApplicationCommitCoordinator, which will execute one aggregate Apply per turn.
