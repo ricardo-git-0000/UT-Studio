@@ -7,6 +7,15 @@ using UTStudio.Processing.Core;
 
 namespace UTStudio.Application;
 
+internal sealed record ProductiveGateInspectionDiagnostics(
+    GateDerivedStoreDiagnostics Store,
+    GateProcessingDiagnostics Live,
+    GatePlanAuthorityPreparedCommitDiagnostics Authority,
+    IReadOnlyList<GateApplyLedgerSnapshot> Ledgers,
+    GateLedgerLifecycleDiagnostics LedgerLifecycle,
+    int ActiveHistoricalObservers,
+    GateReprocessingSchedulerDiagnostics Scheduler);
+
 /// <summary>
 /// Sole inspection-scoped owner of editable gate authority, live/historical processing, derived state and exact
 /// geometry. Sessions and views borrow its ports and never dispose individual owners.
@@ -43,6 +52,14 @@ public sealed class ProductiveGateInspectionScope : IAsyncDisposable
     internal ICommittedGateProcessingIngress Ingress => _live;
     internal IGateDerivedStore DerivedStore => _store;
     internal GatePlanApplyServices ApplyServices { get; }
+    internal Task WaitForHistoricalObserversAsync() => _historical.WaitForObserversAsync();
+    internal Task WaitForHistoricalSchedulerIdleAsync() => _historical.WaitForSchedulerIdleAsync();
+
+    internal ProductiveGateInspectionDiagnostics ReadDiagnostics(bool stableAfterDrain = false) => new(
+        _store.Diagnostics, _live.Diagnostics, _authorityOwner.PreparedCommits.Diagnostics,
+        _authorityOwner.PreparedCommits.ReadRetainedLedgers(InspectionId).ToArray(),
+        _authorityOwner.PreparedCommits.ReadLifecycleDiagnostics(stableAfterDrain),
+        _historical.ActiveObserverCount, _historical.SchedulerDiagnostics);
 
     public static ValueTask<ProductiveGateInspectionScope> CreateAsync(InspectionId inspectionId,
         IInspectionDataStore inspectionStore, ConventionalAcquisitionConfiguration configuration,
@@ -54,7 +71,10 @@ public sealed class ProductiveGateInspectionScope : IAsyncDisposable
         GateHeadlessInspectionOptions options, CancellationToken cancellationToken,
         Func<string, Exception?>? constructionFailure = null, Action<string>? rollbackObserved = null,
         Func<IPreparedGatePlanEpochPort, IPreparedGatePlanEpochPort>? epochDecorator = null,
-        Action? sessionCleanupStarted = null)
+        Action? sessionCleanupStarted = null,
+        Func<IGateReplacementStore, IGateReplacementStore>? replacementDecorator = null,
+        Func<IOwnedGateReprocessingScheduler, IOwnedGateReprocessingScheduler>? schedulerDecorator = null,
+        Action<ProductiveGateInspectionDiagnostics>? beforeAuthorityClose = null)
     {
         if (!inspectionId.IsValid) throw new ArgumentException("A valid inspection is required.", nameof(inspectionId));
         ArgumentNullException.ThrowIfNull(inspectionStore); ArgumentNullException.ThrowIfNull(configuration);
@@ -76,13 +96,23 @@ public sealed class ProductiveGateInspectionScope : IAsyncDisposable
                 store.DesiredReplacementControl, compiler);
             ThrowConstructionFailure(constructionFailure, "apply");
             var scheduler = new GateReprocessingScheduler(inspectionStore, store, options.SchedulerOptions());
-            var replacement = new GateHistoricalReplacementCoordinator(scheduler, store.ReplacementControl,
+            IOwnedGateReprocessingScheduler schedulerPort = schedulerDecorator?.Invoke(scheduler) ?? scheduler;
+            IGateReplacementStore replacementStore = replacementDecorator?.Invoke(store.ReplacementControl) ??
+                store.ReplacementControl;
+            var replacement = new GateHistoricalReplacementCoordinator(schedulerPort, replacementStore,
                 authority.PreparedCommits, options.MaximumHistoricalObservers);
-            historical = new(replacement, scheduler, store.ReplacementControl, authority, live);
+            ProductiveGateInspectionScope? created = null;
+            historical = new(replacement, scheduler, store.ReplacementControl, authority, live,
+                () => created?.ReadDiagnostics(stableAfterDrain: true) ?? new(
+                    store.Diagnostics, live.Diagnostics, authority.PreparedCommits.Diagnostics,
+                    authority.PreparedCommits.ReadRetainedLedgers(inspectionId).ToArray(),
+                    authority.PreparedCommits.ReadLifecycleDiagnostics(stableAfterDrain: true),
+                    replacement.ActiveObserverCount, scheduler.Diagnostics), beforeAuthorityClose);
             ThrowConstructionFailure(constructionFailure, "historical");
             var geometry = new ExactGateGeometryEvaluator(inspectionStore, new CommittedGeometryGuard(reader));
-            return new(inspectionId, initial, store, live, authority, compiler, apply, historical, geometry,
+            created = new(inspectionId, initial, store, live, authority, compiler, apply, historical, geometry,
                 sessionCleanupStarted);
+            return created;
         }
         catch (Exception primary)
         {

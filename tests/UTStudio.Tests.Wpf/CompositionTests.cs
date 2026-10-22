@@ -18,7 +18,10 @@ using UTStudio.Contracts.Application;
 using UTStudio.Contracts.Inspection;
 using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Domain.Inspection;
+using UTStudio.Domain.Processing;
 using UTStudio.Presentation;
+using UTStudio.Processing.Core;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
 using UTStudio.Visualization.Wpf.Controls;
@@ -34,10 +37,14 @@ public sealed class CompositionTests
     {
         var lifecycle = new List<string>();
         var source = new GateControlledSource();
+        var historical = new HistoricalAdmissionProbe();
+        ProductiveGateInspectionDiagnostics? finalGateDiagnostics = null;
         var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
         DesktopRuntime runtime = await DesktopRuntimeFactory.CreateAsync(
             new WpfUiDispatcher(Dispatcher.CurrentDispatcher), source, configuration,
-            new BScanOptions(4_000_000, 8, 2, 2), TimeProvider.System, lifecycleObserver: lifecycle.Add);
+            new BScanOptions(4_000_000, 8, 2, 2), TimeProvider.System, lifecycleObserver: lifecycle.Add,
+            gateHooks: new(SchedulerDecorator: historical.Decorate,
+                BeforeAuthorityClose: snapshot => finalGateDiagnostics = snapshot));
         bool shutdownCompleted = false;
         try
         {
@@ -117,11 +124,30 @@ public sealed class CompositionTests
             Assert.AreEqual(GateEditorViewPhase.Committed, editor.State.Phase);
             await host.StopCommand.ExecuteAsync(null);
             Assert.AreEqual(SessionPhase.Idle, services.GetRequiredService<ApplicationSession>().Snapshot.Phase);
+            GateReprocessingProgressSnapshot historicalTerminal = await historical.Terminal.Task
+                .WaitAsync(TimeSpan.FromSeconds(10));
+            await scope.WaitForHistoricalObserversAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await scope.WaitForHistoricalSchedulerIdleAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(GateReprocessingPublicationPolicy.StoreOnly, historical.Descriptor!.PublicationPolicy);
+            Assert.AreEqual(before.Value + 1, historical.Descriptor.Plan.Source.Revision.Value);
+            Assert.AreEqual(GateReprocessingLifecycle.Completed, historicalTerminal.Lifecycle);
+
+            ProductiveGateInspectionDiagnostics beforeClose = scope.ReadDiagnostics();
+            GateApplyLedgerSnapshot ledger = AssertSingleTerminalLedger(beforeClose, new(before.Value + 1));
+            Assert.AreEqual(GateActivationState.Activated, ledger.Activation);
+            Assert.AreEqual(GateCandidateRetirementState.Activated, ledger.CandidateRetirement);
+            Assert.AreEqual(GateApplyLedgerPendingResource.None, ledger.PendingResources);
+            Assert.AreEqual(1, beforeClose.Store.ActiveViewCount,
+                "The activated view is retained product state, not a provisional resource.");
+            AssertStableProvisionalBalances(beforeClose);
 
             Task first = runtime.Shutdown.ShutdownAsync();
             Assert.AreSame(first, runtime.Shutdown.ShutdownAsync());
             await first.WaitAsync(TimeSpan.FromSeconds(10));
             Assert.IsTrue(runtime.Shutdown.Status.Completed);
+            Assert.IsNotNull(finalGateDiagnostics);
+            AssertStableProvisionalBalances(finalGateDiagnostics);
+            Assert.IsTrue(finalGateDiagnostics.LedgerLifecycle.IsStableAfterDrain);
             shutdownCompleted = true;
             Assert.AreEqual(1, source.DisposeCount);
             CollectionAssert.AreEqual(new[]
@@ -131,6 +157,249 @@ public sealed class CompositionTests
         }
         finally { if (!shutdownCompleted) await runtime.Shutdown.ShutdownAsync(); }
     }, TimeSpan.FromSeconds(40));
+
+    [TestMethod]
+    public Task Productive_FIFO_saturation_is_visible_and_recovers_without_consuming_a_fake_result() => StaTest.Run(async () =>
+    {
+        var source = new GateControlledSource();
+        var blocker = new BlockingInspectionWriter();
+        var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
+        DesktopRuntime runtime = await DesktopRuntimeFactory.CreateAsync(
+            new WpfUiDispatcher(Dispatcher.CurrentDispatcher), source, configuration,
+            new BScanOptions(4_000_000, 8, 2, 2), TimeProvider.System,
+            gateHooks: new(InspectionWriterDecorator: blocker.Decorate));
+        try
+        {
+            var services = runtime.Host.Services;
+            var window = services.GetRequiredService<MainWindow>();
+            var host = services.GetRequiredService<AScanHostViewModel>();
+            var session = services.GetRequiredService<ApplicationSession>();
+            var scope = services.GetRequiredService<ProductiveGateInspectionScope>();
+            window.Show(); window.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, window.AScan));
+            window.UpdateLayout(); await runtime.Host.StartAsync(); await host.StartCommand.ExecuteAsync(null);
+            GateEditorViewCoordinator view = window.AScan.ViewModel!.GateEditor!;
+            var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void Changed(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+            { if (view.CompositeVisual?.HasAuthoritativeIdentity == true) ready.TrySetResult(); }
+            view.PropertyChanged += Changed;
+            GateControlledSource.FrameOwner initial = source.QueueFrame();
+            await Task.WhenAll(initial.Returned.Task, ready.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            view.PropertyChanged -= Changed;
+
+            using var filler = new GatePlanEditorSession(scope.AuthorityKey, scope.Authority, scope.PreviewCompiler);
+            GatePlanEditorSnapshot editing = filler.BeginEdit();
+            GatePlanEditResult preview = filler.Preview();
+            Assert.AreEqual(GatePlanEditOutcome.Previewed, preview.Outcome);
+            GatePlanPreviewCandidate candidate = filler.BorrowApplicablePreview()!.Candidate;
+            var request = new GatePlanApplyRequest(new(GatePlanEditIntentKind.Apply, scope.AuthorityKey,
+                editing.Committed.Revision, editing.Draft!), candidate);
+
+            blocker.Arm(); GateControlledSource.FrameOwner blocked = source.QueueFrame();
+            await blocker.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            GatePlanApplySubmission[] admitted = Enumerable.Range(0, 63)
+                .Select(_ => session.TryApplyGatePlan(request)).ToArray();
+            Assert.IsTrue(admitted.All(x => x.Status == GatePlanApplySubmissionStatus.Admitted));
+            await view.BeginEditCommand.ExecuteAsync(null); await view.PreviewCommand.ExecuteAsync(null);
+            await view.ApplyCommand.ExecuteAsync(null);
+            Assert.AreEqual(GateEditorViewPhase.Busy, view.State.Phase);
+            Assert.AreEqual(GatePlanApplySubmissionStatus.CoordinatorCapacityExceeded, view.State.Admission);
+            Assert.IsNull(view.State.Result, "Pre-admission saturation must not fabricate GatePlanEditResult.");
+
+            blocker.Release(); await blocked.Returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.WhenAll(admitted.Select(x => x.Completion!)).WaitAsync(TimeSpan.FromSeconds(10));
+            await view.BeginEditCommand.ExecuteAsync(null); await view.PreviewCommand.ExecuteAsync(null);
+            await view.ApplyCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.AreNotEqual(GateEditorViewPhase.Busy, view.State.Phase);
+            await runtime.Shutdown.ShutdownAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally { blocker.Release(); if (!runtime.Shutdown.Status.Completed) await runtime.Shutdown.ShutdownAsync(); }
+    }, TimeSpan.FromSeconds(50));
+
+    [TestMethod]
+    public Task Productive_scope_lends_two_views_independent_preview_identities() => StaTest.Run(async () =>
+    {
+        DesktopRuntime runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
+        GatePlanEditorSession? first = null; GatePlanEditorSession? second = null;
+        try
+        {
+            GateEditingComponentContext context = runtime.Host.Services
+                .GetRequiredService<AScanComponentContext>().GateEditing!;
+            first = new(context.AuthorityKey, context.Authority, context.PreviewCompiler);
+            second = new(context.AuthorityKey, context.Authority, context.PreviewCompiler);
+            first.BeginEdit(); second.BeginEdit(); first.Preview(); second.Preview();
+            GatePreviewArtifact a = first.BorrowApplicablePreview()!;
+            GatePreviewArtifact b = second.BorrowApplicablePreview()!;
+            Assert.AreNotEqual(a.Candidate.PreviewIdentity, b.Candidate.PreviewIdentity);
+            Assert.AreEqual(a.Candidate.BaseRevision, b.Candidate.BaseRevision);
+            Assert.AreNotSame(a.Checkpoint, b.Checkpoint,
+                "Each independent view owns its bounded draft/checkpoint.");
+        }
+        finally
+        {
+            first?.Dispose(); second?.Dispose();
+            await runtime.Shutdown.ShutdownAsync();
+        }
+    });
+
+    [TestMethod]
+    public Task Productive_historical_candidate_is_abandoned_when_a_new_run_supersedes_CAS() => StaTest.Run(async () =>
+    {
+        var source = new GateControlledSource();
+        var historical = new HistoricalAdmissionProbe();
+        var cas = new BlockingReplacementStore();
+        var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
+        DesktopRuntime runtime = await DesktopRuntimeFactory.CreateAsync(
+            new WpfUiDispatcher(Dispatcher.CurrentDispatcher), source, configuration,
+            new BScanOptions(4_000_000, 8, 2, 2), TimeProvider.System,
+            gateHooks: new(ReplacementDecorator: cas.Decorate, SchedulerDecorator: historical.Decorate));
+        try
+        {
+            var services = runtime.Host.Services;
+            var window = services.GetRequiredService<MainWindow>();
+            var host = services.GetRequiredService<AScanHostViewModel>();
+            var session = services.GetRequiredService<ApplicationSession>();
+            var scope = services.GetRequiredService<ProductiveGateInspectionScope>();
+            window.Show(); window.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, window.AScan));
+            window.UpdateLayout(); await runtime.Host.StartAsync(); await host.StartCommand.ExecuteAsync(null);
+            GateEditorViewCoordinator editor = window.AScan.ViewModel!.GateEditor!;
+            var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void Changed(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+            { if (editor.CompositeVisual?.HasAuthoritativeIdentity == true) ready.TrySetResult(); }
+            editor.PropertyChanged += Changed;
+            GateControlledSource.FrameOwner frame = source.QueueFrame();
+            await Task.WhenAll(frame.Returned.Task, ready.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            editor.PropertyChanged -= Changed;
+            await editor.BeginEditCommand.ExecuteAsync(null); await editor.PreviewCommand.ExecuteAsync(null);
+            GatePlanRevision revision = new(scope.Authority.Read(scope.AuthorityKey).Committed.Revision.Value + 1);
+            await editor.ApplyCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
+            await host.StopCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
+            await cas.ActivationEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await session.StartAsync(configuration, new AcquisitionRunId(Guid.NewGuid()));
+            cas.Release();
+            await historical.Terminal.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await scope.WaitForHistoricalObserversAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await scope.WaitForHistoricalSchedulerIdleAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await session.StopAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            ProductiveGateInspectionDiagnostics diagnostics = scope.ReadDiagnostics();
+            GateApplyLedgerSnapshot ledger = AssertSingleTerminalLedger(diagnostics, revision);
+            Assert.IsTrue(ledger.Activation is GateActivationState.RunSuperseded or GateActivationState.Superseded);
+            Assert.AreEqual(GateCandidateRetirementState.Reclaimed, ledger.CandidateRetirement);
+            Assert.AreEqual(GateApplyLedgerPendingResource.None, ledger.PendingResources);
+            AssertStableProvisionalBalances(diagnostics);
+            await runtime.Shutdown.ShutdownAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally { cas.Release(); if (!runtime.Shutdown.Status.Completed) await runtime.Shutdown.ShutdownAsync(); }
+    }, TimeSpan.FromSeconds(40));
+
+    [TestMethod]
+    public Task Closing_view_after_apply_admission_does_not_cancel_productive_reconciliation() => StaTest.Run(async () =>
+    {
+        var source = new GateControlledSource();
+        var blocker = new BlockingInspectionWriter();
+        ProductiveGateInspectionDiagnostics? finalDiagnostics = null;
+        var configuration = new ConventionalAcquisitionConfiguration(new(0), 16, 1_000_000, 0, UtSignalMode.Rf);
+        DesktopRuntime runtime = await DesktopRuntimeFactory.CreateAsync(
+            new WpfUiDispatcher(Dispatcher.CurrentDispatcher), source, configuration,
+            new BScanOptions(4_000_000, 8, 2, 2), TimeProvider.System,
+            gateHooks: new(InspectionWriterDecorator: blocker.Decorate,
+                BeforeAuthorityClose: value => finalDiagnostics = value));
+        try
+        {
+            var services = runtime.Host.Services;
+            var window = services.GetRequiredService<MainWindow>();
+            var host = services.GetRequiredService<AScanHostViewModel>();
+            var scope = services.GetRequiredService<ProductiveGateInspectionScope>();
+            window.Show(); window.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, window.AScan));
+            window.UpdateLayout(); await runtime.Host.StartAsync(); await host.StartCommand.ExecuteAsync(null);
+            GateEditorViewCoordinator editor = window.AScan.ViewModel!.GateEditor!;
+            var visualReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void Visual(object? _, System.ComponentModel.PropertyChangedEventArgs __)
+            { if (editor.CompositeVisual?.HasAuthoritativeIdentity == true) visualReady.TrySetResult(); }
+            editor.PropertyChanged += Visual;
+            GateControlledSource.FrameOwner first = source.QueueFrame();
+            await Task.WhenAll(first.Returned.Task, visualReady.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            blocker.Arm();
+            GateControlledSource.FrameOwner blockedFrame = source.QueueFrame();
+            await blocker.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            editor.PropertyChanged -= Visual;
+            await editor.BeginEditCommand.ExecuteAsync(null);
+            await editor.PreviewCommand.ExecuteAsync(null);
+            GatePlanRevision before = scope.Authority.Read(scope.AuthorityKey).Committed.Revision;
+            int publicationsAfterClose = 0;
+            void Published(object? _, System.ComponentModel.PropertyChangedEventArgs __) => publicationsAfterClose++;
+            editor.PropertyChanged += Published;
+
+            Task waiter = editor.ApplyCommand.ExecuteAsync(null);
+            Assert.IsFalse(waiter.IsCompleted, "The admitted Apply must still be awaiting its terminal.");
+            await window.CloseAScanAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            int atClose = publicationsAfterClose;
+            blocker.Release();
+            await blockedFrame.Returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await waiter.WaitAsync(TimeSpan.FromSeconds(5));
+            var committed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using IDisposable subscription = scope.Authority.Observe(scope.AuthorityKey).Subscribe(
+                new ActionObserver<GatePlanAuthoritySnapshot>(snapshot =>
+                { if (snapshot.Committed.Revision.Value == before.Value + 1) committed.TrySetResult(); }));
+            if (scope.Authority.Read(scope.AuthorityKey).Committed.Revision.Value != before.Value + 1)
+                await committed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            Assert.AreEqual(atClose, publicationsAfterClose,
+                "A closed view must not receive the productive terminal or authority publication.");
+            editor.PropertyChanged -= Published;
+
+            Task shutdown = runtime.Shutdown.ShutdownAsync();
+            Assert.AreSame(shutdown, runtime.Shutdown.ShutdownAsync());
+            await shutdown.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsNotNull(finalDiagnostics);
+            AssertStableProvisionalBalances(finalDiagnostics);
+        }
+        finally { blocker.Release(); if (!runtime.Shutdown.Status.Completed) await runtime.Shutdown.ShutdownAsync(); }
+    }, TimeSpan.FromSeconds(40));
+
+    private static GateApplyLedgerSnapshot AssertSingleTerminalLedger(ProductiveGateInspectionDiagnostics diagnostics,
+        GatePlanRevision revision)
+    {
+        GateApplyLedgerSnapshot ledger = diagnostics.Ledgers.Single(x => x.PlanRevision == revision);
+        Assert.AreEqual(GateHistoricalAdmissionState.Admitted, ledger.HistoricalAdmission);
+        Assert.AreEqual(GateHistoricalExecutionState.Completed, ledger.HistoricalExecution);
+        Assert.AreEqual(GateCandidateCoverageState.Complete, ledger.CandidateCoverage);
+        Assert.AreEqual(GateApplyLedgerPendingResource.None, ledger.PendingResources);
+        return ledger;
+    }
+
+    private static void AssertStableProvisionalBalances(ProductiveGateInspectionDiagnostics diagnostics)
+    {
+        Assert.AreEqual(0, diagnostics.ActiveHistoricalObservers);
+        Assert.AreEqual(0, diagnostics.Scheduler.PendingAdmissions);
+        Assert.AreEqual(0, diagnostics.Scheduler.ActiveJobs);
+        Assert.AreEqual(0, diagnostics.Scheduler.ActiveSampleBuffers);
+        Assert.AreEqual(0, diagnostics.Scheduler.ActiveScratchRentals);
+        Assert.AreEqual(0, diagnostics.Store.ReservedBatchCount);
+        Assert.AreEqual(0, diagnostics.Store.ActiveLeases);
+        Assert.AreEqual(0, diagnostics.Store.AdmittedWriters);
+        Assert.AreEqual(0, diagnostics.Store.ActiveReaders);
+        Assert.AreEqual(0, diagnostics.Store.ActiveCoverageWriters);
+        Assert.AreEqual(0, diagnostics.Store.ActiveActivationWriters);
+        Assert.AreEqual(0, diagnostics.Store.ReservedCoverageCount);
+        Assert.AreEqual(0, diagnostics.Store.ReservedActivationCount);
+        Assert.AreEqual(0, diagnostics.Store.InvalidatedViewCount);
+        Assert.AreEqual(0, diagnostics.Store.ReclaimableBatchCount);
+        Assert.AreEqual(0, diagnostics.Store.TombstoneCount);
+        Assert.AreEqual(0, diagnostics.Live.ActiveLeases);
+        Assert.AreEqual(0, diagnostics.Live.ActiveWorkers);
+        Assert.AreEqual(0, diagnostics.Live.ActiveCallbacks);
+        Assert.AreEqual(0, diagnostics.Live.SchedulerDepth);
+        Assert.AreEqual(0, diagnostics.Live.OpenRuns);
+        foreach (GateProcessingRunDiagnostics run in diagnostics.Live.ActiveRuns.Concat(diagnostics.Live.TerminalRuns))
+        {
+            Assert.AreEqual(0, run.WorkPending);
+            Assert.AreEqual(0, run.ActiveLeases);
+            Assert.AreEqual(0, run.ActiveWorkers);
+            Assert.AreEqual(0, run.ActiveCallbacks);
+            Assert.AreEqual(0, run.ProvisionalEpochSlots);
+            Assert.AreEqual(0, run.PreparedEpochPins);
+        }
+    }
 
     [TestMethod]
     public Task ProductiveGateInspectionScopeIsTheSingleRegisteredGateGraph() => StaTest.Run(async () =>
@@ -658,6 +927,88 @@ public sealed class CompositionTests
         public void OnCompleted() { }
     }
 
+    private sealed class HistoricalAdmissionProbe : IOwnedGateReprocessingScheduler
+    {
+        private IOwnedGateReprocessingScheduler? _inner;
+        internal GateReprocessingJobDescriptor? Descriptor { get; private set; }
+        internal TaskCompletionSource<GateReprocessingProgressSnapshot> Terminal { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal IOwnedGateReprocessingScheduler Decorate(IOwnedGateReprocessingScheduler inner)
+        { _inner = inner; return this; }
+
+        public async ValueTask<GateReprocessingAdmissionResult> AdmitOwnedAsync(
+            GateReprocessingJobDescriptor descriptor, IGateReprocessingAdmissionOwner owner,
+            CancellationToken cancellationToken = default)
+        {
+            Descriptor = descriptor;
+            GateReprocessingAdmissionResult result = await _inner!.AdmitOwnedAsync(descriptor, owner, cancellationToken);
+            if (result.Job is { } job) _ = ObserveAsync(job);
+            return result;
+        }
+
+        private async Task ObserveAsync(IGateReprocessingJob job)
+        {
+            try { Terminal.TrySetResult(await job.Completion.ConfigureAwait(false)); }
+            catch (Exception error) { Terminal.TrySetException(error); }
+        }
+    }
+
+    private sealed class BlockingInspectionWriter : IInspectionRunWriter
+    {
+        private IInspectionRunWriter? _inner;
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _armed;
+        internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal IInspectionRunWriter Decorate(IInspectionRunWriter inner)
+        { _inner = inner; return this; }
+        internal void Arm() => Interlocked.Exchange(ref _armed, 1);
+        internal void Release() => _release.TrySetResult();
+        public AcquisitionRunId RunId => _inner!.RunId;
+        public InspectionRunState State => _inner!.State;
+        public async ValueTask<InspectionAppendResult> CommitAsync(InspectionCommitInput commit,
+            CancellationToken cancellationToken = default)
+        {
+            if (Volatile.Read(ref _armed) != 0)
+            {
+                Entered.TrySetResult();
+                await _release.Task.ConfigureAwait(false);
+            }
+            return await _inner!.CommitAsync(commit, cancellationToken).ConfigureAwait(false);
+        }
+        public ValueTask<InspectionAppendResult> CommitGapAsync(GapRecord gap,
+            CancellationToken cancellationToken = default) => _inner!.CommitGapAsync(gap, cancellationToken);
+        public ValueTask<InspectionRunSealResult> SealRunAsync(CancellationToken cancellationToken = default) =>
+            _inner!.SealRunAsync(cancellationToken);
+        public ValueTask DisposeAsync() => _inner!.DisposeAsync();
+    }
+
+    private sealed class BlockingReplacementStore : IGateReplacementStore
+    {
+        private IGateReplacementStore? _inner;
+        private readonly ManualResetEventSlim _release = new(false);
+        internal TaskCompletionSource ActivationEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal IGateReplacementStore Decorate(IGateReplacementStore inner) { _inner = inner; return this; }
+        internal void Release() => _release.Set();
+        public GateCandidateReservationResult ReserveCandidate(InspectionId inspectionId, AcquisitionRunId runId,
+            GateRunGeneration runGeneration, GatePlanId planId, GatePlanRevision planRevision,
+            GateReprocessingAttemptId attemptId) => _inner!.ReserveCandidate(inspectionId, runId, runGeneration,
+                planId, planRevision, attemptId);
+        public GateStoreOnlyCandidateDescriptor MaterializeCandidate(GateCandidateReservation reservation,
+            GateDerivedCoverageManifest manifest) => _inner!.MaterializeCandidate(reservation, manifest);
+        public void ReleaseReservation(GateCandidateReservation reservation) => _inner!.ReleaseReservation(reservation);
+        public GateCandidateActivationResult ActivateCandidate(GateCandidateActivationRequest request)
+        { ActivationEntered.TrySetResult(); _release.Wait(); return _inner!.ActivateCandidate(request); }
+        public GateCandidateAbandonResult AbandonCandidate(GateStoreOnlyCandidateDescriptor candidate) =>
+            _inner!.AbandonCandidate(candidate);
+        public GateCandidateReclaimResult ReclaimCandidate(GateStoreOnlyCandidateDescriptor candidate) =>
+            _inner!.ReclaimCandidate(candidate);
+        public GateDerivedMutationResult ReclaimPreviousView() => _inner!.ReclaimPreviousView();
+        public ValueTask<GateDerivedMutationResult> CompletePreviousViewRetirementAsync() =>
+            _inner!.CompletePreviousViewRetirementAsync();
+    }
+
     private sealed class GateControlledSource : IUtFrameSource
     {
         private readonly Channel<ConventionalUtFrame> _frames = Channel.CreateBounded<ConventionalUtFrame>(1);
@@ -666,6 +1017,7 @@ public sealed class CompositionTests
         private ConventionalUtFrameMetadata? _metadata;
         private ConventionalAcquisitionConfiguration? _configuration;
         private FrameOwner? _owner;
+        private ulong _nextAcquisitionIndex;
         private bool _stopped;
         public UtSourceId SourceId { get; } = new("gate-controlled-wpf");
         public UtSourceCapabilities Capabilities { get; } = new([new PhysicalChannelId(0)], 64, 1_000_000, true);
@@ -687,7 +1039,9 @@ public sealed class CompositionTests
         {
             var owner = _owner = new FrameOwner(_metadata!.Configuration.SampleCount, ReleaseOwner);
             for (int index = 0; index < owner.Memory.Length; index++) owner.Memory.Span[index] = (short)(index * 100);
-            if (!_frames.Writer.TryWrite(new(_metadata, 0, 0, TimeSpan.Zero, null, owner)))
+            ulong acquisitionIndex = _nextAcquisitionIndex++;
+            if (!_frames.Writer.TryWrite(new(_metadata, acquisitionIndex, acquisitionIndex,
+                TimeSpan.FromTicks((long)acquisitionIndex), null, owner)))
                 throw new InvalidOperationException("The controlled frame was not admitted.");
             return owner;
         }

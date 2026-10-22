@@ -14,20 +14,28 @@ internal sealed class GateHistoricalRunServices : IAsyncDisposable
     private readonly object _gate = new();
     private readonly GateHistoricalReplacementCoordinator _coordinator;
     private readonly IOwnedGateReprocessingLifecycle _scheduler;
+    private readonly GateReprocessingScheduler? _schedulerDiagnostics;
     private readonly IGateReplacementStoreLifecycle _store;
     private IGateLiveProcessingLifecycle? _live;
     private readonly InMemoryGatePlanAuthorityOwner _authorityOwner;
     private Task? _disposeTask;
+    private readonly Action<ProductiveGateInspectionDiagnostics>? _beforeAuthorityClose;
+    private readonly Func<ProductiveGateInspectionDiagnostics>? _diagnostics;
 
     internal GateHistoricalRunServices(GateHistoricalReplacementCoordinator coordinator,
         IOwnedGateReprocessingLifecycle scheduler, IGateReplacementStoreLifecycle store,
-        InMemoryGatePlanAuthorityOwner authorityOwner, IGateLiveProcessingLifecycle? live = null)
+        InMemoryGatePlanAuthorityOwner authorityOwner, IGateLiveProcessingLifecycle? live = null,
+        Func<ProductiveGateInspectionDiagnostics>? diagnostics = null,
+        Action<ProductiveGateInspectionDiagnostics>? beforeAuthorityClose = null)
     {
         _coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         _scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _authorityOwner = authorityOwner ?? throw new ArgumentNullException(nameof(authorityOwner));
         _live = live;
+        _schedulerDiagnostics = scheduler as GateReprocessingScheduler;
+        _diagnostics = diagnostics;
+        _beforeAuthorityClose = beforeAuthorityClose;
     }
 
     internal GateLedgerLifecycleDiagnostics LedgerDiagnostics { get; private set; } =
@@ -136,6 +144,11 @@ internal sealed class GateHistoricalRunServices : IAsyncDisposable
             LedgerDiagnostics = _authorityOwner.PreparedCommits.ReadLifecycleDiagnostics(stableAfterDrain: true);
             failures.Add(error);
         }
+        if (_beforeAuthorityClose is not null && _diagnostics is not null)
+        {
+            try { _beforeAuthorityClose(_diagnostics()); }
+            catch (Exception error) { failures.Add(error); }
+        }
         try
         {
             _authorityOwner.Dispose();
@@ -146,4 +159,10 @@ internal sealed class GateHistoricalRunServices : IAsyncDisposable
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
         if (failures.Count > 1) throw new AggregateException(failures);
     }
+
+    internal int ActiveObserverCount => _coordinator.ActiveObserverCount;
+    internal Task WaitForObserversAsync() => _coordinator.DrainAsync();
+    internal Task WaitForSchedulerIdleAsync() => _schedulerDiagnostics?.WaitForIdleAsync() ?? Task.CompletedTask;
+    internal GateReprocessingSchedulerDiagnostics SchedulerDiagnostics =>
+        _schedulerDiagnostics?.Diagnostics ?? default;
 }

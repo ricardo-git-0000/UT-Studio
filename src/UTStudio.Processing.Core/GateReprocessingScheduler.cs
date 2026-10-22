@@ -25,6 +25,7 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwn
     private readonly HashSet<GateReprocessingAttemptId> _attempts = [];
     private int _admissions;
     private TaskCompletionSource? _admissionsDrained;
+    private TaskCompletionSource? _idle;
     private bool _accepting = true;
     private Task? _stopTask;
     private Task? _disposeTask;
@@ -131,6 +132,22 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwn
         return cancellationToken.CanBeCanceled ? stop.WaitAsync(cancellationToken) : stop;
     }
 
+    internal GateReprocessingSchedulerDiagnostics Diagnostics
+    {
+        get
+        {
+            lock (_gate)
+                return new(_accepting, _admissions, _jobs.Count, _sampleBuffers.Diagnostics.ActiveBuffers,
+                    _scratchPool.Snapshot.ActiveRentals);
+        }
+    }
+
+    internal Task WaitForIdleAsync()
+    {
+        lock (_gate) return _admissions == 0 && _jobs.Count == 0 ? Task.CompletedTask :
+            (_idle ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+    }
+
     void IOwnedGateReprocessingLifecycle.CloseAdmission()
     {
         lock (_gate) { _accepting = false; }
@@ -175,9 +192,18 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwn
 
     private void ReleaseAdmission()
     {
-        TaskCompletionSource? signal = null;
-        lock (_gate) { _admissions--; if (_admissions == 0) signal = _admissionsDrained; }
+        TaskCompletionSource? signal = null; TaskCompletionSource? idle = null;
+        lock (_gate)
+        {
+            _admissions--;
+            if (_admissions == 0)
+            {
+                signal = _admissionsDrained;
+                if (_jobs.Count == 0) { idle = _idle; _idle = null; }
+            }
+        }
         signal?.TrySetResult();
+        idle?.TrySetResult();
     }
 
     private async Task WorkerAsync(int workerIndex)
@@ -530,7 +556,13 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwn
 
     private void Remove(Job job)
     {
-        lock (_gate) { _jobs.Remove(job); }
+        TaskCompletionSource? idle = null;
+        lock (_gate)
+        {
+            _jobs.Remove(job);
+            if (_jobs.Count == 0 && _admissions == 0) { idle = _idle; _idle = null; }
+        }
+        idle?.TrySetResult();
     }
 
     private static GateReprocessingAdmissionStatus MapOpen(InspectionSealedRunSnapshotOpenStatus status) => status switch
@@ -946,6 +978,9 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwn
         public void Dispose() => _hash.Dispose();
     }
 }
+
+internal readonly record struct GateReprocessingSchedulerDiagnostics(
+    bool Accepting, int PendingAdmissions, int ActiveJobs, int ActiveSampleBuffers, int ActiveScratchRentals);
 
 internal readonly record struct GateReprocessingSampleBufferDiagnostics(
     long CapacityBytes, long ReservedBytes, long OwnedBytes, long PeakOwnedBytes,

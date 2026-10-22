@@ -76,6 +76,40 @@ reentrada del comando, conservando ambos órdenes autoridad/Completion.
 - El diagnóstico de B8B no establece relación causal con las incidencias lifecycle/B-Scan previas.
 - Persistencia y C-Scan no forman parte de la Fase 6.
 
+## Cierre de la auditoría formal
+
+La ampliación de aceptación usa el grafo real de `DesktopRuntime` y seams `internal` exclusivos de prueba para
+detener fronteras sin sustituir scheduler, store, FIFO, autoridad ni observers:
+
+- `Productive_gate_vertical_apply_stop_and_close_is_owned_and_repeatable` observa la admisión `StoreOnly` de la
+  revisión vigente, Completion, CAS `Activated`, ledger terminal con `PendingResources.None`, un único view
+  activo legítimo y cero jobs, observers, candidatas provisionales, tombstones, leases, pins y reservas. El
+  snapshot se captura antes de cerrar autoridad; la ausencia posterior de ledgers no se usa como balance.
+- `Productive_historical_candidate_is_abandoned_when_a_new_run_supersedes_CAS` bloquea determinísticamente la
+  frontera CAS, instala una nueva run y comprueba `RunSuperseded`, abandono/reclaim y balances finales.
+  La ejecución conjunta reveló y corrigió que esa ruta dejaba `PreviousViewRetirement=Dormant`; el terminal
+  supersedido ahora lo marca `NotApplicable`, por lo que `Dispose` puede demostrar el cierre material.
+- `Closing_view_after_apply_admission_does_not_cancel_productive_reconciliation` retiene una RF real en el FIFO,
+  confirma que Apply queda admitido sin terminal, cierra la vista, libera RF y comprueba reconciliación posterior,
+  ninguna publicación visual tardía, cierre repetido compartido y ausencia final de owners pendientes.
+- `Productive_FIFO_saturation_is_visible_and_recovers_without_consuming_a_fake_result` llena la capacidad real
+  detrás de una RF retenida, observa Busy sin `GatePlanEditResult` inventado y verifica recuperación.
+- `Productive_scope_lends_two_views_independent_preview_identities` crea dos editores contra los puertos del mismo
+  scope real y verifica checkpoints y `PreviewIdentity` independientes.
+
+La matriz productiva restante queda demostrada por la combinación del scope real y las regresiones de la misma
+semántica en sus fronteras: `CancelledWaiterStillOwnsAdmittedConflictTerminal`; terminal inmediato en la
+aceptación vertical principal; `AcceptedApplyDoesNotReplaceANewerEdit`; y
+`AcceptedApplyConvergesForBothAuthorityAndCompletionOrders`. Ninguna de estas pruebas reemplaza el mecanismo
+productivo de autoridad, compilación, FIFO o lifecycle.
+
+Validación posterior a la auditoría: una ejecución Core reprodujo el timeout de cleanup conocido en
+`NewRevisionImmediatelyBeforeCandidateValidationRejectsStaleRaster`; no se atribuye causa ni se declara resuelto.
+La repetición Core completa posterior pasó 1065/1065 y WPF completa Release pasó 144/144. Las
+comprobaciones manuales pendientes son la operación de teclado/ratón con un lector de pantalla real y la
+transición DPI en monitores físicos distintos; no se declaran ejecutadas. La limitación física de DPI y las
+incidencias lifecycle/B-Scan continúan separadas y no se declaran resueltas por estas ejecuciones verdes.
+
 ## Archivos
 
 Cambian composición DesktopRuntime, scope Application, contexto/ViewModel/editor/overlay Presentation, agregado

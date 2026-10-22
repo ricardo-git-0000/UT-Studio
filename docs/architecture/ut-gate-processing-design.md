@@ -1,7 +1,7 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
-Fecha: 2026-10-19. Estado: **contrato aceptado; Fases 1–5 integradas en `main`; Fase 6 implementada en
-`feature/ut-gate-ascan-editor`, con B8B validado y pendiente de punto de control; persistencia y C-Scan
+Fecha: 2026-10-19. Estado: **contrato aceptado; Fases 1–5 integradas en `main`; Fase 6 implementada y validada en
+`feature/ut-gate-ascan-editor`; persistencia y C-Scan
 siguen fuera**. La
 integración de Fase 5 finalizó en `eb3eb2e` mediante `aee0bc1` → `91091a1` → `f29748a` → `eb3eb2e`; la antigua
 rama `feature/ut-gate-reprocessing` fue eliminada. El árbol estaba limpio en la comprobación previa a esta
@@ -523,8 +523,9 @@ fronteras y matriz de pruebas. El [ADR 0018 aceptado](../adr/0018-editable-gate-
 coordinador serial asíncrono Application distinto del `_gate` actual de sesión, epochs y publicación
 preparados, owner terminal de `Completion`, transición de run confirmada bajo el gate store común con CAS,
 ledger normativo acotado, reservas tipadas, snapshot WPF indivisible y rechazo visible por capacidad
-`LiveEpochs`. Mantiene reemplazo `StoreOnly` + CAS/abandono completo. Ha sido auditado y aceptado; Fase 6
-continúa no implementada y esos contratos preparados todavía no existen.
+`LiveEpochs`. Mantiene reemplazo `StoreOnly` + CAS/abandono completo. Fase 6 implementa esos contratos, el
+overlay accesible y la composición productiva. La aceptación vertical conserva evidencia terminal antes de
+cerrar autoridad y comprueba activación, supersesión, reclaim y balances estables del scope.
 
 C-Scan consumirá capas derivadas por región/identidad, no invocará el evaluator desde la View. Su máscara
 distingue valor detectado, ausencia válida (`BelowThreshold`/`NoEvent`) y causas no disponibles o terminales;

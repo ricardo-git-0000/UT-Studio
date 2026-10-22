@@ -1,6 +1,6 @@
 # Plan ejecutable aceptado — Fase 6: editor y overlay de gates en A-Scan
 
-Fecha: 2026-10-19. Estado: **Aceptado; no implementado**.
+Fecha: 2026-10-19. Estado: **implementado y validado en `feature/ut-gate-ascan-editor`**.
 
 Se rige por el
 [ADR 0018](../adr/0018-editable-gate-plan-authority.md), ahora **Accepted**, y por los ADR
@@ -222,13 +222,16 @@ Implementar snapshot visual, render, hit-test, captura versionada, teclado y Aut
 
 Componer DI/lifetimes y ejecutar aceptación integral, arquitectura, format y build/test Release.
 
-Estado a 2026-10-22: B8A está cerrado y B8B tiene implementados el coordinador por vista, la composición
-DesktopRuntime, los comandos y la interacción productiva. La autoridad, el store, el lifecycle y el artefacto
-compilado de Preview siguen siendo únicos y propiedad del scope; las vistas solo toman prestados sus puertos.
-Una aceptación vertical STA determinista con la composición real cubre adquisición, edición, Preview, Apply,
-Stop y cierre compartido; la regresión que impedía la quiescencia del overlay está localizada y cubierta. Las
-validaciones pasan y B8B queda pendiente de su punto de control; este documento no declara por sí solo completada
-la Fase 6.
+Estado a 2026-10-22: B8A y B8B están cerrados. El coordinador por vista, la composición DesktopRuntime, los
+comandos y la interacción productiva usan una autoridad, un store, un lifecycle y el artefacto compilado exacto
+de Preview, todos propiedad del scope. La aceptación vertical STA con composición real cubre adquisición,
+edición, Preview, Apply, Stop, handoff `StoreOnly`, CAS activado o supersedido, cleanup y cierre compartido. La
+auditoría final comprueba el ledger antes de cerrar autoridad, distingue la vista activada legítima de recursos
+provisionales y prueba el cierre de vista con Apply ya admitido. Fase 6 queda funcionalmente completa; las
+comprobaciones manuales y las incidencias externas conocidas se enumeran en el informe B8B.
+
+La evidencia de B1 es el punto de control `5967591790b3285467bfc946d384980c2d16621a` y sus pruebas del
+coordinador FIFO. No se crea retrospectivamente un informe de progreso B1.
 
 Cada paso debe compilar y pasar sus pruebas sin introducir dos autoridades; Apply no queda parcialmente
 productivo entre pasos.

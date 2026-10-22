@@ -37,6 +37,7 @@ internal sealed class GateHistoricalReplacementSubmission
 /// <summary>Owns one historical replacement from reservation through terminal reconciliation.</summary>
 internal sealed class GateHistoricalReplacementCoordinator
 {
+    internal int ActiveObserverCount { get { lock (_registryGate) return _observers; } }
     private readonly IOwnedGateReprocessingScheduler _scheduler;
     private readonly IGateReplacementStore _store;
     private readonly InMemoryGatePlanPreparedCommitOwner _authority;
@@ -449,6 +450,7 @@ internal sealed class GateHistoricalReplacementCoordinator
                 GateLedgerCauseKind.Faulted : GateLedgerCauseKind.CandidateNotAvailable;
             _owner.Advance(_authority, _reservation.PlanRevision, current => Copy(current,
                 activation: terminal, retirement: GateCandidateRetirementState.Required,
+                previous: GatePreviousViewRetirementState.NotApplicable,
                 ownership: GateCandidateOwnershipState.Available,
                 primary: new(GateLedgerStage.Activation, causeKind)));
             _owner.Advance(_authority, _reservation.PlanRevision, current => Copy(current,

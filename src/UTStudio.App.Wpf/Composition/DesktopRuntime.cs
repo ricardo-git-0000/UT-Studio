@@ -195,12 +195,12 @@ public sealed class DesktopRuntime
 
     // Deterministic partial-construction fault injection, without changing neutral APIs.
     internal static Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, string[]? args, TimeProvider clock,
-        Action<string>? checkpoint) => CreateAsync(dispatcher, args, clock, checkpoint, null, null, null, null, null);
+        Action<string>? checkpoint) => CreateAsync(dispatcher, args, clock, checkpoint, null, null, null, null, null, null);
 
     internal static async Task<DesktopRuntime> CreateAsync(IUiDispatcher dispatcher, string[]? args, TimeProvider clock,
         Action<string>? checkpoint, IUtFrameSource? controlledSource,
         ConventionalAcquisitionConfiguration? controlledConfiguration, BScanOptions? bScanOptions,
-        IByteOwnerPool? rasterPool, Action<string>? lifecycleObserver)
+        IByteOwnerPool? rasterPool, Action<string>? lifecycleObserver, DesktopGateTestHooks? gateHooks)
     {
         var runtime = new DesktopRuntime(clock, lifecycleObserver);
         try
@@ -234,8 +234,16 @@ public sealed class DesktopRuntime
                 builder.Configuration.GetValue<int?>("InspectionStore:TargetChunkBytes") ?? 4 * 1024 * 1024);
             var inspectionStores = runtime._inspectionStores = new InspectionDataStoreRegistry(
                 new InspectionId(Guid.NewGuid()), inspectionOptions);
-            var gateScope = runtime._gateScope = await ProductiveGateInspectionScope.CreateAsync(
-                inspectionStores.InspectionId, inspectionStores.Store, configuration);
+            var gateScope = runtime._gateScope = gateHooks is null
+                ? await ProductiveGateInspectionScope.CreateAsync(
+                    inspectionStores.InspectionId, inspectionStores.Store, configuration)
+                : await ProductiveGateInspectionScope.CreateCoreAsync(
+                    inspectionStores.InspectionId, inspectionStores.Store, configuration,
+                    gateHooks.Options ?? new(), CancellationToken.None,
+                    epochDecorator: gateHooks.EpochDecorator,
+                    replacementDecorator: gateHooks.ReplacementDecorator,
+                    schedulerDecorator: gateHooks.SchedulerDecorator,
+                    beforeAuthorityClose: gateHooks.BeforeAuthorityClose);
             var visual = runtime._visual = new AScanVisualDelivery(inspectionStores.Store, timeProvider: clock);
             var bScanIngress = runtime._bScanIngress = new BScanIngress(
                 inspectionStores.Store, inspectionStores.Store, bScanOptions, clock);
@@ -244,7 +252,8 @@ public sealed class DesktopRuntime
                 : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
             checkpoint?.Invoke("visual");
             var session = runtime._session = gateScope.CreateSession(source,
-                runId => inspectionStores.OpenRun(runId), bScanIngress, visual);
+                runId => gateHooks?.InspectionWriterDecorator?.Invoke(inspectionStores.OpenRun(runId)) ??
+                    inspectionStores.OpenRun(runId), bScanIngress, visual);
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
             var selection = runtime._selection = new TraceSelectionScope(dispatcher, selectionResolver);

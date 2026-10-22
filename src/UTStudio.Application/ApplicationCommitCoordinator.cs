@@ -4,6 +4,8 @@ using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 
 [assembly: InternalsVisibleTo("UTStudio.Core.Tests")]
+[assembly: InternalsVisibleTo("UTStudio.App.Wpf")]
+[assembly: InternalsVisibleTo("UTStudio.Tests.Wpf")]
 
 namespace UTStudio.Application;
 
