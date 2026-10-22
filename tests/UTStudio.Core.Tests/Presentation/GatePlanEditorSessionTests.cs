@@ -11,6 +11,51 @@ namespace UTStudio.Core.Tests.Presentation;
 [TestClass]
 public sealed class GatePlanEditorSessionTests
 {
+    [TestMethod]
+    public void PreviewCompilesCandidateNPlusOneAndMaximumRevisionIsTyped()
+    {
+        CommittedGatePlanSnapshot committed = Committed(1);
+        using var authority = new InMemoryGatePlanAuthorityOwner([committed]);
+        using var editor = new GatePlanEditorSession(committed.AuthorityKey, authority.Seal(),
+            new GatePlanPreviewCompiler());
+        editor.BeginEdit();
+
+        GatePlanEditResult preview = editor.Preview();
+        GatePreviewArtifact artifact = editor.BorrowPreviewCandidate()!;
+
+        Assert.AreEqual(GatePlanEditOutcome.Previewed, preview.Outcome);
+        Assert.AreEqual(committed.Revision, artifact.Source.BaseRevision);
+        Assert.AreEqual(new GatePlanRevision(committed.Revision.Value + 1), artifact.Source.CandidateRevision);
+        Assert.AreSame(artifact.Candidate.CompiledPlan, artifact.CompiledPlan);
+
+        CompiledGatePlan maximum = Committed(uint.MaxValue).CompiledPlan;
+        using var maximumAuthority = new InMemoryGatePlanAuthorityOwner([
+            new CommittedGatePlanSnapshot(committed.InspectionId, maximum)]);
+        using var maximumEditor = new GatePlanEditorSession(new(committed.InspectionId, maximum.Source.Id),
+            maximumAuthority.Seal(), new GatePlanPreviewCompiler());
+        maximumEditor.BeginEdit();
+        Assert.AreEqual(GatePlanEditOutcome.RevisionExhausted, maximumEditor.Preview().Outcome);
+        Assert.IsNull(maximumEditor.BorrowPreviewCandidate());
+    }
+
+    [TestMethod]
+    public void TwoEditorsKeepIndependentBorrowedPreviewGuards()
+    {
+        CommittedGatePlanSnapshot committed = Committed(1);
+        using var authority = new InMemoryGatePlanAuthorityOwner([committed]);
+        IGatePlanAuthorityReader reader = authority.Seal();
+        var compiler = new GatePlanPreviewCompiler();
+        using var first = new GatePlanEditorSession(committed.AuthorityKey, reader, compiler);
+        using var second = new GatePlanEditorSession(committed.AuthorityKey, reader, compiler);
+        first.BeginEdit(); second.BeginEdit(); first.Preview(); second.Preview();
+        GatePreviewArtifact a = first.BorrowPreviewCandidate()!;
+        GatePreviewArtifact b = second.BorrowPreviewCandidate()!;
+
+        Assert.AreNotEqual(a.Identity.Value, b.Identity.Value);
+        Assert.AreEqual(GateGeometrySourceValidationStatus.Current, a.PreviewGuard.ValidatePreview(a.Source));
+        Assert.AreEqual(GateGeometrySourceValidationStatus.Current, b.PreviewGuard.ValidatePreview(b.Source));
+        Assert.AreEqual(GateGeometrySourceValidationStatus.Superseded, a.PreviewGuard.ValidatePreview(b.Source));
+    }
     private static readonly InspectionId Inspection = new(Guid.Parse("82000000-0000-0000-0000-000000000001"));
 
     [TestMethod]
@@ -329,10 +374,10 @@ public sealed class GatePlanEditorSessionTests
     {
         internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public GatePlanCompilationResult Compile(GatePlanDraft draft)
+        public GatePlanPreviewCompilationResult Compile(GatePlanDraft draft, GatePreviewIdentity previewIdentity)
         {
             Entered.TrySetResult(); Release.Task.GetAwaiter().GetResult();
-            return new GatePlanPreviewCompiler().Compile(draft);
+            return new GatePlanPreviewCompiler().Compile(draft, previewIdentity);
         }
     }
     private sealed class BlockingStampReader(IGatePlanAuthorityReader inner) : IGatePlanAuthorityReader

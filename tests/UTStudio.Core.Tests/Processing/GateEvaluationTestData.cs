@@ -33,6 +33,14 @@ internal static class GateEvaluationTestData
         return result.CompiledPlan!;
     }
 
+    internal static CompiledGatePlan CompilePreview(params GateDefinition[] gates)
+    {
+        GatePlan plan = GateTestPlan.Plan(gates, revision: 2);
+        GatePlanCompilationResult result = new GatePlanCompiler(new(16)).Compile(plan);
+        Assert.IsTrue(result.IsCompiled, string.Join(";", result.Errors.Select(x => x.Message)));
+        return result.CompiledPlan!;
+    }
+
     internal static GateDefinition Gate(string id, int samples, double rate = 1_000_000,
         string? dependency = null, GateDetectorKind detector = GateDetectorKind.GlobalMaximum,
         GateSignalDomain domain = GateSignalDomain.RawSigned, double? threshold = null,

@@ -43,17 +43,19 @@ public readonly record struct GatePreviewIdentity
 public sealed class GateGeometrySourceIdentity
 {
     private GateGeometrySourceIdentity(GateGeometrySourceKind kind, GatePlanAuthorityKey authority,
-        GatePlanRevision revision, GatePlanSignature signature, GateAuthorityGeneration authorityGeneration,
+        GatePlanRevision baseRevision, GatePlanRevision candidateRevision, GatePlanSignature signature, GateAuthorityGeneration authorityGeneration,
         GateAuthorityPublicationSequence publicationSequence, GatePreviewIdentity preview)
     {
-        Kind = kind; Authority = authority; Revision = revision; Signature = signature;
+        Kind = kind; Authority = authority; BaseRevision = baseRevision; CandidateRevision = candidateRevision; Signature = signature;
         AuthorityGeneration = authorityGeneration; PublicationSequence = publicationSequence; Preview = preview;
     }
 
     public GateGeometrySourceKind Kind { get; }
     public GatePlanAuthorityKey Authority { get; }
-    /// <summary>Committed revision, or the base committed revision for Preview. Preview never claims a new committed revision.</summary>
-    public GatePlanRevision Revision { get; }
+    public GatePlanRevision BaseRevision { get; }
+    /// <summary>The compiled revision. For committed sources it equals BaseRevision; Preview remains non-authoritative.</summary>
+    public GatePlanRevision CandidateRevision { get; }
+    public GatePlanRevision Revision => CandidateRevision;
     public GatePlanSignature Signature { get; }
     public GateAuthorityGeneration AuthorityGeneration { get; }
     public GateAuthorityPublicationSequence PublicationSequence { get; }
@@ -63,15 +65,19 @@ public sealed class GateGeometrySourceIdentity
     {
         ArgumentNullException.ThrowIfNull(authority);
         return new(GateGeometrySourceKind.Committed, authority.Authority, authority.Committed.Revision,
+            authority.Committed.Revision,
             authority.Committed.Signature, authority.Generation, authority.PublicationSequence, default);
     }
 
     public static GateGeometrySourceIdentity PreviewSource(GatePlanAuthorityKey authority,
-        GatePlanRevision baseRevision, GatePlanSignature previewSignature, GatePreviewIdentity preview)
+        GatePlanRevision baseRevision, GatePlanRevision candidateRevision,
+        GatePlanSignature previewSignature, GatePreviewIdentity preview)
     {
-        if (!authority.IsValid || !baseRevision.IsValid || previewSignature is null || !preview.IsValid)
+        if (!authority.IsValid || !baseRevision.IsValid || !candidateRevision.IsValid ||
+            baseRevision.Value == uint.MaxValue || candidateRevision.Value != baseRevision.Value + 1 ||
+            previewSignature is null || !preview.IsValid)
             throw new ArgumentException("A valid Preview source identity is required.");
-        return new(GateGeometrySourceKind.Preview, authority, baseRevision, previewSignature,
+        return new(GateGeometrySourceKind.Preview, authority, baseRevision, candidateRevision, previewSignature,
             default, default, preview);
     }
 }
@@ -79,23 +85,32 @@ public sealed class GateGeometrySourceIdentity
 public readonly record struct GateGeometryEvaluationRequest
 {
     public GateGeometryEvaluationRequest(GateGeometrySourceIdentity source, TraceIdentity traceIdentity,
-        InspectionRevision expectedInspectionRevision)
+        InspectionRevision expectedInspectionRevision, IGatePreviewSourceGuard? previewGuard = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.Authority.IsValid || !traceIdentity.IsValid || expectedInspectionRevision == InspectionRevision.Initial)
             throw new ArgumentException("A valid source, trace, and committed inspection revision are required.");
         if (source.Authority.InspectionId != traceIdentity.Stream.InspectionId)
             throw new ArgumentException("The source and trace must belong to the same inspection.");
+        if ((source.Kind == GateGeometrySourceKind.Preview) != (previewGuard is not null))
+            throw new ArgumentException("Preview geometry requires exactly one borrowed Preview guard.", nameof(previewGuard));
         Source = source; TraceIdentity = traceIdentity; ExpectedInspectionRevision = expectedInspectionRevision;
+        PreviewGuard = previewGuard;
     }
     public GateGeometrySourceIdentity Source { get; }
     public TraceIdentity TraceIdentity { get; }
     public InspectionRevision ExpectedInspectionRevision { get; }
+    public IGatePreviewSourceGuard? PreviewGuard { get; }
 }
 
 public interface IGateGeometrySourceGuard
 {
     GateGeometrySourceValidationStatus Validate(GateGeometrySourceIdentity source);
+}
+
+public interface IGatePreviewSourceGuard
+{
+    GateGeometrySourceValidationStatus ValidatePreview(GateGeometrySourceIdentity source);
 }
 
 public interface IGateGeometryEvaluator

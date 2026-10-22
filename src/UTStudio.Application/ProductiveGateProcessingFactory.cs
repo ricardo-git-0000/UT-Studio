@@ -34,6 +34,14 @@ public static class ProductiveGateProcessingFactory
         ConventionalAcquisitionConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(store); ArgumentNullException.ThrowIfNull(configuration);
+        CompiledGatePlan compiled = CompileDefault(configuration);
+        var derived = new InMemoryGateDerivedStore();
+        return new(new(store, store, derived, new GateEvaluator(new GateScratchPool())), compiled, derived);
+    }
+
+    internal static CompiledGatePlan CompileDefault(ConventionalAcquisitionConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
         double duration = configuration.SampleCount / configuration.SampleRateHz;
         var gate = new GateDefinition(new GateId("default-global-maximum"), new GateRevision(1),
             new GateWindowDefinition(GateTimeReference.TraceOrigin(), configuration.FirstSampleOffsetSeconds, duration),
@@ -45,7 +53,6 @@ public static class ProductiveGateProcessingFactory
         GatePlanCompilationResult result = new GatePlanCompiler().Compile(plan);
         CompiledGatePlan compiled = result.CompiledPlan ?? throw new InvalidOperationException(
             $"The productive gate plan did not compile: {string.Join(", ", result.Errors.Select(x => x.Message))}");
-        var derived = new InMemoryGateDerivedStore();
-        return new(new(store, store, derived, new GateEvaluator(new GateScratchPool())), compiled, derived);
+        return compiled;
     }
 }

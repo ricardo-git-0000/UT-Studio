@@ -18,10 +18,10 @@ public sealed class GatePlanApplyUseCaseTests
     public async Task AcceptedUsesOneCompiledPlanForEpochDesiredAndAuthorityAndPublishesLast()
     {
         await using var fixture = new Fixture();
-        GatePlanEditIntent intent = fixture.Intent();
+        GatePlanApplyRequest intent = fixture.Intent();
         var observed = new List<uint>();
         var revisionTwo = Signal();
-        using IDisposable subscription = fixture.Reader.Observe(intent.Authority).Subscribe(
+        using IDisposable subscription = fixture.Reader.Observe(intent.Intent.Authority).Subscribe(
             new Observer(value =>
             {
                 lock (observed) observed.Add(value.Committed.Revision.Value);
@@ -34,14 +34,89 @@ public sealed class GatePlanApplyUseCaseTests
         Assert.AreEqual(GatePlanApplySubmissionStatus.Admitted, submission.Status);
         Assert.AreEqual(GatePlanEditOutcome.Accepted, result.Outcome);
         Assert.AreEqual(new GatePlanRevision(2), result.ResultingRevision);
-        GatePlanAuthorityInstalledState installed = fixture.Authority.PreparedCommits.ReadInstalled(intent.Authority)!;
+        GatePlanAuthorityInstalledState installed = fixture.Authority.PreparedCommits.ReadInstalled(intent.Intent.Authority)!;
+        Assert.AreSame(intent.Candidate.CompiledPlan, installed.Authority.Committed.CompiledPlan);
         Assert.AreEqual(installed.Authority.Committed.Signature,
             fixture.Orchestrator.Diagnostics.ActiveRuns.Single().Plans.Last().PlanSignature);
         InMemoryGateDerivedStore.InstalledDesiredReplacement desired = fixture.Store.DesiredReplacementControl
-            .FindInstalled(new(fixture.Inspection, intent.Authority.PlanId))!;
+            .FindInstalled(new(fixture.Inspection, intent.Intent.Authority.PlanId))!;
         Assert.AreEqual(installed.Authority.Committed.Revision, desired.PlanRevision);
         await revisionTwo.Task.WaitAsync(TimeSpan.FromSeconds(5));
         lock (observed) CollectionAssert.AreEqual(new uint[] { 1, 2 }, observed);
+    }
+
+    [TestMethod]
+    public async Task DiscordantPreviewArtifactIsTypedAndConsumesNoOrdinal()
+    {
+        await using var fixture = new Fixture();
+        GatePlanApplyRequest valid = fixture.Intent();
+        var discordant = new GatePlanPreviewCandidate(valid.Candidate.Draft,
+            valid.Candidate.CandidateRevision, new(Guid.NewGuid(), 99), valid.Candidate.CompiledPlan,
+            valid.Candidate.ProvenanceProof);
+
+        GatePlanApplySubmission submission = fixture.UseCase.TryApply(
+            new(valid.Intent, discordant), fixture.Context);
+        GatePlanEditResult result = await submission.WaitAsync();
+
+        Assert.AreEqual(GatePlanApplySubmissionStatus.CompletedBeforeAdmission, submission.Status);
+        Assert.AreEqual(GatePlanEditOutcome.InvalidPreviewArtifact, result.Outcome);
+        Assert.AreEqual((ulong)0, fixture.Coordinator.Snapshot.LastAdmissionOrdinal);
+
+        GatePlanDraft original = valid.Candidate.Draft;
+        var otherDraft = new GatePlanDraft(original.Authority, original.BaseRevision,
+            original.SchemaVersion, original.AlgorithmVersion, [GateTestPlan.Gate("A", threshold: 0.91)]);
+        var substituted = new GatePlanPreviewCandidate(otherDraft, valid.Candidate.CandidateRevision,
+            valid.Candidate.PreviewIdentity, valid.Candidate.CompiledPlan, valid.Candidate.ProvenanceProof);
+        var otherIntent = new GatePlanEditIntent(GatePlanEditIntentKind.Apply, otherDraft.Authority,
+            otherDraft.BaseRevision, otherDraft);
+        GatePlanEditResult substitutedResult = await fixture.UseCase.TryApply(
+            new(otherIntent, substituted), fixture.Context).WaitAsync();
+        Assert.AreEqual(GatePlanEditOutcome.InvalidPreviewArtifact, substitutedResult.Outcome);
+        Assert.AreEqual((ulong)0, fixture.Coordinator.Snapshot.LastAdmissionOrdinal);
+    }
+
+    [TestMethod]
+    public async Task StaleDiscordantPreviewArtifactRemainsTypedAndConsumesNoOrdinal()
+    {
+        await using var fixture = new Fixture();
+        GatePlanApplyRequest original = fixture.Intent();
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(original, fixture.Context).WaitAsync()).Outcome);
+        ulong ordinalBefore = fixture.Coordinator.Snapshot.LastAdmissionOrdinal;
+        var discordant = new GatePlanPreviewCandidate(original.Candidate.Draft,
+            original.Candidate.CandidateRevision, new(Guid.NewGuid(), 99),
+            original.Candidate.CompiledPlan, original.Candidate.ProvenanceProof);
+
+        GatePlanEditResult result = await fixture.UseCase.TryApply(
+            new(original.Intent, discordant), fixture.Context).WaitAsync();
+
+        Assert.AreEqual(GatePlanEditOutcome.InvalidPreviewArtifact, result.Outcome);
+        Assert.AreEqual(GatePlanEditorState.Stale, result.Snapshot.State);
+        Assert.AreEqual(original.Intent.ExpectedRevision, result.ExpectedRevision);
+        Assert.AreEqual(ordinalBefore, fixture.Coordinator.Snapshot.LastAdmissionOrdinal);
+    }
+
+    [TestMethod]
+    public async Task CancelledWaiterStillOwnsAdmittedConflictTerminal()
+    {
+        await using var fixture = new Fixture();
+        var entered = Signal(); var release = Signal();
+        ApplicationCommitAdmission blocker = fixture.Coordinator.AdmitCommit(fixture.Run,
+            ApplicationCommitOperationClass.RfCommit, async () =>
+            {
+                entered.TrySetResult(); await release.Task;
+                return new InspectionAppendResult(InspectionAppendStatus.Committed, new(1), wasAccepted: true);
+            });
+        await entered.Task;
+        GatePlanApplySubmission winner = fixture.UseCase.TryApply(fixture.Intent(), fixture.Context);
+        GatePlanApplySubmission stale = fixture.UseCase.TryApply(fixture.Intent(), fixture.Context);
+        using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => stale.WaitAsync(cancellation.Token));
+
+        release.TrySetResult(); await blocker.Completion;
+        Assert.AreEqual(GatePlanEditOutcome.Accepted, (await winner.Completion!).Outcome);
+        Assert.AreEqual(GatePlanEditOutcome.Conflict, (await stale.Completion!).Outcome);
+        Assert.AreEqual((ulong)3, fixture.Coordinator.Snapshot.LastTerminalOrdinal);
     }
 
     [TestMethod]
@@ -92,12 +167,18 @@ public sealed class GatePlanApplyUseCaseTests
             });
         await entered.Task;
         ulong ordinal = fixture.Coordinator.Snapshot.LastAdmissionOrdinal;
+        typeof(GatePlanApplyUseCase).GetField("_operationGeneration",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(fixture.UseCase, long.MaxValue);
 
         GatePlanApplySubmission rejected = fixture.UseCase.TryApply(fixture.Intent(), fixture.Context);
 
         Assert.AreEqual(GatePlanApplySubmissionStatus.CoordinatorCapacityExceeded, rejected.Status);
         Assert.IsNull(rejected.Completion);
         Assert.AreEqual(ordinal, fixture.Coordinator.Snapshot.LastAdmissionOrdinal);
+        Assert.AreEqual(long.MaxValue, typeof(GatePlanApplyUseCase).GetField("_operationGeneration",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(fixture.UseCase));
         Assert.AreEqual(new GatePlanRevision(1), fixture.Reader.Read(fixture.AuthorityKey).Committed.Revision);
         release.TrySetResult(); await blocker.Completion;
     }
@@ -125,7 +206,7 @@ public sealed class GatePlanApplyUseCaseTests
             () => ValueTask.FromResult(new InspectionAppendResult(InspectionAppendStatus.Committed, new(1),
                 wasAccepted: true)));
         await rf1.Completion;
-        GatePlanEditIntent sameIntent = fixture.Intent();
+        GatePlanApplyRequest sameIntent = fixture.Intent();
         Assert.AreEqual(GatePlanEditOutcome.Accepted,
             (await fixture.UseCase.TryApply(sameIntent, fixture.Context).WaitAsync()).Outcome);
         ApplicationCommitAdmission rf3 = fixture.Coordinator.AdmitCommit(fixture.Run,
@@ -271,8 +352,9 @@ public sealed class GatePlanApplyUseCaseTests
         IGatePlanAuthorityReader reader = authority.Seal();
         await using var orchestrator = new CommittedGateProcessingOrchestrator(registry.Store,
             registry.Store, new Sink(), new GateEvaluator(new GateScratchPool()));
+        var previewCompiler = new GatePlanPreviewCompiler();
         var services = new GatePlanApplyServices(reader, authority.PreparedCommits,
-            orchestrator, derived.DesiredReplacementControl);
+            orchestrator, derived.DesiredReplacementControl, previewCompiler);
         await using var session = new ApplicationSession(source, inspection, registry.OpenRun,
             null, null, orchestrator, initial, services);
 
@@ -282,8 +364,10 @@ public sealed class GatePlanApplyUseCaseTests
         var draft = new GatePlanDraft(committed.AuthorityKey, committed.Revision,
             committed.Plan.SchemaVersion, committed.Plan.AlgorithmVersion,
             [GateTestPlan.Gate("A", threshold: 0.25)]);
-        GatePlanApplySubmission apply = session.TryApplyGatePlan(new(GatePlanEditIntentKind.Apply,
-            committed.AuthorityKey, committed.Revision, draft));
+        var intent = new GatePlanEditIntent(GatePlanEditIntentKind.Apply,
+            committed.AuthorityKey, committed.Revision, draft);
+        GatePlanPreviewCandidate candidate = previewCompiler.Compile(draft, new(Guid.NewGuid(), 1)).Candidate!;
+        GatePlanApplySubmission apply = session.TryApplyGatePlan(new(intent, candidate));
 
         Assert.AreEqual(GatePlanEditOutcome.Accepted, (await apply.WaitAsync()).Outcome);
         await session.StopAsync();
@@ -588,8 +672,9 @@ public sealed class GatePlanApplyUseCaseTests
         IGatePlanAuthorityReader reader = authority.Seal();
         await using var orchestrator = new CommittedGateProcessingOrchestrator(registry.Store,
             registry.Store, new Sink(), new GateEvaluator(new GateScratchPool()));
+        var previewCompiler = new GatePlanPreviewCompiler();
         var plans = new GatePlanApplyServices(reader, authority.PreparedCommits,
-            orchestrator, store.DesiredReplacementControl);
+            orchestrator, store.DesiredReplacementControl, previewCompiler);
         var scheduler = new LifecycleControlledScheduler();
         var coordinator = new GateHistoricalReplacementCoordinator(scheduler,
             store.ReplacementControl, authority.PreparedCommits);
@@ -605,8 +690,11 @@ public sealed class GatePlanApplyUseCaseTests
         var draft = new GatePlanDraft(committed.AuthorityKey, committed.Revision,
             committed.Plan.SchemaVersion, committed.Plan.AlgorithmVersion,
             [GateTestPlan.Gate("A", threshold: 0.4)]);
-        Assert.AreEqual(GatePlanEditOutcome.Accepted, (await session.TryApplyGatePlan(new(
-            GatePlanEditIntentKind.Apply, committed.AuthorityKey, committed.Revision, draft)).WaitAsync()).Outcome);
+        var intent = new GatePlanEditIntent(GatePlanEditIntentKind.Apply,
+            committed.AuthorityKey, committed.Revision, draft);
+        GatePlanPreviewCandidate candidate = previewCompiler.Compile(draft, new(Guid.NewGuid(), 1)).Candidate!;
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await session.TryApplyGatePlan(new(intent, candidate)).WaitAsync()).Outcome);
 
         Task stop = session.StopAsync();
         await scheduler.Admission.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -820,6 +908,7 @@ public sealed class GatePlanApplyUseCaseTests
         internal readonly GatePlanApplyServices Services;
         internal readonly GatePlanAuthorityKey AuthorityKey;
         internal readonly GatePlanApplyRunContext Context;
+        internal readonly GatePlanPreviewCompiler PreviewCompiler = new();
 
         internal Fixture(int coordinatorCapacity = 8, GateProcessingOptions? processingOptions = null,
             bool faultEpochCommit = false, bool throwEpochCommit = false, bool throwInvariantEpochCommit = false,
@@ -835,29 +924,37 @@ public sealed class GatePlanApplyUseCaseTests
             Assert.AreEqual(GateProcessingAdmissionStatus.Accepted, Orchestrator.OpenRun(new(
                 Inspection, Run, [new(Inspection, Run, new("apply-test"), new(0))], initial)));
             Services = new GatePlanApplyServices(Reader, Authority.PreparedCommits,
-                Orchestrator, Store.DesiredReplacementControl);
+                Orchestrator, Store.DesiredReplacementControl, PreviewCompiler);
             Context = Services.OpenRun(Inspection, Run); Lifecycle.Context = Context;
             Coordinator = new(Inspection, coordinatorCapacity);
             IPreparedGatePlanEpochPort epochs = faultEpochCommit || throwEpochCommit || throwInvariantEpochCommit ?
                 new FaultingEpochPort(Orchestrator, throwEpochCommit, throwInvariantEpochCommit) : Orchestrator;
             UseCase = new(Coordinator, Reader, Authority.PreparedCommits, epochs,
-                Store.DesiredReplacementControl, Lifecycle);
+                Store.DesiredReplacementControl, Lifecycle, PreviewCompiler);
         }
 
-        internal GatePlanEditIntent Intent()
+        internal GatePlanApplyRequest Intent()
         {
             CommittedGatePlanSnapshot current = Reader.Read(AuthorityKey).Committed;
             var draft = new GatePlanDraft(AuthorityKey, new(1), current.Plan.SchemaVersion,
                 current.Plan.AlgorithmVersion, [GateTestPlan.Gate("A", threshold: 0.2)]);
-            return new(GatePlanEditIntentKind.Apply, AuthorityKey, new(1), draft);
+            return Request(new(GatePlanEditIntentKind.Apply, AuthorityKey, new(1), draft));
         }
 
-        internal GatePlanEditIntent IntentCurrent(double threshold)
+        internal GatePlanApplyRequest IntentCurrent(double threshold)
         {
             CommittedGatePlanSnapshot current = Reader.Read(AuthorityKey).Committed;
             var draft = new GatePlanDraft(AuthorityKey, current.Revision, current.Plan.SchemaVersion,
                 current.Plan.AlgorithmVersion, [GateTestPlan.Gate("A", threshold: threshold)]);
-            return new(GatePlanEditIntentKind.Apply, AuthorityKey, current.Revision, draft);
+            return Request(new(GatePlanEditIntentKind.Apply, AuthorityKey, current.Revision, draft));
+        }
+
+        internal GatePlanApplyRequest Request(GatePlanEditIntent intent)
+        {
+            GatePlanPreviewCompilationResult preview = PreviewCompiler.Compile(intent.Draft!,
+                new(Guid.NewGuid(), 1));
+            Assert.IsTrue(preview.IsCompiled);
+            return new(intent, preview.Candidate!);
         }
 
         public async ValueTask DisposeAsync()
@@ -950,6 +1047,7 @@ public sealed class GatePlanApplyUseCaseTests
         internal readonly ApplicationSession Session;
         internal readonly CompiledGatePlan Initial;
         internal readonly GatePlanAuthorityKey AuthorityKey;
+        internal readonly GatePlanPreviewCompiler PreviewCompiler = new();
 
         internal SessionFixture(BlockEpochAt blockAt)
         {
@@ -961,19 +1059,21 @@ public sealed class GatePlanApplyUseCaseTests
                 new GateEvaluator(new GateScratchPool()));
             Epochs = new(Orchestrator, blockAt);
             var services = new GatePlanApplyServices(Reader, Authority.PreparedCommits,
-                Epochs, Store.DesiredReplacementControl);
+                Epochs, Store.DesiredReplacementControl, PreviewCompiler);
             Session = new(Source, Inspection, Registry.OpenRun, null, null, Orchestrator, Initial, services);
         }
 
         internal Task StartAsync() => Session.StartAsync(new(new PhysicalChannelId(0), 8, 50_000_000,
             firstSampleOffsetSeconds: 0.000_001), Run);
 
-        internal GatePlanEditIntent Intent()
+        internal GatePlanApplyRequest Intent()
         {
             CommittedGatePlanSnapshot current = Reader.Read(AuthorityKey).Committed;
             var draft = new GatePlanDraft(AuthorityKey, current.Revision, current.Plan.SchemaVersion,
                 current.Plan.AlgorithmVersion, [GateTestPlan.Gate("A", threshold: 0.4)]);
-            return new(GatePlanEditIntentKind.Apply, AuthorityKey, current.Revision, draft);
+            var intent = new GatePlanEditIntent(GatePlanEditIntentKind.Apply, AuthorityKey, current.Revision, draft);
+            GatePlanPreviewCompilationResult preview = PreviewCompiler.Compile(draft, new(Guid.NewGuid(), 1));
+            return new(intent, preview.Candidate!);
         }
 
         public async ValueTask DisposeAsync()

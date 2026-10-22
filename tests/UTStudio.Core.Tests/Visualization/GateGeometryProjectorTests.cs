@@ -55,12 +55,12 @@ public sealed class GateGeometryProjectorTests
     private static GateGeometrySnapshot Snapshot(GateSignalDomain domain, double? threshold,
         double? start, double? end)
     {
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(
             GateEvaluationTestData.Gate("A", 4, domain: domain, threshold: threshold));
         ConfirmedGateTraceDescriptor trace = GateEvaluationTestData.Trace(4);
         var authority = new GatePlanAuthorityKey(trace.ConfirmedIdentity.Stream.InspectionId, plan.Source.Id);
         GateGeometrySourceIdentity source = GateGeometrySourceIdentity.PreviewSource(authority,
-            plan.Source.Revision, plan.Signature, new(Guid.NewGuid(), 1));
+            new(1), new(2), plan.Signature, new(Guid.NewGuid(), 1));
         return new(source, trace.ConfirmedIdentity, trace.SourceInspectionRevision,
             [new(new GateId("A"), new GateRevision(1), domain, GateResultStatus.Detected,
                 null, start, end, threshold)]);

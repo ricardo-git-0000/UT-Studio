@@ -15,7 +15,7 @@ namespace UTStudio.Application;
 /// Stop preserves a healthy connection. Failed startup/operation and disposal disconnect after safe cleanup.
 /// Presentation uses IApplicationSession from Contracts, never a reference to this implementation.
 /// </remarks>
-public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
+public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession, IGatePlanApplyPort
 {
     // Capacity counts one runner plus at most 63 queued operations. The current sole reader can own only one RF/gap
     // admission, so this route retains at most one pending frame. Any future concurrent Application consumer must
@@ -32,6 +32,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private readonly GatePlanApplyServices? _gatePlanServices;
     private readonly GateHistoricalRunServices? _gateHistoricalServices;
     private readonly IGateLiveProcessingLifecycle? _gateLiveLifecycle;
+    private readonly bool _ownsGateServices;
+    private readonly Action? _cleanupRequested;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
     private Operation? _active;
@@ -53,7 +55,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         ICommittedTraceSink? bScanSink, ICommittedTraceSink? aScanSink,
         ICommittedGateProcessingIngress? processingIngress, CompiledGatePlan? processingPlan,
         GatePlanApplyServices? gatePlanServices, GateHistoricalRunServices? gateHistoricalServices = null,
-        IGateLiveProcessingLifecycle? gateLiveLifecycle = null)
+        IGateLiveProcessingLifecycle? gateLiveLifecycle = null, bool ownsGateServices = true,
+        Action? cleanupRequested = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
@@ -72,6 +75,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _gatePlanServices = gatePlanServices;
         _gateHistoricalServices = gateHistoricalServices;
         _gateLiveLifecycle = gateLiveLifecycle ?? processingIngress as IGateLiveProcessingLifecycle;
+        _ownsGateServices = ownsGateServices;
+        _cleanupRequested = cleanupRequested;
         if (gateHistoricalServices is not null && gatePlanServices is null)
             throw new ArgumentException("Historical gate services require gate-plan services.",
                 nameof(gateHistoricalServices));
@@ -89,7 +94,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     /// </summary>
     public IDisposable Subscribe(IObserver<SessionSnapshot> observer) => _publisher.Subscribe(observer);
 
-    internal GatePlanApplySubmission TryApplyGatePlan(GatePlanEditIntent intent,
+    public GatePlanApplySubmission TryApplyGatePlan(GatePlanApplyRequest request,
         CancellationToken cancellationToken = default)
     {
         GatePlanApplyUseCase? apply;
@@ -102,7 +107,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             apply = operation.GatePlanApply;
             context = runContext;
         }
-        return apply.TryApply(intent, context, cancellationToken);
+        return apply.TryApply(request, context, cancellationToken);
     }
 
     /// <summary>Rejects overlapping starts. Cancellation applies only to pending preparation, not an established run.</summary>
@@ -287,7 +292,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             if (operation.CleanupRequested) throw new OperationCanceledException();
             operation.GatePlanApply = new(operation.CommitCoordinator, services.AuthorityReader,
                 services.Authority, services.Epochs, services.Store,
-                new SessionGatePlanApplyLifecycle(this, operation));
+                new SessionGatePlanApplyLifecycle(this, operation), services.CandidateValidator);
         }
     }
 
@@ -297,6 +302,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         if (operation.CleanupRequested) { return operation.Cleanup.Task; }
         operation.CleanupRequested = true;
         operation.CommitCoordinator.CloseApplyAdmission();
+        _cleanupRequested?.Invoke();
         Publish(operation, SessionPhase.Stopping);
         // Marks cancellation before waiting for lifecycle exclusion; callbacks execute outside _gate.
         operation.CancellationCallbacks = operation.StartCancellation.CancelAsync();
@@ -880,13 +886,13 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             throw failure ?? new InvalidOperationException("Frame release has not been confirmed.");
         }
 
-        if (_gateHistoricalServices is not null)
+        if (_ownsGateServices && _gateHistoricalServices is not null)
         {
             _gateHistoricalServices.CloseAdmission();
             try { await _gateHistoricalServices.DisposeAsync().ConfigureAwait(false); }
             catch (Exception error) { failure = AppendCleanupFailure(failure, error); }
         }
-        else if (_gateLiveLifecycle is not null)
+        else if (_ownsGateServices && _gateLiveLifecycle is not null)
         {
             try { await _gateLiveLifecycle.DisposeAsync().ConfigureAwait(false); }
             catch (Exception error) { failure = AppendCleanupFailure(failure, error); }

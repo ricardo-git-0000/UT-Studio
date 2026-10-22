@@ -310,7 +310,7 @@ public sealed class GateOverlaySession : IAsyncDisposable
                 _signal.InspectionRevision == InspectionRevision.Initial || _transform is null)
                 return ValueTask.FromResult(GateOverlayRequestOutcome.NotAvailable);
             request = new(checked(++_evaluationSequence), _contextGeneration, artifact,
-                new(artifact.Source, trace, _signal.InspectionRevision), cancellationToken);
+                new(artifact.Source, trace, _signal.InspectionRevision, artifact.PreviewGuard), cancellationToken);
             superseded = _pending; _pending = request;
             if (_runner is null)
             {

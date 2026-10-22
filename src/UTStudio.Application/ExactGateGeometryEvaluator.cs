@@ -57,7 +57,7 @@ public sealed class ExactGateGeometryEvaluator : IGateGeometryEvaluator
         try
         {
             GateGeometrySourceValidationStatus initial;
-            try { initial = _guard.Validate(request.Source); }
+            try { initial = ValidateSource(request); }
             catch (Exception error) { return Fault(request, $"source-validation-{error.GetType().Name}"); }
             if (initial != GateGeometrySourceValidationStatus.Current) return GuardResult(initial, request);
             InspectionTraceReadResult read;
@@ -103,7 +103,7 @@ public sealed class ExactGateGeometryEvaluator : IGateGeometryEvaluator
                         ? Result(GateGeometryEvaluationStatus.CapacityExceeded, request)
                         : Fault(request, evaluated.PrimaryError?.Code.ToString() ?? "evaluation-failed");
                 GateGeometrySourceValidationStatus final;
-                try { final = _guard.Validate(request.Source); }
+                try { final = ValidateSource(request); }
                 catch (Exception error) { return Fault(request, $"source-validation-{error.GetType().Name}"); }
                 if (final != GateGeometrySourceValidationStatus.Current) return GuardResult(final, request);
                 return new(GateGeometryEvaluationStatus.Completed, request,
@@ -139,10 +139,15 @@ public sealed class ExactGateGeometryEvaluator : IGateGeometryEvaluator
 
     private static void ValidatePlanIdentity(GateGeometrySourceIdentity source, CompiledGatePlan plan)
     {
-        if (plan.Source.Id != source.Authority.PlanId || plan.Source.Revision != source.Revision ||
+        if (plan.Source.Id != source.Authority.PlanId || plan.Source.Revision != source.CandidateRevision ||
             !plan.Signature.Equals(source.Signature))
             throw new ArgumentException("The compiled plan does not match the geometry source.", nameof(plan));
     }
+
+    private GateGeometrySourceValidationStatus ValidateSource(GateGeometryEvaluationRequest request) =>
+        request.Source.Kind == GateGeometrySourceKind.Preview
+            ? request.PreviewGuard!.ValidatePreview(request.Source)
+            : _guard.Validate(request.Source);
 
     private static GateGeometryEvaluationResult ReadResult(InspectionReadStatus status,
         GateGeometryEvaluationRequest request, string? error) => status switch

@@ -19,7 +19,7 @@ public sealed class ExactGateGeometryEvaluatorTests
             detector: GateDetectorKind.GlobalMaximum, offsetSeconds: 2e-6);
         GateDefinition c = GateEvaluationTestData.Gate("C", 2, dependency: "B",
             detector: GateDetectorKind.GlobalMaximum, offsetSeconds: 2e-6);
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(a, b, c);
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(a, b, c);
         Fixture fixture = Fixture.Create(samples, plan, previewGeneration: 4);
 
         GateGeometryEvaluationResult result = await fixture.Evaluator.EvaluateAsync(fixture.Request, plan);
@@ -40,7 +40,7 @@ public sealed class ExactGateGeometryEvaluatorTests
         GateDefinition noEvent = GateEvaluationTestData.Gate("A", 2,
             detector: GateDetectorKind.FirstRisingCrossing, threshold: 1);
         GateDefinition dependent = GateEvaluationTestData.Gate("B", 2, dependency: "A");
-        CompiledGatePlan terminalPlan = GateEvaluationTestData.Compile(noEvent, dependent);
+        CompiledGatePlan terminalPlan = GateEvaluationTestData.CompilePreview(noEvent, dependent);
         Fixture terminal = Fixture.Create([0, 0, 0], terminalPlan, previewGeneration: 5);
         GateGeometryEvaluationResult absent = await terminal.Evaluator.EvaluateAsync(terminal.Request, terminalPlan);
         Assert.AreEqual(GateResultStatus.DependencyNotDetected, absent.Snapshot!.Gates[1].EvaluationStatus);
@@ -51,7 +51,7 @@ public sealed class ExactGateGeometryEvaluatorTests
     [TestMethod]
     public async Task CapacityIsExactRejectsOneOverAndRecoversWithoutAcquiringLease()
     {
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(GateEvaluationTestData.Gate("A", 4));
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(GateEvaluationTestData.Gate("A", 4));
         var provider = new BlockingProvider(GateEvaluationTestData.Trace(4).Descriptor, [0, 1, 2, 3]);
         var guard = new Guard();
         var evaluator = new ExactGateGeometryEvaluator(provider, guard, new(2));
@@ -75,7 +75,7 @@ public sealed class ExactGateGeometryEvaluatorTests
     [TestMethod]
     public async Task CancellationDuringReadAndEvaluationReleasesLeaseBufferScratchAndSlot()
     {
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(GateEvaluationTestData.Gate("A", 32,
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(GateEvaluationTestData.Gate("A", 32,
             detector: GateDetectorKind.FirstLocalMaximum, local: new(1, 0, 1)));
         var blocked = new BlockingProvider(GateEvaluationTestData.Trace(32).Descriptor, new short[32]);
         var evaluator = new ExactGateGeometryEvaluator(blocked, new Guard(), new(1));
@@ -111,7 +111,7 @@ public sealed class ExactGateGeometryEvaluatorTests
     [TestMethod]
     public async Task RevalidationAndSuccessivePreviewIdentitiesMakeOutOfOrderResultsDiscardable()
     {
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(GateEvaluationTestData.Gate("A", 4));
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(GateEvaluationTestData.Gate("A", 4));
         ConfirmedGateTraceDescriptor trace = GateEvaluationTestData.Trace(4);
         var firstProvider = new BlockingProvider(trace.Descriptor, [0, 1, 2, 3]);
         var secondProvider = new BlockingProvider(trace.Descriptor, [3, 2, 1, 0]);
@@ -134,7 +134,7 @@ public sealed class ExactGateGeometryEvaluatorTests
         var guard = new Guard { StatusAfterFirst = GateGeometrySourceValidationStatus.Superseded };
         var provider = new BlockingProvider(GateEvaluationTestData.Trace(4).Descriptor, [0, 1, 2, 3], block: false);
         var stale = new ExactGateGeometryEvaluator(provider, guard, new(1));
-        GateGeometryEvaluationResult result = await stale.EvaluateAsync(Request(plan, provider.Descriptor.Identity, 12), plan);
+        GateGeometryEvaluationResult result = await stale.EvaluateAsync(Request(plan, provider.Descriptor.Identity, 12, guard), plan);
         Assert.AreEqual(GateGeometryEvaluationStatus.Stale, result.Status);
         Assert.AreEqual(1, provider.LeasesDisposed);
         Assert.AreEqual(0, provider.ActiveLeases);
@@ -143,7 +143,7 @@ public sealed class ExactGateGeometryEvaluatorTests
     [TestMethod]
     public async Task ReadTerminalsRemainTypedAndPlanIdentityCannotBeMixed()
     {
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(GateEvaluationTestData.Gate("A", 4));
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(GateEvaluationTestData.Gate("A", 4));
         ConfirmedGateTraceDescriptor trace = GateEvaluationTestData.Trace(4);
         GateGeometryEvaluationRequest request = Request(plan, trace.ConfirmedIdentity, 20);
         foreach ((InspectionReadStatus read, GateGeometryEvaluationStatus expected) in new[]
@@ -160,7 +160,7 @@ public sealed class ExactGateGeometryEvaluatorTests
             Assert.AreEqual(expected, (await evaluator.EvaluateAsync(request, plan)).Status);
         }
 
-        CompiledGatePlan other = GateEvaluationTestData.Compile(
+        CompiledGatePlan other = GateEvaluationTestData.CompilePreview(
             GateEvaluationTestData.Gate("A", 4, threshold: .75));
         var available = new BlockingProvider(trace.Descriptor, [0, 1, 2, 3], block: false);
         var exact = new ExactGateGeometryEvaluator(available, new Guard(), new(1));
@@ -172,7 +172,7 @@ public sealed class ExactGateGeometryEvaluatorTests
     [TestMethod]
     public async Task CommittedIdentityAndLeaseCleanupFailureRemainExplicit()
     {
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(GateEvaluationTestData.Gate("A", 4));
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(GateEvaluationTestData.Gate("A", 4));
         ConfirmedGateTraceDescriptor trace = GateEvaluationTestData.Trace(4);
         var committed = new CommittedGatePlanSnapshot(trace.ConfirmedIdentity.Stream.InspectionId, plan);
         var authority = new GatePlanAuthoritySnapshot(committed, new GateAuthorityGeneration(7),
@@ -208,7 +208,7 @@ public sealed class ExactGateGeometryEvaluatorTests
     [TestMethod]
     public async Task ScratchCapacityFailureIsTypedAndRecovers()
     {
-        CompiledGatePlan plan = GateEvaluationTestData.Compile(GateEvaluationTestData.Gate("A", 32,
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(GateEvaluationTestData.Gate("A", 32,
             detector: GateDetectorKind.FirstLocalMaximum, local: new(1, 0, 1)));
         ConfirmedGateTraceDescriptor trace = GateEvaluationTestData.Trace(32);
         var provider = new BlockingProvider(trace.Descriptor, Alternating(32), block: false);
@@ -224,12 +224,13 @@ public sealed class ExactGateGeometryEvaluatorTests
         Assert.AreEqual(0, scratch.Snapshot.ActiveRentals);
     }
 
-    private static GateGeometryEvaluationRequest Request(CompiledGatePlan plan, TraceIdentity identity, ulong generation)
+    private static GateGeometryEvaluationRequest Request(CompiledGatePlan plan, TraceIdentity identity,
+        ulong generation, Guard? previewGuard = null)
     {
         var authority = new GatePlanAuthorityKey(identity.Stream.InspectionId, plan.Source.Id);
-        var source = GateGeometrySourceIdentity.PreviewSource(authority, plan.Source.Revision,
+        var source = GateGeometrySourceIdentity.PreviewSource(authority, new(1), plan.Source.Revision,
             plan.Signature, new(Guid.NewGuid(), generation));
-        return new(source, identity, new InspectionRevision(5));
+        return new(source, identity, new InspectionRevision(5), previewGuard ?? new Guard());
     }
 
     private static short[] Alternating(int count) => Enumerable.Range(0, count)
@@ -247,12 +248,13 @@ public sealed class ExactGateGeometryEvaluatorTests
         }
     }
 
-    private sealed class Guard : IGateGeometrySourceGuard
+    private sealed class Guard : IGateGeometrySourceGuard, IGatePreviewSourceGuard
     {
         private int _calls;
         internal GateGeometrySourceValidationStatus StatusAfterFirst { get; init; } = GateGeometrySourceValidationStatus.Current;
         public GateGeometrySourceValidationStatus Validate(GateGeometrySourceIdentity source) =>
             Interlocked.Increment(ref _calls) == 1 ? GateGeometrySourceValidationStatus.Current : StatusAfterFirst;
+        public GateGeometrySourceValidationStatus ValidatePreview(GateGeometrySourceIdentity source) => Validate(source);
     }
 
     private sealed class BlockingProvider : IUtTraceProvider

@@ -142,6 +142,8 @@ public sealed class GateSignatureAndArchitectureTests
             "PresentationFramework", "PresentationCore", "WindowsBase", "System.Xaml"];
         Assert.IsFalse(contracts.GetReferencedAssemblies().Any(x => forbiddenAssemblies.Contains(x.Name, StringComparer.Ordinal)));
         HashSet<Type> stepOneContracts = StepOneContracts().ToHashSet();
+        HashSet<Type> operationalBoundaryContracts =
+        [typeof(GatePlanApplySubmission), typeof(IGatePlanApplyPort)];
         foreach (Type owner in contracts.GetExportedTypes().Where(x => x.Namespace == "UTStudio.Contracts.Processing"))
         {
             foreach (Type used in PublicSignatureTypes(owner))
@@ -153,13 +155,14 @@ public sealed class GateSignatureAndArchitectureTests
                     name is "System.Threading.SemaphoreSlim" or "System.Threading.Tasks.TaskCompletionSource" ||
                     name.StartsWith("System.Threading.Tasks.TaskCompletionSource`", StringComparison.Ordinal);
                 Assert.IsFalse(forbidden, $"{owner.FullName} exposes forbidden type {name} from {assembly}.");
-                if (stepOneContracts.Contains(owner))
+                if (stepOneContracts.Contains(owner) && !operationalBoundaryContracts.Contains(owner))
                 {
                     Assert.IsFalse(IsOperationalType(used),
                         $"{owner.FullName} exposes operational type {name}.");
                 }
             }
-            if (stepOneContracts.Contains(owner)) AssertStepOneContractShape(owner);
+            if (stepOneContracts.Contains(owner) && !operationalBoundaryContracts.Contains(owner))
+                AssertStepOneContractShape(owner);
         }
         string root = FindRepositoryRoot();
         string[] files = ["GateEditingContracts.cs", "GatePreparedOperationContracts.cs",
@@ -256,6 +259,10 @@ public sealed class GateSignatureAndArchitectureTests
         typeof(GatePlanRecoveryInstallStatus), typeof(GatePlanRecoveryInstallResult), typeof(GatePlanDraft),
         typeof(GatePlanEditIntent), typeof(GatePlanEditorSnapshot), typeof(GatePlanEditResult),
         typeof(IGatePlanAuthorityReader), typeof(IGatePlanPreviewCompiler),
+        typeof(GatePlanPreviewCompilationStatus), typeof(GatePlanPreviewCandidate),
+        typeof(GatePlanPreviewCompilationResult), typeof(IGatePlanPreviewCandidateValidator),
+        typeof(GatePlanApplySubmissionStatus), typeof(GatePlanApplyRequest),
+        typeof(GatePlanApplySubmission), typeof(IGatePlanApplyPort),
         typeof(GatePreparedReservationState), typeof(GatePreparedReservationOperation),
         typeof(GatePreparedReservationResultStatus), typeof(GatePreparedReservationId),
         typeof(GateAuthorityGeneration), typeof(GatePreparedOperationGeneration),

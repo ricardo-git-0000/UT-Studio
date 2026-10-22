@@ -30,7 +30,9 @@ public sealed class GateOverlaySessionTests
         Assert.AreEqual(GateOverlayRequestOutcome.Completed, outcome);
         Assert.AreSame(fixture.Compiler.LastCompiled, fixture.Evaluator.ReceivedPlans.Single());
         Assert.AreEqual(GateGeometrySourceKind.Preview, overlay.Snapshot.Source!.Kind);
-        Assert.AreEqual(draft.BaseRevision, overlay.Snapshot.Source.Revision);
+        Assert.AreEqual(draft.BaseRevision, overlay.Snapshot.Source.BaseRevision);
+        Assert.AreEqual(new GatePlanRevision(draft.BaseRevision.Value + 1),
+            overlay.Snapshot.Source.CandidateRevision);
         Assert.IsTrue(overlay.Snapshot.Source.Preview.IsValid);
         AScanCompositeVisualSnapshot composite = overlay.CompositeSnapshot!;
         Assert.AreSame(fixture.Signal, composite.Signal);
@@ -357,15 +359,14 @@ public sealed class GateOverlaySessionTests
 
     private sealed class TrackingCompiler : IGatePlanPreviewCompiler
     {
+        private readonly GatePlanPreviewCompiler _inner = new();
         internal int Compilations { get; private set; }
         internal CompiledGatePlan? LastCompiled { get; private set; }
-        public GatePlanCompilationResult Compile(GatePlanDraft draft)
+        public GatePlanPreviewCompilationResult Compile(GatePlanDraft draft, GatePreviewIdentity previewIdentity)
         {
             Compilations++;
-            var plan = new GatePlan(draft.Authority.PlanId, draft.BaseRevision, draft.SchemaVersion,
-                draft.AlgorithmVersion, draft.Gates);
-            GatePlanCompilationResult result = new GatePlanCompiler().Compile(plan);
-            LastCompiled = result.CompiledPlan; return result;
+            GatePlanPreviewCompilationResult result = _inner.Compile(draft, previewIdentity);
+            LastCompiled = result.Candidate?.CompiledPlan; return result;
         }
     }
 

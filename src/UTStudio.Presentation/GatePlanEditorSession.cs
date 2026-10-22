@@ -99,6 +99,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
         CommittedGatePlanSnapshot observedCommitted;
         GateAuthorityGeneration authorityGeneration;
         ulong operationGeneration;
+        GatePreviewIdentity previewIdentity;
         GatePlanEditorSnapshot? conflictSnapshot = null;
         GatePlanEditResult? conflictResult = null;
         bool publish = false;
@@ -109,6 +110,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             observedCommitted = _current.Committed;
             authorityGeneration = _authorityCurrent.Generation;
             operationGeneration = ++_editorGeneration;
+            previewIdentity = _previewWorkspace.ReserveIdentity();
             _lastInvalidation = EditorialInvalidation.None;
             if (draft.BaseRevision != observedCommitted.Revision)
             {
@@ -119,7 +121,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
         if (conflictResult is not null)
         { if (publish) DrainPublications(); EditorialChanged?.Invoke(conflictResult.Snapshot); return conflictResult; }
 
-        GatePlanCompilationResult compilation = _previewCompiler.Compile(draft);
+        GatePlanPreviewCompilationResult compilation = _previewCompiler.Compile(draft, previewIdentity);
         GatePlanAuthorityReadStampResult stampResult = _authority.TryReadStamp(_authorityKey, authorityGeneration);
         GatePlanEditResult? result = null;
         GatePlanAuthoritySnapshot? authoritative = stampResult.Current;
@@ -152,10 +154,16 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
                 (next, result) = CreateConflict(draft, authoritative.Committed);
                 publish = EnqueueUnderLock(next);
             }
+            else if (compilation.Status == GatePlanPreviewCompilationStatus.RevisionExhausted)
+            {
+                next = new(_current.Committed, draft, state: GatePlanEditorState.Editing);
+                result = GatePlanEditResult.RevisionExhausted(next);
+                publish = EnqueueUnderLock(next);
+            }
             else if (compilation.IsCompiled)
             {
                 next = new(_current.Committed, draft, state: GatePlanEditorState.Previewed);
-                _previewWorkspace.Install(draft, compilation.CompiledPlan!);
+                _previewWorkspace.Install(compilation.Candidate!);
                 result = GatePlanEditResult.Previewed(next);
                 publish = EnqueueUnderLock(next);
             }

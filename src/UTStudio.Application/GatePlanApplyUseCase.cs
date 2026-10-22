@@ -7,16 +7,6 @@ using UTStudio.Processing.Core;
 
 namespace UTStudio.Application;
 
-internal enum GatePlanApplySubmissionStatus
-{
-    Admitted,
-    CompletedBeforeAdmission,
-    CancelledBeforeAdmission,
-    AdmissionClosed,
-    CoordinatorCapacityExceeded,
-    CoordinatorOrdinalExhausted
-}
-
 internal readonly record struct GatePlanApplyRunContext(
     InspectionId InspectionId,
     AcquisitionRunId RunId,
@@ -38,18 +28,20 @@ internal sealed class GatePlanApplyServices
 
     internal GatePlanApplyServices(IGatePlanAuthorityReader authorityReader,
         InMemoryGatePlanPreparedCommitOwner authority, IPreparedGatePlanEpochPort epochs,
-        IPreparedGateStoreControl store)
+        IPreparedGateStoreControl store, IGatePlanPreviewCandidateValidator candidateValidator)
     {
         AuthorityReader = authorityReader ?? throw new ArgumentNullException(nameof(authorityReader));
         Authority = authority ?? throw new ArgumentNullException(nameof(authority));
         Epochs = epochs ?? throw new ArgumentNullException(nameof(epochs));
         Store = store ?? throw new ArgumentNullException(nameof(store));
+        CandidateValidator = candidateValidator ?? throw new ArgumentNullException(nameof(candidateValidator));
     }
 
     internal IGatePlanAuthorityReader AuthorityReader { get; }
     internal InMemoryGatePlanPreparedCommitOwner Authority { get; }
     internal IPreparedGatePlanEpochPort Epochs { get; }
     internal IPreparedGateStoreControl Store { get; }
+    internal IGatePlanPreviewCandidateValidator CandidateValidator { get; }
 
     internal GatePlanApplyRunContext OpenRun(InspectionId inspectionId, AcquisitionRunId runId)
     {
@@ -129,20 +121,6 @@ internal sealed class GatePlanApplyServices
     }
 }
 
-internal sealed class GatePlanApplySubmission
-{
-    internal GatePlanApplySubmission(GatePlanApplySubmissionStatus status,
-        Task<GatePlanEditResult>? completion = null)
-    { Status = status; Completion = completion; }
-
-    internal GatePlanApplySubmissionStatus Status { get; }
-    internal Task<GatePlanEditResult>? Completion { get; }
-    internal bool IsAdmitted => Status == GatePlanApplySubmissionStatus.Admitted;
-    internal Task<GatePlanEditResult> WaitAsync(CancellationToken cancellationToken = default) =>
-        Completion is null ? throw new InvalidOperationException("The Apply request was not admitted.") :
-            Completion.WaitAsync(cancellationToken);
-}
-
 internal sealed class GatePlanApplyUseCase
 {
     private readonly ApplicationCommitCoordinator _coordinator;
@@ -150,14 +128,14 @@ internal sealed class GatePlanApplyUseCase
     private readonly InMemoryGatePlanPreparedCommitOwner _authority;
     private readonly IPreparedGatePlanEpochPort _epochs;
     private readonly IPreparedGateStoreControl _store;
+    private readonly IGatePlanPreviewCandidateValidator _candidateValidator;
     private readonly IGatePlanApplyLifecycle _lifecycle;
-    private readonly GatePlanCompiler _compiler = new();
     private long _operationGeneration;
 
     internal GatePlanApplyUseCase(ApplicationCommitCoordinator coordinator,
         IGatePlanAuthorityReader authorityReader, InMemoryGatePlanPreparedCommitOwner authority,
         IPreparedGatePlanEpochPort epochs, IPreparedGateStoreControl store,
-        IGatePlanApplyLifecycle lifecycle)
+        IGatePlanApplyLifecycle lifecycle, IGatePlanPreviewCandidateValidator candidateValidator)
     {
         _coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         _authorityReader = authorityReader ?? throw new ArgumentNullException(nameof(authorityReader));
@@ -165,11 +143,15 @@ internal sealed class GatePlanApplyUseCase
         _epochs = epochs ?? throw new ArgumentNullException(nameof(epochs));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _lifecycle = lifecycle ?? throw new ArgumentNullException(nameof(lifecycle));
+        _candidateValidator = candidateValidator ?? throw new ArgumentNullException(nameof(candidateValidator));
     }
 
-    internal GatePlanApplySubmission TryApply(GatePlanEditIntent intent, GatePlanApplyRunContext context,
+    internal GatePlanApplySubmission TryApply(GatePlanApplyRequest request, GatePlanApplyRunContext context,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        GatePlanEditIntent intent = request.Intent;
+        GatePlanPreviewCandidate candidate = request.Candidate;
         ArgumentNullException.ThrowIfNull(intent);
         if (intent.Kind != GatePlanEditIntentKind.Apply || intent.Draft is null)
             throw new ArgumentException("An Apply intent with a coherent draft is required.", nameof(intent));
@@ -180,33 +162,26 @@ internal sealed class GatePlanApplyUseCase
         GatePlanEditorSnapshot editing = new(observed.Committed, intent.Draft,
             state: intent.ExpectedRevision == observed.Committed.Revision ?
                 GatePlanEditorState.Editing : GatePlanEditorState.Stale);
-        if (intent.ExpectedRevision != observed.Committed.Revision)
-            return Completed(GatePlanEditResult.Conflict(intent.ExpectedRevision, editing));
-        if (intent.ExpectedRevision.Value == uint.MaxValue)
-            return Completed(GatePlanEditResult.RevisionExhausted(editing));
+        if (!CandidateMatchesIntent(candidate, intent) || !_candidateValidator.IsAuthentic(candidate))
+            return Completed(GatePlanEditResult.InvalidPreviewArtifact(editing));
 
-        var candidate = new GatePlan(intent.Authority.PlanId,
-            new GatePlanRevision(intent.ExpectedRevision.Value + 1), intent.Draft.SchemaVersion,
-            intent.Draft.AlgorithmVersion, intent.Draft.Gates);
-        GatePlanCompilationResult compilation = _compiler.Compile(candidate);
-        if (!compilation.IsCompiled)
-        {
-            var invalid = new GatePlanEditorSnapshot(observed.Committed, intent.Draft,
-                compilation.Errors, GatePlanEditorState.ValidationFailed);
-            return Completed(GatePlanEditResult.ValidationFailed(invalid, compilation.Errors));
-        }
-
-        long rawGeneration = Interlocked.Increment(ref _operationGeneration);
-        if (rawGeneration <= 0)
-            return new(GatePlanApplySubmissionStatus.CoordinatorOrdinalExhausted);
-        var operationGeneration = new GatePreparedOperationGeneration((ulong)rawGeneration);
-        var owner = new GatePreparedReservationOwner(Guid.NewGuid());
         GatePlanEditResult? semanticResult = null;
 
         ApplicationCommitAdmissionResult admission = _coordinator.TryAdmitGatePlanApply(context.RunId,
             new($"GatePlanApply:{intent.Authority.PlanId.Value}:{intent.ExpectedRevision.Value}"),
-            () => ExecuteAsync(intent, intent.Draft, context, editing, compilation.CompiledPlan!, owner,
-                operationGeneration, result => semanticResult = result), cancellationToken);
+            () =>
+            {
+                long rawGeneration = Interlocked.Increment(ref _operationGeneration);
+                if (rawGeneration <= 0)
+                {
+                    semanticResult = GatePlanEditResult.FaultedBeforeCommit(editing);
+                    return ValueTask.FromResult<Action?>(null);
+                }
+                var operationGeneration = new GatePreparedOperationGeneration((ulong)rawGeneration);
+                var owner = new GatePreparedReservationOwner(Guid.NewGuid());
+                return ExecuteAsync(intent, intent.Draft, context, editing, candidate, owner,
+                    operationGeneration, result => semanticResult = result);
+            }, cancellationToken);
         if (!admission.IsAdmitted)
             return Rejected(admission.Status);
 
@@ -216,7 +191,7 @@ internal sealed class GatePlanApplyUseCase
 
     private ValueTask<Action?> ExecuteAsync(GatePlanEditIntent intent, GatePlanDraft draft,
         GatePlanApplyRunContext context,
-        GatePlanEditorSnapshot editing, CompiledGatePlan compiled, GatePreparedReservationOwner owner,
+        GatePlanEditorSnapshot editing, GatePlanPreviewCandidate candidate, GatePreparedReservationOwner owner,
         GatePreparedOperationGeneration operationGeneration, Action<GatePlanEditResult> setResult)
     {
         if (!_lifecycle.IsRunning(context))
@@ -230,6 +205,12 @@ internal sealed class GatePlanApplyUseCase
             setResult(GatePlanEditResult.Conflict(intent.ExpectedRevision, stale));
             return ValueTask.FromResult<Action?>(null);
         }
+        if (!CandidateMatchesIntent(candidate, intent) || !_candidateValidator.IsAuthentic(candidate))
+        {
+            setResult(GatePlanEditResult.InvalidPreviewArtifact(editing));
+            return ValueTask.FromResult<Action?>(null);
+        }
+        CompiledGatePlan compiled = candidate.CompiledPlan;
 
         ApplicationCommitCoordinatorSnapshot frontier = _coordinator.Snapshot;
         if (frontier.RevisionRun.IsValid && frontier.RevisionRun != context.RunId)
@@ -394,6 +375,14 @@ internal sealed class GatePlanApplyUseCase
 
     private static GatePlanEditResult Closed(GatePlanEditorSnapshot editing) =>
         GatePlanEditResult.Closed(new(editing.Committed, state: GatePlanEditorState.Closed), editing.CurrentRevision);
+
+    private static bool CandidateMatchesIntent(GatePlanPreviewCandidate candidate, GatePlanEditIntent intent) =>
+        ReferenceEquals(candidate.Draft, intent.Draft) && candidate.Draft.Authority == intent.Authority &&
+        candidate.BaseRevision == intent.ExpectedRevision && intent.ExpectedRevision.Value != uint.MaxValue &&
+        candidate.CandidateRevision.Value == intent.ExpectedRevision.Value + 1 &&
+        candidate.CompiledPlan.Source.Id == intent.Authority.PlanId &&
+        candidate.CompiledPlan.Source.Revision == candidate.CandidateRevision &&
+        candidate.CompiledPlan.Signature.Equals(candidate.Signature);
 
     private static void RequireAbort(GatePreparedReservationResult result, string owner)
     {

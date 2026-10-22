@@ -8,7 +8,7 @@ public enum GatePlanEditIntentKind { Unknown, Preview, Cancel, Apply }
 public enum GatePlanEditOutcome
 {
     Unknown, Previewed, Cancelled, Superseded, Closed, Accepted, ValidationFailed, Conflict,
-    CapacityExceeded, RevisionExhausted, CancelledBeforeCommit, FaultedBeforeCommit
+    CapacityExceeded, RevisionExhausted, InvalidPreviewArtifact, CancelledBeforeCommit, FaultedBeforeCommit
 }
 public enum GatePlanCapacityResource { Unknown, LiveEpochs, LedgerRevisions, LedgerBytes, DerivedStore }
 public enum GatePlanEditorState
@@ -225,7 +225,97 @@ public interface IGatePlanAuthorityReader
 
 public interface IGatePlanPreviewCompiler
 {
-    GatePlanCompilationResult Compile(GatePlanDraft draft);
+    GatePlanPreviewCompilationResult Compile(GatePlanDraft draft, GatePreviewIdentity previewIdentity);
+}
+
+public enum GatePlanPreviewCompilationStatus { Unknown, Compiled, ValidationFailed, RevisionExhausted }
+
+/// <summary>
+/// Exact, immutable candidate produced for Preview. The opaque provenance proof is verified by the issuing
+/// compiler and is not an authorization credential; authority is always revalidated independently by Apply.
+/// </summary>
+public sealed class GatePlanPreviewCandidate
+{
+    public GatePlanPreviewCandidate(GatePlanDraft draft, GatePlanRevision candidateRevision,
+        GatePreviewIdentity previewIdentity, CompiledGatePlan compiledPlan, string provenanceProof)
+    {
+        ArgumentNullException.ThrowIfNull(draft); ArgumentNullException.ThrowIfNull(compiledPlan);
+        if (!candidateRevision.IsValid || !previewIdentity.IsValid ||
+            compiledPlan.Source.Id != draft.Authority.PlanId || compiledPlan.Source.Revision != candidateRevision ||
+            string.IsNullOrWhiteSpace(provenanceProof))
+            throw new ArgumentException("The Preview candidate is inconsistent.");
+        Draft = draft; BaseRevision = draft.BaseRevision; CandidateRevision = candidateRevision;
+        PreviewIdentity = previewIdentity; CompiledPlan = compiledPlan; ProvenanceProof = provenanceProof;
+    }
+    public GatePlanDraft Draft { get; }
+    public GatePlanRevision BaseRevision { get; }
+    public GatePlanRevision CandidateRevision { get; }
+    public GatePreviewIdentity PreviewIdentity { get; }
+    public CompiledGatePlan CompiledPlan { get; }
+    public GatePlanSignature Signature => CompiledPlan.Signature;
+    public string ProvenanceProof { get; }
+}
+
+public sealed class GatePlanPreviewCompilationResult
+{
+    private readonly ReadOnlyCollection<GateCompilationError> _errors;
+    public GatePlanPreviewCompilationResult(GatePlanPreviewCompilationStatus status,
+        GatePlanPreviewCandidate? candidate = null, IEnumerable<GateCompilationError>? errors = null)
+    {
+        if (!Enum.IsDefined(status) || status == GatePlanPreviewCompilationStatus.Unknown)
+            throw new ArgumentOutOfRangeException(nameof(status));
+        GateCompilationError[] captured = GatePlanEditorSnapshot.CaptureErrors(errors, nameof(errors));
+        if ((status == GatePlanPreviewCompilationStatus.Compiled) != (candidate is not null) ||
+            status == GatePlanPreviewCompilationStatus.ValidationFailed != (captured.Length != 0) ||
+            status == GatePlanPreviewCompilationStatus.RevisionExhausted && (candidate is not null || captured.Length != 0))
+            throw new ArgumentException("The Preview compilation payload contradicts its status.");
+        Status = status; Candidate = candidate; _errors = Array.AsReadOnly(captured);
+    }
+    public GatePlanPreviewCompilationStatus Status { get; }
+    public GatePlanPreviewCandidate? Candidate { get; }
+    public IReadOnlyList<GateCompilationError> Errors => _errors;
+    public bool IsCompiled => Status == GatePlanPreviewCompilationStatus.Compiled;
+}
+
+public interface IGatePlanPreviewCandidateValidator
+{
+    bool IsAuthentic(GatePlanPreviewCandidate candidate);
+}
+
+public enum GatePlanApplySubmissionStatus
+{
+    Unknown, Admitted, CompletedBeforeAdmission, CancelledBeforeAdmission, AdmissionClosed,
+    CoordinatorCapacityExceeded, CoordinatorOrdinalExhausted
+}
+
+public sealed class GatePlanApplyRequest
+{
+    public GatePlanApplyRequest(GatePlanEditIntent intent, GatePlanPreviewCandidate candidate)
+    { Intent = intent ?? throw new ArgumentNullException(nameof(intent)); Candidate = candidate ?? throw new ArgumentNullException(nameof(candidate)); }
+    public GatePlanEditIntent Intent { get; }
+    public GatePlanPreviewCandidate Candidate { get; }
+}
+
+public sealed class GatePlanApplySubmission
+{
+    public GatePlanApplySubmission(GatePlanApplySubmissionStatus status, Task<GatePlanEditResult>? completion = null)
+    {
+        if (!Enum.IsDefined(status) || status == GatePlanApplySubmissionStatus.Unknown)
+            throw new ArgumentOutOfRangeException(nameof(status));
+        if ((status is GatePlanApplySubmissionStatus.Admitted or GatePlanApplySubmissionStatus.CompletedBeforeAdmission) !=
+            (completion is not null)) throw new ArgumentException("The Apply admission payload contradicts its status.", nameof(completion));
+        Status = status; Completion = completion;
+    }
+    public GatePlanApplySubmissionStatus Status { get; }
+    public Task<GatePlanEditResult>? Completion { get; }
+    public bool IsAdmitted => Status == GatePlanApplySubmissionStatus.Admitted;
+    public Task<GatePlanEditResult> WaitAsync(CancellationToken cancellationToken = default) => Completion is null
+        ? throw new InvalidOperationException("The Apply request was not admitted.") : Completion.WaitAsync(cancellationToken);
+}
+
+public interface IGatePlanApplyPort
+{
+    GatePlanApplySubmission TryApplyGatePlan(GatePlanApplyRequest request, CancellationToken cancellationToken = default);
 }
 
 public sealed class GatePlanEditResult
@@ -314,6 +404,11 @@ public sealed class GatePlanEditResult
         if (snapshot.CurrentRevision.Value != uint.MaxValue) throw new ArgumentException("Revision exhaustion requires the maximum current revision.", nameof(snapshot));
         return new(GatePlanEditOutcome.RevisionExhausted, snapshot, snapshot.CurrentRevision);
     }
+    public static GatePlanEditResult InvalidPreviewArtifact(GatePlanEditorSnapshot snapshot)
+    {
+        RequireValidDraft(snapshot);
+        return new(GatePlanEditOutcome.InvalidPreviewArtifact, snapshot, snapshot.Draft!.BaseRevision);
+    }
     public static GatePlanEditResult CancelledBeforeCommit(GatePlanEditorSnapshot snapshot)
     { RequireValidCurrentDraft(snapshot); return new(GatePlanEditOutcome.CancelledBeforeCommit, snapshot, snapshot.CurrentRevision); }
     public static GatePlanEditResult FaultedBeforeCommit(GatePlanEditorSnapshot snapshot)
@@ -336,5 +431,12 @@ public sealed class GatePlanEditResult
         RequireCurrentDraft(snapshot);
         if (snapshot.DraftErrors.Count != 0)
             throw new ArgumentException("Apply outcomes require a draft without preview diagnostics.", nameof(snapshot));
+    }
+    private static void RequireValidDraft(GatePlanEditorSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        if (snapshot.Draft is null || snapshot.DraftErrors.Count != 0 ||
+            snapshot.State is not (GatePlanEditorState.Editing or GatePlanEditorState.Stale))
+            throw new ArgumentException("The outcome requires a valid editing or stale draft.", nameof(snapshot));
     }
 }
