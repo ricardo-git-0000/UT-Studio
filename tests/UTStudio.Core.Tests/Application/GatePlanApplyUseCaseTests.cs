@@ -250,6 +250,11 @@ public sealed class GatePlanApplyUseCaseTests
         CollectionAssert.DoesNotContain(fields, typeof(InMemoryGateDerivedStore));
         Assert.IsFalse(type.IsPublic);
         Assert.IsFalse(typeof(GatePlanApplyServices).IsPublic);
+        Assert.IsFalse(typeof(GateHistoricalRunServices).IsPublic);
+        Assert.IsFalse(typeof(GateHistoricalReplacementCoordinator).IsPublic);
+        CollectionAssert.DoesNotContain(typeof(GateHistoricalRunServices).GetFields(
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            .Select(field => field.FieldType).ToArray(), typeof(InMemoryGateDerivedStore));
     }
 
     [TestMethod]
@@ -351,6 +356,196 @@ public sealed class GatePlanApplyUseCaseTests
             fixture.AuthorityKey, fixture.Context, new(1),
             [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1);
         Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.AlreadyRequested, duplicate.Status);
+    }
+
+    [TestMethod]
+    public async Task SealSelectsOnlyLatestDeferredRevisionAndSupersedesEarlierRevisions()
+    {
+        await using var fixture = new Fixture();
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.Intent(), fixture.Context).WaitAsync()).Outcome);
+        await ConfirmRfAsync(1);
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.IntentCurrent(0.3), fixture.Context).WaitAsync()).Outcome);
+        await ConfirmRfAsync(2);
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.IntentCurrent(0.4), fixture.Context).WaitAsync()).Outcome);
+
+        GateHistoricalSealResolution selected = fixture.Authority.PreparedCommits.ResolveHistoricalAtSeal(
+            fixture.Inspection, fixture.Run, fixture.Context.RunGeneration);
+        GateApplyLedgerSnapshot[] ledgers = fixture.Authority.PreparedCommits
+            .ReadRetainedLedgers(fixture.Inspection).OrderBy(x => x.PlanRevision.Value).ToArray();
+
+        Assert.IsTrue(selected.HasTarget);
+        Assert.AreEqual(new GatePlanRevision(4), selected.PlanRevision);
+        CollectionAssert.AreEqual(new[] { GateHistoricalAdmissionState.Superseded,
+                GateHistoricalAdmissionState.Superseded, GateHistoricalAdmissionState.Deferred },
+            ledgers.Select(x => x.HistoricalAdmission).ToArray());
+        Assert.IsTrue(ledgers.All(x => x.LiveEpoch == GateLiveEpochState.Drained));
+
+        async Task ConfirmRfAsync(ulong revision)
+        {
+            ApplicationCommitAdmission admission = fixture.Coordinator.AdmitCommit(fixture.Run,
+                ApplicationCommitOperationClass.RfCommit, () => ValueTask.FromResult(
+                    new InspectionAppendResult(InspectionAppendStatus.Committed, new(revision), wasAccepted: true)));
+            Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await admission.Completion).Status);
+        }
+    }
+
+    [TestMethod]
+    public async Task ObserverRegistryIsBoundedAndDrainWaitsForTerminalOwner()
+    {
+        await using var fixture = new Fixture();
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.Intent(), fixture.Context).WaitAsync()).Outcome);
+        var scheduler = new ControlledOwnedScheduler();
+        var coordinator = new GateHistoricalReplacementCoordinator(scheduler,
+            fixture.Store.ReplacementControl, fixture.Authority.PreparedCommits, observerCapacity: 1);
+        var stream = new UtStreamIdentity(fixture.Inspection, fixture.Run, new("history"), new(0));
+        GateHistoricalReplacementSubmission admitted = await coordinator.TryAdmitAsync(fixture.AuthorityKey,
+            fixture.Context, new(1), [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1);
+
+        GateHistoricalReplacementSubmission saturated = await coordinator.TryAdmitAsync(fixture.AuthorityKey,
+            fixture.Context, new(1), [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1);
+        coordinator.CloseAdmission();
+        Task drain = coordinator.DrainAsync();
+
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.ObserverCapacityExceeded, saturated.Status);
+        Assert.IsFalse(drain.IsCompleted);
+        scheduler.Complete(GateReprocessingLifecycle.Cancelled);
+        await admitted.Completion!;
+        await drain;
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.Closed,
+            (await coordinator.TryAdmitAsync(fixture.AuthorityKey, fixture.Context, new(1),
+                [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1)).Status);
+    }
+
+    [TestMethod]
+    public async Task SealedRunHandoffReturnsAfterAdmissionAndStopsOnlyAfterTerminalObserver()
+    {
+        await using var fixture = new Fixture();
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.Intent(), fixture.Context).WaitAsync()).Outcome);
+        var scheduler = new LifecycleControlledScheduler();
+        var coordinator = new GateHistoricalReplacementCoordinator(scheduler,
+            fixture.Store.ReplacementControl, fixture.Authority.PreparedCommits);
+        await using var historical = new GateHistoricalRunServices(coordinator, scheduler,
+            fixture.Store.ReplacementControl, fixture.Authority);
+        var stream = new UtStreamIdentity(fixture.Inspection, fixture.Run, new("history"), new(0));
+
+        GateHistoricalReplacementSubmission submission = await historical.HandoffAsync(fixture.Services,
+            fixture.Context, new(fixture.Run, new(1), 0, 0, null, null, 1, 0), stream, 1);
+
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.Admitted, submission.Status);
+        Assert.AreEqual(GateStoreRunLifecycle.FinalReconciling,
+            fixture.Store.DesiredReplacementControl.RunDiagnostics.Current.Lifecycle);
+        scheduler.Complete(GateReprocessingLifecycle.Cancelled);
+        await submission.Completion!;
+        Assert.AreEqual(GateStoreRunLifecycle.Stopped,
+            fixture.Store.DesiredReplacementControl.RunDiagnostics.Current.Lifecycle);
+    }
+
+    [TestMethod]
+    public async Task InspectionScopedDisposeClosesAdmissionAndWaitsForAdmittedObserverBeforeStore()
+    {
+        await using var fixture = new Fixture();
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.Intent(), fixture.Context).WaitAsync()).Outcome);
+        var scheduler = new LifecycleControlledScheduler();
+        var coordinator = new GateHistoricalReplacementCoordinator(scheduler,
+            fixture.Store.ReplacementControl, fixture.Authority.PreparedCommits);
+        var historical = new GateHistoricalRunServices(coordinator, scheduler,
+            fixture.Store.ReplacementControl, fixture.Authority);
+        var stream = new UtStreamIdentity(fixture.Inspection, fixture.Run, new("history"), new(0));
+        GateHistoricalReplacementSubmission submission = await historical.HandoffAsync(fixture.Services,
+            fixture.Context, new(fixture.Run, new(1), 0, 0, null, null, 1, 0), stream, 1);
+
+        Task dispose = historical.DisposeAsync().AsTask();
+        Assert.IsFalse(dispose.IsCompleted);
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.Closed,
+            (await coordinator.TryAdmitAsync(fixture.AuthorityKey, fixture.Context, new(1),
+                [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1)).Status);
+        scheduler.Complete(GateReprocessingLifecycle.Cancelled);
+        GateHistoricalReplacementTerminal terminal = await submission.Completion!;
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.IsNull(terminal.ObserverError);
+        Assert.AreEqual(GateCandidateReservationStatus.Closed, fixture.Store.ReplacementControl.ReserveCandidate(
+            fixture.Inspection, fixture.Run, fixture.Context.RunGeneration, fixture.AuthorityKey.PlanId,
+            new(2), new(Guid.NewGuid())).Status);
+    }
+
+    [TestMethod]
+    public async Task EmptySealedCoverageCreatesNoSyntheticRangeAndTerminalizesLedger()
+    {
+        await using var fixture = new Fixture();
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.Intent(), fixture.Context).WaitAsync()).Outcome);
+        var scheduler = new LifecycleControlledScheduler();
+        var coordinator = new GateHistoricalReplacementCoordinator(scheduler,
+            fixture.Store.ReplacementControl, fixture.Authority.PreparedCommits);
+        await using var historical = new GateHistoricalRunServices(coordinator, scheduler,
+            fixture.Store.ReplacementControl, fixture.Authority);
+        var stream = new UtStreamIdentity(fixture.Inspection, fixture.Run, new("history"), new(0));
+
+        GateHistoricalReplacementSubmission result = await historical.HandoffAsync(fixture.Services,
+            fixture.Context, new(fixture.Run, new(1), null, null, null, null, 0, 0), stream, 1);
+        GateApplyLedgerSnapshot ledger = fixture.Authority.PreparedCommits
+            .ReadRetainedLedgers(fixture.Inspection).Single();
+
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.Superseded, result.Status);
+        Assert.IsFalse(scheduler.Admission.Task.IsCompleted);
+        Assert.AreEqual(GateHistoricalAdmissionState.NotApplicable, ledger.HistoricalAdmission);
+        Assert.AreEqual(GateStoreRunLifecycle.Stopped,
+            fixture.Store.DesiredReplacementControl.RunDiagnostics.Current.Lifecycle);
+    }
+
+    [TestMethod]
+    public async Task ApplicationSessionStopSealsAdmitsHistoricalAndReturnsBeforeCompletion()
+    {
+        var inspection = new InspectionId(Guid.NewGuid());
+        var run = new AcquisitionRunId(Guid.NewGuid());
+        await using var source = new ManualSessionSource();
+        await using var registry = new InspectionDataStoreRegistry(inspection,
+            new InMemoryInspectionStoreOptions(1024 * 1024, 32));
+        var store = new InMemoryGateDerivedStore();
+        CompiledGatePlan initial = Fixture.CompilePlan(1);
+        var authority = new InMemoryGatePlanAuthorityOwner([new(inspection, initial)]);
+        IGatePlanAuthorityReader reader = authority.Seal();
+        await using var orchestrator = new CommittedGateProcessingOrchestrator(registry.Store,
+            registry.Store, new Sink(), new GateEvaluator(new GateScratchPool()));
+        var plans = new GatePlanApplyServices(reader, authority.PreparedCommits,
+            orchestrator, store.DesiredReplacementControl);
+        var scheduler = new LifecycleControlledScheduler();
+        var coordinator = new GateHistoricalReplacementCoordinator(scheduler,
+            store.ReplacementControl, authority.PreparedCommits);
+        var historical = new GateHistoricalRunServices(coordinator, scheduler,
+            store.ReplacementControl, authority);
+        await using var session = new ApplicationSession(source, inspection, registry.OpenRun,
+            null, null, orchestrator, initial, plans, historical);
+        await session.StartAsync(new(new PhysicalChannelId(0), 8, 50_000_000,
+            firstSampleOffsetSeconds: 0.000_001), run);
+        ManualSessionSource.CountingOwner frame = source.QueueFrame(0);
+        await frame.Returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        CommittedGatePlanSnapshot committed = reader.Read(new(inspection, initial.Source.Id)).Committed;
+        var draft = new GatePlanDraft(committed.AuthorityKey, committed.Revision,
+            committed.Plan.SchemaVersion, committed.Plan.AlgorithmVersion,
+            [GateTestPlan.Gate("A", threshold: 0.4)]);
+        Assert.AreEqual(GatePlanEditOutcome.Accepted, (await session.TryApplyGatePlan(new(
+            GatePlanEditIntentKind.Apply, committed.AuthorityKey, committed.Revision, draft)).WaitAsync()).Outcome);
+
+        Task stop = session.StopAsync();
+        await scheduler.Admission.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await stop.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.AreEqual(SessionPhase.Idle, session.Snapshot.Phase);
+        Assert.AreEqual(GateStoreRunLifecycle.FinalReconciling,
+            store.DesiredReplacementControl.RunDiagnostics.Current.Lifecycle);
+        scheduler.Complete(GateReprocessingLifecycle.Cancelled);
+        coordinator.CloseAdmission();
+        await coordinator.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.AreEqual(GateStoreRunLifecycle.Stopped,
+            store.DesiredReplacementControl.RunDiagnostics.Current.Lifecycle);
     }
 
     [TestMethod]
@@ -548,6 +743,7 @@ public sealed class GatePlanApplyUseCaseTests
         internal readonly ApplicationCommitCoordinator Coordinator;
         internal readonly TestLifecycle Lifecycle = new();
         internal readonly GatePlanApplyUseCase UseCase;
+        internal readonly GatePlanApplyServices Services;
         internal readonly GatePlanAuthorityKey AuthorityKey;
         internal readonly GatePlanApplyRunContext Context;
 
@@ -562,9 +758,9 @@ public sealed class GatePlanApplyUseCaseTests
                 new GateEvaluator(new GateScratchPool()), processingOptions);
             Assert.AreEqual(GateProcessingAdmissionStatus.Accepted, Orchestrator.OpenRun(new(
                 Inspection, Run, [new(Inspection, Run, new("apply-test"), new(0))], initial)));
-            var services = new GatePlanApplyServices(Reader, Authority.PreparedCommits,
+            Services = new GatePlanApplyServices(Reader, Authority.PreparedCommits,
                 Orchestrator, Store.DesiredReplacementControl);
-            Context = services.OpenRun(Inspection, Run); Lifecycle.Context = Context;
+            Context = Services.OpenRun(Inspection, Run); Lifecycle.Context = Context;
             Coordinator = new(Inspection, coordinatorCapacity);
             IPreparedGatePlanEpochPort epochs = faultEpochCommit || throwEpochCommit || throwInvariantEpochCommit ?
                 new FaultingEpochPort(Orchestrator, throwEpochCommit, throwInvariantEpochCommit) : Orchestrator;
@@ -825,6 +1021,38 @@ public sealed class GatePlanApplyUseCaseTests
                 _completion.SetResult(_progress);
             }
         }
+    }
+
+    private sealed class LifecycleControlledScheduler : IOwnedGateReprocessingScheduler,
+        IOwnedGateReprocessingLifecycle
+    {
+        private readonly object _gate = new();
+        private ControlledOwnedScheduler? _inner = new();
+        private bool _closed;
+        internal TaskCompletionSource Admission { get; } = Signal();
+
+        public ValueTask<GateReprocessingAdmissionResult> AdmitOwnedAsync(GateReprocessingJobDescriptor descriptor,
+            IGateReprocessingAdmissionOwner owner, CancellationToken cancellationToken = default)
+        {
+            lock (_gate)
+            {
+                if (_closed) return ValueTask.FromResult(new GateReprocessingAdmissionResult(
+                    GateReprocessingAdmissionStatus.Closed));
+                ValueTask<GateReprocessingAdmissionResult> result = _inner!.AdmitOwnedAsync(
+                    descriptor, owner, cancellationToken);
+                Admission.TrySetResult();
+                return result;
+            }
+        }
+
+        internal void Complete(GateReprocessingLifecycle lifecycle)
+        {
+            lock (_gate) _inner!.Complete(lifecycle);
+        }
+
+        public void CloseAdmission() { lock (_gate) _closed = true; }
+        public Task StopAsync() { CloseAdmission(); return Task.CompletedTask; }
+        public ValueTask DisposeAsync() { lock (_gate) { _closed = true; _inner = null; } return ValueTask.CompletedTask; }
     }
 
     private sealed class BindBarrierScheduler : IOwnedGateReprocessingScheduler

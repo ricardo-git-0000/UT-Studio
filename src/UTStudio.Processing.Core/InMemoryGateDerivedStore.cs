@@ -71,7 +71,7 @@ public sealed partial class InMemoryGateDerivedStore : IGateDerivedStore, IGateP
     }
 
     internal PreparedDesiredReplacementOwner DesiredReplacementControl { get; }
-    internal IGateReplacementStore ReplacementControl { get; }
+    internal IGateReplacementStoreLifecycle ReplacementControl { get; }
 
     public DerivedStoreRevision Revision { get { lock (_gate) { return new(_revision); } } }
     public ActiveDerivedViewDescriptor? ActiveView
@@ -287,6 +287,45 @@ public sealed partial class InMemoryGateDerivedStore : IGateDerivedStore, IGateP
         }
     }
 
+    internal GateStoreRunStopResult BeginFinalReconciliation(GateStoreRunAuthoritySnapshot expected)
+    {
+        lock (_gate)
+        {
+            if (_admissionClosed || _closed)
+                return new(GateStoreRunStopStatus.Closed, _currentRun);
+            if (!_currentRun.IsValid)
+                return new(GateStoreRunStopStatus.NotConfigured, _currentRun);
+            if (!_currentRun.Equals(expected))
+                return new(GateStoreRunStopStatus.IdentityMismatch, _currentRun);
+            if (_currentRun.Lifecycle == GateStoreRunLifecycle.FinalReconciling)
+                return new(GateStoreRunStopStatus.AlreadyStopped, _currentRun);
+            if (_currentRun.Lifecycle != GateStoreRunLifecycle.Open)
+                return new(GateStoreRunStopStatus.IdentityMismatch, _currentRun);
+            _currentRun = _currentRun with { Lifecycle = GateStoreRunLifecycle.FinalReconciling };
+            return new(GateStoreRunStopStatus.Stopped, _currentRun);
+        }
+    }
+
+    internal GateStoreRunStopResult CompleteFinalReconciliation(GateStoreRunAuthoritySnapshot expected)
+    {
+        lock (_gate)
+        {
+            if (_admissionClosed || _closed)
+                return new(GateStoreRunStopStatus.Closed, _currentRun);
+            if (!_currentRun.IsValid)
+                return new(GateStoreRunStopStatus.NotConfigured, _currentRun);
+            if (!_currentRun.Equals(expected))
+                return new(GateStoreRunStopStatus.IdentityMismatch, _currentRun);
+            if (_currentRun.Lifecycle == GateStoreRunLifecycle.Stopped)
+                return new(GateStoreRunStopStatus.AlreadyStopped, _currentRun);
+            if (_currentRun.Lifecycle != GateStoreRunLifecycle.FinalReconciling)
+                return new(GateStoreRunStopStatus.IdentityMismatch, _currentRun);
+            _currentRun = _currentRun with { Lifecycle = GateStoreRunLifecycle.Stopped };
+            _activeVisible = false;
+            return new(GateStoreRunStopStatus.Stopped, _currentRun);
+        }
+    }
+
     internal PrepareGateRunTransitionResult PrepareRunTransition(PrepareGateRunTransitionRequest request)
     {
         var speculativeReservationId = new GatePreparedReservationId(Guid.NewGuid());
@@ -309,7 +348,8 @@ public sealed partial class InMemoryGateDerivedStore : IGateDerivedStore, IGateP
                     expected.RunId != current.RunId || expected.Generation != current.Generation ||
                     expected.Lifecycle != current.Lifecycle)
                     return PrepareGateRunTransitionResult.Rejected(PrepareGateRunTransitionStatus.OutgoingMismatch);
-                if (current.Lifecycle != GateStoreRunLifecycle.Stopped)
+                if (current.Lifecycle is not (GateStoreRunLifecycle.Stopped or
+                    GateStoreRunLifecycle.FinalReconciling))
                     return PrepareGateRunTransitionResult.Rejected(PrepareGateRunTransitionStatus.OutgoingNotStopped);
                 if (current.InspectionId == request.IncomingInspectionId && current.RunId == request.IncomingRunId)
                     return PrepareGateRunTransitionResult.Rejected(PrepareGateRunTransitionStatus.IncomingMatchesOutgoing);

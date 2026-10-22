@@ -227,6 +227,17 @@ internal sealed record GatePlanAuthorityPreparedCommitDiagnostics(
     int ConfirmedPublicationsPending, int TerminalReservationTombstones,
     int TerminalReservationTombstoneCapacity);
 
+internal enum GateHistoricalSealResolutionStatus
+{ TargetSelected, NoDeferredTarget, Closed, IdentityMismatch }
+
+internal readonly record struct GateHistoricalSealResolution(
+    GateHistoricalSealResolutionStatus Status,
+    GatePlanAuthorityKey Authority,
+    GatePlanRevision PlanRevision)
+{
+    internal bool HasTarget => Status == GateHistoricalSealResolutionStatus.TargetSelected;
+}
+
 internal sealed class InMemoryGatePlanPreparedCommitOwner
 {
     private readonly InMemoryGatePlanAuthorityOwner.AuthorityReader _reader;
@@ -249,6 +260,17 @@ internal sealed class InMemoryGatePlanPreparedCommitOwner
     internal bool TryAdvanceLedger(GatePlanAuthorityKey authority, GatePlanRevision revision,
         Func<GateApplyLedgerSnapshot, GateApplyLedgerSnapshot> transition) =>
         _reader.TryAdvanceLedger(authority, revision, transition);
+    internal GateHistoricalSealResolution ResolveHistoricalAtSeal(InspectionId inspectionId,
+        AcquisitionRunId runId, GateRunGeneration runGeneration) =>
+        _reader.ResolveHistoricalAtSeal(inspectionId, runId, runGeneration);
+    internal bool CompleteHistoricalWithoutData(GatePlanAuthorityKey authority, GatePlanRevision revision) =>
+        _reader.TryAdvanceLedger(authority, revision, current => GateApplyLedgerSnapshot.Create(
+            current.InspectionId, current.RunId, current.RunGeneration, current.PlanId, current.PlanRevision,
+            current.Commit, current.LiveEpoch, GateHistoricalAdmissionState.NotApplicable,
+            GateHistoricalExecutionState.NotApplicable, GateCandidateCoverageState.NotApplicable,
+            GateActivationState.NotApplicable, GateCandidateRetirementState.NotApplicable,
+            GatePreviousViewRetirementState.NotApplicable, current.CandidateOwnership, current.PrimaryCause,
+            current.SecondaryCauses, current.Lifecycle, GateApplyLedgerPendingResource.None));
 }
 
 public sealed partial class InMemoryGatePlanAuthorityOwner
@@ -498,6 +520,70 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
             }
         }
 
+        internal GateHistoricalSealResolution ResolveHistoricalAtSeal(InspectionId inspectionId,
+            AcquisitionRunId runId, GateRunGeneration runGeneration)
+        {
+            if (!inspectionId.IsValid || !runId.IsValid || !runGeneration.IsValid)
+                return new(GateHistoricalSealResolutionStatus.IdentityMismatch, default, default);
+            lock (_gate)
+            {
+                if (_closing) return new(GateHistoricalSealResolutionStatus.Closed, default, default);
+                if (!_ledgerBudgets.TryGetValue(inspectionId, out InspectionLedgerBudget? budget))
+                    return new(GateHistoricalSealResolutionStatus.NoDeferredTarget, default, default);
+                RetainedLedger[] deferred = budget.Retained.Where(item =>
+                    item.Ledger.RunId == runId && item.Ledger.RunGeneration == runGeneration &&
+                    item.Ledger.Commit == GateApplyCommitState.Accepted &&
+                    item.Ledger.HistoricalAdmission == GateHistoricalAdmissionState.Deferred).ToArray();
+                if (deferred.Length == 0)
+                    return new(GateHistoricalSealResolutionStatus.NoDeferredTarget, default, default);
+                RetainedLedger target = deferred[^1];
+                var staged = new (RetainedLedger Retained, GateApplyLedgerSnapshot Next)[deferred.Length];
+                for (int index = 0; index < deferred.Length; index++)
+                {
+                    GateApplyLedgerSnapshot current = deferred[index].Ledger;
+                    bool selected = ReferenceEquals(deferred[index], target);
+                    GateApplyLedgerSnapshot next = selected ? CopySealLedger(current,
+                        GateLiveEpochState.Drained) : CopySealLedger(current, GateLiveEpochState.Drained,
+                        GateHistoricalAdmissionState.Superseded, GateHistoricalExecutionState.NotApplicable,
+                        GateCandidateCoverageState.NotApplicable, GateActivationState.NotApplicable,
+                        GateCandidateRetirementState.NotApplicable, GatePreviousViewRetirementState.NotApplicable,
+                        new(GateLedgerStage.HistoricalAdmission, GateLedgerCauseKind.Superseded));
+                    GateApplyLedgerTransitionResult validation = GateApplyLedgerTransitionResult.Validate(current, next);
+                    if (validation.Status != GateApplyLedgerTransitionStatus.Valid)
+                        throw new ApplicationCommitInvariantException(
+                            $"Invalid seal ledger transition {validation.Status} at {validation.Stage}.");
+                    staged[index] = (deferred[index], next);
+                }
+                GateApplyLedgerSnapshot chosen = target.Ledger;
+                var authority = new GatePlanAuthorityKey(inspectionId, chosen.PlanId);
+                if (!_entries.TryGetValue(authority, out Entry? installed) ||
+                    installed.Current.Committed.Revision != chosen.PlanRevision)
+                    throw new ApplicationCommitInvariantException(
+                        "The deferred historical target is not the installed authority revision.");
+                foreach ((RetainedLedger retained, GateApplyLedgerSnapshot next) in staged)
+                {
+                    retained.Ledger = next;
+                    if (_entries.TryGetValue(new(inspectionId, next.PlanId), out Entry? entry) &&
+                        entry.Ledger?.PlanRevision == next.PlanRevision)
+                        entry.ReplaceLedger(next);
+                }
+                return new(GateHistoricalSealResolutionStatus.TargetSelected, authority, chosen.PlanRevision);
+            }
+        }
+
+        private static GateApplyLedgerSnapshot CopySealLedger(GateApplyLedgerSnapshot source,
+            GateLiveEpochState live, GateHistoricalAdmissionState? admission = null,
+            GateHistoricalExecutionState? execution = null, GateCandidateCoverageState? coverage = null,
+            GateActivationState? activation = null, GateCandidateRetirementState? retirement = null,
+            GatePreviousViewRetirementState? previous = null, GateLedgerCause? primary = null) =>
+            GateApplyLedgerSnapshot.Create(source.InspectionId, source.RunId, source.RunGeneration,
+                source.PlanId, source.PlanRevision, source.Commit, live,
+                admission ?? source.HistoricalAdmission, execution ?? source.HistoricalExecution,
+                coverage ?? source.CandidateCoverage, activation ?? source.Activation,
+                retirement ?? source.CandidateRetirement, previous ?? source.PreviousViewRetirement,
+                source.CandidateOwnership, primary ?? source.PrimaryCause, source.SecondaryCauses,
+                source.Lifecycle, source.PendingResources);
+
         internal bool PublishPrepared(ConfirmedAuthorityPublicationTicket requested)
         {
             List<Entry.Subscription> drains;
@@ -621,12 +707,14 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
             return evictions.ToArray();
         }
 
-        /// <summary>Stable internal estimate: fixed bytes + UTF-8 PlanId bytes + 24 bytes per canonical cause.</summary>
+        /// <summary>
+        /// Stable lifetime estimate: fixed bytes + UTF-8 PlanId bytes + space for every canonical stage cause.
+        /// Terminal reconciliation may add causes after admission, so retained bytes cannot depend on the current count.
+        /// </summary>
         private long EstimateLedgerBytes(GateApplyLedgerSnapshot ledger)
         {
-            int causeCount = (ledger.PrimaryCause is null ? 0 : 1) + ledger.SecondaryCauses.Count;
             return checked(_preparedOptions.EstimatedLedgerFixedBytes +
-                Encoding.UTF8.GetByteCount(ledger.PlanId.Value) + checked(causeCount * 24L));
+                Encoding.UTF8.GetByteCount(ledger.PlanId.Value) + (8L * 24L));
         }
 
         private static GatePlanGeometrySnapshot BuildGeometry(CompiledGatePlan plan) =>

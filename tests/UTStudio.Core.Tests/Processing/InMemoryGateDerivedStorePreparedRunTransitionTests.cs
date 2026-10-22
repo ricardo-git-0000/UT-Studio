@@ -75,6 +75,27 @@ public sealed class InMemoryGateDerivedStorePreparedRunTransitionTests
     }
 
     [TestMethod]
+    public async Task FinalReconciliationBlocksDesiredAndOldCompletionCannotChangeNewRun()
+    {
+        await using var store = new InMemoryGateDerivedStore();
+        GateStoreRunAuthoritySnapshot open = Open(store, Inspection, RunA);
+        GateStoreRunStopResult finalizingResult = store.DesiredReplacementControl
+            .BeginFinalReconciliation(open);
+        GateStoreRunAuthoritySnapshot finalizing = finalizingResult.Current;
+
+        Assert.AreEqual(GateStoreRunLifecycle.FinalReconciling, finalizing.Lifecycle);
+        Assert.AreEqual(PrepareDesiredReplacementStatus.RunNotOpen,
+            store.DesiredReplacementControl.Prepare(new(Inspection, RunA, open.Generation,
+                new("P"), new(1), Owner)).Status);
+        PreparedGateRunTransition next = Prepare(store, finalizing, Inspection, RunB);
+        Commit(store, next);
+
+        Assert.AreEqual(GateStoreRunStopStatus.IdentityMismatch, store.DesiredReplacementControl
+            .CompleteFinalReconciliation(finalizing).Status);
+        Assert.AreEqual(next.Incoming, store.DesiredReplacementControl.RunDiagnostics.Current);
+    }
+
+    [TestMethod]
     public async Task AbortPreservesStoppedOutgoingAndInstalledDesire()
     {
         await using var store = new InMemoryGateDerivedStore();

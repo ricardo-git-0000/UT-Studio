@@ -17,3 +17,10 @@ internal interface IOwnedGateReprocessingScheduler
     ValueTask<GateReprocessingAdmissionResult> AdmitOwnedAsync(GateReprocessingJobDescriptor descriptor,
         IGateReprocessingAdmissionOwner owner, CancellationToken cancellationToken = default);
 }
+
+/// <summary>Internal lifecycle used by the inspection-scoped historical owner.</summary>
+internal interface IOwnedGateReprocessingLifecycle : IAsyncDisposable
+{
+    void CloseAdmission();
+    Task StopAsync();
+}

@@ -47,7 +47,9 @@ internal interface IGateReplacementStore
     ValueTask<GateDerivedMutationResult> CompletePreviousViewRetirementAsync();
 }
 
-internal sealed class InMemoryGateReplacementStore(InMemoryGateDerivedStore store) : IGateReplacementStore
+internal interface IGateReplacementStoreLifecycle : IGateReplacementStore, IAsyncDisposable;
+
+internal sealed class InMemoryGateReplacementStore(InMemoryGateDerivedStore store) : IGateReplacementStoreLifecycle
 {
     public GateCandidateReservationResult ReserveCandidate(InspectionId inspectionId, AcquisitionRunId runId,
         GateRunGeneration runGeneration, GatePlanId planId, GatePlanRevision planRevision,
@@ -66,6 +68,7 @@ internal sealed class InMemoryGateReplacementStore(InMemoryGateDerivedStore stor
         store.ReclaimInvalidatedAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
     public ValueTask<GateDerivedMutationResult> CompletePreviousViewRetirementAsync() =>
         store.CompletePreviousViewRetirementAsync();
+    public ValueTask DisposeAsync() => store.DisposeAsync();
 }
 
 public sealed partial class InMemoryGateDerivedStore

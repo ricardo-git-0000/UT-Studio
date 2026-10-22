@@ -294,15 +294,17 @@ public sealed class InMemoryGatePlanAuthorityPreparedCommitTests
     }
 
     [TestMethod]
-    public void LedgerByteEstimateUsesUtf8AndCanonicalCauseCount()
+    public void LedgerByteEstimateUsesUtf8AndReservesAllCanonicalCauseStages()
     {
         CommittedGatePlanSnapshot initial = Committed("estimate", 1);
         using var owner = new InMemoryGatePlanAuthorityOwner([initial]);
         owner.Seal();
         GateApplyLedgerSnapshot ascii = TerminalLedger("e");
         GateApplyLedgerSnapshot multibyte = TerminalLedger("é");
-        Assert.AreEqual(128 + Encoding.UTF8.GetByteCount("e"), owner.PreparedCommits.EstimateLedgerBytes(ascii));
-        Assert.AreEqual(128 + Encoding.UTF8.GetByteCount("é"), owner.PreparedCommits.EstimateLedgerBytes(multibyte));
+        Assert.AreEqual(128 + Encoding.UTF8.GetByteCount("e") + (8 * 24),
+            owner.PreparedCommits.EstimateLedgerBytes(ascii));
+        Assert.AreEqual(128 + Encoding.UTF8.GetByteCount("é") + (8 * 24),
+            owner.PreparedCommits.EstimateLedgerBytes(multibyte));
 
         GateApplyLedgerSnapshot caused = GateApplyLedgerSnapshot.Create(Inspection, Run, new(1), new("causes"), new(1),
             GateApplyCommitState.Accepted, GateLiveEpochState.Faulted, GateHistoricalAdmissionState.Rejected,
@@ -311,7 +313,7 @@ public sealed class InMemoryGatePlanAuthorityPreparedCommitTests
             GatePreviousViewRetirementState.NotApplicable, primaryCause:
                 new(GateLedgerStage.LiveEpoch, GateLedgerCauseKind.Faulted), secondaryCauses:
                 [new(GateLedgerStage.HistoricalAdmission, GateLedgerCauseKind.Rejected)]);
-        Assert.AreEqual(128 + Encoding.UTF8.GetByteCount("causes") + (2 * 24),
+        Assert.AreEqual(128 + Encoding.UTF8.GetByteCount("causes") + (8 * 24),
             owner.PreparedCommits.EstimateLedgerBytes(caused));
     }
 
@@ -394,7 +396,7 @@ public sealed class InMemoryGatePlanAuthorityPreparedCommitTests
         GateApplyLedgerSnapshot second = TerminalLedger("b");
         GateApplyLedgerSnapshot third = TerminalLedger("c");
         using (var owner = new InMemoryGatePlanAuthorityOwner([initial], default,
-            new(maximumRetainedLedgersPerInspection: 4, maximumEstimatedLedgerBytesPerInspection: 387),
+            new(maximumRetainedLedgersPerInspection: 4, maximumEstimatedLedgerBytesPerInspection: 1000),
             [new(first), new(second), new(third)]))
         {
             IGatePlanAuthorityReader reader = owner.Seal();

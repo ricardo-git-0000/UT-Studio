@@ -4,7 +4,7 @@ using UTStudio.Domain.Inspection;
 
 namespace UTStudio.Processing.Core;
 
-internal enum GateStoreRunLifecycle { None, Open, Stopped }
+internal enum GateStoreRunLifecycle { None, Open, FinalReconciling, Stopped }
 internal enum GateStorePreparedOperationKind { None, DesiredReplacement, RunTransition }
 
 internal readonly record struct GateStoreRunAuthoritySnapshot(
@@ -14,7 +14,8 @@ internal readonly record struct GateStoreRunAuthoritySnapshot(
     GateStoreRunLifecycle Lifecycle)
 {
     internal bool IsValid => InspectionId.IsValid && RunId.IsValid && Generation.IsValid &&
-        Lifecycle is GateStoreRunLifecycle.Open or GateStoreRunLifecycle.Stopped;
+        Lifecycle is GateStoreRunLifecycle.Open or GateStoreRunLifecycle.FinalReconciling or
+        GateStoreRunLifecycle.Stopped;
 }
 
 internal enum GateStoreRunStopStatus
@@ -105,6 +106,8 @@ internal interface IPreparedGateStoreControl
         GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation);
     GatePreparedReservationResult AbortRunTransition(GatePreparedReservation reservation,
         GatePreparedReservationOwner owner, GatePreparedOperationGeneration generation);
+    GateStoreRunStopResult BeginFinalReconciliation(GateStoreRunAuthoritySnapshot expected);
+    GateStoreRunStopResult CompleteFinalReconciliation(GateStoreRunAuthoritySnapshot expected);
     GateStoreRunStopResult StopCurrentRun(GateStoreRunAuthoritySnapshot expected);
 }
 

@@ -29,6 +29,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private readonly ICommittedGateProcessingIngress? _processingIngress;
     private readonly CompiledGatePlan? _processingPlan;
     private readonly GatePlanApplyServices? _gatePlanServices;
+    private readonly GateHistoricalRunServices? _gateHistoricalServices;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
     private Operation? _active;
@@ -42,14 +43,14 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         ICommittedTraceSink? bScanSink = null, ICommittedTraceSink? aScanSink = null,
         ICommittedGateProcessingIngress? processingIngress = null, CompiledGatePlan? processingPlan = null)
         : this(source, inspectionId, inspectionWriterFactory, bScanSink, aScanSink,
-            processingIngress, processingPlan, null)
+            processingIngress, processingPlan, null, null)
     { }
 
     internal ApplicationSession(IUtFrameSource source, InspectionId inspectionId,
         Func<AcquisitionRunId, IInspectionRunWriter> inspectionWriterFactory,
         ICommittedTraceSink? bScanSink, ICommittedTraceSink? aScanSink,
         ICommittedGateProcessingIngress? processingIngress, CompiledGatePlan? processingPlan,
-        GatePlanApplyServices? gatePlanServices)
+        GatePlanApplyServices? gatePlanServices, GateHistoricalRunServices? gateHistoricalServices = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
@@ -66,6 +67,10 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _processingIngress = processingIngress;
         _processingPlan = processingPlan;
         _gatePlanServices = gatePlanServices;
+        _gateHistoricalServices = gateHistoricalServices;
+        if (gateHistoricalServices is not null && gatePlanServices is null)
+            throw new ArgumentException("Historical gate services require gate-plan services.",
+                nameof(gateHistoricalServices));
         _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0, canStart: true);
         _publisher = new SessionSnapshotPublisher(_snapshot);
     }
@@ -168,12 +173,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
                 {
                     throw new InvalidOperationException("The execution descriptor does not match the request.");
                 }
+                operation.HistoricalStream = new UtStreamIdentity(_inspectionId, operation.RunId,
+                    run.Metadata.SourceId, run.Metadata.Configuration.PhysicalChannelId);
                 if (!operation.CleanupRequested && _processingIngress is not null)
                 {
-                    var stream = new UtStreamIdentity(_inspectionId, operation.RunId, run.Metadata.SourceId,
-                        run.Metadata.Configuration.PhysicalChannelId);
                     GateProcessingAdmissionStatus admission = _processingIngress.OpenRun(
-                        new(_inspectionId, operation.RunId, [stream], _processingPlan!));
+                        new(_inspectionId, operation.RunId, [operation.HistoricalStream.Value], _processingPlan!));
                     operation.ProcessingOpened = admission == GateProcessingAdmissionStatus.Accepted;
                     if (!operation.ProcessingOpened)
                     { AddBranchError(operation, new("session.processing.open", $"Processing admission was {admission}.")); }
@@ -684,12 +689,20 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             }
 
             await operation.CommitCoordinator.DisposeAsync().ConfigureAwait(false);
-            if (_gatePlanServices is not null && operation.GateRunContext is { } gateRun)
+            if (_gateHistoricalServices is null && _gatePlanServices is not null &&
+                operation.GateRunContext is { } gateRun)
             {
                 try { _gatePlanServices.StopRun(gateRun); }
                 catch (Exception error) { lock (_gate) { RecordError(operation, error, "session.gates.stop"); } }
             }
             await FinalizeProcessingAsync(operation).ConfigureAwait(false);
+            await AdmitHistoricalHandoffAsync(operation).ConfigureAwait(false);
+            if (_gateHistoricalServices is not null && _gatePlanServices is not null &&
+                !operation.HistoricalHandoffAttempted && operation.GateRunContext is { } unhandledGateRun)
+            {
+                try { _gatePlanServices.StopRun(unhandledGateRun); }
+                catch (Exception error) { lock (_gate) { RecordError(operation, error, "session.gates.stop"); } }
+            }
             await FinalizeBScanAsync(operation, operation.SealedRun).ConfigureAwait(false);
 
             lock (_gate) { CloseAScan(operation); }
@@ -817,6 +830,23 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         { lock (_gate) { RecordError(operation, error, "session.processing.drain"); } }
     }
 
+    private async Task AdmitHistoricalHandoffAsync(Operation operation)
+    {
+        if (_gateHistoricalServices is null || _gatePlanServices is null ||
+            operation.HistoricalHandoffAttempted || !operation.WriterSealed ||
+            operation.SealedRun is not { } seal || operation.GateRunContext is not { } gateRun ||
+            operation.HistoricalStream is not { } stream ||
+            (operation.ProcessingOpened && !operation.ProcessingDrained)) return;
+        operation.HistoricalHandoffAttempted = true;
+        try
+        {
+            operation.HistoricalSubmission = await _gateHistoricalServices.HandoffAsync(
+                _gatePlanServices, gateRun, seal, stream).ConfigureAwait(false);
+        }
+        catch (Exception error)
+        { lock (_gate) { RecordError(operation, error, "session.gates.historical"); } }
+    }
+
     private void RecordStageFailures(Operation operation, IReadOnlyList<Exception> failures, string code)
     {
         lock (_gate)
@@ -842,6 +872,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         if (operation is { ResourcesReleased: false })
         {
             throw failure ?? new InvalidOperationException("Frame release has not been confirmed.");
+        }
+
+        if (_gateHistoricalServices is not null)
+        {
+            try { await _gateHistoricalServices.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) { failure ??= error; }
         }
 
         if (operation?.Disconnected != true)
@@ -993,6 +1029,9 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
             new(inspectionId, CommitCoordinatorCapacity);
         internal GatePlanApplyRunContext? GateRunContext;
         internal GatePlanApplyUseCase? GatePlanApply;
+        internal UtStreamIdentity? HistoricalStream;
+        internal bool HistoricalHandoffAttempted;
+        internal GateHistoricalReplacementSubmission? HistoricalSubmission;
         internal bool GateApplyPointOfNoReturn;
         internal ulong AcquisitionMissingFrames;
         internal ulong DuplicateFramesRejected;

@@ -8,7 +8,8 @@ using UTStudio.Domain.Processing;
 namespace UTStudio.Processing.Core;
 
 /// <summary>Bounded historical scheduler. It owns workers and scratch that are not shared with live processing.</summary>
-public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwnedGateReprocessingScheduler
+public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwnedGateReprocessingScheduler,
+    IOwnedGateReprocessingLifecycle
 {
     private readonly object _gate = new();
     private readonly IInspectionSealedRunSnapshotProvider _snapshots;
@@ -129,6 +130,13 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwn
         lock (_gate) { stop = _stopTask ??= StopCoreAsync(); }
         return cancellationToken.CanBeCanceled ? stop.WaitAsync(cancellationToken) : stop;
     }
+
+    void IOwnedGateReprocessingLifecycle.CloseAdmission()
+    {
+        lock (_gate) { _accepting = false; }
+    }
+
+    Task IOwnedGateReprocessingLifecycle.StopAsync() => StopAsync();
 
     public ValueTask DisposeAsync()
     {

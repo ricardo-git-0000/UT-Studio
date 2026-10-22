@@ -84,6 +84,49 @@ internal sealed class GatePlanApplyServices
             throw new ApplicationCommitInvariantException($"Gate store Stop returned {stopped.Status}.");
         lock (_gate) _currentRun = stopped.Current;
     }
+
+    internal GateStoreRunAuthoritySnapshot BeginFinalReconciliation(GatePlanApplyRunContext context)
+    {
+        GateStoreRunAuthoritySnapshot current = RequireCurrent(context);
+        GateStoreRunStopResult transition = Store.BeginFinalReconciliation(current);
+        if (transition.Status is not (GateStoreRunStopStatus.Stopped or GateStoreRunStopStatus.AlreadyStopped))
+            throw new ApplicationCommitInvariantException(
+                $"Gate store final reconciliation returned {transition.Status}.");
+        lock (_gate)
+        {
+            if (_currentRun == current) _currentRun = transition.Current;
+        }
+        return transition.Current;
+    }
+
+    internal bool CompleteFinalReconciliation(GateStoreRunAuthoritySnapshot expected)
+    {
+        lock (_gate)
+        {
+            if (_currentRun != expected) return false;
+        }
+        GateStoreRunStopResult transition = Store.CompleteFinalReconciliation(expected);
+        if (transition.Status == GateStoreRunStopStatus.IdentityMismatch) return false;
+        if (transition.Status is not (GateStoreRunStopStatus.Stopped or GateStoreRunStopStatus.AlreadyStopped))
+            throw new ApplicationCommitInvariantException(
+                $"Gate store final completion returned {transition.Status}.");
+        lock (_gate)
+        {
+            if (_currentRun == expected) _currentRun = transition.Current;
+        }
+        return true;
+    }
+
+    private GateStoreRunAuthoritySnapshot RequireCurrent(GatePlanApplyRunContext context)
+    {
+        lock (_gate)
+        {
+            if (_currentRun is not { } current || current.InspectionId != context.InspectionId ||
+                current.RunId != context.RunId || current.Generation != context.RunGeneration)
+                throw new ApplicationCommitInvariantException("The gate store run context changed.");
+            return current;
+        }
+    }
 }
 
 internal sealed class GatePlanApplySubmission

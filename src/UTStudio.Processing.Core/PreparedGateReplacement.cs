@@ -154,6 +154,10 @@ internal sealed class PreparedDesiredReplacementOwner : IPreparedGateStoreContro
         _store.AbortRunTransition(reservation, owner, generation);
     public GateStoreRunStopResult StopCurrentRun(GateStoreRunAuthoritySnapshot expected) =>
         _store.StopCurrentRun(expected);
+    public GateStoreRunStopResult BeginFinalReconciliation(GateStoreRunAuthoritySnapshot expected) =>
+        _store.BeginFinalReconciliation(expected);
+    public GateStoreRunStopResult CompleteFinalReconciliation(GateStoreRunAuthoritySnapshot expected) =>
+        _store.CompleteFinalReconciliation(expected);
 }
 
 internal sealed class PreparedDesiredReplacementState

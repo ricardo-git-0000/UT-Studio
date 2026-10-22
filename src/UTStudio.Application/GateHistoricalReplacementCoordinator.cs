@@ -9,7 +9,8 @@ namespace UTStudio.Application;
 
 internal enum GateHistoricalReplacementSubmissionStatus
 {
-    Admitted, AlreadyRequested, Cancelled, CapacityExceeded, Closed, Superseded, Rejected, Faulted
+    Admitted, AlreadyRequested, Cancelled, CapacityExceeded, ObserverCapacityExceeded, Closed, Superseded,
+    Rejected, Faulted
 }
 
 internal sealed record GateHistoricalReplacementTerminal(
@@ -39,25 +40,47 @@ internal sealed class GateHistoricalReplacementCoordinator
     private readonly IOwnedGateReprocessingScheduler _scheduler;
     private readonly IGateReplacementStore _store;
     private readonly InMemoryGatePlanPreparedCommitOwner _authority;
+    private readonly object _registryGate = new();
+    private readonly int _observerCapacity;
+    private int _observers;
+    private bool _admissionClosed;
+    private TaskCompletionSource? _drained;
 
     internal GateHistoricalReplacementCoordinator(IOwnedGateReprocessingScheduler scheduler,
-        IGateReplacementStore store, InMemoryGatePlanPreparedCommitOwner authority)
+        IGateReplacementStore store, InMemoryGatePlanPreparedCommitOwner authority, int observerCapacity = 64)
     {
         _scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _authority = authority ?? throw new ArgumentNullException(nameof(authority));
+        if (observerCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(observerCapacity));
+        _observerCapacity = observerCapacity;
+    }
+
+    internal void CloseAdmission()
+    {
+        lock (_registryGate) { _admissionClosed = true; }
+    }
+
+    internal Task DrainAsync()
+    {
+        lock (_registryGate)
+            return _observers == 0 ? Task.CompletedTask :
+                (_drained ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
     }
 
     internal async ValueTask<GateHistoricalReplacementSubmission> TryAdmitAsync(
         GatePlanAuthorityKey authority, GatePlanApplyRunContext run, InspectionRevision sourceFinalRevision,
         IReadOnlyList<GateReprocessingStreamSelection> selection, int blockSize,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Func<GateHistoricalReplacementTerminal, ValueTask>? terminal = null)
     {
         if (!authority.IsValid || !run.IsValid || authority.InspectionId != run.InspectionId ||
             sourceFinalRevision == InspectionRevision.Initial || selection is null || selection.Count == 0)
             throw new ArgumentException("Historical replacement identity is invalid.");
         GatePlanAuthorityInstalledState installed = _authority.ReadInstalled(authority) ??
             throw new InvalidOperationException("The committed gate-plan authority is unavailable.");
+        if (!TryReserveObserver(out GateHistoricalReplacementSubmissionStatus registryFailure))
+            return new(registryFailure);
         CompiledGatePlan plan = installed.Authority.Committed.CompiledPlan;
         var attempt = new GateReprocessingAttemptId(Guid.NewGuid());
         GateCandidateReservationResult reserved = _store.ReserveCandidate(run.InspectionId, run.RunId,
@@ -66,15 +89,28 @@ internal sealed class GateHistoricalReplacementCoordinator
         {
             if (reserved.Status != GateCandidateReservationStatus.AlreadyRequested)
                 FinishAdmissionFailure(authority, plan.Source.Revision, reserved.Status);
+            ReleaseObserver();
             return new(Map(reserved.Status));
         }
 
         GateCandidateReservation reservation = reserved.Reservation!;
-        if (!Advance(authority, plan.Source.Revision, current => Copy(current,
-            admission: GateHistoricalAdmissionState.Admitting,
-            pending: GateApplyLedgerPendingResource.Observer)))
+        bool markedAdmitting;
+        try
+        {
+            markedAdmitting = Advance(authority, plan.Source.Revision, current => Copy(current,
+                admission: GateHistoricalAdmissionState.Admitting,
+                pending: GateApplyLedgerPendingResource.Observer));
+        }
+        catch
         {
             _store.ReleaseReservation(reservation);
+            ReleaseObserver();
+            throw;
+        }
+        if (!markedAdmitting)
+        {
+            _store.ReleaseReservation(reservation);
+            ReleaseObserver();
             return new(GateHistoricalReplacementSubmissionStatus.Closed);
         }
         var owner = new ObserverOwner(this, authority, reservation);
@@ -95,7 +131,9 @@ internal sealed class GateHistoricalReplacementCoordinator
                 _store.ReleaseReservation(reservation);
                 FinishAdmissionFailure(authority, plan.Source.Revision, GateCandidateReservationStatus.Closed,
                     GateHistoricalAdmissionState.Faulted);
+                ReleaseObserver();
             }
+            else _ = TrackDetachedAsync(observation, terminal);
             throw;
         }
         if (admission.Status != GateReprocessingAdmissionStatus.Admitted)
@@ -105,9 +143,57 @@ internal sealed class GateHistoricalReplacementCoordinator
             FinishAdmissionFailure(authority, plan.Source.Revision, GateCandidateReservationStatus.Closed,
                 admission.Status == GateReprocessingAdmissionStatus.Cancelled ?
                     GateHistoricalAdmissionState.Cancelled : GateHistoricalAdmissionState.Rejected);
+            ReleaseObserver();
             return new(Map(admission.Status));
         }
-        return new(GateHistoricalReplacementSubmissionStatus.Admitted, observation);
+        return new(GateHistoricalReplacementSubmissionStatus.Admitted,
+            TrackObserverAsync(observation, terminal));
+    }
+
+    private bool TryReserveObserver(out GateHistoricalReplacementSubmissionStatus failure)
+    {
+        lock (_registryGate)
+        {
+            if (_admissionClosed)
+            { failure = GateHistoricalReplacementSubmissionStatus.Closed; return false; }
+            if (_observers >= _observerCapacity)
+            { failure = GateHistoricalReplacementSubmissionStatus.ObserverCapacityExceeded; return false; }
+            _observers++;
+            failure = default;
+            return true;
+        }
+    }
+
+    private async Task<GateHistoricalReplacementTerminal> TrackObserverAsync(
+        Task<GateHistoricalReplacementTerminal> observation,
+        Func<GateHistoricalReplacementTerminal, ValueTask>? terminal)
+    {
+        try
+        {
+            GateHistoricalReplacementTerminal result = await observation.ConfigureAwait(false);
+            if (terminal is not null) await terminal(result).ConfigureAwait(false);
+            return result;
+        }
+        finally { ReleaseObserver(); }
+    }
+
+    private async Task TrackDetachedAsync(Task<GateHistoricalReplacementTerminal> observation,
+        Func<GateHistoricalReplacementTerminal, ValueTask>? terminal)
+    {
+        try { await TrackObserverAsync(observation, terminal).ConfigureAwait(false); }
+        catch { /* The admission exception remains primary; terminal ownership was still drained. */ }
+    }
+
+    private void ReleaseObserver()
+    {
+        TaskCompletionSource? signal = null;
+        lock (_registryGate)
+        {
+            if (_observers <= 0) throw new ApplicationCommitInvariantException("Historical observer registry underflow.");
+            _observers--;
+            if (_observers == 0) signal = _drained;
+        }
+        signal?.TrySetResult();
     }
 
     private bool Advance(GatePlanAuthorityKey authority, GatePlanRevision revision,

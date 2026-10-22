@@ -175,6 +175,7 @@ public readonly record struct GateApplyLedgerTransitionResult
             GateHistoricalAdmissionState.NotApplicable or GateHistoricalAdmissionState.Superseded or
             GateHistoricalAdmissionState.Cancelled or GateHistoricalAdmissionState.Rejected or GateHistoricalAdmissionState.Faulted,
         GateHistoricalAdmissionState.Deferred => to is GateHistoricalAdmissionState.Admitting or
+            GateHistoricalAdmissionState.NotApplicable or
             GateHistoricalAdmissionState.Superseded or GateHistoricalAdmissionState.Cancelled or
             GateHistoricalAdmissionState.Rejected or GateHistoricalAdmissionState.Faulted,
         GateHistoricalAdmissionState.Admitting => to is GateHistoricalAdmissionState.Admitted or
