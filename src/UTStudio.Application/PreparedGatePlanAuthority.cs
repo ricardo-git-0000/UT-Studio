@@ -227,6 +227,10 @@ internal sealed record GatePlanAuthorityPreparedCommitDiagnostics(
     int ConfirmedPublicationsPending, int TerminalReservationTombstones,
     int TerminalReservationTombstoneCapacity);
 
+internal sealed record GateLedgerLifecycleDiagnostics(
+    bool IsStableAfterDrain, int Active, int Disposing, int Disposed,
+    int PendingObservers, int PendingLeases, int PendingTombstones);
+
 internal enum GateHistoricalSealResolutionStatus
 { TargetSelected, NoDeferredTarget, Closed, IdentityMismatch }
 
@@ -263,6 +267,10 @@ internal sealed class InMemoryGatePlanPreparedCommitOwner
     internal GateHistoricalSealResolution ResolveHistoricalAtSeal(InspectionId inspectionId,
         AcquisitionRunId runId, GateRunGeneration runGeneration) =>
         _reader.ResolveHistoricalAtSeal(inspectionId, runId, runGeneration);
+    internal GateLedgerLifecycleDiagnostics ReadLifecycleDiagnostics(bool stableAfterDrain = false) =>
+        _reader.ReadLedgerLifecycleDiagnostics(stableAfterDrain);
+    internal void BeginLedgerDisposal() => _reader.BeginLedgerDisposal();
+    internal void CompleteLedgerDisposal() => _reader.CompleteLedgerDisposal();
     internal bool CompleteHistoricalWithoutData(GatePlanAuthorityKey authority, GatePlanRevision revision) =>
         _reader.TryAdvanceLedger(authority, revision, current => GateApplyLedgerSnapshot.Create(
             current.InspectionId, current.RunId, current.RunGeneration, current.PlanId, current.PlanRevision,
@@ -486,6 +494,101 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
         {
             ArgumentNullException.ThrowIfNull(ledger);
             lock (_gate) return EstimateLedgerBytes(ledger);
+        }
+
+        internal GateLedgerLifecycleDiagnostics ReadLedgerLifecycleDiagnostics(bool stableAfterDrain)
+        {
+            lock (_gate)
+            {
+                GateApplyLedgerSnapshot[] ledgers = _ledgerBudgets.Values
+                    .SelectMany(budget => budget.Retained.Select(item => item.Ledger)).ToArray();
+                return new(stableAfterDrain,
+                    ledgers.Count(x => x.Lifecycle == GateApplyLedgerLifecycleState.Active),
+                    ledgers.Count(x => x.Lifecycle == GateApplyLedgerLifecycleState.Disposing),
+                    ledgers.Count(x => x.Lifecycle == GateApplyLedgerLifecycleState.Disposed),
+                    ledgers.Count(x => x.PendingResources.HasFlag(GateApplyLedgerPendingResource.Observer)),
+                    ledgers.Count(x => x.PendingResources.HasFlag(GateApplyLedgerPendingResource.Lease)),
+                    ledgers.Count(x => x.PendingResources.HasFlag(GateApplyLedgerPendingResource.Tombstone)));
+            }
+        }
+
+        internal void BeginLedgerDisposal()
+        {
+            lock (_gate)
+            {
+                _preparedOperational = false;
+                if (_preparedAuthority is { } prepared) AbortPreparedAuthorityUnderGate(prepared.Reservation.Id);
+                foreach (InspectionLedgerBudget budget in _ledgerBudgets.Values)
+                    foreach (RetainedLedger retained in budget.Retained)
+                    {
+                        if (retained.Ledger.Lifecycle != GateApplyLedgerLifecycleState.Active) continue;
+                        GateApplyLedgerSnapshot current = retained.Ledger;
+                        GateApplyLedgerSnapshot next = CopyLifecycle(current, GateApplyLedgerLifecycleState.Disposing);
+                        EnsureLifecycleTransition(current, next);
+                        retained.Ledger = next;
+                        ReplaceInstalledLedgerUnderGate(next);
+                    }
+            }
+        }
+
+        internal void CompleteLedgerDisposal()
+        {
+            lock (_gate)
+            {
+                foreach (InspectionLedgerBudget budget in _ledgerBudgets.Values)
+                    foreach (RetainedLedger retained in budget.Retained)
+                    {
+                        if (retained.Ledger.Lifecycle == GateApplyLedgerLifecycleState.Disposed) continue;
+                        if (retained.Ledger.Lifecycle != GateApplyLedgerLifecycleState.Disposing ||
+                            retained.Ledger.PendingResources != GateApplyLedgerPendingResource.None ||
+                            !IsLedgerEvictionEligible(retained.Ledger))
+                            throw new ApplicationCommitInvariantException(
+                                $"A gate ledger still owns material resources at disposal completion: " +
+                                $"plan={retained.Ledger.PlanRevision.Value}, pending={retained.Ledger.PendingResources}, " +
+                                $"live={retained.Ledger.LiveEpoch}, admission={retained.Ledger.HistoricalAdmission}, " +
+                                $"execution={retained.Ledger.HistoricalExecution}, coverage={retained.Ledger.CandidateCoverage}, " +
+                                $"activation={retained.Ledger.Activation}, retirement={retained.Ledger.CandidateRetirement}, " +
+                                $"previous={retained.Ledger.PreviousViewRetirement}.");
+                        GateApplyLedgerSnapshot current = retained.Ledger;
+                        GateApplyLedgerSnapshot next = CopyLifecycle(current, GateApplyLedgerLifecycleState.Disposed);
+                        EnsureLifecycleTransition(current, next);
+                        retained.Ledger = next;
+                        ReplaceInstalledLedgerUnderGate(next);
+                    }
+            }
+        }
+
+        private static GateApplyLedgerSnapshot CopyLifecycle(GateApplyLedgerSnapshot source,
+            GateApplyLedgerLifecycleState lifecycle)
+        {
+            GateLedgerCause disposal = new(GateLedgerStage.Lifecycle, GateLedgerCauseKind.Disposed);
+            bool hasLifecycle = source.PrimaryCause?.Stage == GateLedgerStage.Lifecycle ||
+                source.SecondaryCauses.Any(x => x.Stage == GateLedgerStage.Lifecycle);
+            GateLedgerCause? primary = source.PrimaryCause ?? disposal;
+            IEnumerable<GateLedgerCause> secondary = source.PrimaryCause is null || hasLifecycle ?
+                source.SecondaryCauses : [.. source.SecondaryCauses, disposal];
+            return GateApplyLedgerSnapshot.Create(
+                source.InspectionId, source.RunId, source.RunGeneration, source.PlanId, source.PlanRevision,
+                source.Commit, source.LiveEpoch, source.HistoricalAdmission, source.HistoricalExecution,
+                source.CandidateCoverage, source.Activation, source.CandidateRetirement,
+                source.PreviousViewRetirement, source.CandidateOwnership, primary,
+                secondary, lifecycle, source.PendingResources);
+        }
+
+        private static void EnsureLifecycleTransition(GateApplyLedgerSnapshot current,
+            GateApplyLedgerSnapshot next)
+        {
+            GateApplyLedgerTransitionResult validation = GateApplyLedgerTransitionResult.Validate(current, next);
+            if (validation.Status != GateApplyLedgerTransitionStatus.Valid)
+                throw new ApplicationCommitInvariantException(
+                    $"Invalid lifecycle transition {validation.Status} at {validation.Stage}.");
+        }
+
+        private void ReplaceInstalledLedgerUnderGate(GateApplyLedgerSnapshot ledger)
+        {
+            if (_entries.TryGetValue(new(ledger.InspectionId, ledger.PlanId), out Entry? entry) &&
+                entry.Ledger?.PlanRevision == ledger.PlanRevision)
+                entry.ReplaceLedger(ledger);
         }
 
         internal bool TryAdvanceLedger(GatePlanAuthorityKey authority, GatePlanRevision revision,

@@ -4,6 +4,7 @@ using UTStudio.Contracts.Inspection;
 using UTStudio.Contracts.Processing;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
+using UTStudio.Processing.Core;
 
 namespace UTStudio.Application;
 
@@ -30,6 +31,7 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
     private readonly CompiledGatePlan? _processingPlan;
     private readonly GatePlanApplyServices? _gatePlanServices;
     private readonly GateHistoricalRunServices? _gateHistoricalServices;
+    private readonly IGateLiveProcessingLifecycle? _gateLiveLifecycle;
     private readonly SessionSnapshotPublisher _publisher;
     private SessionSnapshot _snapshot;
     private Operation? _active;
@@ -50,7 +52,8 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         Func<AcquisitionRunId, IInspectionRunWriter> inspectionWriterFactory,
         ICommittedTraceSink? bScanSink, ICommittedTraceSink? aScanSink,
         ICommittedGateProcessingIngress? processingIngress, CompiledGatePlan? processingPlan,
-        GatePlanApplyServices? gatePlanServices, GateHistoricalRunServices? gateHistoricalServices = null)
+        GatePlanApplyServices? gatePlanServices, GateHistoricalRunServices? gateHistoricalServices = null,
+        IGateLiveProcessingLifecycle? gateLiveLifecycle = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (!source.SourceId.IsValid) { throw new ArgumentException("The source identifier is invalid.", nameof(source)); }
@@ -68,9 +71,12 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
         _processingPlan = processingPlan;
         _gatePlanServices = gatePlanServices;
         _gateHistoricalServices = gateHistoricalServices;
+        _gateLiveLifecycle = gateLiveLifecycle ?? processingIngress as IGateLiveProcessingLifecycle;
         if (gateHistoricalServices is not null && gatePlanServices is null)
             throw new ArgumentException("Historical gate services require gate-plan services.",
                 nameof(gateHistoricalServices));
+        if (gateHistoricalServices is not null && _gateLiveLifecycle is not null)
+            gateHistoricalServices.AttachLiveLifecycle(_gateLiveLifecycle);
         _snapshot = new SessionSnapshot(0, SessionPhase.Idle, source.SourceId, null, 0, 0, null, null, null, [], 0, canStart: true);
         _publisher = new SessionSnapshotPublisher(_snapshot);
     }
@@ -876,8 +882,14 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
         if (_gateHistoricalServices is not null)
         {
+            _gateHistoricalServices.CloseAdmission();
             try { await _gateHistoricalServices.DisposeAsync().ConfigureAwait(false); }
-            catch (Exception error) { failure ??= error; }
+            catch (Exception error) { failure = AppendCleanupFailure(failure, error); }
+        }
+        else if (_gateLiveLifecycle is not null)
+        {
+            try { await _gateLiveLifecycle.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) { failure = AppendCleanupFailure(failure, error); }
         }
 
         if (operation?.Disconnected != true)
@@ -926,6 +938,13 @@ public sealed class ApplicationSession : IAsyncDisposable, IApplicationSession
 
         if (failure is not null) { System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw(); }
     }
+
+    private static Exception AppendCleanupFailure(Exception? primary, Exception secondary) => primary switch
+    {
+        null => secondary,
+        AggregateException aggregate => new AggregateException(aggregate.InnerExceptions.Append(secondary)),
+        _ => new AggregateException(primary, secondary)
+    };
 
     private async Task<bool> ObserveAsync(Operation operation, Func<Task> action, string code)
     {

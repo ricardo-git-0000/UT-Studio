@@ -421,6 +421,49 @@ public sealed class GatePlanApplyUseCaseTests
     }
 
     [TestMethod]
+    public async Task CandidateCapacityAcceptsExactRejectsOneOverAndAllowsRetryAfterRelease()
+    {
+        await using var fixture = new Fixture(maximumReplacementCandidates: 1);
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.Intent(), fixture.Context).WaitAsync()).Outcome);
+        var firstScheduler = new LifecycleControlledScheduler();
+        var firstCoordinator = new GateHistoricalReplacementCoordinator(firstScheduler,
+            fixture.Store.ReplacementControl, fixture.Authority.PreparedCommits);
+        var stream = new UtStreamIdentity(fixture.Inspection, fixture.Run, new("history"), new(0));
+        GateHistoricalReplacementSubmission first = await firstCoordinator.TryAdmitAsync(fixture.AuthorityKey,
+            fixture.Context, new(1), [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1);
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.Admitted, first.Status);
+
+        ApplicationCommitAdmission rf = fixture.Coordinator.AdmitCommit(fixture.Run,
+            ApplicationCommitOperationClass.RfCommit, () => ValueTask.FromResult(
+                new InspectionAppendResult(InspectionAppendStatus.Committed, new(1), wasAccepted: true)));
+        Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await rf.Completion).Status);
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.IntentCurrent(0.4), fixture.Context).WaitAsync()).Outcome);
+        var secondScheduler = new LifecycleControlledScheduler();
+        var secondCoordinator = new GateHistoricalReplacementCoordinator(secondScheduler,
+            fixture.Store.ReplacementControl, fixture.Authority.PreparedCommits);
+        GateHistoricalReplacementSubmission oneOver = await secondCoordinator.TryAdmitAsync(fixture.AuthorityKey,
+            fixture.Context, new(1), [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1);
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.CapacityExceeded, oneOver.Status);
+        Assert.IsFalse(secondScheduler.Admission.Task.IsCompleted);
+
+        firstScheduler.Complete(GateReprocessingLifecycle.Cancelled);
+        await first.Completion!;
+        ApplicationCommitAdmission nextRf = fixture.Coordinator.AdmitCommit(fixture.Run,
+            ApplicationCommitOperationClass.RfCommit, () => ValueTask.FromResult(
+                new InspectionAppendResult(InspectionAppendStatus.Committed, new(2), wasAccepted: true)));
+        Assert.AreEqual(ApplicationCommitTerminalStatus.Confirmed, (await nextRf.Completion).Status);
+        Assert.AreEqual(GatePlanEditOutcome.Accepted,
+            (await fixture.UseCase.TryApply(fixture.IntentCurrent(0.5), fixture.Context).WaitAsync()).Outcome);
+        GateHistoricalReplacementSubmission retry = await secondCoordinator.TryAdmitAsync(fixture.AuthorityKey,
+            fixture.Context, new(1), [new GateReprocessingStreamSelection(stream, [new(0, 0)])], 1);
+        Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.Admitted, retry.Status);
+        secondScheduler.Complete(GateReprocessingLifecycle.Cancelled);
+        await retry.Completion!;
+    }
+
+    [TestMethod]
     public async Task SealedRunHandoffReturnsAfterAdmissionAndStopsOnlyAfterTerminalObserver()
     {
         await using var fixture = new Fixture();
@@ -461,6 +504,8 @@ public sealed class GatePlanApplyUseCaseTests
             fixture.Context, new(fixture.Run, new(1), 0, 0, null, null, 1, 0), stream, 1);
 
         Task dispose = historical.DisposeAsync().AsTask();
+        Task repeatedDispose = historical.DisposeAsync().AsTask();
+        Assert.AreSame(dispose, repeatedDispose);
         Assert.IsFalse(dispose.IsCompleted);
         Assert.AreEqual(GateHistoricalReplacementSubmissionStatus.Closed,
             (await coordinator.TryAdmitAsync(fixture.AuthorityKey, fixture.Context, new(1),
@@ -470,9 +515,38 @@ public sealed class GatePlanApplyUseCaseTests
         await dispose.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.IsNull(terminal.ObserverError);
+        Assert.IsTrue(historical.LedgerDiagnostics.IsStableAfterDrain);
+        Assert.AreEqual(0, historical.LedgerDiagnostics.Active);
+        Assert.AreEqual(0, historical.LedgerDiagnostics.Disposing);
+        Assert.AreEqual(1, historical.LedgerDiagnostics.Disposed);
+        Assert.AreEqual(0, historical.LedgerDiagnostics.PendingObservers);
+        Assert.AreEqual(0, historical.LedgerDiagnostics.PendingLeases);
+        Assert.AreEqual(0, historical.LedgerDiagnostics.PendingTombstones);
         Assert.AreEqual(GateCandidateReservationStatus.Closed, fixture.Store.ReplacementControl.ReserveCandidate(
             fixture.Inspection, fixture.Run, fixture.Context.RunGeneration, fixture.AuthorityKey.PlanId,
             new(2), new(Guid.NewGuid())).Status);
+    }
+
+    [TestMethod]
+    public void InspectionScopedOptionsKeepIndependentDefaultsAndRejectEachInvalidLimit()
+    {
+        var defaults = new GateHeadlessInspectionOptions();
+        Assert.AreEqual(8, defaults.MaximumRetainedLedgers);
+        Assert.AreEqual(64 * 1024, defaults.MaximumEstimatedLedgerBytes);
+        Assert.AreEqual(64, defaults.MaximumHistoricalObservers);
+        Assert.AreEqual(64, defaults.MaximumReplacementCandidates);
+        Assert.AreEqual(64, defaults.MaximumHistoricalJobs);
+        Assert.AreEqual(8, defaults.MaximumLiveEpochsPerRun);
+        Assert.AreEqual(defaults.MaximumHistoricalJobs, defaults.SchedulerOptions().MaximumAdmittedJobs);
+        Assert.AreEqual(defaults.MaximumRetainedLedgers,
+            defaults.AuthorityOptions().MaximumRetainedLedgersPerInspection);
+
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateHeadlessInspectionOptions(
+            maximumHistoricalObservers: 0));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateHeadlessInspectionOptions(
+            maximumReplacementCandidates: 0));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GateHeadlessInspectionOptions(
+            maximumLiveEpochsPerRun: 0));
     }
 
     [TestMethod]
@@ -735,7 +809,7 @@ public sealed class GatePlanApplyUseCaseTests
     {
         internal readonly InspectionId Inspection = new(Guid.NewGuid());
         internal readonly AcquisitionRunId Run = new(Guid.NewGuid());
-        internal readonly InMemoryGateDerivedStore Store = new();
+        internal readonly InMemoryGateDerivedStore Store;
         internal readonly InspectionDataStoreRegistry Registry;
         internal readonly InMemoryGatePlanAuthorityOwner Authority;
         internal readonly IGatePlanAuthorityReader Reader;
@@ -748,8 +822,10 @@ public sealed class GatePlanApplyUseCaseTests
         internal readonly GatePlanApplyRunContext Context;
 
         internal Fixture(int coordinatorCapacity = 8, GateProcessingOptions? processingOptions = null,
-            bool faultEpochCommit = false, bool throwEpochCommit = false, bool throwInvariantEpochCommit = false)
+            bool faultEpochCommit = false, bool throwEpochCommit = false, bool throwInvariantEpochCommit = false,
+            int maximumReplacementCandidates = 64)
         {
+            Store = new(null, new(), maximumReplacementCandidates);
             CompiledGatePlan initial = Compile(1);
             var committed = new CommittedGatePlanSnapshot(Inspection, initial);
             Authority = new([committed]); Reader = Authority.Seal(); AuthorityKey = committed.AuthorityKey;

@@ -58,9 +58,12 @@ public sealed partial class InMemoryGateDerivedStore : IGateDerivedStore, IGateP
         : this(options, new DesiredReplacementControlLimits()) { }
 
     internal InMemoryGateDerivedStore(GateDerivedStoreOptions? options,
-        DesiredReplacementControlLimits desiredReplacementLimits)
+        DesiredReplacementControlLimits desiredReplacementLimits,
+        int maximumReplacementCandidates = 64)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maximumReplacementCandidates, 1);
         _options = options ?? new();
+        _maximumReplacementCandidates = maximumReplacementCandidates;
         _desiredReplacementLimits = desiredReplacementLimits ?? throw new ArgumentNullException(nameof(desiredReplacementLimits));
         _desiredReplacementTombstones = new DesiredReplacementReservationTombstone[
             desiredReplacementLimits.TerminalReservationTombstoneCapacity];

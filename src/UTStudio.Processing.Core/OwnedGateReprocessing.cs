@@ -24,3 +24,9 @@ internal interface IOwnedGateReprocessingLifecycle : IAsyncDisposable
     void CloseAdmission();
     Task StopAsync();
 }
+
+/// <summary>Segregated inspection lifecycle for the owner of live epochs, workers, callbacks and leases.</summary>
+internal interface IGateLiveProcessingLifecycle : IAsyncDisposable
+{
+    GateProcessingDiagnostics Diagnostics { get; }
+}

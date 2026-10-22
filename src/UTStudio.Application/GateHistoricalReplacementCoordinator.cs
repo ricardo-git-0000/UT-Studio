@@ -133,7 +133,7 @@ internal sealed class GateHistoricalReplacementCoordinator
                     GateHistoricalAdmissionState.Faulted);
                 ReleaseObserver();
             }
-            else _ = TrackDetachedAsync(observation, terminal);
+            else _ = TrackDetachedAsync(observation, terminal, authority, plan.Source.Revision);
             throw;
         }
         if (admission.Status != GateReprocessingAdmissionStatus.Admitted)
@@ -147,7 +147,7 @@ internal sealed class GateHistoricalReplacementCoordinator
             return new(Map(admission.Status));
         }
         return new(GateHistoricalReplacementSubmissionStatus.Admitted,
-            TrackObserverAsync(observation, terminal));
+            TrackObserverAsync(observation, terminal, authority, plan.Source.Revision));
     }
 
     private bool TryReserveObserver(out GateHistoricalReplacementSubmissionStatus failure)
@@ -166,21 +166,41 @@ internal sealed class GateHistoricalReplacementCoordinator
 
     private async Task<GateHistoricalReplacementTerminal> TrackObserverAsync(
         Task<GateHistoricalReplacementTerminal> observation,
-        Func<GateHistoricalReplacementTerminal, ValueTask>? terminal)
+        Func<GateHistoricalReplacementTerminal, ValueTask>? terminal,
+        GatePlanAuthorityKey authority, GatePlanRevision revision)
     {
+        Exception? primary = null;
         try
         {
             GateHistoricalReplacementTerminal result = await observation.ConfigureAwait(false);
             if (terminal is not null) await terminal(result).ConfigureAwait(false);
             return result;
         }
-        finally { ReleaseObserver(); }
+        catch (Exception error)
+        {
+            primary = error;
+            throw;
+        }
+        finally
+        {
+            try
+            {
+                Advance(authority, revision, current => Copy(current,
+                    pending: current.PendingResources & ~GateApplyLedgerPendingResource.Observer));
+            }
+            catch (Exception cleanup) when (primary is not null)
+            {
+                throw new AggregateException(primary, cleanup);
+            }
+            finally { ReleaseObserver(); }
+        }
     }
 
     private async Task TrackDetachedAsync(Task<GateHistoricalReplacementTerminal> observation,
-        Func<GateHistoricalReplacementTerminal, ValueTask>? terminal)
+        Func<GateHistoricalReplacementTerminal, ValueTask>? terminal,
+        GatePlanAuthorityKey authority, GatePlanRevision revision)
     {
-        try { await TrackObserverAsync(observation, terminal).ConfigureAwait(false); }
+        try { await TrackObserverAsync(observation, terminal, authority, revision).ConfigureAwait(false); }
         catch { /* The admission exception remains primary; terminal ownership was still drained. */ }
     }
 
@@ -343,7 +363,8 @@ internal sealed class GateHistoricalReplacementCoordinator
                                 previous: state, primary: cause,
                                 pending: state == GatePreviousViewRetirementState.DeferredByLeases ?
                                     GateApplyLedgerPendingResource.Observer |
-                                    GateApplyLedgerPendingResource.Tombstone : GateApplyLedgerPendingResource.None));
+                                    GateApplyLedgerPendingResource.Lease |
+                                    GateApplyLedgerPendingResource.Tombstone : GateApplyLedgerPendingResource.Observer));
                             if (state == GatePreviousViewRetirementState.DeferredByLeases)
                             {
                                 previous = await _owner._store.CompletePreviousViewRetirementAsync()
@@ -351,11 +372,12 @@ internal sealed class GateHistoricalReplacementCoordinator
                                 if (previous.Value.Status == GateDerivedMutationStatus.Reclaimed)
                                     _owner.Advance(_authority, _reservation.PlanRevision, current => Copy(current,
                                         previous: GatePreviousViewRetirementState.Retired,
-                                        pending: GateApplyLedgerPendingResource.None));
+                                        pending: GateApplyLedgerPendingResource.Observer));
                             }
                         }
                         else _owner.Advance(_authority, _reservation.PlanRevision,
-                            current => Copy(current, pending: GateApplyLedgerPendingResource.None));
+                            current => Copy(current, previous: GatePreviousViewRetirementState.NotApplicable,
+                                pending: GateApplyLedgerPendingResource.Observer));
                     }
                     else
                     {
@@ -444,7 +466,7 @@ internal sealed class GateHistoricalReplacementCoordinator
                 _owner.Advance(_authority, _reservation.PlanRevision, current => Copy(current,
                     retirement: GateCandidateRetirementState.Reclaimed,
                     ownership: GateCandidateOwnershipState.Reclaimed,
-                    pending: GateApplyLedgerPendingResource.None));
+                    pending: GateApplyLedgerPendingResource.Observer));
                 GateCandidateReclaimResult disposedReclaim = _owner._store.ReclaimCandidate(abandoned.Candidate);
                 return (abandoned, disposedReclaim);
             }
@@ -460,9 +482,14 @@ internal sealed class GateHistoricalReplacementCoordinator
                 _owner.Advance(_authority, _reservation.PlanRevision, current => Copy(current,
                     retirement: GateCandidateRetirementState.Reclaimed,
                     ownership: GateCandidateOwnershipState.Reclaimed,
-                    pending: GateApplyLedgerPendingResource.None));
+                    pending: GateApplyLedgerPendingResource.Observer));
             else if (reclaimed.Status != GateCandidateReclaimStatus.Busy)
                 throw new ApplicationCommitInvariantException($"Candidate reclaim returned {reclaimed.Status}.");
+            else _owner.Advance(_authority, _reservation.PlanRevision, current => Copy(current,
+                secondary: AppendCause(current,
+                    new(GateLedgerStage.CandidateRetirement, GateLedgerCauseKind.ReclaimBusy)),
+                pending: GateApplyLedgerPendingResource.Observer | GateApplyLedgerPendingResource.Lease |
+                    GateApplyLedgerPendingResource.Tombstone));
             return (abandoned, reclaimed);
         }
 
@@ -481,6 +508,7 @@ internal sealed class GateHistoricalReplacementCoordinator
                     GateCandidateCoverageState.Cancelled : GateCandidateCoverageState.Faulted,
                 activation: GateActivationState.Abandoned,
                 retirement: GateCandidateRetirementState.Required,
+                previous: GatePreviousViewRetirementState.NotApplicable,
                 ownership: GateCandidateOwnershipState.Reserved,
                 primary: new(GateLedgerStage.HistoricalExecution, kind),
                 secondary: [new(GateLedgerStage.CandidateCoverage, kind),
@@ -494,7 +522,7 @@ internal sealed class GateHistoricalReplacementCoordinator
             _owner.Advance(_authority, _reservation.PlanRevision, current => Copy(current,
                 retirement: GateCandidateRetirementState.Reclaimed,
                 ownership: GateCandidateOwnershipState.Reclaimed,
-                pending: GateApplyLedgerPendingResource.None));
+                pending: GateApplyLedgerPendingResource.Observer));
         }
     }
 }

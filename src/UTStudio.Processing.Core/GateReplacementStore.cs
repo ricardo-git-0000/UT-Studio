@@ -73,7 +73,8 @@ internal sealed class InMemoryGateReplacementStore(InMemoryGateDerivedStore stor
 
 public sealed partial class InMemoryGateDerivedStore
 {
-    private const int MaximumReplacementCandidates = 64;
+    private const int DefaultMaximumReplacementCandidates = 64;
+    private readonly int _maximumReplacementCandidates = DefaultMaximumReplacementCandidates;
     private readonly Dictionary<Guid, CandidateState> _replacementCandidates = [];
     private readonly Dictionary<(InspectionId, AcquisitionRunId, GatePlanId, GatePlanRevision), Guid>
         _candidateRevisionClaims = [];
@@ -97,7 +98,7 @@ public sealed partial class InMemoryGateDerivedStore
             if (!_desiredReplacements.TryGetValue(desiredKey, out InstalledDesiredReplacement? desired) ||
                 desired.RunId != runId || desired.RunGeneration != runGeneration || desired.PlanRevision != planRevision)
                 return new(GateCandidateReservationStatus.TokenSuperseded, null);
-            if (_replacementCandidates.Count >= MaximumReplacementCandidates)
+            if (_replacementCandidates.Count >= _maximumReplacementCandidates)
                 return new(GateCandidateReservationStatus.CapacityExceeded, null);
             Guid id = Guid.NewGuid();
             var reservation = new GateCandidateReservation(id, inspectionId, runId, runGeneration, planId,

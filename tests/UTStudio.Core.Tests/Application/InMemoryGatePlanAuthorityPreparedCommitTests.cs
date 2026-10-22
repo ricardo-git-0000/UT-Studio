@@ -343,16 +343,44 @@ public sealed class InMemoryGatePlanAuthorityPreparedCommitTests
             Assert.AreEqual(GatePlanAuthorityPrepareStatus.LedgerSlotCapacityExceeded,
                 owner.PreparedCommits.Prepare(Request(reader, initial.AuthorityKey)).Status);
         }
-        GateApplyLedgerSnapshot pending = GateApplyLedgerSnapshot.Create(Inspection, Run, new(1), new("pending"), new(1),
-            GateApplyCommitState.Accepted, GateLiveEpochState.NotApplicable, GateHistoricalAdmissionState.NotApplicable,
-            GateHistoricalExecutionState.NotApplicable, GateCandidateCoverageState.NotApplicable,
-            GateActivationState.NotApplicable, GateCandidateRetirementState.NotApplicable,
-            GatePreviousViewRetirementState.NotApplicable, pendingResources: GateApplyLedgerPendingResource.Observer);
-        using var pendingOwner = new InMemoryGatePlanAuthorityOwner([initial], default,
-            new(maximumRetainedLedgersPerInspection: 1), [new(pending)]);
-        IGatePlanAuthorityReader pendingReader = pendingOwner.Seal();
-        Assert.AreEqual(GatePlanAuthorityPrepareStatus.LedgerSlotCapacityExceeded,
-            pendingOwner.PreparedCommits.Prepare(Request(pendingReader, initial.AuthorityKey)).Status);
+        foreach (GateApplyLedgerPendingResource resource in new[] { GateApplyLedgerPendingResource.Observer,
+                     GateApplyLedgerPendingResource.Lease, GateApplyLedgerPendingResource.Tombstone })
+        {
+            GateApplyLedgerSnapshot pending = GateApplyLedgerSnapshot.Create(Inspection, Run, new(1),
+                new($"pending-{resource}"), new(1), GateApplyCommitState.Accepted,
+                GateLiveEpochState.NotApplicable, GateHistoricalAdmissionState.NotApplicable,
+                GateHistoricalExecutionState.NotApplicable, GateCandidateCoverageState.NotApplicable,
+                GateActivationState.NotApplicable, GateCandidateRetirementState.NotApplicable,
+                GatePreviousViewRetirementState.NotApplicable, pendingResources: resource);
+            using var pendingOwner = new InMemoryGatePlanAuthorityOwner([initial], default,
+                new(maximumRetainedLedgersPerInspection: 1), [new(pending)]);
+            IGatePlanAuthorityReader pendingReader = pendingOwner.Seal();
+            Assert.AreEqual(GatePlanAuthorityPrepareStatus.LedgerSlotCapacityExceeded,
+                pendingOwner.PreparedCommits.Prepare(Request(pendingReader, initial.AuthorityKey)).Status, resource.ToString());
+        }
+    }
+
+    [TestMethod]
+    public void LedgerLifecycleRetainsTerminalEvidenceThroughDisposingAndDisposed()
+    {
+        CommittedGatePlanSnapshot initial = Committed("lifecycle", 1);
+        GateApplyLedgerSnapshot terminal = TerminalLedger("lifecycle");
+        using var owner = new InMemoryGatePlanAuthorityOwner([initial], default, new(), [new(terminal)]);
+        owner.Seal();
+
+        owner.PreparedCommits.BeginLedgerDisposal();
+        GateApplyLedgerSnapshot disposing = owner.PreparedCommits.ReadRetainedLedgers(Inspection).Single();
+        Assert.AreEqual(GateApplyLedgerLifecycleState.Disposing, disposing.Lifecycle);
+        Assert.AreEqual(terminal.Activation, disposing.Activation);
+        Assert.AreEqual(terminal.CandidateRetirement, disposing.CandidateRetirement);
+
+        owner.PreparedCommits.CompleteLedgerDisposal();
+        GateApplyLedgerSnapshot disposed = owner.PreparedCommits.ReadRetainedLedgers(Inspection).Single();
+        GateLedgerLifecycleDiagnostics diagnostics = owner.PreparedCommits.ReadLifecycleDiagnostics(true);
+        Assert.AreEqual(GateApplyLedgerLifecycleState.Disposed, disposed.Lifecycle);
+        Assert.AreEqual(GateApplyLedgerPendingResource.None, disposed.PendingResources);
+        Assert.IsTrue(diagnostics.IsStableAfterDrain);
+        Assert.AreEqual(1, diagnostics.Disposed);
     }
 
     [TestMethod]

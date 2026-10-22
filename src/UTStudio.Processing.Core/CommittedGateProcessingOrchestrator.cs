@@ -45,7 +45,7 @@ internal readonly record struct GatePlanEpochTerminalTombstone(
 
 /// <summary>Bounded, sample-free post-commit reconciler. One worker preserves revision order.</summary>
 public sealed class CommittedGateProcessingOrchestrator : ICommittedGateProcessingIngress,
-    IPreparedGatePlanEpochPort, IAsyncDisposable
+    IPreparedGatePlanEpochPort, IAsyncDisposable, IGateLiveProcessingLifecycle
 {
     private readonly object _gate = new();
     private readonly IInspectionChangeProvider _catalog;

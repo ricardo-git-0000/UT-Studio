@@ -15,17 +15,41 @@ internal sealed class GateHistoricalRunServices : IAsyncDisposable
     private readonly GateHistoricalReplacementCoordinator _coordinator;
     private readonly IOwnedGateReprocessingLifecycle _scheduler;
     private readonly IGateReplacementStoreLifecycle _store;
+    private IGateLiveProcessingLifecycle? _live;
     private readonly InMemoryGatePlanAuthorityOwner _authorityOwner;
     private Task? _disposeTask;
 
     internal GateHistoricalRunServices(GateHistoricalReplacementCoordinator coordinator,
         IOwnedGateReprocessingLifecycle scheduler, IGateReplacementStoreLifecycle store,
-        InMemoryGatePlanAuthorityOwner authorityOwner)
+        InMemoryGatePlanAuthorityOwner authorityOwner, IGateLiveProcessingLifecycle? live = null)
     {
         _coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         _scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _authorityOwner = authorityOwner ?? throw new ArgumentNullException(nameof(authorityOwner));
+        _live = live;
+    }
+
+    internal GateLedgerLifecycleDiagnostics LedgerDiagnostics { get; private set; } =
+        new(false, 0, 0, 0, 0, 0, 0);
+
+    internal void CloseAdmission()
+    {
+        _coordinator.CloseAdmission();
+        _scheduler.CloseAdmission();
+    }
+
+    internal void AttachLiveLifecycle(IGateLiveProcessingLifecycle live)
+    {
+        ArgumentNullException.ThrowIfNull(live);
+        lock (_gate)
+        {
+            if (_disposeTask is not null)
+                throw new InvalidOperationException("The historical lifecycle is already closing.");
+            if (_live is not null && !ReferenceEquals(_live, live))
+                throw new InvalidOperationException("A different live lifecycle is already attached.");
+            _live = live;
+        }
     }
 
     internal async ValueTask<GateHistoricalReplacementSubmission> HandoffAsync(GatePlanApplyServices plans,
@@ -85,8 +109,7 @@ internal sealed class GateHistoricalRunServices : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
-        _coordinator.CloseAdmission();
-        _scheduler.CloseAdmission();
+        CloseAdmission();
         List<Exception> failures = [];
         try { await _scheduler.StopAsync().ConfigureAwait(false); }
         catch (Exception error) { failures.Add(error); }
@@ -94,8 +117,25 @@ internal sealed class GateHistoricalRunServices : IAsyncDisposable
         catch (Exception error) { failures.Add(error); }
         try { await _scheduler.DisposeAsync().ConfigureAwait(false); }
         catch (Exception error) { failures.Add(error); }
+        if (_live is not null)
+        {
+            try { await _live.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) { failures.Add(error); }
+        }
+        try { _authorityOwner.PreparedCommits.BeginLedgerDisposal(); }
+        catch (Exception error) { failures.Add(error); }
         try { await _store.DisposeAsync().ConfigureAwait(false); }
         catch (Exception error) { failures.Add(error); }
+        try
+        {
+            _authorityOwner.PreparedCommits.CompleteLedgerDisposal();
+            LedgerDiagnostics = _authorityOwner.PreparedCommits.ReadLifecycleDiagnostics(stableAfterDrain: true);
+        }
+        catch (Exception error)
+        {
+            LedgerDiagnostics = _authorityOwner.PreparedCommits.ReadLifecycleDiagnostics(stableAfterDrain: true);
+            failures.Add(error);
+        }
         try
         {
             _authorityOwner.Dispose();
