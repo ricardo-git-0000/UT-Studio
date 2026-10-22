@@ -8,7 +8,7 @@ using UTStudio.Domain.Processing;
 namespace UTStudio.Processing.Core;
 
 /// <summary>Bounded, reconstructible, non-authoritative RAM store for UT gate results.</summary>
-public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessingTerminalCoverageSink
+public sealed partial class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessingTerminalCoverageSink
 {
     private readonly object _gate = new();
     private readonly SemaphoreSlim _commitSerial = new(1, 1);
@@ -67,9 +67,11 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
         _runTransitionTombstones = new GateRunTransitionReservationTombstone[
             desiredReplacementLimits.TerminalRunTransitionTombstoneCapacity];
         DesiredReplacementControl = new(this);
+        ReplacementControl = new InMemoryGateReplacementStore(this);
     }
 
     internal PreparedDesiredReplacementOwner DesiredReplacementControl { get; }
+    internal IGateReplacementStore ReplacementControl { get; }
 
     public DerivedStoreRevision Revision { get { lock (_gate) { return new(_revision); } } }
     public ActiveDerivedViewDescriptor? ActiveView
@@ -380,6 +382,7 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
         if (classified.Status == GatePreparedReservationResultStatus.Committed)
         {
             foreach (DesiredReplacementKey key in prepared.OutgoingDesiredKeys) _desiredReplacements.Remove(key);
+            if (prepared.Outgoing is { } outgoing) RetireReplacementClaimsForRunUnderLock(outgoing.RunId);
             _activeVisible = prepared.Outgoing is null && _active is { } active &&
                 active.Descriptor.Manifest.InspectionId == prepared.Incoming.InspectionId &&
                 active.Descriptor.Manifest.RunId == prepared.Incoming.RunId;
@@ -932,6 +935,8 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
             reservationSize = totalSize;
             lock (_gate)
             {
+                if (_revision == ulong.MaxValue)
+                    return WriterResultUnderLock(GateDerivedMutationStatus.Faulted, "revision-overflow");
                 if (reservationSize > _options.LogicalPayloadBudgetBytes - _logicalBytes - _reservedBytes -
                     _reservedCoverageBytes - _reservedActivationBytes)
                 { _capacityExceeded++; return WriterResultUnderLock(GateDerivedMutationStatus.CapacityExceeded); }
@@ -943,6 +948,7 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
                     return WriterResultUnderLock(GateDerivedMutationStatus.Conflict, "stale-terminal-coverage");
                 ReleaseCoverageReservationUnderLock(reservationSize); reservationHeld = false;
                 _terminalCoverage = staged; _logicalBytes = checked(_logicalBytes + totalSize);
+                _revision = checked(_revision + 1);
                 return new GateDerivedMutationResult(GateDerivedMutationStatus.Committed,
                     new(_revision), wasAccepted: true);
             }
@@ -987,6 +993,7 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
             _active = null; _activeVisible = false; _batches.Clear(); _views.Clear(); _invalidated.Clear();
             _terminalCoverage.Clear();
             _usedViewIds.Clear(); _leaseViews.Clear(); _leasedMemberships.Clear();
+            ClearReplacementStateUnderLock();
             _logicalBytes = 0; _closed = true;
         }
     }
@@ -1059,7 +1066,26 @@ public sealed class InMemoryGateDerivedStore : IGateDerivedStore, IGateProcessin
         }
     }
     private void ReleaseLease(DerivedViewId viewId)
-    { lock (_gate) { _leases--; if (--_leaseViews[viewId] == 0) { _leaseViews.Remove(viewId); _leasedMemberships.Remove(viewId); } if (_leases == 0) _leasesDrained?.TrySetResult(); } }
+    {
+        lock (_gate)
+        {
+            _leases--;
+            if (--_leaseViews[viewId] == 0)
+            { _leaseViews.Remove(viewId); _leasedMemberships.Remove(viewId); }
+            SignalReplacementRetirementIfReadyUnderLock();
+            if (_leases == 0) _leasesDrained?.TrySetResult();
+        }
+    }
+
+    private bool HasInvalidatedLeaseBlockersUnderLock()
+    {
+        if (_invalidated.Count == 0) return false;
+        HashSet<GateDerivedBatchKey> retained = _views.Where(x => !_invalidated.Contains(x.Key))
+            .SelectMany(x => x.Value.Membership).ToHashSet();
+        HashSet<GateDerivedBatchKey> remove = _views.Where(x => _invalidated.Contains(x.Key))
+            .SelectMany(x => x.Value.Membership).Where(x => !retained.Contains(x)).ToHashSet();
+        return _leaseViews.Any(x => x.Value != 0 && _leasedMemberships[x.Key].Overlaps(remove));
+    }
     private static Task WaitUnderLock(int count, ref TaskCompletionSource? source)
     { if (count == 0) return Task.CompletedTask; source ??= new(TaskCreationOptions.RunContinuationsAsynchronously); return source.Task; }
     private GateDerivedMutationResult Result(GateDerivedMutationStatus status, string? error = null)

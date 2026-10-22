@@ -616,6 +616,31 @@ public sealed class GateReprocessingSchedulerTests
         Assert.AreEqual(0, provider.QueryCount);
     }
 
+    [TestMethod]
+    public async Task OwnedAdmissionBindsBeforeImmediateTerminalAndPublishesAuthoritativeReceipt()
+    {
+        var trace = new TraceDescriptor(new TraceIdentity(Stream, 0), 0, TimeSpan.Zero, null, null,
+            4, 10_000_000, 0, UtSignalMode.Rf, traceQuality: UtTraceQuality.Good);
+        var provider = new ScriptedSnapshotProvider(InspectionTraceReadResult.Available(new(1),
+            new ScriptedLease(trace)));
+        await using var store = new InMemoryGateDerivedStore();
+        await using var scheduler = new GateReprocessingScheduler(provider, store);
+        var owner = new ReceiptOwner();
+
+        GateReprocessingAdmissionResult admitted = await ((IOwnedGateReprocessingScheduler)scheduler)
+            .AdmitOwnedAsync(Descriptor(Compile(), new(1), Guid.NewGuid(), Guid.NewGuid()), owner);
+        GateReprocessingProgressSnapshot terminal = await admitted.Job!.Completion;
+
+        Assert.IsTrue(owner.WasBound);
+        Assert.AreSame(admitted.Job, owner.BoundJob);
+        Assert.AreEqual(GateReprocessingLifecycle.Completed, terminal.Lifecycle);
+        Assert.IsNotNull(terminal.StoreOnlyCandidate);
+        Assert.AreEqual(GateCandidateOwnershipState.Available,
+            terminal.StoreOnlyCandidate.OwnershipState);
+        Assert.AreEqual(terminal.SelectedTraceCount,
+            terminal.StoreOnlyCandidate.Manifest.TotalEligibleTraceCount);
+    }
+
     private static GateReprocessingJobDescriptor Descriptor(CompiledGatePlan plan, InspectionRevision revision,
         Guid job, Guid attempt, GateReprocessingPublicationPolicy policy = GateReprocessingPublicationPolicy.StoreOnly) =>
         new(new(job), new(attempt), Inspection, Run, revision,
@@ -633,6 +658,16 @@ public sealed class GateReprocessingSchedulerTests
             4, 10_000_000, 0, UtSignalMode.Rf, traceQuality: UtTraceQuality.Good);
         Assert.AreEqual(InspectionAppendStatus.Committed,
             (await writer.CommitAsync(new(new(descriptor, new short[] { 1, 7, 2, 0 })))).Status);
+    }
+
+    private sealed class ReceiptOwner : IGateReprocessingAdmissionOwner
+    {
+        internal bool WasBound { get; private set; }
+        internal IGateReprocessingJob? BoundJob { get; private set; }
+        public void Bind(IGateReprocessingJob job)
+        { BoundJob = job; WasBound = true; }
+        public GateStoreOnlyCandidateDescriptor MaterializeCandidate(GateDerivedCoverageManifest manifest) =>
+            new(manifest, new("owned-candidate"), new(1), new(1), GateCandidateOwnershipState.Available);
     }
 
     private sealed class ScriptedSnapshotProvider(InspectionTraceReadResult read) :

@@ -115,12 +115,10 @@ public sealed class GateReplacementCasObservedState
             candidate is not null && (ownership is null or GateCandidateOwnershipState.Reclaimed ||
                 candidate.OwnershipState != ownership))
             throw new ArgumentException("Candidate presence and material ownership must agree.", nameof(ownership));
-        if (candidate is not null && (candidate.ReplacementToken != desiredToken || candidate.Generation != desiredGeneration ||
-            candidate.Manifest.InspectionId != inspectionId || candidate.Manifest.RunId != runId ||
+        if (candidate is not null && (candidate.Manifest.InspectionId != inspectionId ||
             candidate.Manifest.PlanId != planId || candidate.Manifest.PlanRevision != planRevision))
             throw new ArgumentException("Observed candidate coordinates contradict the atomic CAS snapshot.", nameof(candidate));
-        if (predecessor is not null && (predecessor.Manifest.InspectionId != inspectionId ||
-            predecessor.Manifest.RunId != runId))
+        if (predecessor is not null && predecessor.Manifest.InspectionId != inspectionId)
             throw new ArgumentException("Observed predecessor coordinates contradict the atomic CAS snapshot.", nameof(predecessor));
         if (activeView is not null && (activeView.Manifest.InspectionId != inspectionId ||
             activeView.Manifest.RunId != runId))

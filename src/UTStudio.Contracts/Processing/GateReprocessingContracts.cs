@@ -135,7 +135,8 @@ public sealed class GateReprocessingProgressSnapshot
         GateReprocessingOperationProgress? activationProgress = null,
         GateReprocessingResourceProgress? bufferProgress = null,
         GateReprocessingResourceProgress? scratchProgress = null,
-        GateReprocessingResourceProgress? leaseProgress = null)
+        GateReprocessingResourceProgress? leaseProgress = null,
+        GateStoreOnlyCandidateDescriptor? storeOnlyCandidate = null)
     {
         bool terminal = lifecycle is GateReprocessingLifecycle.Completed or
             GateReprocessingLifecycle.Cancelled or GateReprocessingLifecycle.Faulted;
@@ -215,6 +216,20 @@ public sealed class GateReprocessingProgressSnapshot
         if (terminal && new[] { CommitProgress, CoverageProgress, ActivationProgress }
             .Where(x => x is not null).Any(x => x!.Active != 0))
             throw new ArgumentException("Terminal operation progress cannot retain active work.");
+        if (storeOnlyCandidate is not null)
+        {
+            GateDerivedCoverageManifest manifest = storeOnlyCandidate.Manifest;
+            if (lifecycle != GateReprocessingLifecycle.Completed ||
+                publicationPolicy != GateReprocessingPublicationPolicy.StoreOnly ||
+                storeOnlyCandidate.OwnershipState != GateCandidateOwnershipState.Available ||
+                manifest.SourceFinalRevision != sourceFinalRevision || manifest.PlanRevision != planRevision ||
+                manifest.TotalEligibleTraceCount != selected ||
+                planEpoch is null || manifest.PlanId != planEpoch.PlanId ||
+                !string.Equals(manifest.PlanSignature, planEpoch.Signature.Hex, StringComparison.Ordinal) ||
+                manifest.SchemaVersion != planEpoch.SchemaVersion || manifest.AlgorithmVersion != planEpoch.AlgorithmVersion)
+                throw new ArgumentException("The StoreOnly terminal receipt is inconsistent.", nameof(storeOnlyCandidate));
+        }
+        StoreOnlyCandidate = storeOnlyCandidate;
     }
     public GateReprocessingJobId JobId { get; }
     public GateReprocessingAttemptId AttemptId { get; }
@@ -280,6 +295,7 @@ public sealed class GateReprocessingProgressSnapshot
     public GateReprocessingResourceProgress? BufferProgress { get; }
     public GateReprocessingResourceProgress? ScratchProgress { get; }
     public GateReprocessingResourceProgress? LeaseProgress { get; }
+    public GateStoreOnlyCandidateDescriptor? StoreOnlyCandidate { get; }
 }
 
 public sealed record GateReprocessingPlanEpoch

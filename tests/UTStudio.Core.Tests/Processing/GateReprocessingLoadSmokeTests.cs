@@ -327,7 +327,8 @@ public sealed class GateReprocessingLoadSmokeTests
         GateDerivedStoreDiagnostics diagnostics = derived.Diagnostics;
         Assert.AreEqual(expectedLifecycle == GateReprocessingLifecycle.Completed ? 1 : 0,
             diagnostics.TerminalEvidenceCount, scenario.ToString());
-        Assert.AreEqual((ulong)diagnostics.BatchCount + (ulong)diagnostics.Activations,
+        Assert.AreEqual((ulong)diagnostics.BatchCount + (ulong)diagnostics.Activations +
+            (ulong)diagnostics.TerminalEvidenceCount,
             diagnostics.Revision.Value, scenario.ToString());
         if (scenario.Termination == LoadTermination.Normal)
             Assert.AreEqual(expected, terminal.NewlyCommittedBatchCount, scenario.ToString());

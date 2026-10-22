@@ -246,6 +246,9 @@ internal sealed class InMemoryGatePlanPreparedCommitOwner
     internal IReadOnlyList<GateApplyLedgerSnapshot> ReadRetainedLedgers(InspectionId inspectionId) =>
         _reader.ReadRetainedLedgers(inspectionId);
     internal long EstimateLedgerBytes(GateApplyLedgerSnapshot ledger) => _reader.EstimateLedgerBytesForDiagnostics(ledger);
+    internal bool TryAdvanceLedger(GatePlanAuthorityKey authority, GatePlanRevision revision,
+        Func<GateApplyLedgerSnapshot, GateApplyLedgerSnapshot> transition) =>
+        _reader.TryAdvanceLedger(authority, revision, transition);
 }
 
 public sealed partial class InMemoryGatePlanAuthorityOwner
@@ -276,7 +279,7 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
                 if (budget.Retained.Count >= options.MaximumRetainedLedgersPerInspection ||
                     checked(budget.RetainedBytes + bytes) > options.MaximumEstimatedLedgerBytesPerInspection)
                     throw new ArgumentException("Seed ledgers exceed the configured budget.", nameof(retainedLedgers));
-                budget.Retained.Add(new(ledger, bytes, IsLedgerEvictionEligible(ledger)));
+                budget.Retained.Add(new(ledger, bytes));
                 budget.RetainedBytes += bytes;
             }
         }
@@ -362,7 +365,7 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
                     request.OperationGeneration, GatePreparedReservationState.Prepared);
                 var ticket = new ConfirmedAuthorityPublicationTicket(this, entry, authoritySnapshot);
                 var publication = new GatePlanAuthorityDeferredPublication(ticket);
-                var retained = new RetainedLedger(ledger, bytes, false);
+                var retained = new RetainedLedger(ledger, bytes);
                 var prepared = new PreparedAuthorityCommit(reservation, request.Authority, entry,
                     authoritySnapshot, geometry, ledger, retained, budget, evictions, publication,
                     ticket);
@@ -461,6 +464,38 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
         {
             ArgumentNullException.ThrowIfNull(ledger);
             lock (_gate) return EstimateLedgerBytes(ledger);
+        }
+
+        internal bool TryAdvanceLedger(GatePlanAuthorityKey authority, GatePlanRevision revision,
+            Func<GateApplyLedgerSnapshot, GateApplyLedgerSnapshot> transition)
+        {
+            ArgumentNullException.ThrowIfNull(transition);
+            lock (_gate)
+            {
+                if (_closing || !_entries.TryGetValue(authority, out Entry? entry) ||
+                    !_ledgerBudgets.TryGetValue(authority.InspectionId, out InspectionLedgerBudget? budget))
+                    return false;
+                RetainedLedger? retained = budget.Retained.SingleOrDefault(item =>
+                    item.Ledger.PlanId == authority.PlanId && item.Ledger.PlanRevision == revision);
+                if (retained is null) return false;
+                GateApplyLedgerSnapshot current = retained.Ledger;
+                GateApplyLedgerSnapshot next = transition(current) ??
+                    throw new ApplicationCommitInvariantException("A ledger transition returned null.");
+                GateApplyLedgerTransitionResult validation = GateApplyLedgerTransitionResult.Validate(current, next);
+                if (validation.Status != GateApplyLedgerTransitionStatus.Valid)
+                    throw new ApplicationCommitInvariantException(
+                        $"Invalid ledger transition {validation.Status} at {validation.Stage}.");
+                long bytes = EstimateLedgerBytes(next);
+                long adjusted = checked(budget.RetainedBytes - retained.EstimatedBytes + bytes);
+                if (adjusted > _preparedOptions.MaximumEstimatedLedgerBytesPerInspection)
+                    throw new ApplicationCommitInvariantException("A retained ledger transition exceeded its byte budget.");
+                retained.Ledger = next; retained.EstimatedBytes = bytes;
+                budget.RetainedBytes = adjusted;
+                if (entry.Ledger is { } installed && installed.PlanId == authority.PlanId &&
+                    installed.PlanRevision == revision)
+                    entry.ReplaceLedger(next);
+                return true;
+            }
         }
 
         internal bool PublishPrepared(ConfirmedAuthorityPublicationTicket requested)
@@ -636,11 +671,11 @@ public sealed partial class InMemoryGatePlanAuthorityOwner
             internal long RetainedBytes, ProvisionalBytes;
             internal int ProvisionalSlots;
         }
-        private sealed class RetainedLedger(GateApplyLedgerSnapshot ledger, long estimatedBytes, bool eligible)
+        private sealed class RetainedLedger(GateApplyLedgerSnapshot ledger, long estimatedBytes)
         {
-            internal GateApplyLedgerSnapshot Ledger { get; } = ledger;
-            internal long EstimatedBytes { get; } = estimatedBytes;
-            internal bool Eligible { get; } = eligible;
+            internal GateApplyLedgerSnapshot Ledger { get; set; } = ledger;
+            internal long EstimatedBytes { get; set; } = estimatedBytes;
+            internal bool Eligible => IsLedgerEvictionEligible(Ledger);
             internal bool EvictionReserved { get; set; }
         }
         private sealed record PreparedAuthorityCommit(GatePreparedReservation Reservation,

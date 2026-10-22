@@ -8,7 +8,7 @@ using UTStudio.Domain.Processing;
 namespace UTStudio.Processing.Core;
 
 /// <summary>Bounded historical scheduler. It owns workers and scratch that are not shared with live processing.</summary>
-public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
+public sealed class GateReprocessingScheduler : IGateReprocessingScheduler, IOwnedGateReprocessingScheduler
 {
     private readonly object _gate = new();
     private readonly IInspectionSealedRunSnapshotProvider _snapshots;
@@ -46,7 +46,16 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
     }
 
     public async ValueTask<GateReprocessingAdmissionResult> AdmitAsync(GateReprocessingJobDescriptor descriptor,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        await AdmitCoreAsync(descriptor, null, cancellationToken).ConfigureAwait(false);
+
+    ValueTask<GateReprocessingAdmissionResult> IOwnedGateReprocessingScheduler.AdmitOwnedAsync(
+        GateReprocessingJobDescriptor descriptor, IGateReprocessingAdmissionOwner owner,
+        CancellationToken cancellationToken) => AdmitCoreAsync(descriptor,
+            owner ?? throw new ArgumentNullException(nameof(owner)), cancellationToken);
+
+    private async ValueTask<GateReprocessingAdmissionResult> AdmitCoreAsync(GateReprocessingJobDescriptor descriptor,
+        IGateReprocessingAdmissionOwner? admissionOwner, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(descriptor);
         lock (_gate)
@@ -78,10 +87,12 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
             ValidateSnapshotHeader(snapshot, request);
             int[] selectedByStream = CountSelected(snapshot, descriptor.Selection, linked.Token);
             long selected = selectedByStream.Aggregate(0L, static (sum, value) => checked(sum + value));
-            var job = new Job(this, descriptor, snapshot, selected, selectedByStream, _timeProvider.GetUtcNow());
+            var job = new Job(this, descriptor, snapshot, selected, selectedByStream,
+                _timeProvider.GetUtcNow(), admissionOwner);
             lock (_gate)
             {
                 if (!_accepting) return ClosedAndDispose(job);
+                admissionOwner?.Bind(job);
                 _jobs.Add(job); job.SetLifecycle(GateReprocessingLifecycle.Admitted);
             }
             snapshot = null;
@@ -407,13 +418,19 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
         { FinishCancelled(job); return; }
         if (terminalResult.Status is not (GateDerivedMutationStatus.Committed or GateDerivedMutationStatus.Duplicate))
         { Fault(job, $"terminal-coverage-{terminalResult.Status}:{terminalResult.ErrorCode}"); return; }
-        if (job.Descriptor.PublicationPolicy == GateReprocessingPublicationPolicy.ActivateOnComplete)
+        var manifest = new GateDerivedCoverageManifest(job.Descriptor.InspectionId, job.Descriptor.RunId,
+            streams, job.Descriptor.SourceFinalRevision, job.Descriptor.Plan.Source.Id,
+            job.Descriptor.Plan.Source.Revision, job.Descriptor.Plan.Signature.Hex,
+            job.Descriptor.Plan.Source.SchemaVersion, job.Descriptor.Plan.Source.AlgorithmVersion,
+            checked((int)job.Selected), _store.Revision, coverageScope);
+        if (job.Descriptor.PublicationPolicy == GateReprocessingPublicationPolicy.StoreOnly &&
+            job.AdmissionOwner is { } owner)
         {
-            var manifest = new GateDerivedCoverageManifest(job.Descriptor.InspectionId, job.Descriptor.RunId,
-                streams, job.Descriptor.SourceFinalRevision, job.Descriptor.Plan.Source.Id,
-                job.Descriptor.Plan.Source.Revision, job.Descriptor.Plan.Signature.Hex,
-                job.Descriptor.Plan.Source.SchemaVersion, job.Descriptor.Plan.Source.AlgorithmVersion,
-                checked((int)job.Selected), _store.Revision, coverageScope);
+            GateStoreOnlyCandidateDescriptor candidate = owner.MaterializeCandidate(manifest);
+            job.SetStoreOnlyCandidate(candidate);
+        }
+        else if (job.Descriptor.PublicationPolicy == GateReprocessingPublicationPolicy.ActivateOnComplete)
+        {
             job.Cancellation.Token.ThrowIfCancellationRequested();
             job.CallbackActive(1);
             job.ActivationAttempt();
@@ -610,8 +627,10 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
         private readonly OperationCounter _commitProgress = new();
         private readonly OperationCounter _coverageProgress = new();
         private readonly OperationCounter _activationProgress = new();
+        private GateStoreOnlyCandidateDescriptor? _storeOnlyCandidate;
         internal Job(GateReprocessingScheduler owner, GateReprocessingJobDescriptor descriptor,
-            IInspectionSealedRunSnapshot snapshot, long selected, int[] selectedByStream, DateTimeOffset created)
+            IInspectionSealedRunSnapshot snapshot, long selected, int[] selectedByStream, DateTimeOffset created,
+            IGateReprocessingAdmissionOwner? admissionOwner)
         {
             _owner = owner; Descriptor = descriptor; Snapshot = snapshot; Selected = selected;
             Reader = new(snapshot, descriptor.Selection); Created = created; _updated = created;
@@ -624,6 +643,7 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
             ScratchPool = new JobGateScratchPool(owner._scratchPool);
             Evaluator = new GateEvaluator(ScratchPool);
             BufferPool = new JobReprocessingBufferPool(owner._sampleBuffers);
+            AdmissionOwner = admissionOwner;
         }
         internal GateReprocessingJobDescriptor Descriptor { get; }
         internal IInspectionSealedRunSnapshot Snapshot { get; }
@@ -634,6 +654,7 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
         internal JobGateScratchPool ScratchPool { get; }
         internal GateEvaluator Evaluator { get; }
         internal JobReprocessingBufferPool BufferPool { get; }
+        internal IGateReprocessingAdmissionOwner? AdmissionOwner { get; }
         internal bool IsTerminal { get { lock (_gate) return _lifecycle is GateReprocessingLifecycle.Completed or GateReprocessingLifecycle.Cancelled or GateReprocessingLifecycle.Faulted; } }
         public GateReprocessingProgressSnapshot Progress { get { lock (_gate) return SnapshotProgress(); } }
         public Task<GateReprocessingProgressSnapshot> Completion => _completion.Task;
@@ -708,6 +729,16 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
         internal void ActivationAttempt() { lock (_gate) _activationProgress.Attempt(); }
         internal void ActivationResult(GateDerivedMutationResult result) { lock (_gate) _activationProgress.Result(result); }
         internal void ActivationException() { lock (_gate) _activationProgress.Exception(); }
+        internal void SetStoreOnlyCandidate(GateStoreOnlyCandidateDescriptor candidate)
+        {
+            ArgumentNullException.ThrowIfNull(candidate);
+            lock (_gate)
+            {
+                if (_lifecycle != GateReprocessingLifecycle.Completing || _storeOnlyCandidate is not null)
+                    throw new InvalidOperationException("The StoreOnly candidate cannot be installed in this state.");
+                _storeOnlyCandidate = candidate;
+            }
+        }
         internal GateDerivedStreamCoverage[] BuildCoverage(CancellationToken cancellationToken)
         {
             var result = new GateDerivedStreamCoverage[_coverage.Length];
@@ -821,7 +852,8 @@ public sealed class GateReprocessingScheduler : IGateReprocessingScheduler
                     scratch.ReturnAttempted, scratch.ReturnSucceeded, scratch.ReturnFailed,
                     scratch.ActiveRentals, scratch.PeakActiveRentals, scratch.OwnedElements, scratch.PeakOwnedElements),
                 new(_leasesAcquired, _leasesAcquired, 0, _leasesReleased + _leaseReleaseFailed,
-                    _leasesReleased, _leaseReleaseFailed, _activeLeases, _peakLeases));
+                    _leasesReleased, _leaseReleaseFailed, _activeLeases, _peakLeases),
+                _storeOnlyCandidate);
         }
     }
 

@@ -382,16 +382,27 @@ public sealed class GateEditorContractTests
     public void ObservedCasStateRejectsEveryContradictoryCoordinateAndOwnership()
     {
         GateStoreOnlyCandidateDescriptor candidate = Candidate(Manifest());
-        AssertObservedRejected(candidate, desiredToken: new(5));
-        AssertObservedRejected(candidate, desiredGeneration: new(8));
         AssertObservedRejected(Candidate(ManifestVariant(inspection: new(Guid.NewGuid()))));
-        AssertObservedRejected(Candidate(ManifestVariant(run: new(Guid.NewGuid()))));
         AssertObservedRejected(Candidate(ManifestVariant(planId: new("other-plan"))));
         AssertObservedRejected(Candidate(ManifestVariant(planRevision: new(2))));
         AssertObservedRejected(candidate, ownership: null);
         AssertObservedRejected(candidate, ownership: GateCandidateOwnershipState.Reclaimed);
         AssertObservedRejected(null, ownership: GateCandidateOwnershipState.Available);
         AssertObservedRejected(null, ownership: GateCandidateOwnershipState.Reserved);
+    }
+
+    [TestMethod]
+    public void ObservedCasStateAllowsCandidateFromSupersededDesiredAndClassifiesToken()
+    {
+        GateStoreOnlyCandidateDescriptor candidate = Candidate(Manifest());
+        var observed = new GateReplacementCasObservedState(
+            GateApplyLedgerLifecycleState.Active, Inspection, Run, new("plan"), new(1), new(8),
+            new(5), new(8), GateObservedPredecessorKind.None, null, candidate,
+            GateCandidateOwnershipState.Available, true, null);
+        var request = new GateCandidateActivationRequest(candidate, null, Run, new(8));
+
+        Assert.AreEqual(GateCandidateActivationStatus.TokenSuperseded,
+            GateCandidateActivationResult.Classify(request, observed).Status);
     }
 
     [TestMethod]

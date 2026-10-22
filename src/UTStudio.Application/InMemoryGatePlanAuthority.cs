@@ -318,6 +318,12 @@ public sealed partial class InMemoryGatePlanAuthorityOwner : IDisposable
         internal GatePlanGeometrySnapshot? Geometry { get; private set; }
         internal GateApplyLedgerSnapshot? Ledger { get; private set; }
 
+        internal void ReplaceLedger(GateApplyLedgerSnapshot ledger)
+        {
+            ArgumentNullException.ThrowIfNull(ledger);
+            lock (_subscriptions) Ledger = ledger;
+        }
+
         internal List<Subscription> EnqueueDeferred(GatePlanAuthoritySnapshot snapshot)
         {
             lock (_subscriptions)

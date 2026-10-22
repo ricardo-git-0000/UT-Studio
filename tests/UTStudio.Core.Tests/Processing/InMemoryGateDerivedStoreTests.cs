@@ -173,7 +173,7 @@ public sealed class InMemoryGateDerivedStoreTests
         Assert.AreEqual(GateDerivedMutationStatus.CoverageMismatch,
             Activate(store, manifest, "wrong").Status);
         Assert.IsNull(store.ActiveView);
-        Assert.AreEqual(new DerivedStoreRevision(1), store.Revision);
+        Assert.AreEqual(new DerivedStoreRevision(2), store.Revision);
     }
 
     [TestMethod]

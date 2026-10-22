@@ -61,7 +61,7 @@ public readonly record struct GateLedgerCause
                 GateLedgerCauseKind.CandidateNotAvailable or GateLedgerCauseKind.AlreadyActivated or
                 GateLedgerCauseKind.RunSuperseded or
                 GateLedgerCauseKind.CandidateAbandoned or GateLedgerCauseKind.Faulted,
-            GateLedgerStage.CandidateRetirement => kind == GateLedgerCauseKind.ReclaimBusy,
+            GateLedgerStage.CandidateRetirement => kind is GateLedgerCauseKind.ReclaimBusy or GateLedgerCauseKind.Disposed,
             GateLedgerStage.PreviousViewRetirement => kind is GateLedgerCauseKind.DeferredByLeases or GateLedgerCauseKind.Faulted,
             GateLedgerStage.Lifecycle => kind == GateLedgerCauseKind.Disposed,
             _ => false
@@ -153,7 +153,7 @@ public readonly record struct GateApplyLedgerTransitionResult
         GateLedgerStage.CandidateRetirement => state is nameof(GateCandidateRetirementState.Reclaimed) or
             nameof(GateCandidateRetirementState.NotApplicable) or nameof(GateCandidateRetirementState.Activated),
         GateLedgerStage.PreviousViewRetirement => state is nameof(GatePreviousViewRetirementState.Retired) or
-            nameof(GatePreviousViewRetirementState.NotApplicable) or nameof(GatePreviousViewRetirementState.DeferredByLeases) or
+            nameof(GatePreviousViewRetirementState.NotApplicable) or
             nameof(GatePreviousViewRetirementState.Faulted),
         _ => false
     };
@@ -231,6 +231,8 @@ public readonly record struct GateApplyLedgerTransitionResult
             GatePreviousViewRetirementState.DeferredByLeases or GatePreviousViewRetirementState.Faulted,
         GatePreviousViewRetirementState.Retiring => to is GatePreviousViewRetirementState.Retired or
             GatePreviousViewRetirementState.DeferredByLeases or GatePreviousViewRetirementState.Faulted,
+        GatePreviousViewRetirementState.DeferredByLeases => to is GatePreviousViewRetirementState.Retiring or
+            GatePreviousViewRetirementState.Retired or GatePreviousViewRetirementState.Faulted,
         _ => false
     };
     private static bool OwnershipCanAdvance(GateCandidateOwnershipState? from, GateCandidateOwnershipState? to) =>
@@ -519,7 +521,8 @@ public sealed class GateApplyLedgerSnapshot : IEquatable<GateApplyLedgerSnapshot
             nameof(GateCandidateRetirementState.Reclaimed))
         {
             GateLedgerCause? retirement = causes.Where(x => x.Stage == stage).Cast<GateLedgerCause?>().SingleOrDefault();
-            if (retirement is not null && retirement.Value.Kind != GateLedgerCauseKind.ReclaimBusy)
+            if (retirement is not null && retirement.Value.Kind is not
+                (GateLedgerCauseKind.ReclaimBusy or GateLedgerCauseKind.Disposed))
                 throw new ArgumentException("Ledger cause is incompatible with candidate retirement.", nameof(causes));
             return;
         }
@@ -531,6 +534,22 @@ public sealed class GateApplyLedgerSnapshot : IEquatable<GateApplyLedgerSnapshot
                 GateLedgerCauseKind.CandidateNotAvailable, GateLedgerCauseKind.Disposed];
             if (rejection is null || !allowed.Contains(rejection.Value.Kind))
                 throw new ArgumentException("CAS rejection requires its concrete typed cause.", nameof(causes));
+            return;
+        }
+        if (stage == GateLedgerStage.Activation && name == nameof(GateActivationState.Superseded))
+        {
+            GateLedgerCause? superseded = causes.Where(x => x.Stage == stage).Cast<GateLedgerCause?>().SingleOrDefault();
+            if (superseded is null || superseded.Value.Kind is not
+                (GateLedgerCauseKind.Superseded or GateLedgerCauseKind.TokenSuperseded))
+                throw new ArgumentException("Activation supersession requires its typed cause.", nameof(causes));
+            return;
+        }
+        if (stage == GateLedgerStage.PreviousViewRetirement &&
+            name == nameof(GatePreviousViewRetirementState.Retired))
+        {
+            GateLedgerCause? retirement = causes.Where(x => x.Stage == stage).Cast<GateLedgerCause?>().SingleOrDefault();
+            if (retirement is not null && retirement.Value.Kind != GateLedgerCauseKind.DeferredByLeases)
+                throw new ArgumentException("Previous-view retirement retained an incompatible cause.", nameof(causes));
             return;
         }
         RequireCause(stage, expected, causes);
