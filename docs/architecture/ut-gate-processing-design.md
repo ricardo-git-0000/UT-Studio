@@ -118,7 +118,9 @@ Colecciones se copian al construir; no se usan diccionarios `string/object`. Cad
 tipados. Segundos son `double` finitos; amplitud inicial, cuentas digitales. El porcentaje visual del A-Scan
 no es unidad de procesamiento.
 
-El modelo canónico de Fase 2 usa `GateSchemaVersion=2` y `GateAlgorithmVersion=2`. No existe una política
+El modelo canónico usa `GateSchemaVersion=2` y `GateAlgorithmVersion=3`. La versión 3 filtra candidatos de máximo
+local en el orden vecindad, prominencia, umbral estricto, distancia y selección temporal. Los planes v2 se rechazan
+por versión en el compilador actual y no se reinterpretan. No existe una política
 `GoodOnly` por puerta: la calidad efectiva del descriptor confirmado es la única autoridad.
 
 Firma completa de reproducibilidad:

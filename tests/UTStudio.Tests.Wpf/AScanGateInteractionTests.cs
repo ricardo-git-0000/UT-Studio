@@ -315,7 +315,8 @@ public sealed class AScanGateInteractionTests
             var trace = new TraceIdentity(stream, 1); signal.SetAuthority(trace, new(1));
             GateDefinition gate = new(new("A"), new(1), new(GateTimeReference.TraceOrigin(), 0, 6e-6),
                 GateSignalDomain.RawSigned, new(GateDetectorKind.FirstRisingCrossing, new(.25)), [GateMeasureKind.Amplitude]);
-            GatePlan plan = new(new("plan"), new(2), new(2), new(2), [gate]);
+            GatePlan plan = new(new("plan"), new(2), new(2),
+                new(GatePlanCompilerOptions.CurrentAlgorithmVersion), [gate]);
             GatePlanSignature signature = new GatePlanCompiler().Compile(plan).CompiledPlan!.Signature;
             var source = GateGeometrySourceIdentity.PreviewSource(new(inspection, plan.Id), new(1),
                 plan.Revision, signature, new(Guid.NewGuid(), 1));

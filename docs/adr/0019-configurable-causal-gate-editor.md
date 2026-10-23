@@ -1,7 +1,7 @@
 # ADR 0019 — Editor configurable de detectores y referencias causales
 
-Fecha: 2026-10-22. Estado: implementados la corrección de usabilidad y el bootstrap estacionario A/B/C;
-la edición de detector/referencia, algoritmo v3 y eventos exactos visibles siguen aceptados pero no implementados.
+Fecha: 2026-10-22. Estado: implementados la corrección de usabilidad, el bootstrap estacionario A/B/C y el
+algoritmo v3 de máximos locales; la edición de detector/referencia y los eventos exactos visibles siguen pendientes.
 
 ## Contexto
 
@@ -16,8 +16,8 @@ campos editables. Se conservan sin cambios la autoridad única, draft no autorit
 epochs, control de revisiones, histórico y artefacto exacto autenticado.
 
 La aceptación no significa disponibilidad general. Esta rama implementa descubrimiento y edición de ventanas,
-además del selector previo a Start y el bootstrap estacionario A/B/C descrito abajo. Detector y referencia
-configurables, algoritmo v3 y eventos detectados visibles siguen sin implementar.
+el selector previo a Start, el bootstrap estacionario A/B/C y la semántica v3 de máximos locales. Detector y
+referencia configurables y eventos detectados visibles siguen sin implementar.
 
 El draft podrá cambiar, para puertas existentes, ventana, detector, parámetros compatibles y referencia causal.
 La cardinalidad e identidad permanecen fijas: crear y eliminar puertas queda fuera de alcance.
@@ -35,9 +35,10 @@ La cardinalidad e identidad permanecen fijas: crear y eliminar puertas queda fue
   inexistentes y ciclos se rechazan al compilar Preview. Un padre sin evento produce `DependencyNotDetected`,
   sin cero ni evento antiguo.
 
-El cambio de orden de filtrado de máximos locales modifica resultados reproducibles. Su implementación requiere
-incrementar a `GateAlgorithmVersion=3` y actualizar firma/golden tests. Un plan v2 nunca se evalúa con reglas v3;
-si una versión no está soportada se rechaza de forma tipada, sin reinterpretar ni sobrescribir su identidad.
+El cambio de orden de filtrado de máximos locales modifica resultados reproducibles y se implementa como
+`GateAlgorithmVersion=3`, con firma y golden propios. El compilador actual solo admite v3: un plan v2 conservado
+mantiene su identidad histórica, pero debe procesarse con un runtime v2 compatible o migrarse explícitamente a un
+plan v3 nuevo. Nunca se evalúa con reglas v3 ni se sobrescribe silenciosamente su versión.
 
 ## Perfiles de simulación y bootstrap
 

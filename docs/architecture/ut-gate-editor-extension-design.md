@@ -1,19 +1,20 @@
 # Ampliación del editor A-Scan: detectores, causalidad y tres puertas
 
-Fecha: 2026-10-22. Estado: decisiones aceptadas no implementadas, salvo la corrección de usabilidad del bloque 1.
+Fecha: 2026-10-22. Estado: implementados usabilidad, algoritmo v3 y perfil estacionario; edición estructural y
+representación exacta de eventos siguen pendientes.
 
 ## Separación del trabajo
 
 1. **Usabilidad implementada en esta rama:** descubrir y seleccionar la puerta existente; handles interiores sin alterar tiempos;
    arrastre, teclado y controles numéricos por el mismo draft; Preview y Apply separados.
-2. **Semántica aceptada, no implementada:** máximo/mínimo sin umbral; cruces interpolados; máximos locales con umbral estricto
-   antes de supresión por distancia y selección temporal.
+2. **Semántica v3 implementada:** cruces interpolados sin cambios; máximos locales con umbral estricto antes de
+   supresión por distancia y selección temporal.
 3. **Edición aceptada, no implementada:** formulario discriminado y recompilación del DAG mediante Preview.
 4. **Perfil estacionario implementado:** selector previo a Start y bootstrap A/B/C para inspecciones nuevas;
    el perfil móvil vigente se conserva como predeterminado.
 5. **Eventos exactos aceptados, no implementados:** resultados originales proyectados con identidad completa.
 
-Los bloques 1 y 4 están implementados. Los bloques 2, 3 y 5 siguen fuera de este incremento.
+Los bloques 1, 2 y 4 están implementados. Los bloques 3 y 5 siguen fuera de este incremento.
 
 ## Umbral por dominio
 
@@ -43,6 +44,9 @@ no puede coexistir con threshold simple. `RectifiedInput` no se ofrece.
 Si no existe candidato tras vecindad/prominencia, el resultado es `NoEvent`. Si existían candidatos locales
 prominentes pero ninguno cumple `amplitud > threshold`, es `BelowThreshold`. Nunca se transforma el modo en cruce
 ni máximo global.
+
+Esta semántica pertenece exclusivamente a `GateAlgorithmVersion=3`. El compilador rechaza v2 con
+`InvalidVersion`; los artefactos y resultados v2 conservan su versión y firma históricas y no se reinterpretan.
 
 ## Perfil estacionario A/B/C implementado
 

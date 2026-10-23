@@ -97,12 +97,25 @@ public sealed class GatePlanCompilerTests
             [GateTestPlan.Gate("A")])), GateCompilationErrorCode.InvalidIdentity);
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A")], schema: 1)),
             GateCompilationErrorCode.InvalidVersion);
-        AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A")], algorithm: 3)),
+        AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A")], algorithm: 2)),
             GateCompilationErrorCode.InvalidVersion);
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A", durationSeconds: 0)])),
             GateCompilationErrorCode.InvalidDuration);
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A",
             offsetSeconds: double.MaxValue, durationSeconds: double.MaxValue)])), GateCompilationErrorCode.TemporalOverflow);
+    }
+
+    [TestMethod]
+    public void AlgorithmV3IsRequiredAndV2IsRejectedWithoutReinterpretation()
+    {
+        GatePlanCompilationResult current = _compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A")]));
+        Assert.IsTrue(current.IsCompiled);
+        Assert.AreEqual((ushort)3, current.CompiledPlan!.Source.AlgorithmVersion.Value);
+
+        GatePlanCompilationResult legacy = _compiler.Compile(
+            GateTestPlan.Plan([GateTestPlan.Gate("A")], algorithm: 2));
+        AssertFailure(legacy, GateCompilationErrorCode.InvalidVersion);
+        StringAssert.Contains(legacy.Errors.Single().Message, "must be 3");
     }
 
     [TestMethod]

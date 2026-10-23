@@ -69,7 +69,7 @@ public sealed class GateSignatureAndArchitectureTests
     {
         string actual = new GatePlanCompiler().Compile(
             GateTestPlan.Plan([GateTestPlan.Gate("A")])).CompiledPlan!.Signature.Hex;
-        Assert.AreEqual("ADBA1CC30AEAEB12536FA8974A15B89D8F20C0980AAA452C51485EBC09EE29E4", actual);
+        Assert.AreEqual("F4DDEE3AC754099BFAF499BB41737BABC46EAA57045582FAD9C71A46E842D7D4", actual);
     }
 
     [TestMethod]

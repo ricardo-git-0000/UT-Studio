@@ -101,13 +101,18 @@ internal static class GateScalarReference
             }
             a = b + 1;
         }
+        double? threshold = normalized.HasValue ? Threshold(domain, normalized.Value) : null;
+        List<(int Index, double Amplitude, double Prominence)> eligible = threshold.HasValue
+            ? candidates.Where(x => x.Amplitude > threshold.Value).ToList() : candidates;
+        if (eligible.Count == 0)
+            return new(candidates.Count == 0 ? GateResultStatus.NoEvent : GateResultStatus.BelowThreshold,
+                GateDetectionEventKind.Unknown, null, null, null, null, null, null);
         List<(int Index, double Amplitude, double Prominence)> accepted = [];
-        foreach (var candidate in candidates.OrderByDescending(x => x.Amplitude).ThenByDescending(x => x.Prominence).ThenBy(x => x.Index))
+        foreach (var candidate in eligible.OrderByDescending(x => x.Amplitude).ThenByDescending(x => x.Prominence).ThenBy(x => x.Index))
             if (accepted.All(x => Math.Abs(x.Index - candidate.Index) >= p.MinimumDistanceSamples)) { accepted.Add(candidate); }
-        if (accepted.Count == 0) { return new(GateResultStatus.NoEvent, GateDetectionEventKind.Unknown, null, null, null, null, null, null); }
         var selected = first ? accepted.MinBy(x => x.Index) : accepted.MaxBy(x => x.Index);
-        double? margin = normalized.HasValue ? selected.Amplitude - Threshold(domain, normalized.Value) : null;
-        return new(margin < 0 ? GateResultStatus.BelowThreshold : GateResultStatus.Detected,
+        double? margin = threshold.HasValue ? selected.Amplitude - threshold.Value : null;
+        return new(GateResultStatus.Detected,
             GateDetectionEventKind.LocalMaximum, selected.Index, selected.Index, selected.Amplitude,
             samples[selected.Index], selected.Prominence, margin);
     }

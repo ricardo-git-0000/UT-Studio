@@ -251,6 +251,21 @@ public sealed class GateEvaluator
         }
         if (retained == 0) { return Detection.None(GateResultStatus.NoEvent); }
 
+        double? threshold = gate.Detector.Threshold is { } acceptance
+            ? ConvertNormalizedThreshold(gate.SignalDomain, acceptance.NormalizedValue) : null;
+        if (threshold is { } minimumAmplitude)
+        {
+            int eligible = 0;
+            for (int i = 0; i < retained; i++)
+            {
+                CheckCancellation(i, token, GateEvaluationCheckpoint.LocalOrdering);
+                GateCandidate candidate = scratch.Candidates[i];
+                if (candidate.Amplitude > minimumAmplitude) scratch.Candidates[eligible++] = candidate;
+            }
+            if (eligible == 0) { return Detection.None(GateResultStatus.BelowThreshold); }
+            retained = eligible;
+        }
+
         SortCandidates(scratch.Candidates, retained, token);
         ClearFenwick(scratch.Fenwick, length + 1, token);
         for (int i = 0; i < retained; i++)
@@ -271,13 +286,7 @@ public sealed class GateEvaluator
             { selected = i; }
         }
         GateCandidate result = scratch.Candidates[selected];
-        double? margin = gate.Detector.Threshold is { } acceptance
-            ? result.Amplitude - ConvertNormalizedThreshold(gate.SignalDomain, acceptance.NormalizedValue) : null;
-        if (margin < 0)
-        {
-            return Detection.Rejected(GateDetectionEventKind.LocalMaximum,
-            first + result.Index, result.Amplitude, samples[first + result.Index], result.Prominence, margin);
-        }
+        double? margin = threshold is { } acceptedThreshold ? result.Amplitude - acceptedThreshold : null;
         return Detection.Found(GateDetectionEventKind.LocalMaximum, first + result.Index, first + result.Index,
             result.Amplitude, samples[first + result.Index], result.Prominence, margin);
     }

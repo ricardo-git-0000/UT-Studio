@@ -228,6 +228,77 @@ public sealed class GateEvaluatorTests
     }
 
     [TestMethod]
+    [DataRow(GateSignalDomain.RawSigned)]
+    [DataRow(GateSignalDomain.Positive)]
+    [DataRow(GateSignalDomain.NegativeMagnitude)]
+    [DataRow(GateSignalDomain.Absolute)]
+    public void LocalMaximumThresholdFiltersEligibilityBeforeTemporalSelection(GateSignalDomain domain)
+    {
+        double threshold = NormalizedThreshold(domain, 6);
+        GateEvaluationEntry first = EvaluateOne(SignalForDomain(domain, [0, 5, 0, 8, 0]),
+            GateDetectorKind.FirstLocalMaximum, domain, threshold: threshold, local: new(1, 1, 1));
+        AssertDetected(first, 3, 8);
+        Assert.IsGreaterThan(0, first.Metrics.ThresholdMarginCounts!.Value);
+
+        GateEvaluationEntry last = EvaluateOne(SignalForDomain(domain, [0, 8, 0, 5, 0]),
+            GateDetectorKind.LastLocalMaximum, domain, threshold: threshold, local: new(1, 1, 1));
+        AssertDetected(last, 1, 8);
+    }
+
+    [TestMethod]
+    [DataRow(GateSignalDomain.RawSigned)]
+    [DataRow(GateSignalDomain.Positive)]
+    [DataRow(GateSignalDomain.NegativeMagnitude)]
+    [DataRow(GateSignalDomain.Absolute)]
+    public void LocalMaximumRequiresStrictlyGreaterThanThreshold(GateSignalDomain domain)
+    {
+        double threshold = NormalizedThreshold(domain, 6);
+        GateEvaluationEntry equal = EvaluateOne(SignalForDomain(domain, [0, 6, 0]),
+            GateDetectorKind.FirstLocalMaximum, domain, threshold: threshold, local: new(1, 1, 1));
+        Assert.AreEqual(GateResultStatus.BelowThreshold, equal.Status);
+        Assert.IsNull(equal.SampleIndex);
+
+        GateEvaluationEntry noneEligible = EvaluateOne(SignalForDomain(domain, [0, 5, 0]),
+            GateDetectorKind.LastLocalMaximum, domain, threshold: threshold, local: new(1, 1, 1));
+        Assert.AreEqual(GateResultStatus.BelowThreshold, noneEligible.Status);
+        Assert.IsNull(noneEligible.SampleIndex);
+    }
+
+    [TestMethod]
+    public void LocalMaximumV3RetainsPlateauProminenceAndDistanceRulesAfterThresholdFiltering()
+    {
+        double threshold = NormalizedThreshold(GateSignalDomain.RawSigned, 6);
+        AssertDetected(EvaluateOne([0, 7, 7, 0], GateDetectorKind.FirstLocalMaximum,
+            GateSignalDomain.RawSigned, threshold: threshold, local: new(1, 7, 1)), 1, 7);
+        AssertDetected(EvaluateOne([0, 8, 7, 0], GateDetectorKind.FirstLocalMaximum,
+            GateSignalDomain.RawSigned, threshold: threshold, local: new(1, 2, 1)), 1, 8);
+        AssertDetected(EvaluateOne([0, 9, 0, 8, 0], GateDetectorKind.LastLocalMaximum,
+            GateSignalDomain.RawSigned, threshold: threshold, local: new(1, 1, 3)), 1, 9);
+
+        GateEvaluationEntry discardedCannotSuppress = EvaluateOne([0, 5, 0, 8, 0],
+            GateDetectorKind.LastLocalMaximum, GateSignalDomain.RawSigned,
+            threshold: threshold, local: new(1, 1, 3));
+        AssertDetected(discardedCannotSuppress, 3, 8);
+    }
+
+    [TestMethod]
+    public void LocalMaximumBelowThresholdParentPropagatesDependencyNotDetected()
+    {
+        double threshold = NormalizedThreshold(GateSignalDomain.RawSigned, 6);
+        CompiledGatePlan plan = GateEvaluationTestData.Compile(
+            GateEvaluationTestData.Gate("A", 3, detector: GateDetectorKind.FirstLocalMaximum,
+                threshold: threshold, local: new(1, 1, 1)),
+            GateEvaluationTestData.Gate("B", 1, dependency: "A"));
+        GateEvaluationBatch batch = new GateEvaluator().Evaluate(plan,
+            GateEvaluationTestData.Trace(3), new short[] { 0, 6, 0 }).Batch!;
+
+        Assert.AreEqual(GateResultStatus.BelowThreshold, batch.Entries[0].Status);
+        Assert.AreEqual(GateResultStatus.DependencyNotDetected, batch.Entries[1].Status);
+        Assert.AreEqual(new UTStudio.Domain.Processing.GateId("A"), batch.Entries[1].CausalGateId);
+        Assert.IsNull(batch.Entries[1].DetectionTimeSeconds);
+    }
+
+    [TestMethod]
     public void WindowsAreExactNeverClippedAndSupportSingleSample()
     {
         short[] samples = [1, 9, 3];
@@ -649,4 +720,20 @@ public sealed class GateEvaluatorTests
 
     private static void AssertDetected(GateEvaluationEntry entry, int index, double amplitude)
     { Assert.AreEqual(GateResultStatus.Detected, entry.Status); Assert.AreEqual(index, entry.SampleIndex); Assert.AreEqual(amplitude, entry.AmplitudeCounts); }
+
+    private static double NormalizedThreshold(GateSignalDomain domain, double counts) => domain switch
+    {
+        GateSignalDomain.RawSigned => (counts + 32768d) / 65535d,
+        GateSignalDomain.Positive => counts / 32767d,
+        GateSignalDomain.NegativeMagnitude or GateSignalDomain.Absolute => counts / 32768d,
+        _ => throw new ArgumentOutOfRangeException(nameof(domain))
+    };
+
+    private static short[] SignalForDomain(GateSignalDomain domain, short[] magnitudes) => domain switch
+    {
+        GateSignalDomain.RawSigned or GateSignalDomain.Positive => magnitudes,
+        GateSignalDomain.NegativeMagnitude or GateSignalDomain.Absolute =>
+            magnitudes.Select(x => checked((short)-x)).ToArray(),
+        _ => throw new ArgumentOutOfRangeException(nameof(domain))
+    };
 }
