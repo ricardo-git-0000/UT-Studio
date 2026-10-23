@@ -66,6 +66,12 @@ public sealed class ProductiveGateInspectionScope : IAsyncDisposable
         CancellationToken cancellationToken = default) =>
         CreateCoreAsync(inspectionId, inspectionStore, configuration, new(), cancellationToken);
 
+    public static ValueTask<ProductiveGateInspectionScope> CreateAsync(InspectionId inspectionId,
+        IInspectionDataStore inspectionStore, ConventionalAcquisitionConfiguration configuration,
+        CompiledGatePlan initialPlan, CancellationToken cancellationToken = default) =>
+        CreateCoreAsync(inspectionId, inspectionStore, configuration, new(), cancellationToken,
+            explicitInitialPlan: initialPlan);
+
     internal static async ValueTask<ProductiveGateInspectionScope> CreateCoreAsync(InspectionId inspectionId,
         IInspectionDataStore inspectionStore, ConventionalAcquisitionConfiguration configuration,
         GateHeadlessInspectionOptions options, CancellationToken cancellationToken,
@@ -74,7 +80,8 @@ public sealed class ProductiveGateInspectionScope : IAsyncDisposable
         Action? sessionCleanupStarted = null,
         Func<IGateReplacementStore, IGateReplacementStore>? replacementDecorator = null,
         Func<IOwnedGateReprocessingScheduler, IOwnedGateReprocessingScheduler>? schedulerDecorator = null,
-        Action<ProductiveGateInspectionDiagnostics>? beforeAuthorityClose = null)
+        Action<ProductiveGateInspectionDiagnostics>? beforeAuthorityClose = null,
+        CompiledGatePlan? explicitInitialPlan = null)
     {
         if (!inspectionId.IsValid) throw new ArgumentException("A valid inspection is required.", nameof(inspectionId));
         ArgumentNullException.ThrowIfNull(inspectionStore); ArgumentNullException.ThrowIfNull(configuration);
@@ -83,7 +90,7 @@ public sealed class ProductiveGateInspectionScope : IAsyncDisposable
         InMemoryGatePlanAuthorityOwner? authority = null; GateHistoricalRunServices? historical = null;
         try
         {
-            CompiledGatePlan initial = ProductiveGateProcessingFactory.CompileDefault(configuration);
+            CompiledGatePlan initial = explicitInitialPlan ?? ProductiveGateProcessingFactory.CompileDefault(configuration);
             store = new(null, new(), options.MaximumReplacementCandidates);
             live = new(inspectionStore, inspectionStore, store, new(new()),
                 new(maximumPlanEpochsPerRun: options.MaximumLiveEpochsPerRun));

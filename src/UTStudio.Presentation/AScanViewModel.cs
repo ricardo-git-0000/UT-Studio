@@ -23,13 +23,15 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
     private readonly IApplicationSession? _session;
     private readonly bool _canControlSession;
     private readonly UiLifetime _lifetime;
+    private readonly IUiDispatcher _dispatcher;
     private readonly ConventionalAcquisitionConfiguration? _configuration;
     private readonly Func<AcquisitionRunId> _newRun;
     private readonly Func<AScanDeliveryStatistics>? _readStatistics;
     private readonly SharedScanTimeViewport _timeViewport;
     private readonly TraceSelectionScope? _selectionCoordinator;
     private readonly bool _ownsTimeViewport;
-    private readonly GateEditorViewCoordinator? _gateEditor;
+    private GateEditorViewCoordinator? _gateEditor;
+    private readonly GateEditingContextSource? _deferredGateEditing;
     private readonly string _viewportConsumerId = $"ascan-{Guid.NewGuid():N}";
     private readonly UiAsyncCommand _start, _stop;
     private readonly RelayCommand _toggleCursors, _resetCursors, _resetViewport, _zoomIn, _zoomOut, _panLeft, _panRight,
@@ -63,9 +65,10 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         IObservable<AScanSnapshot> visualFeed, IUiDispatcher dispatcher,
         Func<AScanDeliveryStatistics>? readVisualStatistics = null,
         IObservable<AScanDeliveryStatus>? visualStatus = null, SharedScanTimeViewport? timeViewport = null,
-        TraceSelectionScope? selectionCoordinator = null, GateEditingComponentContext? gateEditing = null)
+        TraceSelectionScope? selectionCoordinator = null, GateEditingComponentContext? gateEditing = null,
+        GateEditingContextSource? deferredGateEditing = null)
         : this(null, sessionStates, initialSession, visualFeed, dispatcher, null, null,
-            readVisualStatistics, visualStatus, timeViewport, selectionCoordinator, gateEditing)
+            readVisualStatistics, visualStatus, timeViewport, selectionCoordinator, gateEditing, deferredGateEditing)
     { }
 
     private AScanViewModel(IApplicationSession? controllableSession,
@@ -74,7 +77,8 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         ConventionalAcquisitionConfiguration? configuration, Func<AcquisitionRunId>? newRun,
         Func<AScanDeliveryStatistics>? readVisualStatistics,
         IObservable<AScanDeliveryStatus>? visualStatus, SharedScanTimeViewport? timeViewport,
-        TraceSelectionScope? selectionCoordinator, GateEditingComponentContext? gateEditing)
+        TraceSelectionScope? selectionCoordinator, GateEditingComponentContext? gateEditing,
+        GateEditingContextSource? deferredGateEditing = null)
     {
         ArgumentNullException.ThrowIfNull(sessionStates);
         ArgumentNullException.ThrowIfNull(visualFeed);
@@ -84,11 +88,16 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         _configuration = configuration;
         _newRun = newRun ?? (() => new AcquisitionRunId(Guid.NewGuid()));
         _readStatistics = readVisualStatistics;
+        _dispatcher = dispatcher;
         _lifetime = new UiLifetime(dispatcher);
         _ownsTimeViewport = timeViewport is null;
         _timeViewport = timeViewport ?? new SharedScanTimeViewport(dispatcher);
         _selectionCoordinator = selectionCoordinator;
+        _deferredGateEditing = deferredGateEditing;
         _gateEditor = gateEditing is null ? null : new(gateEditing, dispatcher);
+        if (_gateEditor is null && deferredGateEditing?.Current is { } available)
+            _gateEditor = new(available, dispatcher);
+        if (deferredGateEditing is not null) deferredGateEditing.Available += OnGateEditingAvailable;
         _timeViewport.PropertyChanged += OnTimeViewportChanged;
         if (_selectionCoordinator is not null) { _selectionCoordinator.PropertyChanged += OnSelectionChanged; }
         if (_gateEditor is not null) { _gateEditor.PropertyChanged += OnGateEditorChanged; }
@@ -485,6 +494,15 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         });
     }
 
+    private void OnGateEditingAvailable(GateEditingComponentContext context) => _lifetime.Post(() =>
+    {
+        if (IsClosing || _gateEditor is not null) return;
+        _gateEditor = new(context, _dispatcher);
+        _gateEditor.PropertyChanged += OnGateEditorChanged;
+        ReplaceState(_state with { GateEditor = _gateEditor.State, CompositeVisual = _gateEditor.CompositeVisual });
+        OnPropertyChanged(nameof(GateEditor));
+    });
+
     private bool IsCompatibleSelection(AScanSnapshot selected, TraceIdentity? requested) =>
         requested is { } identity && selected.TraceIdentity == identity &&
         _state.LatestCompatibleLive is { } live &&
@@ -555,6 +573,7 @@ public sealed class AScanViewModel : ObservableObject, IAsyncDisposable
         List<Exception> errors = [];
         _timeViewport.PropertyChanged -= OnTimeViewportChanged;
         if (_selectionCoordinator is not null) { _selectionCoordinator.PropertyChanged -= OnSelectionChanged; }
+        if (_deferredGateEditing is not null) { _deferredGateEditing.Available -= OnGateEditingAvailable; }
         if (_gateEditor is not null) { _gateEditor.PropertyChanged -= OnGateEditorChanged; }
         foreach (var subscription in new[] { _sessionSubscription, _visualSubscription, _statusSubscription })
         {

@@ -1,7 +1,7 @@
 # ADR 0019 — Editor configurable de detectores y referencias causales
 
-Fecha: 2026-10-22. Estado: decisiones aceptadas, todavía no implementadas salvo la corrección de usabilidad
-de la puerta existente. El perfil estacionario A/B/C está aceptado de forma condicionada y no está implementado.
+Fecha: 2026-10-22. Estado: implementados la corrección de usabilidad y el bootstrap estacionario A/B/C;
+la edición de detector/referencia, algoritmo v3 y eventos exactos visibles siguen aceptados pero no implementados.
 
 ## Contexto
 
@@ -15,9 +15,9 @@ Esta decisión complementa ADR 0018 y sustituye desde su aceptación únicamente
 campos editables. Se conservan sin cambios la autoridad única, draft no autoritativo, Preview, Apply explícito,
 epochs, control de revisiones, histórico y artefacto exacto autenticado.
 
-La aceptación no significa disponibilidad. Esta rama implementa solamente descubrimiento, selección y edición
-de ventana/umbral de la puerta existente. Detector y referencia configurables, algoritmo v3, perfil estacionario,
-A/B/C y eventos detectados visibles siguen sin implementar.
+La aceptación no significa disponibilidad general. Esta rama implementa descubrimiento y edición de ventanas,
+además del selector previo a Start y el bootstrap estacionario A/B/C descrito abajo. Detector y referencia
+configurables, algoritmo v3 y eventos detectados visibles siguen sin implementar.
 
 El draft podrá cambiar, para puertas existentes, ventana, detector, parámetros compatibles y referencia causal.
 La cardinalidad e identidad permanecen fijas: crear y eliminar puertas queda fuera de alcance.
@@ -41,15 +41,15 @@ si una versión no está soportada se rechaza de forma tipada, sin reinterpretar
 
 ## Perfiles de simulación y bootstrap
 
-El perfil móvil actual, incluido su desplazamiento y wrap, se conserva sin migración. Se acepta de forma
-condicionada un perfil adicional y seleccionable de ecos estacionarios con tres puertas A/B/C para configuraciones
-nuevas. No se reemplazan planes ya configurados y esta selección todavía no está implementada. El perfil concreto
-y sus condiciones están definidos en
+El perfil móvil actual, incluido su desplazamiento y wrap, se conserva como predeterminado. Se implementa un
+perfil adicional seleccionable de ecos estacionarios con bootstrap A/B/C para inspecciones nuevas. La selección
+se valida y queda congelada en el primer Start; no reemplaza planes ya configurados. El perfil concreto y sus
+condiciones están definidos en
 `docs/architecture/ut-gate-editor-extension-design.md`.
 
-La selección futura se hará antes de **Start** mediante una opción tipada y explícita; `móvil` seguirá siendo el
-valor predeterminado y la elección quedará inmutable durante la run. La selección reproducible distinguirá
-`SourceSignalProfileId/Version` de `GateBootstrapProfileId/Version` y los capturará junto con eje, seed y run.
+La selección se hace antes de **Start** mediante una opción tipada y explícita; `moving-echoes` sigue siendo el
+valor predeterminado y la elección queda inmutable para toda la inspección, incluidos Stop/reinicio. La captura
+reproducible distingue `SignalProfileId/Version` de `GateBootstrapProfileId/Version` y conserva eje y seed.
 Cambiar cualquier componente crea identidad nueva; nunca reinterpreta una run.
 
 ## Representación exacta

@@ -9,11 +9,11 @@ Fecha: 2026-10-22. Estado: decisiones aceptadas no implementadas, salvo la corre
 2. **Semántica aceptada, no implementada:** máximo/mínimo sin umbral; cruces interpolados; máximos locales con umbral estricto
    antes de supresión por distancia y selección temporal.
 3. **Edición aceptada, no implementada:** formulario discriminado y recompilación del DAG mediante Preview.
-4. **Perfil aceptado condicionado, no implementado:** perfil estacionario A/B/C solo para configuraciones nuevas;
-   el perfil móvil vigente se conserva.
+4. **Perfil estacionario implementado:** selector previo a Start y bootstrap A/B/C para inspecciones nuevas;
+   el perfil móvil vigente se conserva como predeterminado.
 5. **Eventos exactos aceptados, no implementados:** resultados originales proyectados con identidad completa.
 
-Solo el primer bloque forma parte de la corrección de código actual.
+Los bloques 1 y 4 están implementados. Los bloques 2, 3 y 5 siguen fuera de este incremento.
 
 ## Umbral por dominio
 
@@ -44,7 +44,7 @@ Si no existe candidato tras vecindad/prominencia, el resultado es `NoEvent`. Si 
 prominentes pero ninguno cumple `amplitud > threshold`, es `BelowThreshold`. Nunca se transforma el modo en cruce
 ni máximo global.
 
-## Perfil estacionario A/B/C aceptado condicionado, no implementado
+## Perfil estacionario A/B/C implementado
 
 El simulador normal usa 2048 muestras a 50 MHz, offset 0 y rango `[0,40.96 µs)`. Genera ecos RF de 5 MHz,
 sigma 0,35 µs y amplitudes nominales 0,6 y 0,3 en 10 y 25 µs, con ruido máximo 0,01.
@@ -52,8 +52,7 @@ sigma 0,35 µs y amplitudes nominales 0,6 y 0,3 en 10 y 25 µs, con ruido máxim
 El perfil móvil actual desplaza ambos ecos una muestra por frame y hace wrap; se conserva sin cambios y no es un
 defecto. Por ello ninguna ventana causal B
 estática y positiva puede ser válida para todos los frames cuando A puede aparecer arbitrariamente cerca del fin.
-El perfil siguiente está aceptado condicionado a una configuración adicional, explícita y seleccionable, con
-fase de eco estable. No se instala todavía:
+El perfil siguiente se instala solo al seleccionar explícitamente `stationary-echoes` antes de Start:
 
 | Gate | Referencia | Detector | Dominio | Offset | Duración | Umbral | Parámetros locales |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
@@ -71,10 +70,9 @@ El perfil se valida contra `FirstSampleOffsetSeconds`, `SampleRateHz` y `SampleC
 Los centros y amplitudes de eco pertenecen a un perfil versionado de fuente, no a la configuración genérica de
 adquisición. Los planes existentes nunca se sustituyen automáticamente.
 
-El siguiente bloque propondrá un selector de perfil previo a **Start**, respaldado por una opción de configuración
-tipada y explícita (`móvil` o `estacionario-a-b-c`). La elección quedará bloqueada durante la run; cambiarla
-exigirá crear una configuración/run nueva y nunca mutará una simulación existente. El valor predeterminado seguirá
-siendo `móvil`, de modo que actualizar la aplicación no cambie el comportamiento actual.
+El selector ofrece `moving-echoes` y `stationary-echoes` antes del primer **Start**. La elección queda bloqueada
+para toda la inspección, incluidos Stop y reinicio. `moving-echoes` es el valor predeterminado, por lo que actualizar
+la aplicación no cambia el comportamiento previo.
 Una combinación incompatible se rechaza antes de autoridad/epoch mediante resultado tipado con identidad/versiones
 de ambos perfiles y una causa estable equivalente a `EchoMotionMayWrapCausalWindow`. El wrap durante el perfil
 móvil no se recorta: una ventana resuelta fuera de traza conserva `WindowOutOfRange`, sin cero, clipping ni anchor
@@ -83,7 +81,8 @@ antiguo.
 La reproducibilidad requiere dos identidades: perfil de señal (centros, amplitudes, portadora, sigma, ruido/seed y
 política de movimiento/wrap) y perfil bootstrap de gates (orden, IDs, referencias, ventanas, detector, dominio,
 parámetros y medidas). La run captura ambas versiones con su eje; la misma tupla y seed produce la misma señal,
-plan y firma. Estos contratos de selección e identidad aún no están implementados.
+plan y firma. La composición captura estas identidades y versiones, seed y eje en
+`SimulationInspectionConfiguration` antes de crear autoridad o epochs.
 
 ## Flujo editorial futuro
 

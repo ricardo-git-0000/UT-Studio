@@ -16,7 +16,8 @@ public sealed record AScanComponentContext(
     Func<AScanDeliveryStatistics>? ReadStatistics = null,
     SharedScanTimeViewport? TimeViewport = null,
     TraceSelectionScope? SelectionScope = null,
-    GateEditingComponentContext? GateEditing = null);
+    GateEditingComponentContext? GateEditing = null,
+    GateEditingContextSource? DeferredGateEditing = null);
 
 /// <summary>Borrowed neutral ports used to create one independent gate editor per A-Scan view.</summary>
 public sealed record GateEditingComponentContext(

@@ -67,7 +67,7 @@ public partial class AScanView : UserControl, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(context.Visuals);
         _viewModel = new(context.SessionStates, context.InitialSession, context.Visuals,
             new WpfUiDispatcher(Dispatcher), context.ReadStatistics, context.VisualStatus,
-            context.TimeViewport, context.SelectionScope, context.GateEditing);
+            context.TimeViewport, context.SelectionScope, context.GateEditing, context.DeferredGateEditing);
         Root.DataContext = _viewModel;
         _viewModel.PropertyChanged += OnViewModelChanged;
         PublishState();

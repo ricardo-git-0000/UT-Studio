@@ -375,8 +375,10 @@ public sealed class CompositionTests
         GatePlanEditorSession? first = null; GatePlanEditorSession? second = null;
         try
         {
+            ProfiledSimulationSession owner = runtime.Host.Services.GetRequiredService<ProfiledSimulationSession>();
+            await owner.PrepareAsync();
             GateEditingComponentContext context = runtime.Host.Services
-                .GetRequiredService<AScanComponentContext>().GateEditing!;
+                .GetRequiredService<AScanComponentContext>().DeferredGateEditing!.Current!;
             first = new(context.AuthorityKey, context.Authority, context.PreviewCompiler);
             second = new(context.AuthorityKey, context.Authority, context.PreviewCompiler);
             first.BeginEdit(); second.BeginEdit(); first.Preview(); second.Preview();
@@ -560,17 +562,79 @@ public sealed class CompositionTests
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
         try
         {
+            ProfiledSimulationSession owner = runtime.Host.Services.GetRequiredService<ProfiledSimulationSession>();
+            await owner.PrepareAsync();
+            IApplicationSession profiled = runtime.Host.Services.GetRequiredService<IApplicationSession>();
             ProductiveGateInspectionScope scope = runtime.Host.Services.GetRequiredService<ProductiveGateInspectionScope>();
-            ApplicationSession session = runtime.Host.Services.GetRequiredService<ApplicationSession>();
             AScanComponentContext context = runtime.Host.Services.GetRequiredService<AScanComponentContext>();
-            Assert.AreSame(session, runtime.Host.Services.GetRequiredService<IApplicationSession>());
+            Assert.AreSame(profiled, owner);
             Assert.IsNull(runtime.Host.Services.GetService<ICommittedGateProcessingIngress>());
-            Assert.AreSame(scope.Authority, context.GateEditing!.Authority);
-            Assert.AreSame(scope.PreviewCompiler, context.GateEditing.PreviewCompiler);
-            Assert.AreSame(scope.GeometryEvaluator, context.GateEditing.GeometryEvaluator);
-            Assert.AreSame(session, context.GateEditing.Apply);
-            Assert.AreEqual(scope.AuthorityKey, context.GateEditing.AuthorityKey);
+            GateEditingComponentContext editing = context.DeferredGateEditing!.Current!;
+            Assert.AreSame(scope.Authority, editing.Authority);
+            Assert.AreSame(scope.PreviewCompiler, editing.PreviewCompiler);
+            Assert.AreSame(scope.GeometryEvaluator, editing.GeometryEvaluator);
+            Assert.IsInstanceOfType<ApplicationSession>(editing.Apply);
+            Assert.AreEqual(scope.AuthorityKey, editing.AuthorityKey);
             Assert.IsNull(runtime.Host.Services.GetService<ProductiveGateProcessing>());
+        }
+        finally { await runtime.Shutdown.ShutdownAsync(); }
+    });
+
+    [TestMethod]
+    public Task StationaryProfileCreatesEditableAbcPlanAndFreezesSelectionForInspection() => StaTest.Run(async () =>
+    {
+        var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
+        try
+        {
+            var services = runtime.Host.Services;
+            var host = services.GetRequiredService<AScanHostViewModel>();
+            var window = services.GetRequiredService<MainWindow>();
+            host.SelectedSimulationProfileId = SimulatorSignalProfiles.StationaryV1.Id;
+            window.Show();
+            window.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, window.AScan));
+            window.UpdateLayout();
+            await host.StartCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
+            await Dispatcher.Yield();
+
+            ProfiledSimulationSession owner = services.GetRequiredService<ProfiledSimulationSession>();
+            ProductiveGateInspectionScope scope = services.GetRequiredService<ProductiveGateInspectionScope>();
+            Assert.IsFalse(host.CanSelectSimulationProfile);
+            Assert.AreEqual(SimulatorSignalProfiles.StationaryV1.Id, owner.FrozenConfiguration!.SignalProfileId);
+            Assert.AreEqual("stationary-abc", owner.FrozenConfiguration.GateBootstrapProfileId);
+            CollectionAssert.AreEqual(new[] { "A", "B", "C" },
+                scope.Authority.Read(scope.AuthorityKey).Committed.Plan.Gates.Select(x => x.Id.Value).ToArray());
+
+            GateEditorViewCoordinator editor = window.AScan.ViewModel!.GateEditor!;
+            await DiagnosticWait.Until(() => editor.CompositeVisual?.HasAuthoritativeIdentity == true,
+                "stationary visual has an authoritative trace");
+            await DiagnosticWait.Until(() => editor.BeginEditCommand.CanExecute(null),
+                "stationary gate editor becomes ready");
+            await editor.BeginEditCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
+            await DiagnosticWait.Until(() => editor.State.Editor.Draft is not null,
+                "stationary draft is available");
+            editor.SelectedGateId = "B";
+            Assert.AreEqual("B", editor.SelectedGateId);
+            Assert.AreEqual("respecto de A", editor.SelectedGateReferenceLabel);
+            editor.SelectedGateStartMicroseconds = 14d;
+            await DiagnosticWait.Until(() => editor.SelectedGateStartMicroseconds == 14d,
+                "stationary B start draft converges");
+            editor.SelectedGateEndMicroseconds = 17d;
+            await DiagnosticWait.Until(() => editor.SelectedGateStartMicroseconds == 14d &&
+                editor.SelectedGateEndMicroseconds == 17d, "stationary B numeric draft converges");
+            await editor.PreviewCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
+            GatePlanRevision before = scope.Authority.Read(scope.AuthorityKey).Committed.Revision;
+            await editor.ApplyCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
+            GatePlanAuthoritySnapshot committed = scope.Authority.Read(scope.AuthorityKey);
+            GateDefinition b = committed.Committed.Plan.Gates.Single(x => x.Id.Value == "B");
+            Assert.AreEqual(before.Value + 1, committed.Committed.Revision.Value);
+            Assert.AreEqual(14e-6, b.Window.StartOffsetSeconds, 1e-15);
+            Assert.AreEqual(3e-6, b.Window.DurationSeconds, 1e-15);
+
+            await host.StopCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsFalse(host.CanSelectSimulationProfile);
+            await host.StartCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(SimulatorSignalProfiles.StationaryV1.Id, owner.FrozenConfiguration.SignalProfileId);
+            await host.StopCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
         }
         finally { await runtime.Shutdown.ShutdownAsync(); }
     });
@@ -595,7 +659,7 @@ public sealed class CompositionTests
     {
         var clock = new ManualClock { FailNextTimer = true };
         var runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher), clock: clock);
-        var session = runtime.Host.Services.GetRequiredService<ApplicationSession>();
+        var session = runtime.Host.Services.GetRequiredService<IApplicationSession>();
         var source = runtime.Host.Services.GetRequiredService<SimulatorUtFrameSource>();
         try
         {
@@ -636,7 +700,8 @@ public sealed class CompositionTests
         {
             var services = runtime.Host.Services;
             Assert.AreSame(services.GetRequiredService<SimulatorUtFrameSource>(), services.GetRequiredService<IUtFrameSource>());
-            Assert.AreSame(services.GetRequiredService<ApplicationSession>(), services.GetRequiredService<IApplicationSession>());
+            Assert.AreSame(services.GetRequiredService<ProfiledSimulationSession>(),
+                services.GetRequiredService<IApplicationSession>());
             Assert.IsNotNull(services.GetRequiredService<InspectionDataStoreRegistry>());
             Assert.IsNotNull(services.GetRequiredService<BScanIngress>());
             Assert.AreSame(services.GetRequiredService<AScanVisualDelivery>(), services.GetRequiredService<IObservable<AScanSnapshot>>());

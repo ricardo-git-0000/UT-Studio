@@ -4,7 +4,8 @@ namespace UTStudio.Acquisition.Simulator;
 public sealed class SimulatorOptions
 {
     public SimulatorOptions(ulong seed = 1, double maxAScansPerSecond = 100,
-        int channelCapacity = 4, int bufferCount = 8, double noiseAmplitude = 0.01)
+        int channelCapacity = 4, int bufferCount = 8, double noiseAmplitude = 0.01,
+        SimulatorSignalProfile? signalProfile = null)
     {
         if (!double.IsFinite(maxAScansPerSecond) || maxAScansPerSecond <= 0 || maxAScansPerSecond > 100 ||
             1 / maxAScansPerSecond > uint.MaxValue / 1000d - 1)
@@ -28,6 +29,8 @@ public sealed class SimulatorOptions
         ChannelCapacity = channelCapacity;
         BufferCount = bufferCount;
         NoiseAmplitude = noiseAmplitude;
+        SignalProfile = signalProfile ?? SimulatorSignalProfiles.MovingV1;
+        if (!SignalProfile.IsValid) throw new ArgumentException("A valid signal profile is required.", nameof(signalProfile));
         // Task.Delay may truncate fractional milliseconds; round conservatively.
         Period = TimeSpan.FromMilliseconds(Math.Ceiling(1000 / maxAScansPerSecond));
     }
@@ -37,5 +40,6 @@ public sealed class SimulatorOptions
     public int ChannelCapacity { get; }
     public int BufferCount { get; }
     public double NoiseAmplitude { get; }
+    public SimulatorSignalProfile SignalProfile { get; }
     internal TimeSpan Period { get; }
 }

@@ -23,7 +23,8 @@ public class SignalGenerationBenchmarks
     [Benchmark(OperationsPerInvoke = 1)]
     public short Fill()
     {
-        SyntheticRfGenerator.Fill(_samples, _configuration, _options, _sequence++, CancellationToken.None);
+        SyntheticRfGenerator.Fill(_samples, _configuration, _options, _options.SignalProfile,
+            _sequence++, CancellationToken.None);
         return _samples[^1];
     }
 }

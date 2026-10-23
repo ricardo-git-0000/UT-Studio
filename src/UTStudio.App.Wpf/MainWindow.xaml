@@ -18,6 +18,14 @@
                 <TextBlock Text="A-Scan convencional · RF bipolar · 2.048 muestras · 50 MHz" Foreground="#AEBFD4" Margin="0,4,0,0" />
             </StackPanel>
             <StackPanel x:Name="Interactions" Orientation="Horizontal" HorizontalAlignment="Right">
+                <TextBlock Text="Perfil:" VerticalAlignment="Center" Margin="16,0,6,0" />
+                <ComboBox x:Name="SimulationProfileSelector" Width="190" Margin="0,0,8,0"
+                          ItemsSource="{Binding SimulationProfiles}"
+                          DisplayMemberPath="DisplayName" SelectedValuePath="Id"
+                          SelectedValue="{Binding SelectedSimulationProfileId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                          IsEnabled="{Binding CanSelectSimulationProfile}"
+                          AutomationProperties.Name="Perfil de simulación"
+                          AutomationProperties.HelpText="Se fija al iniciar la primera ejecución de esta inspección" />
                 <Button Content="B-Scan" Click="OnOpenBScan" MinWidth="80" Padding="12,8" Margin="16,0,8,0" />
                 <Button Content="Start" Command="{Binding StartCommand}" MinWidth="90" Padding="16,8" Margin="0,0,8,0" />
                 <Button Content="Stop" Command="{Binding StopCommand}" MinWidth="90" Padding="16,8" />

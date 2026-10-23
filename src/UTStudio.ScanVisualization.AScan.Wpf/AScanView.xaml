@@ -44,9 +44,11 @@
         </Style>
       </StackPanel.Style>
       <TextBlock Text="Puerta: " VerticalAlignment="Center" FontWeight="SemiBold"/>
-      <TextBlock Text="{Binding GateEditor.SelectedGateId}" VerticalAlignment="Center" Margin="0,0,16,0"
-                 AutomationProperties.Name="Identificador de puerta"/>
-      <TextBlock Text="Inicio (µs):" VerticalAlignment="Center"/>
+      <ComboBox Width="100" Margin="0,0,10,0" ItemsSource="{Binding GateEditor.GateIds}"
+                SelectedItem="{Binding GateEditor.SelectedGateId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                AutomationProperties.Name="Puerta seleccionada"/>
+      <TextBlock Text="{Binding GateEditor.SelectedGateReferenceLabel}" VerticalAlignment="Center" Margin="0,0,16,0"/>
+      <TextBlock Text="Inicio/offset (µs):" VerticalAlignment="Center"/>
       <StackPanel Margin="6,0,14,0">
         <TextBox x:Name="GateStartValue" Width="92" VerticalContentAlignment="Center"
                  Tag="Start" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"

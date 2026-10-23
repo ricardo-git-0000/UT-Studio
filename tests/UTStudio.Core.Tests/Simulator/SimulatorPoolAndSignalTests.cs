@@ -1,4 +1,5 @@
 using UTStudio.Acquisition.Simulator;
+using UTStudio.Contracts.Acquisition;
 using UTStudio.Domain.Acquisition;
 using UTStudio.Core.Tests.TestDoubles;
 
@@ -112,14 +113,16 @@ public sealed class SimulatorPoolAndSignalTests
     {
         var configuration = SimulatorUtFrameSource.DefaultConfiguration;
         var samples = new short[configuration.SampleCount];
-        SyntheticRfGenerator.Fill(samples, configuration, new SimulatorOptions(noiseAmplitude: 0), 0, default);
+        SimulatorOptions options = new(noiseAmplitude: 0);
+        SyntheticRfGenerator.Fill(samples, configuration, options, options.SignalProfile, 0, default);
         Assert.AreEqual(0, samples[500]); // First pulse center at 10 us.
         Assert.IsTrue(samples[502] > 18000 && samples[502] < 20000);
         Assert.IsTrue(samples[498] < -18000 && samples[498] > -20000);
         Assert.IsTrue(samples[1252] > 9000 && samples[1252] < 10000);
         Assert.AreEqual(0, samples[0]);
         Assert.ThrowsExactly<OperationCanceledException>(() =>
-            SyntheticRfGenerator.Fill(samples, configuration, new SimulatorOptions(), 0, new CancellationToken(true)));
+            SyntheticRfGenerator.Fill(samples, configuration, new SimulatorOptions(), SimulatorSignalProfiles.MovingV1,
+                0, new CancellationToken(true)));
     }
 
     [TestMethod]
@@ -131,9 +134,9 @@ public sealed class SimulatorPoolAndSignalTests
         var shifted = new short[configuration.SampleCount];
         var wrapped = new short[configuration.SampleCount];
 
-        SyntheticRfGenerator.Fill(initial, configuration, options, 0, default);
-        SyntheticRfGenerator.Fill(shifted, configuration, options, 1, default);
-        SyntheticRfGenerator.Fill(wrapped, configuration, options, 1548, default);
+        SyntheticRfGenerator.Fill(initial, configuration, options, options.SignalProfile, 0, default);
+        SyntheticRfGenerator.Fill(shifted, configuration, options, options.SignalProfile, 1, default);
+        SyntheticRfGenerator.Fill(wrapped, configuration, options, options.SignalProfile, 1548, default);
 
         Assert.AreEqual(initial[502], shifted[503]);
         Assert.AreEqual(initial[498], shifted[499]);
@@ -141,5 +144,43 @@ public sealed class SimulatorPoolAndSignalTests
         Assert.AreEqual(initial[498], wrapped[^2]);
         Assert.AreEqual(initial[1252], wrapped[752]);
         Assert.AreEqual(0, wrapped[0]);
+    }
+
+    [TestMethod]
+    public void StationaryProfileKeepsEchoesFixedAndIsReproducible()
+    {
+        var configuration = SimulatorUtFrameSource.DefaultConfiguration;
+        var options = new SimulatorOptions(noiseAmplitude: 0, signalProfile: SimulatorSignalProfiles.StationaryV1);
+        var first = new short[configuration.SampleCount];
+        var later = new short[configuration.SampleCount];
+        var repeated = new short[configuration.SampleCount];
+
+        SyntheticRfGenerator.Fill(first, configuration, options, options.SignalProfile, 0, default);
+        SyntheticRfGenerator.Fill(later, configuration, options, options.SignalProfile, 1000, default);
+        SyntheticRfGenerator.Fill(repeated, configuration, options, options.SignalProfile, 0, default);
+
+        CollectionAssert.AreEqual(first, later);
+        CollectionAssert.AreEqual(first, repeated);
+        Assert.AreEqual(first[502], later[502]);
+        Assert.AreEqual(first[1252], later[1252]);
+    }
+
+    [TestMethod]
+    public async Task SignalProfileCanChangeOnlyWhileIdle()
+    {
+        await using var source = new SimulatorUtFrameSource(new("profile-test"),
+            new SimulatorOptions(maxAScansPerSecond: 10));
+        await source.ConnectAsync();
+        source.SelectSignalProfile(SimulatorSignalProfiles.StationaryV1);
+        await source.ConfigureAsync(SimulatorUtFrameSource.DefaultConfiguration);
+        UtAcquisitionRun run = await source.StartAsync(new(Guid.NewGuid()));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            source.SelectSignalProfile(SimulatorSignalProfiles.MovingV1));
+
+        await source.StopAsync();
+        await foreach (ConventionalUtFrame frame in run.Frames.ReadAllAsync()) frame.Dispose();
+        await run.ProducerCompletion;
+        await run.AllFramesReleased;
     }
 }

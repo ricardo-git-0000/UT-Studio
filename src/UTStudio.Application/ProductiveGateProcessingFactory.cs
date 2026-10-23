@@ -39,7 +39,7 @@ public static class ProductiveGateProcessingFactory
         return new(new(store, store, derived, new GateEvaluator(new GateScratchPool())), compiled, derived);
     }
 
-    internal static CompiledGatePlan CompileDefault(ConventionalAcquisitionConfiguration configuration)
+    public static CompiledGatePlan CompileDefault(ConventionalAcquisitionConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         double duration = configuration.SampleCount / configuration.SampleRateHz;
@@ -54,5 +54,24 @@ public static class ProductiveGateProcessingFactory
         CompiledGatePlan compiled = result.CompiledPlan ?? throw new InvalidOperationException(
             $"The productive gate plan did not compile: {string.Join(", ", result.Errors.Select(x => x.Message))}");
         return compiled;
+    }
+
+    public static CompiledGatePlan CompileStationaryAbc(ConventionalAcquisitionConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        GateMeasureKind[] measures = [GateMeasureKind.Amplitude, GateMeasureKind.DetectionTime,
+            GateMeasureKind.Status, GateMeasureKind.Quality];
+        var a = new GateDefinition(new("A"), new(1), new(GateTimeReference.TraceOrigin(), 8.5e-6, 3e-6),
+            GateSignalDomain.Absolute, new(GateDetectorKind.GlobalMaximum), measures);
+        var b = new GateDefinition(new("B"), new(1), new(GateTimeReference.GateEvent(a.Id), 13.5e-6, 3e-6),
+            GateSignalDomain.Absolute, new(GateDetectorKind.GlobalMaximum), measures);
+        var c = new GateDefinition(new("C"), new(1), new(GateTimeReference.TraceOrigin(), 23.5e-6, 3e-6),
+            GateSignalDomain.Absolute, new(GateDetectorKind.GlobalMaximum), measures);
+        var plan = new GatePlan(new("stationary-abc"), new(1),
+            new(GatePlanCompilerOptions.CurrentSchemaVersion),
+            new(GatePlanCompilerOptions.CurrentAlgorithmVersion), [a, b, c]);
+        GatePlanCompilationResult result = new GatePlanCompiler().Compile(plan);
+        return result.CompiledPlan ?? throw new InvalidOperationException(
+            $"The stationary A/B/C gate plan did not compile: {string.Join(", ", result.Errors.Select(x => x.Message))}");
     }
 }

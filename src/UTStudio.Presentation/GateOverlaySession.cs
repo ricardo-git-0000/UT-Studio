@@ -244,6 +244,23 @@ public sealed class GateOverlaySession : IAsyncDisposable
         Publish(publish); return true;
     }
 
+    public bool SelectGate(GateId gateId)
+    {
+        if (!gateId.IsValid) return false;
+        GateOverlayVisualSnapshot publish;
+        lock (_gate)
+        {
+            GatePlanDraft? draft = _editor.Snapshot.Draft;
+            if (_closed || draft is null || !draft.Gates.Any(x => x.Id == gateId)) return false;
+            _selectedGate = gateId; _focusedHandle = GateHandleKind.Start;
+            _capture = null; _capturedHandleState = null; _gestureOwner = PortablePointerCaptureOwner.None;
+            publish = BuildOverlayUnderLock(_overlay.Status, _overlay.Source, _overlay.TraceIdentity,
+                _overlay.InspectionRevision, _stableGeometry, _evaluationSequence, _overlay.ErrorCode);
+            SetSnapshotUnderLock(publish);
+        }
+        Publish(publish); return true;
+    }
+
     public GateCaptureGeneration? BeginGateCapture()
     {
         GateOverlayVisualSnapshot? publish = null;

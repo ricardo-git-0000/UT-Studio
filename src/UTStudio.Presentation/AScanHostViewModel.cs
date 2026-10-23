@@ -2,6 +2,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
+using UTStudio.Contracts.Acquisition;
 using System.ComponentModel;
 
 namespace UTStudio.Presentation;
@@ -13,6 +14,7 @@ public sealed class AScanHostViewModel : ObservableObject, IAsyncDisposable
     private readonly IApplicationSession _session;
     private readonly ConventionalAcquisitionConfiguration _configuration;
     private readonly Func<AcquisitionRunId> _newRun;
+    private readonly ISimulationProfileSelection? _profileSelection;
     private readonly UiLifetime _lifetime;
     private readonly UiAsyncCommand _start, _stop;
     private readonly IDisposable _subscription;
@@ -22,11 +24,13 @@ public sealed class AScanHostViewModel : ObservableObject, IAsyncDisposable
     private int _closing;
 
     public AScanHostViewModel(IApplicationSession session, IUiDispatcher dispatcher,
-        ConventionalAcquisitionConfiguration configuration, Func<AcquisitionRunId>? newRun = null)
+        ConventionalAcquisitionConfiguration configuration, Func<AcquisitionRunId>? newRun = null,
+        ISimulationProfileSelection? profileSelection = null)
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         _newRun = newRun ?? (() => new AcquisitionRunId(Guid.NewGuid()));
+        _profileSelection = profileSelection;
         _lifetime = new(dispatcher ?? throw new ArgumentNullException(nameof(dispatcher)));
         _state = session.Snapshot;
         _start = new(_lifetime, StartAsync, () => Volatile.Read(ref _closing) == 0 && State.CanStart && !_start!.IsRunning && !_stop!.IsRunning,
@@ -42,13 +46,34 @@ public sealed class AScanHostViewModel : ObservableObject, IAsyncDisposable
     public IAsyncRelayCommand StartCommand => _start;
     public IAsyncRelayCommand StopCommand => _stop;
     public UtSourceError? Error => _error ?? State.PrimaryError;
+    public IReadOnlyList<SimulationProfileOption> SimulationProfiles =>
+        _profileSelection?.Options ?? Array.Empty<SimulationProfileOption>();
+    public string? SelectedSimulationProfileId
+    {
+        get => _profileSelection?.SelectedProfileId;
+        set
+        {
+            if (_profileSelection is null || value is null || value == _profileSelection.SelectedProfileId) return;
+            _profileSelection.SelectProfile(value);
+            OnPropertyChanged(); OnPropertyChanged(nameof(CanSelectSimulationProfile));
+        }
+    }
+    public bool CanSelectSimulationProfile => _profileSelection?.CanSelectProfile == true;
 
     private async Task StartAsync(CancellationToken token)
     {
         await ClearErrorAsync().ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
         try { await _session.StartAsync(_configuration, _newRun(), token).ConfigureAwait(false); }
-        finally { await SynchronizeSessionAsync().ConfigureAwait(false); }
+        finally
+        {
+            await SynchronizeSessionAsync().ConfigureAwait(false);
+            await _lifetime.InvokeAsync(() =>
+            {
+                OnPropertyChanged(nameof(CanSelectSimulationProfile));
+                OnPropertyChanged(nameof(SelectedSimulationProfileId));
+            }).ConfigureAwait(false);
+        }
     }
 
     private async Task StopAsync(CancellationToken token)

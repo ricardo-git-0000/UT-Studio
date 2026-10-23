@@ -70,7 +70,19 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
     public IAsyncRelayCommand PreviewCommand => _preview;
     public IAsyncRelayCommand CancelCommand => _cancel;
     public IAsyncRelayCommand ApplyCommand => _applyCommand;
-    public string? SelectedGateId => SelectedGate()?.Id.Value;
+    public IReadOnlyList<string> GateIds => _editor.Snapshot.Draft?.Gates.Select(x => x.Id.Value).ToArray() ??
+        _editor.Snapshot.Committed.Plan.Gates.Select(x => x.Id.Value).ToArray();
+    public string? SelectedGateId
+    {
+        get => SelectedGate()?.Id.Value;
+        set
+        {
+            if (value is null || value == SelectedGateId) return;
+            if (_overlay.SelectGate(new(value))) Publish(_state with { Overlay = _overlay.Snapshot });
+        }
+    }
+    public string SelectedGateReferenceLabel => SelectedGate()?.Window.StartReference.Kind == GateTimeReferenceKind.GateEvent
+        ? $"respecto de {SelectedGate()!.Window.StartReference.DependencyGateId.Value}" : "respecto del origen";
     public double? SelectedGateStartMicroseconds
     {
         get => SelectedGate()?.Window.StartOffsetSeconds * 1_000_000d;
@@ -498,6 +510,8 @@ public sealed class GateEditorViewCoordinator : ObservableObject, IAsyncDisposab
         {
             _publishedNumeric = numeric;
             OnPropertyChanged(nameof(SelectedGateId));
+            OnPropertyChanged(nameof(GateIds));
+            OnPropertyChanged(nameof(SelectedGateReferenceLabel));
             OnPropertyChanged(nameof(SelectedGateStartMicroseconds));
             OnPropertyChanged(nameof(SelectedGateEndMicroseconds));
             OnPropertyChanged(nameof(SelectedGateThresholdPercent));

@@ -16,6 +16,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
     private readonly object _gate = new();
     private readonly SimulatorOptions _options;
     private readonly TimeProvider _time;
+    private SimulatorSignalProfile _signalProfile;
     private ConventionalAcquisitionConfiguration? _configuration;
     private RunContext? _run;
     private AcquisitionRunId _lastRunId;
@@ -28,6 +29,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
         if (!sourceId.IsValid) { throw new ArgumentException("A valid source identifier is required.", nameof(sourceId)); }
         SourceId = sourceId;
         _options = options ?? new SimulatorOptions();
+        _signalProfile = _options.SignalProfile;
         _time = timeProvider ?? TimeProvider.System;
         Capabilities = new UtSourceCapabilities([new PhysicalChannelId(0)],
             ConventionalAcquisitionConfiguration.MaximumSampleCount,
@@ -42,6 +44,24 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
     internal int MaximumOutstandingBuffers { get { lock (_gate) { return _run?.Pool.MaximumOutstanding ?? 0; } } }
     internal AcquisitionMetrics? Metrics { get; init; }
     internal long ProducedFrames => Interlocked.Read(ref _producedFrames);
+    public SimulatorSignalProfile SignalProfile { get { lock (_gate) return _signalProfile; } }
+    public ulong Seed => _options.Seed;
+    public static void ValidateProfileConfiguration(ConventionalAcquisitionConfiguration configuration,
+        SimulatorSignalProfile profile) => SyntheticRfGenerator.Validate(configuration, profile);
+
+    public void SelectSignalProfile(SimulatorSignalProfile profile)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        lock (_gate)
+        {
+            EnsureAvailable();
+            Refresh();
+            if (_run is not null || _state.Acquisition != UtAcquisitionState.Idle)
+                throw new InvalidOperationException("The signal profile is immutable during a run.");
+            SyntheticRfGenerator.Validate(_configuration ?? DefaultConfiguration, profile);
+            _signalProfile = profile;
+        }
+    }
     public UtSourceState State
     {
         get { lock (_gate) { Refresh(); return _state; } }
@@ -70,7 +90,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
             EnsureAvailable();
             cancellationToken.ThrowIfCancellationRequested();
             RequireIdle();
-            SyntheticRfGenerator.Validate(configuration);
+            SyntheticRfGenerator.Validate(configuration, _signalProfile);
             _configuration = configuration;
             return Task.CompletedTask;
         }
@@ -92,7 +112,8 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
             {
                 pool = new BoundedSampleBufferPool(_options.BufferCount, configuration.SampleCount);
                 var metadata = new ConventionalUtFrameMetadata(SourceId, runId, configuration, _time.GetUtcNow());
-                context = new RunContext(metadata, pool, _options.ChannelCapacity, _time.GetTimestamp(), Metrics);
+                context = new RunContext(metadata, pool, _options.ChannelCapacity, _time.GetTimestamp(), Metrics,
+                    _signalProfile);
                 var result = new UtAcquisitionRun(metadata, context.Metrics?.Reader(context.Channel.Reader) ?? context.Channel.Reader, context.Producer.Task, pool.AllFramesReleased);
                 cancellationToken.ThrowIfCancellationRequested();
                 // Commit: all fallible preparation precedes enabling the producer. No request token is linked.
@@ -215,7 +236,8 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
                 context.WaitReason = SimulatorWaitReason.None;
                 token.ThrowIfCancellationRequested();
                 var elapsed = _time.GetElapsedTime(context.OriginTimestamp);
-                SyntheticRfGenerator.Fill(owner.Memory.Span, context.Metadata.Configuration, _options, sequence, token);
+                SyntheticRfGenerator.Fill(owner.Memory.Span, context.Metadata.Configuration, _options,
+                    context.SignalProfile, sequence, token);
                 frame = new ConventionalUtFrame(context.Metadata, sequence, sequence, elapsed, null, owner);
                 tracked?.Generated();
                 owner = null;
@@ -359,12 +381,14 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
 
     private sealed class RunContext
     {
-        internal RunContext(ConventionalUtFrameMetadata metadata, BoundedSampleBufferPool pool, int capacity, long originTimestamp, AcquisitionMetrics? metrics)
+        internal RunContext(ConventionalUtFrameMetadata metadata, BoundedSampleBufferPool pool, int capacity,
+            long originTimestamp, AcquisitionMetrics? metrics, SimulatorSignalProfile signalProfile)
         {
             Metadata = metadata;
             Pool = pool;
             OriginTimestamp = originTimestamp;
             Metrics = metrics;
+            SignalProfile = signalProfile;
             Channel = System.Threading.Channels.Channel.CreateBounded<ConventionalUtFrame>(new BoundedChannelOptions(capacity)
             {
                 SingleReader = true,
@@ -378,6 +402,7 @@ public sealed class SimulatorUtFrameSource : IUtFrameSource
         internal BoundedSampleBufferPool Pool { get; }
         internal long OriginTimestamp { get; }
         internal AcquisitionMetrics? Metrics { get; }
+        internal SimulatorSignalProfile SignalProfile { get; }
         internal Channel<ConventionalUtFrame> Channel { get; }
         internal CancellationTokenSource Cancellation { get; } = new();
         internal TaskCompletionSource Producer { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

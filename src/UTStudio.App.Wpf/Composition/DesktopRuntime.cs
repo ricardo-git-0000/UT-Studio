@@ -31,7 +31,8 @@ public sealed class DesktopRuntime
     private BScanVisualDelivery? _bScanVisual;
     private TraceSelectionScope? _selection;
     private BScanWindowManager? _bScanWindows;
-    private ApplicationSession? _session;
+    private IApplicationSession? _session;
+    private ProfiledSimulationSession? _profiledSession;
     private InspectionDataStoreRegistry? _inspectionStores;
     private ProductiveGateInspectionScope? _gateScope;
     private AScanHostViewModel? _viewModel;
@@ -82,7 +83,7 @@ public sealed class DesktopRuntime
         try
         {
             await (_gateScope?.DisposeAsync().AsTask() ??
-            _session?.DisposeAsync().AsTask() ?? Task.CompletedTask).ConfigureAwait(false);
+            (_session as IAsyncDisposable)?.DisposeAsync().AsTask() ?? Task.CompletedTask).ConfigureAwait(false);
         }
         finally { _sessionReleased = _session is null || _session.Snapshot.Phase == SessionPhase.Disposed; }
     }
@@ -234,16 +235,6 @@ public sealed class DesktopRuntime
                 builder.Configuration.GetValue<int?>("InspectionStore:TargetChunkBytes") ?? 4 * 1024 * 1024);
             var inspectionStores = runtime._inspectionStores = new InspectionDataStoreRegistry(
                 new InspectionId(Guid.NewGuid()), inspectionOptions);
-            var gateScope = runtime._gateScope = gateHooks is null
-                ? await ProductiveGateInspectionScope.CreateAsync(
-                    inspectionStores.InspectionId, inspectionStores.Store, configuration)
-                : await ProductiveGateInspectionScope.CreateCoreAsync(
-                    inspectionStores.InspectionId, inspectionStores.Store, configuration,
-                    gateHooks.Options ?? new(), CancellationToken.None,
-                    epochDecorator: gateHooks.EpochDecorator,
-                    replacementDecorator: gateHooks.ReplacementDecorator,
-                    schedulerDecorator: gateHooks.SchedulerDecorator,
-                    beforeAuthorityClose: gateHooks.BeforeAuthorityClose);
             var visual = runtime._visual = new AScanVisualDelivery(inspectionStores.Store, timeProvider: clock);
             var bScanIngress = runtime._bScanIngress = new BScanIngress(
                 inspectionStores.Store, inspectionStores.Store, bScanOptions, clock);
@@ -251,17 +242,43 @@ public sealed class DesktopRuntime
                 ? new BScanVisualDelivery(bScanIngress, clock)
                 : new BScanVisualDelivery(bScanIngress, clock, rasterPool);
             checkpoint?.Invoke("visual");
-            var session = runtime._session = gateScope.CreateSession(source,
-                runId => gateHooks?.InspectionWriterDecorator?.Invoke(inspectionStores.OpenRun(runId)) ??
-                    inspectionStores.OpenRun(runId), bScanIngress, visual);
+            var deferredGateContexts = new GateEditingContextSource();
+            ProductiveGateInspectionScope? gateScope = null;
+            IApplicationSession session;
+            IGatePlanApplyPort apply;
+            if (simulator is not null)
+            {
+                var profiled = runtime._profiledSession = new ProfiledSimulationSession(simulator,
+                    inspectionStores, configuration, bScanIngress, visual, deferredGateContexts, gateHooks);
+                session = profiled; apply = profiled;
+            }
+            else
+            {
+                gateScope = runtime._gateScope = gateHooks is null
+                    ? await ProductiveGateInspectionScope.CreateAsync(
+                        inspectionStores.InspectionId, inspectionStores.Store, configuration)
+                    : await ProductiveGateInspectionScope.CreateCoreAsync(
+                        inspectionStores.InspectionId, inspectionStores.Store, configuration,
+                        gateHooks.Options ?? new(), CancellationToken.None,
+                        epochDecorator: gateHooks.EpochDecorator,
+                        replacementDecorator: gateHooks.ReplacementDecorator,
+                        schedulerDecorator: gateHooks.SchedulerDecorator,
+                        beforeAuthorityClose: gateHooks.BeforeAuthorityClose);
+                var concrete = gateScope.CreateSession(source,
+                    runId => gateHooks?.InspectionWriterDecorator?.Invoke(inspectionStores.OpenRun(runId)) ??
+                        inspectionStores.OpenRun(runId), bScanIngress, visual);
+                session = concrete; apply = concrete;
+            }
+            runtime._session = session;
             var timeViewport = runtime._timeViewport = new SharedScanTimeViewport(dispatcher);
             var selectionResolver = new UtTraceAScanSelector(inspectionStores.Store, new AScanProjector());
             var selection = runtime._selection = new TraceSelectionScope(dispatcher, selectionResolver);
-            var viewModel = runtime._viewModel = new AScanHostViewModel(session, dispatcher, configuration);
+            var viewModel = runtime._viewModel = new AScanHostViewModel(session, dispatcher, configuration,
+                profileSelection: runtime._profiledSession);
             var aScanContext = new AScanComponentContext(session, session.Snapshot, visual, visual.StatusChanges,
                 () => visual.Statistics, timeViewport, selection,
-                new(gateScope.AuthorityKey, gateScope.Authority, gateScope.PreviewCompiler,
-                    gateScope.GeometryEvaluator, session));
+                gateScope is null ? null : new(gateScope.AuthorityKey, gateScope.Authority, gateScope.PreviewCompiler,
+                    gateScope.GeometryEvaluator, apply), gateScope is null ? deferredGateContexts : null);
             System.Windows.Threading.Dispatcher windowDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
             var preferenceStore = new BScanResamplingPreferenceStore(BScanResamplingPreferenceStore.DefaultPath);
             await preferenceStore.LoadAsync().ConfigureAwait(false);
@@ -272,10 +289,22 @@ public sealed class DesktopRuntime
             builder.Services.AddSingleton<IUtFrameSource>(source);
             builder.Services.AddSingleton(visual);
             builder.Services.AddSingleton<IObservable<AScanSnapshot>>(visual);
-            builder.Services.AddSingleton(session);
+            if (session is ApplicationSession concreteSession) builder.Services.AddSingleton(concreteSession);
+            if (runtime._profiledSession is { } profiledSession) builder.Services.AddSingleton(profiledSession);
             builder.Services.AddSingleton(inspectionStores);
-            builder.Services.AddSingleton(gateScope);
+            if (gateScope is not null)
+            {
+                builder.Services.AddSingleton(gateScope);
+            }
+            else
+            {
+                builder.Services.AddSingleton(sp =>
+                    sp.GetRequiredService<ProfiledSimulationSession>().GateScope
+                    ?? throw new InvalidOperationException("The gate scope is available after the simulation profile has been admitted by Start."));
+            }
             builder.Services.AddSingleton<IApplicationSession>(session);
+            if (runtime._profiledSession is { } profileSelection)
+                builder.Services.AddSingleton<ISimulationProfileSelection>(profileSelection);
             builder.Services.AddSingleton(viewModel);
             builder.Services.AddSingleton(aScanContext);
             builder.Services.AddSingleton(timeViewport);
