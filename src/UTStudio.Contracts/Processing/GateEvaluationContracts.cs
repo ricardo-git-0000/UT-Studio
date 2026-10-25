@@ -61,6 +61,44 @@ public sealed class GateDetectorMetrics : IEquatable<GateDetectorMetrics>
     private static long? Bits(double? value) => value.HasValue ? BitConverter.DoubleToInt64Bits(value.Value) : null;
 }
 
+/// <summary>
+/// Exact detector output retained independently from the consumer-selected measures. It is used by
+/// exact visual projections and never changes the requested-measure surface of a gate result.
+/// </summary>
+public sealed class GateExactDetectionData : IEquatable<GateExactDetectionData>
+{
+    internal GateExactDetectionData(GateDetectionEventKind eventKind, int sampleIndex,
+        double fractionalSamplePosition, double detectionTimeSeconds, double detectorAmplitudeCounts,
+        short signedRfAmplitudeCounts)
+    {
+        if (!Enum.IsDefined(eventKind) || eventKind == GateDetectionEventKind.Unknown || sampleIndex < 0 ||
+            !double.IsFinite(fractionalSamplePosition) || fractionalSamplePosition < sampleIndex ||
+            fractionalSamplePosition > sampleIndex + 1d || !double.IsFinite(detectionTimeSeconds) ||
+            !double.IsFinite(detectorAmplitudeCounts))
+            throw new ArgumentException("The exact detection payload is invalid.");
+        EventKind = eventKind; SampleIndex = sampleIndex;
+        FractionalSamplePosition = Canonical(fractionalSamplePosition);
+        DetectionTimeSeconds = Canonical(detectionTimeSeconds);
+        DetectorAmplitudeCounts = Canonical(detectorAmplitudeCounts);
+        SignedRfAmplitudeCounts = signedRfAmplitudeCounts;
+    }
+    public GateDetectionEventKind EventKind { get; }
+    public int SampleIndex { get; }
+    public double FractionalSamplePosition { get; }
+    public double DetectionTimeSeconds { get; }
+    public double DetectorAmplitudeCounts { get; }
+    public short SignedRfAmplitudeCounts { get; }
+    public bool Equals(GateExactDetectionData? other) => other is not null && EventKind == other.EventKind &&
+        SampleIndex == other.SampleIndex && Bits(FractionalSamplePosition) == Bits(other.FractionalSamplePosition) &&
+        Bits(DetectionTimeSeconds) == Bits(other.DetectionTimeSeconds) &&
+        Bits(DetectorAmplitudeCounts) == Bits(other.DetectorAmplitudeCounts) &&
+        SignedRfAmplitudeCounts == other.SignedRfAmplitudeCounts;
+    public override bool Equals(object? obj) => Equals(obj as GateExactDetectionData);
+    public override int GetHashCode() => HashCode.Combine(EventKind, SampleIndex, Bits(FractionalSamplePosition));
+    private static double Canonical(double value) => value == 0d ? 0d : value;
+    private static long Bits(double value) => BitConverter.DoubleToInt64Bits(value);
+}
+
 public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
 {
     internal GateEvaluationEntry(TraceIdentity traceIdentity, InspectionRevision sourceInspectionRevision,
@@ -71,7 +109,8 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
         double? detectionTimeSeconds, double? amplitudeCounts, short? signedRfAmplitudeCounts,
         double? timeOfFlightSeconds, double? offsetWithinWindowSeconds, GateResultQuality quality,
         GateSignalDomain signalDomain, UtTraceProvenance provenance, GateId? causalGateId,
-        GateResultStatus? causalStatus, GateDiagnosticCode diagnosticCode, GateDetectorMetrics metrics)
+        GateResultStatus? causalStatus, GateDiagnosticCode diagnosticCode, GateDetectorMetrics metrics,
+        GateExactDetectionData? exactDetection)
     {
         TraceIdentity = traceIdentity; SourceInspectionRevision = sourceInspectionRevision;
         PlanId = planId; PlanRevision = planRevision; PlanSignature = planSignature;
@@ -83,7 +122,7 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
         SignedRfAmplitudeCounts = signedRfAmplitudeCounts; TimeOfFlightSeconds = Canonical(timeOfFlightSeconds);
         OffsetWithinWindowSeconds = Canonical(offsetWithinWindowSeconds); Quality = quality;
         SignalDomain = signalDomain; Provenance = provenance; CausalGateId = causalGateId; CausalStatus = causalStatus;
-        DiagnosticCode = diagnosticCode; Metrics = metrics;
+        DiagnosticCode = diagnosticCode; Metrics = metrics; ExactDetection = exactDetection;
     }
 
     public TraceIdentity TraceIdentity { get; }
@@ -113,6 +152,7 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
     public GateResultStatus? CausalStatus { get; }
     public GateDiagnosticCode DiagnosticCode { get; }
     public GateDetectorMetrics Metrics { get; }
+    public GateExactDetectionData? ExactDetection { get; }
 
     public bool Equals(GateEvaluationEntry? other) => other is not null &&
         TraceIdentity == other.TraceIdentity && SourceInspectionRevision == other.SourceInspectionRevision &&
@@ -124,7 +164,8 @@ public sealed class GateEvaluationEntry : IEquatable<GateEvaluationEntry>
         SignedRfAmplitudeCounts == other.SignedRfAmplitudeCounts && Bits(TimeOfFlightSeconds) == Bits(other.TimeOfFlightSeconds) &&
         Bits(OffsetWithinWindowSeconds) == Bits(other.OffsetWithinWindowSeconds) && Quality == other.Quality &&
         SignalDomain == other.SignalDomain && Provenance == other.Provenance && CausalGateId == other.CausalGateId &&
-        CausalStatus == other.CausalStatus && DiagnosticCode == other.DiagnosticCode && Metrics.Equals(other.Metrics);
+        CausalStatus == other.CausalStatus && DiagnosticCode == other.DiagnosticCode && Metrics.Equals(other.Metrics) &&
+        Equals(ExactDetection, other.ExactDetection);
     public override bool Equals(object? obj) => Equals(obj as GateEvaluationEntry);
     public override int GetHashCode() => HashCode.Combine(GateId, GateRevision, Status, SampleIndex);
     private static double? Canonical(double? value) => value == 0d ? 0d : value;

@@ -77,7 +77,11 @@ public sealed class GateEvaluator
     }
 
     public static double ConvertNormalizedThreshold(GateSignalDomain domain, double normalized)
-        => GateThresholdScale.ToSignalCounts(domain, normalized);
+    {
+        if (!Enum.IsDefined(domain) || domain == GateSignalDomain.Unknown)
+            throw new ArgumentOutOfRangeException(nameof(domain));
+        return GateThresholdScale.ToSignalCounts(GateSignalDomain.RawSigned, normalized);
+    }
 
     private GateEvaluationEntry EvaluateGate(CompiledGatePlan plan, ConfirmedGateTraceDescriptor trace,
         CompiledGate gate, ReadOnlySpan<short> samples, GateScratchBuffer? scratch,
@@ -151,15 +155,17 @@ public sealed class GateEvaluator
     private Detection AbsoluteMaximum(ReadOnlySpan<short> samples, int first, int end,
         GateThreshold? acceptance, CancellationToken token)
     {
-        int selected = first; double value = Math.Abs((int)samples[first]);
+        // Legacy detector identity is retained for stored plans, but the evaluator must not rectify its input.
+        // New plans use GlobalMaximum over the appropriate already-processed DSP output.
+        int selected = first; double value = samples[first];
         for (int i = first + 1; i < end; i++)
         {
-            CheckCancellation(i, token); double candidate = Math.Abs((int)samples[i]);
+            CheckCancellation(i, token); double candidate = samples[i];
             if (candidate > value) { value = candidate; selected = i; }
         }
         if (acceptance is not null)
         {
-            double margin = value - ConvertNormalizedThreshold(GateSignalDomain.Absolute, acceptance.NormalizedValue);
+            double margin = value - ConvertNormalizedThreshold(GateSignalDomain.RawSigned, acceptance.NormalizedValue);
             if (margin < 0)
             {
                 return Detection.Rejected(GateDetectionEventKind.AbsoluteMaximum,
@@ -374,14 +380,7 @@ public sealed class GateEvaluator
         return first < endExclusive ? WindowResolution.Resolved : WindowResolution.Empty;
     }
 
-    private static double Transform(short value, GateSignalDomain domain) => domain switch
-    {
-        GateSignalDomain.RawSigned => value,
-        GateSignalDomain.Positive => Math.Max((int)value, 0),
-        GateSignalDomain.NegativeMagnitude => Math.Max(-(int)value, 0),
-        GateSignalDomain.Absolute => Math.Abs((int)value),
-        _ => throw new InvalidOperationException("Unsupported compiled domain.")
-    };
+    private static double Transform(short value, GateSignalDomain domain) => value;
 
     private void CheckCancellation(int index, CancellationToken token,
         GateEvaluationCheckpoint checkpoint = GateEvaluationCheckpoint.InWindow)
@@ -448,6 +447,9 @@ public sealed class GateEvaluator
         bool amplitudeRequested = measures.Contains(GateMeasureKind.Amplitude);
         bool timeRequested = measures.Contains(GateMeasureKind.DetectionTime);
         bool tofRequested = measures.Contains(GateMeasureKind.TimeOfFlight);
+        GateExactDetectionData? exactDetection = eventKind == GateDetectionEventKind.Unknown ? null :
+            new(eventKind, sampleIndex!.Value, position!.Value, time!.Value, amplitude!.Value,
+                signedAmplitude!.Value);
         return new(trace.ConfirmedIdentity,
             trace.SourceInspectionRevision, plan.Source.Id, plan.Source.Revision, plan.Signature,
             plan.Source.SchemaVersion, plan.Source.AlgorithmVersion, gate.Definition.Id, gate.Definition.Revision,
@@ -457,7 +459,7 @@ public sealed class GateEvaluator
             timeRequested ? offset : null,
             trace.EffectiveQuality switch { UtTraceQuality.Good => GateResultQuality.Valid, UtTraceQuality.Degraded => GateResultQuality.Degraded, _ => GateResultQuality.Invalid },
             gate.Definition.SignalDomain, trace.Descriptor.Provenance, causalGate, causalStatus,
-            DiagnosticFor(status), metrics);
+            DiagnosticFor(status), metrics, exactDetection);
     }
 
     private readonly record struct Detection(bool Detected, GateResultStatus Status, GateDetectionEventKind EventKind,

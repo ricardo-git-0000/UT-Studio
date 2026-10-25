@@ -23,7 +23,8 @@ public sealed class StationaryGateProfileTests
         Assert.AreEqual(gates[0].Id, gates[1].Window.StartReference.DependencyGateId);
         Assert.AreEqual(GateTimeReferenceKind.TraceOrigin, gates[2].Window.StartReference.Kind);
         Assert.IsTrue(gates.All(x => x.Detector.Kind == GateDetectorKind.GlobalMaximum &&
-            x.SignalDomain == GateSignalDomain.Absolute && x.Detector.Threshold is null));
+            x.SignalDomain == GateSignalDomain.RawSigned &&
+            x.Detector.Threshold?.NormalizedValue == .6));
 
         var options = new SimulatorOptions(noiseAmplitude: 0, signalProfile: SimulatorSignalProfiles.StationaryV1);
         var samples = new short[configuration.SampleCount];

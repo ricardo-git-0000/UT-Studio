@@ -96,7 +96,7 @@ public sealed class GatePlanCompiler
     {
         if (!gate.Revision.IsValid) { errors.Add(Error(GateCompilationErrorCode.InvalidRevision, "GateRevision is invalid.", gate.Id)); }
         if (!Enum.IsDefined(gate.SignalDomain) || gate.SignalDomain == GateSignalDomain.Unknown)
-        { errors.Add(Error(GateCompilationErrorCode.UnsupportedCombination, "Signal domain is unknown.", gate.Id)); }
+        { errors.Add(Error(GateCompilationErrorCode.UnsupportedCombination, "Signal metadata is unknown.", gate.Id)); }
         ValidateWindow(gate, errors);
         ValidateDetector(gate, errors);
         if (gate.RequestedMeasures.Count == 0 || gate.RequestedMeasures.Any(x => !Enum.IsDefined(x) || x == GateMeasureKind.Unknown) ||
@@ -150,8 +150,6 @@ public sealed class GatePlanCompiler
         else if (detector.LocalExtrema is not null)
         { errors.Add(Error(GateCompilationErrorCode.UnsupportedCombination, "Local extrema parameters are supported only by local-maximum detectors.", gate.Id)); }
 
-        if (detector.Kind == GateDetectorKind.AbsoluteMaximum && gate.SignalDomain != GateSignalDomain.RawSigned)
-        { errors.Add(Error(GateCompilationErrorCode.UnsupportedCombination, "AbsoluteMaximum requires RawSigned input.", gate.Id)); }
     }
 
     private static bool UnitInterval(double value) => double.IsFinite(value) && value is >= 0 and <= 1;

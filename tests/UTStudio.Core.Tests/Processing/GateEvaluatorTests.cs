@@ -8,14 +8,14 @@ namespace UTStudio.Core.Tests.Processing;
 public sealed class GateEvaluatorTests
 {
     [TestMethod]
-    public void ThresholdConversionIsExactForEveryDomainAndRejectsInvalidValues()
+    public void ThresholdConversionUsesTheProcessedInputRangeForEveryLegacyMetadataValue()
     {
         CollectionAssert.AreEqual(new[] { -32768d, -.5d, 32767d }, new[] { 0d, .5d, 1d }
             .Select(x => GateEvaluator.ConvertNormalizedThreshold(GateSignalDomain.RawSigned, x)).ToArray());
-        CollectionAssert.AreEqual(new[] { 0d, 16383.5d, 32767d }, new[] { 0d, .5d, 1d }
+        CollectionAssert.AreEqual(new[] { -32768d, -.5d, 32767d }, new[] { 0d, .5d, 1d }
             .Select(x => GateEvaluator.ConvertNormalizedThreshold(GateSignalDomain.Positive, x)).ToArray());
         foreach (GateSignalDomain domain in new[] { GateSignalDomain.NegativeMagnitude, GateSignalDomain.Absolute })
-            CollectionAssert.AreEqual(new[] { 0d, 16384d, 32768d }, new[] { 0d, .5d, 1d }
+            CollectionAssert.AreEqual(new[] { -32768d, -.5d, 32767d }, new[] { 0d, .5d, 1d }
                 .Select(x => GateEvaluator.ConvertNormalizedThreshold(domain, x)).ToArray());
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => GateEvaluator.ConvertNormalizedThreshold(GateSignalDomain.RawSigned, double.NaN));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => GateEvaluator.ConvertNormalizedThreshold(GateSignalDomain.RawSigned, double.PositiveInfinity));
@@ -34,15 +34,15 @@ public sealed class GateEvaluatorTests
         GateEvaluationEntry min = EvaluateOne(rf, GateDetectorKind.GlobalMinimum, GateSignalDomain.RawSigned);
         AssertDetected(min, 0, -32768);
         GateEvaluationEntry absolute = EvaluateOne(rf, GateDetectorKind.AbsoluteMaximum, GateSignalDomain.RawSigned);
-        AssertDetected(absolute, 0, 32768); Assert.AreEqual(short.MinValue, absolute.SignedRfAmplitudeCounts);
+        AssertDetected(absolute, 5, 32767); Assert.AreEqual(short.MaxValue, absolute.SignedRfAmplitudeCounts);
         AssertDetected(EvaluateOne([-3, 5, 5], GateDetectorKind.GlobalMaximum, GateSignalDomain.Positive), 1, 5);
-        AssertDetected(EvaluateOne([-8, 4], GateDetectorKind.GlobalMaximum, GateSignalDomain.NegativeMagnitude), 0, 8);
-        AssertDetected(EvaluateOne([-8, 8], GateDetectorKind.GlobalMaximum, GateSignalDomain.Absolute), 0, 8);
+        AssertDetected(EvaluateOne([-8, 4], GateDetectorKind.GlobalMaximum, GateSignalDomain.NegativeMagnitude), 1, 4);
+        AssertDetected(EvaluateOne([-8, 8], GateDetectorKind.GlobalMaximum, GateSignalDomain.Absolute), 1, 8);
         GateEvaluationEntry below = EvaluateOne([0, 100], GateDetectorKind.GlobalMaximum,
-            GateSignalDomain.Positive, threshold: .5);
+            GateSignalDomain.Positive, threshold: .75);
         Assert.AreEqual(GateResultStatus.BelowThreshold, below.Status);
         Assert.AreEqual(GateDiagnosticCode.BelowAcceptanceThreshold, below.DiagnosticCode);
-        Assert.AreEqual(100 - 16383.5, below.Metrics.ThresholdMarginCounts);
+        Assert.AreEqual(100 - 16383.25, below.Metrics.ThresholdMarginCounts);
     }
 
     [TestMethod]
@@ -192,13 +192,13 @@ public sealed class GateEvaluatorTests
             GateSignalDomain.RawSigned, threshold: .5);
         Assert.AreEqual(2, lastFall.SampleIndex);
 
-        short[] armed = [20_000, 5_000, 30_000, 5_000, 32_000];
+        short[] armed = [20_000, -20_000, 30_000, -20_000, 32_000];
         GateEvaluationEntry hysteresis = EvaluateOne(armed, GateDetectorKind.LastRisingCrossing,
             GateSignalDomain.Positive, hysteresis: new(.25, .75));
         Assert.AreEqual(3, hysteresis.SampleIndex);
         Assert.AreEqual(GateResultStatus.NoEvent, EvaluateOne([20_000, 30_000],
             GateDetectorKind.FirstRisingCrossing, GateSignalDomain.Positive, hysteresis: new(.25, .75)).Status);
-        GateEvaluationEntry fallingRearmed = EvaluateOne([5_000, 30_000, 5_000, 30_000, 1_000],
+        GateEvaluationEntry fallingRearmed = EvaluateOne([-20_000, 30_000, -20_000, 30_000, -25_000],
             GateDetectorKind.LastFallingCrossing, GateSignalDomain.Positive, hysteresis: new(.25, .75));
         Assert.AreEqual(3, fallingRearmed.SampleIndex);
     }
@@ -229,9 +229,6 @@ public sealed class GateEvaluatorTests
 
     [TestMethod]
     [DataRow(GateSignalDomain.RawSigned)]
-    [DataRow(GateSignalDomain.Positive)]
-    [DataRow(GateSignalDomain.NegativeMagnitude)]
-    [DataRow(GateSignalDomain.Absolute)]
     public void LocalMaximumThresholdFiltersEligibilityBeforeTemporalSelection(GateSignalDomain domain)
     {
         double threshold = NormalizedThreshold(domain, 6);
@@ -247,9 +244,6 @@ public sealed class GateEvaluatorTests
 
     [TestMethod]
     [DataRow(GateSignalDomain.RawSigned)]
-    [DataRow(GateSignalDomain.Positive)]
-    [DataRow(GateSignalDomain.NegativeMagnitude)]
-    [DataRow(GateSignalDomain.Absolute)]
     public void LocalMaximumRequiresStrictlyGreaterThanThreshold(GateSignalDomain domain)
     {
         double threshold = NormalizedThreshold(domain, 6);

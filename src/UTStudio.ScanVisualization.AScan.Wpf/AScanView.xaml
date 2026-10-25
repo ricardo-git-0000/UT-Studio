@@ -4,6 +4,12 @@
     xmlns:controls="clr-namespace:UTStudio.Visualization.Wpf.Controls;assembly=UTStudio.Visualization.Wpf"
     Focusable="True" AutomationProperties.Name="Componente A-Scan"
     KeyboardNavigation.TabNavigation="Local">
+  <UserControl.Resources>
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+  </UserControl.Resources>
   <UserControl.InputBindings>
     <KeyBinding Key="Home" Command="{Binding ResetViewportCommand, ElementName=Root}" />
     <KeyBinding Key="Add" Command="{Binding ZoomInCommand, ElementName=Root}" />
@@ -11,7 +17,7 @@
     <KeyBinding Key="Left" Modifiers="Alt" Command="{Binding PanLeftCommand, ElementName=Root}" />
     <KeyBinding Key="Right" Modifiers="Alt" Command="{Binding PanRightCommand, ElementName=Root}" />
   </UserControl.InputBindings>
-  <Grid x:Name="Root">
+  <Grid x:Name="Root" DataContext="{x:Null}">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <StackPanel Orientation="Horizontal" Margin="0,0,0,12" AutomationProperties.Name="Herramientas A-Scan">
       <TextBlock Text="{Binding ComponentPhase}" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,12,0" AutomationProperties.LiveSetting="Polite"/>
@@ -31,10 +37,10 @@
       <TextBlock Text="{Binding GateEditor.State.Phase}" Margin="8,0,0,0" VerticalAlignment="Center"
                  AutomationProperties.Name="Estado del editor de gates" AutomationProperties.LiveSetting="Polite"/>
     </StackPanel>
-    <StackPanel x:Name="GateEditorPanel" Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10"
+    <WrapPanel x:Name="GateEditorPanel" Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10"
                 AutomationProperties.Name="Valores de la puerta seleccionada">
-      <StackPanel.Style>
-        <Style TargetType="StackPanel">
+      <WrapPanel.Style>
+        <Style TargetType="WrapPanel">
           <Setter Property="Visibility" Value="Visible"/>
           <Style.Triggers>
             <DataTrigger Binding="{Binding GateEditor.SelectedGateId}" Value="{x:Null}">
@@ -42,26 +48,39 @@
             </DataTrigger>
           </Style.Triggers>
         </Style>
-      </StackPanel.Style>
+      </WrapPanel.Style>
       <TextBlock Text="Puerta: " VerticalAlignment="Center" FontWeight="SemiBold"/>
-      <ComboBox Width="100" Margin="0,0,10,0" ItemsSource="{Binding GateEditor.GateIds}"
+      <ComboBox x:Name="GateSelector" Width="100" Margin="0,0,10,0" ItemsSource="{Binding GateEditor.GateIds}"
+                IsEnabled="{Binding GateEditor.IsDefinitionEditingEnabled}"
                 SelectedItem="{Binding GateEditor.SelectedGateId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                 AutomationProperties.Name="Puerta seleccionada"/>
+      <TextBlock Text="Detector:" VerticalAlignment="Center"/>
+      <ComboBox x:Name="GateDetectorSelector" Width="190" Margin="6,0,10,0" ItemsSource="{Binding GateEditor.DetectorChoices}"
+                IsEnabled="{Binding GateEditor.IsDefinitionEditingEnabled}"
+                DisplayMemberPath="Label" SelectedValuePath="Value"
+                SelectedValue="{Binding GateEditor.SelectedGateDetector, Mode=TwoWay}"
+                AutomationProperties.Name="Detector de la puerta"/>
+      <TextBlock Text="Referencia:" VerticalAlignment="Center"/>
+      <ComboBox x:Name="GateReferenceSelector" Width="145" Margin="6,0,10,0" ItemsSource="{Binding GateEditor.ReferenceChoices}"
+                IsEnabled="{Binding GateEditor.IsDefinitionEditingEnabled}"
+                DisplayMemberPath="Label" SelectedValuePath="Value"
+                SelectedValue="{Binding GateEditor.SelectedGateReference, Mode=TwoWay}"
+                AutomationProperties.Name="Referencia temporal"/>
       <TextBlock Text="{Binding GateEditor.SelectedGateReferenceLabel}" VerticalAlignment="Center" Margin="0,0,16,0"/>
-      <TextBlock Text="Inicio/offset (µs):" VerticalAlignment="Center"/>
+      <TextBlock Text="{Binding GateEditor.SelectedGateStartLabel}" VerticalAlignment="Center"/>
       <StackPanel Margin="6,0,14,0">
         <TextBox x:Name="GateStartValue" Width="92" VerticalContentAlignment="Center"
-                 Tag="Start" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
-                 AutomationProperties.Name="Inicio de puerta en microsegundos"
+                 Tag="Start" TextChanged="OnGateNumericTextChanged" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
+                 AutomationProperties.Name="{Binding GateEditor.SelectedGateStartLabel}"
                  AutomationProperties.HelpText="Al salir del campo valida y genera el mismo Preview que el arrastre"/>
         <TextBlock x:Name="GateStartValidation" Foreground="#FFB4AB" Visibility="Collapsed"
                    AutomationProperties.LiveSetting="Assertive"/>
       </StackPanel>
-      <TextBlock Text="Fin (µs):" VerticalAlignment="Center"/>
+      <TextBlock Text="{Binding GateEditor.SelectedGateEndLabel}" VerticalAlignment="Center"/>
       <StackPanel Margin="6,0,14,0">
         <TextBox x:Name="GateEndValue" Width="92" VerticalContentAlignment="Center"
-                 Tag="End" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
-                 AutomationProperties.Name="Fin de puerta en microsegundos"
+                 Tag="End" TextChanged="OnGateNumericTextChanged" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
+                 AutomationProperties.Name="{Binding GateEditor.SelectedGateEndLabel}"
                  AutomationProperties.HelpText="Al salir del campo valida y genera el mismo Preview que el arrastre"/>
         <TextBlock x:Name="GateEndValidation" Foreground="#FFB4AB" Visibility="Collapsed"
                    AutomationProperties.LiveSetting="Assertive"/>
@@ -80,18 +99,68 @@
         <TextBlock Text="Umbral (%):" VerticalAlignment="Center"/>
         <StackPanel Margin="6,0,14,0">
           <TextBox x:Name="GateThresholdValue" Width="80" VerticalContentAlignment="Center"
-                   Tag="Threshold" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
+                   Tag="Threshold" TextChanged="OnGateNumericTextChanged" LostKeyboardFocus="OnGateNumericLostKeyboardFocus"
                    AutomationProperties.Name="Umbral de puerta en porcentaje"
                    AutomationProperties.HelpText="Al salir del campo valida y genera el mismo Preview que el handle gráfico"/>
           <TextBlock x:Name="GateThresholdValidation" Foreground="#FFB4AB" Visibility="Collapsed"
                      AutomationProperties.LiveSetting="Assertive"/>
         </StackPanel>
+        <TextBlock Text="=" VerticalAlignment="Center"/>
+        <TextBlock Text="{Binding GateEditor.SelectedGateThresholdCounts, StringFormat={}{0:0.###} counts}"
+                   VerticalAlignment="Center" Margin="4,0,12,0"
+                   AutomationProperties.Name="Equivalencia de umbral en counts"/>
       </StackPanel>
+      <StackPanel Orientation="Horizontal">
+        <StackPanel.Style><Style TargetType="StackPanel"><Setter Property="Visibility" Value="Collapsed"/>
+          <Style.Triggers><DataTrigger Binding="{Binding GateEditor.SelectedGateHasLocalParameters}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers>
+        </Style></StackPanel.Style>
+        <TextBlock Text="Radio (muestras):" VerticalAlignment="Center"/>
+        <TextBox x:Name="GateRadiusValue" Width="52" Margin="6,0,10,0" Tag="Radius"
+                 IsEnabled="{Binding GateEditor.IsDefinitionEditingEnabled}"
+                 LostKeyboardFocus="OnGateParameterLostKeyboardFocus" AutomationProperties.Name="Radio de vecindad en muestras"
+                 AutomationProperties.HelpText="{Binding GateEditor.DefinitionValidationMessage, TargetNullValue=''}"/>
+        <TextBlock x:Name="GateRadiusValidation" Foreground="#FFB4AB" Visibility="Collapsed"
+                   AutomationProperties.LiveSetting="Assertive"/>
+        <TextBlock Text="Prominencia (counts):" VerticalAlignment="Center"/>
+        <TextBox x:Name="GateProminenceValue" Width="70" Margin="6,0,10,0" Tag="Prominence"
+                 IsEnabled="{Binding GateEditor.IsDefinitionEditingEnabled}"
+                 LostKeyboardFocus="OnGateParameterLostKeyboardFocus" AutomationProperties.Name="Prominencia mínima en counts"
+                 AutomationProperties.HelpText="{Binding GateEditor.DefinitionValidationMessage, TargetNullValue=''}"/>
+        <TextBlock x:Name="GateProminenceValidation" Foreground="#FFB4AB" Visibility="Collapsed"
+                   AutomationProperties.LiveSetting="Assertive"/>
+        <TextBlock Text="Distancia (muestras):" VerticalAlignment="Center"/>
+        <TextBox x:Name="GateDistanceValue" Width="52" Margin="6,0,10,0" Tag="Distance"
+                 IsEnabled="{Binding GateEditor.IsDefinitionEditingEnabled}"
+                 LostKeyboardFocus="OnGateParameterLostKeyboardFocus" AutomationProperties.Name="Distancia mínima en muestras"
+                 AutomationProperties.HelpText="{Binding GateEditor.DefinitionValidationMessage, TargetNullValue=''}"/>
+        <TextBlock x:Name="GateDistanceValidation" Foreground="#FFB4AB" Visibility="Collapsed"
+                   AutomationProperties.LiveSetting="Assertive"/>
+        <TextBlock Text="Meseta: LowerCenter" VerticalAlignment="Center"/>
+      </StackPanel>
+      <TextBlock Text="{Binding GateEditor.DefinitionValidationMessage}" Foreground="#FFB4AB"
+                 VerticalAlignment="Center" AutomationProperties.LiveSetting="Assertive"/>
+      <TextBlock Text="{Binding GateEditor.SelectedGateHysteresisDescription}" Foreground="#FFD18A"
+                 VerticalAlignment="Center" AutomationProperties.Name="Configuración de histéresis"
+                 AutomationProperties.LiveSetting="Polite"/>
+      <!-- Keep the result cells at a stable width.  Starting a graphical Preview temporarily replaces the
+           exact result; allowing these strings to resize the wrapping panel also resized the plot and
+           invalidated the just-acquired gate pointer transform. -->
+      <TextBlock x:Name="GateResolvedWindow" Width="220" TextTrimming="CharacterEllipsis"
+                 Text="{Binding GateEditor.SelectedGateResolvedWindow}" ToolTip="{Binding GateEditor.SelectedGateResolvedWindow}"
+                 Margin="12,0,0,0" VerticalAlignment="Center"/>
+      <TextBlock x:Name="GateResolutionStatus" Width="130" TextTrimming="CharacterEllipsis"
+                 Text="{Binding GateEditor.SelectedGateResolutionStatus}" ToolTip="{Binding GateEditor.SelectedGateResolutionStatus}"
+                 Margin="12,0,0,0" VerticalAlignment="Center"/>
+      <TextBlock x:Name="GateExactEvent" Width="430" TextTrimming="CharacterEllipsis"
+                 Text="{Binding GateEditor.SelectedGateExactEvent}" ToolTip="{Binding GateEditor.SelectedGateExactEvent}"
+                 Margin="12,0,0,0" VerticalAlignment="Center"
+                 AutomationProperties.Name="Evento exacto de la puerta" AutomationProperties.LiveSetting="Polite"/>
       <TextBlock Text="{Binding GateEditor.NumericValidationMessage}" Foreground="#FFB4AB"
                  VerticalAlignment="Center" AutomationProperties.LiveSetting="Assertive"/>
-    </StackPanel>
+    </WrapPanel>
     <controls:AScanControl x:Name="Scan" Grid.Row="2" AutomationProperties.Name="Gráfico A-Scan"
       CursorActivated="OnCursorActivated" CursorMoveRequested="OnCursorMoveRequested"
+      GateBeginWindowCaptureRequested="OnGateBeginWindowCaptureRequested"
       TimeZoomRequested="OnTimeZoomRequested" TimePanRequested="OnTimePanRequested" TimeResetRequested="OnTimeResetRequested"/>
     <StackPanel Grid.Row="3" Margin="0,12,0,0">
       <TextBlock Text="Zoom temporal: rueda sobre el gráfico · desplazar: botón central o Mayús + arrastre izquierdo." Foreground="#AEBFD4"/>

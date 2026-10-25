@@ -76,6 +76,30 @@ public sealed class GateOverlaySessionTests
     }
 
     [TestMethod]
+    public async Task WindowCaptureMovesOnlyStartOffsetAndPreservesDurationAndDefinition()
+    {
+        Fixture fixture = Fixture.Create();
+        await using GateOverlaySession overlay = fixture.Overlay;
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed, await overlay.RequestCommittedAsync());
+        GatePlanDraft draft = fixture.Editor.BeginEdit().Draft!;
+        Assert.IsTrue(overlay.BeginEditing(draft));
+        GateDefinition before = draft.Gates.Single();
+
+        GateCaptureGeneration capture = overlay.BeginWindowCapture(before.Id)!.Value;
+        Assert.AreEqual(GateHandleKind.Window, capture.Handle);
+        Assert.IsFalse(overlay.Snapshot.Handles.Any(x => x.Kind == GateHandleKind.Window));
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed, await overlay.MoveCapturedHandleAsync(1e-6));
+        overlay.EndCapture();
+
+        GateDefinition moved = fixture.Editor.Snapshot.Draft!.Gates.Single();
+        Assert.AreEqual(1e-6, moved.Window.StartOffsetSeconds, 1e-15);
+        Assert.AreEqual(before.Window.DurationSeconds, moved.Window.DurationSeconds, 1e-15);
+        Assert.AreEqual(before.Window.StartReference, moved.Window.StartReference);
+        Assert.AreEqual(before.Detector, moved.Detector);
+        Assert.AreEqual(before.SignalDomain, moved.SignalDomain);
+    }
+
+    [TestMethod]
     public async Task PanOutsideRemovesHandlesWithoutChangingDraftAndPanBackRestoresExactPositions()
     {
         Fixture fixture = Fixture.Create();
@@ -149,6 +173,36 @@ public sealed class GateOverlaySessionTests
     }
 
     [TestMethod]
+    public async Task NewLiveTraceDoesNotStarveExactResultAndPublishesOnlyMatchingSignalGeometryPairs()
+    {
+        var evaluator = new ControlledEvaluator();
+        Fixture fixture = Fixture.Create(evaluator);
+        await using GateOverlaySession overlay = fixture.Overlay;
+        var completed = new List<AScanCompositeVisualSnapshot>();
+        overlay.CompositeSnapshotChanged += (snapshot, composite) =>
+        {
+            if (snapshot.Status == GateOverlayGeometryStatus.Current && composite is not null)
+                completed.Add(composite);
+        };
+
+        Task<GateOverlayRequestOutcome> first = overlay.PreviewAsync(fixture.BeginDraft(.10)).AsTask();
+        await evaluator.FirstEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        AScanSnapshot latest = Fixture.SignalSnapshot(8);
+        Assert.IsTrue(overlay.SetVisualContext(latest, null, Fixture.Transform(1)));
+        Task<GateOverlayRequestOutcome> pending = overlay.RequestEditingAsync().AsTask();
+
+        evaluator.ReleaseFirst.TrySetResult();
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed, await first.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed, await pending.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreEqual(2, evaluator.Calls);
+        Assert.IsGreaterThanOrEqualTo(2, completed.Count);
+        Assert.IsTrue(completed.All(x => x.Signal.TraceIdentity == x.Gates.TraceIdentity));
+        Assert.AreSame(latest, completed[^1].Signal);
+        Assert.AreSame(latest, overlay.CompositeSnapshot!.Signal);
+        Assert.AreEqual(GateGeometrySourceKind.Preview, overlay.Snapshot.Source!.Kind);
+    }
+
+    [TestMethod]
     public async Task ContinuousCaptureKeepsNonceAndContextWhileLateOwnResultCannotRegress()
     {
         var evaluator = new ControlledEvaluator();
@@ -170,6 +224,26 @@ public sealed class GateOverlaySessionTests
         overlay.SetVisualContext(fixture.Signal, null, Fixture.Transform(2));
         Assert.IsNull(overlay.Snapshot.Capture);
         Assert.AreEqual(PortablePointerCaptureOwner.None, overlay.GestureOwner);
+    }
+
+    [TestMethod]
+    public async Task CompatibleLiveFrameBeforeFirstMovePreservesCapture()
+    {
+        Fixture fixture = Fixture.Create();
+        await using GateOverlaySession overlay = fixture.Overlay;
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.PreviewAsync(fixture.BeginDraft(.10)));
+        Assert.IsTrue(overlay.Select(new GateId("A"), GateHandleKind.Threshold));
+        GateCaptureGeneration capture = overlay.BeginGateCapture()!.Value;
+
+        AScanSnapshot nextFrame = Fixture.SignalSnapshot(8);
+        Assert.IsTrue(overlay.SetVisualContext(nextFrame, null, Fixture.Transform(1)));
+
+        Assert.AreEqual(capture, overlay.Snapshot.Capture);
+        Assert.AreEqual(PortablePointerCaptureOwner.Gate, overlay.GestureOwner);
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.MoveCapturedHandleAsync(.25));
+        Assert.AreEqual(.25, fixture.Editor.Snapshot.Draft!.Gates[0].Detector.Threshold!.NormalizedValue);
     }
 
     [TestMethod]
@@ -394,6 +468,49 @@ public sealed class GateOverlaySessionTests
         Assert.AreEqual(2, fixture.Compiler.Compilations);
     }
 
+    [TestMethod]
+    public async Task CausalHandleDragConvertsAbsoluteTraceTimeToRelativeOffsetAndWidth()
+    {
+        Fixture fixture = Fixture.CreateCausal(anchorDetected: true);
+        await using GateOverlaySession overlay = fixture.Overlay;
+        fixture.Editor.BeginEdit();
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.PreviewAsync(fixture.Editor.Snapshot.Draft!));
+
+        GateHandleVisualState start = overlay.Snapshot.Handles.Single(x =>
+            x.GateId == new GateId("B") && x.Kind == GateHandleKind.Start);
+        Assert.IsNotNull(overlay.BeginGateCapture(start));
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.MoveCapturedHandleAsync(4.5e-6));
+        overlay.EndCapture();
+        GateDefinition movedStart = fixture.Editor.Snapshot.Draft!.Gates.Single(x => x.Id == new GateId("B"));
+        Assert.AreEqual(1.5e-6, movedStart.Window.StartOffsetSeconds, 1e-15);
+        Assert.AreEqual(.5e-6, movedStart.Window.DurationSeconds, 1e-15);
+
+        GateHandleVisualState end = overlay.Snapshot.Handles.Single(x =>
+            x.GateId == new GateId("B") && x.Kind == GateHandleKind.End);
+        Assert.IsNotNull(overlay.BeginGateCapture(end));
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.MoveCapturedHandleAsync(6.5e-6));
+        overlay.EndCapture();
+        GateDefinition movedEnd = fixture.Editor.Snapshot.Draft!.Gates.Single(x => x.Id == new GateId("B"));
+        Assert.AreEqual(1.5e-6, movedEnd.Window.StartOffsetSeconds, 1e-15);
+        Assert.AreEqual(2e-6, movedEnd.Window.DurationSeconds, 1e-15);
+    }
+
+    [TestMethod]
+    public async Task CausalHandleCannotBeCapturedWithoutDetectedAnchor()
+    {
+        Fixture fixture = Fixture.CreateCausal(anchorDetected: false);
+        await using GateOverlaySession overlay = fixture.Overlay;
+        fixture.Editor.BeginEdit();
+        Assert.AreEqual(GateOverlayRequestOutcome.Completed,
+            await overlay.PreviewAsync(fixture.Editor.Snapshot.Draft!));
+
+        Assert.IsFalse(overlay.Snapshot.Handles.Any(x => x.GateId == new GateId("B")),
+            "A causal gate without a detected anchor has no exact geometry that can be dragged.");
+    }
+
     private sealed class Fixture
     {
         private Fixture(TrackingCompiler compiler, GatePlanEditorSession editor,
@@ -421,6 +538,22 @@ public sealed class GateOverlaySessionTests
             return new(compiler, editor, evaluator, overlay, signal);
         }
 
+        internal static Fixture CreateCausal(bool anchorDetected)
+        {
+            GateDefinition first = GateTestPlan.Gate("A", offsetSeconds: 0, durationSeconds: 2e-6);
+            GateDefinition causal = GateTestPlan.Gate("B", "A", offsetSeconds: 1e-6, durationSeconds: 1e-6);
+            GatePlanCompilationResult committedResult = new GatePlanCompiler().Compile(GateTestPlan.Plan([first, causal]));
+            var committed = new CommittedGatePlanSnapshot(Inspection, committedResult.CompiledPlan!);
+            var authority = new InMemoryGatePlanAuthorityOwner([committed]); authority.Seal();
+            var compiler = new TrackingCompiler();
+            var editor = new GatePlanEditorSession(committed.AuthorityKey, authority.Reader, compiler);
+            var evaluator = new CausalEvaluator(anchorDetected);
+            var overlay = new GateOverlaySession(editor, evaluator);
+            AScanSnapshot signal = SignalSnapshot();
+            overlay.SetVisualContext(signal, null, Transform(1));
+            return new(compiler, editor, evaluator, overlay, signal);
+        }
+
         internal GatePlanDraft BeginDraft(double threshold)
         { Editor.BeginEdit(); return Draft(threshold); }
         internal GatePlanDraft Draft(double threshold)
@@ -441,12 +574,12 @@ public sealed class GateOverlaySessionTests
             viewport, GateAmplitudePresentationKind.RawRf,
             0, 800, 200, -200, 800, 400, 1, 1);
 
-        private static AScanSnapshot SignalSnapshot()
+        internal static AScanSnapshot SignalSnapshot(ulong sequence = 7)
         {
             var configuration = new ConventionalAcquisitionConfiguration(new PhysicalChannelId(0), 8, 1_000_000);
             var metadata = new ConventionalUtFrameMetadata(new UtSourceId("overlay-test"), Run,
                 configuration, DateTimeOffset.UnixEpoch);
-            AScanSnapshot signal = new AScanProjector().Project(metadata, 7, TimeSpan.Zero,
+            AScanSnapshot signal = new AScanProjector().Project(metadata, sequence, TimeSpan.Zero,
                 new short[] { 0, 100, 0, 0, 0, 0, 0, 0 }, 1);
             var stream = new UtStreamIdentity(Inspection, Run, metadata.SourceId, configuration.PhysicalChannelId);
             signal.SetAuthority(new(stream, 1), new(1));
@@ -498,6 +631,32 @@ public sealed class GateOverlaySessionTests
         {
             if (Interlocked.Increment(ref _calls) != 1) return;
             FirstEntered.TrySetResult(); await ReleaseFirst.Task.WaitAsync(token);
+        }
+    }
+
+    private sealed class CausalEvaluator(bool anchorDetected) : RecordingEvaluator
+    {
+        public override ValueTask<GateGeometryEvaluationResult> EvaluateAsync(GateGeometryEvaluationRequest request,
+            CompiledGatePlan compiledPlan, CancellationToken cancellationToken = default)
+        {
+            ReceivedPlans.Add(compiledPlan);
+            GateDefinition first = compiledPlan.DeclaredGates[0].Definition;
+            GateDefinition causal = compiledPlan.DeclaredGates[1].Definition;
+            GateResultStatus anchorStatus = anchorDetected ? GateResultStatus.Detected : GateResultStatus.NoEvent;
+            double? anchorTime = anchorDetected ? 3e-6 : null;
+            var anchor = new GateAnchorSnapshot(first.Id, first.Revision, GateTimeReferenceKind.GateEvent,
+                first.Id, anchorStatus, null, null, anchorTime);
+            GateGeometryItemSnapshot[] gates =
+            [
+                new(first.Id, first.Revision, first.SignalDomain, anchorStatus, null,
+                    0, 2e-6, first.Detector.Threshold?.NormalizedValue),
+                new(causal.Id, causal.Revision, causal.SignalDomain, GateResultStatus.NoEvent, anchor,
+                    anchorTime + causal.Window.StartOffsetSeconds,
+                    anchorTime + causal.Window.StartOffsetSeconds + causal.Window.DurationSeconds,
+                    causal.Detector.Threshold?.NormalizedValue)
+            ];
+            return ValueTask.FromResult(new GateGeometryEvaluationResult(GateGeometryEvaluationStatus.Completed,
+                request, new(request.Source, request.TraceIdentity, request.ExpectedInspectionRevision, gates)));
         }
     }
 

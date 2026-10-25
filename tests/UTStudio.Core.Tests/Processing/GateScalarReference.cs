@@ -15,8 +15,8 @@ internal static class GateScalarReference
         {
             GateDetectorKind.GlobalMaximum => Global(samples, values, domain, true, threshold),
             GateDetectorKind.GlobalMinimum => Global(samples, values, domain, false, threshold),
-            GateDetectorKind.AbsoluteMaximum => Global(samples, samples.Select(x => (double)Math.Abs((int)x)).ToArray(),
-                GateSignalDomain.Absolute, true, threshold, GateDetectionEventKind.AbsoluteMaximum),
+            GateDetectorKind.AbsoluteMaximum => Global(samples, values,
+                domain, true, threshold, GateDetectionEventKind.AbsoluteMaximum),
             GateDetectorKind.FirstRisingCrossing => Crossing(samples, values, domain, true, true, threshold, hysteresis),
             GateDetectorKind.LastRisingCrossing => Crossing(samples, values, domain, true, false, threshold, hysteresis),
             GateDetectorKind.FirstFallingCrossing => Crossing(samples, values, domain, false, true, threshold, hysteresis),
@@ -117,20 +117,8 @@ internal static class GateScalarReference
             samples[selected.Index], selected.Prominence, margin);
     }
 
-    private static double Threshold(GateSignalDomain domain, double normalized) => domain switch
-    {
-        GateSignalDomain.RawSigned => -32768d + 65535d * normalized,
-        GateSignalDomain.Positive => 32767d * normalized,
-        GateSignalDomain.NegativeMagnitude or GateSignalDomain.Absolute => 32768d * normalized,
-        _ => throw new ArgumentOutOfRangeException(nameof(domain))
-    };
+    private static double Threshold(GateSignalDomain domain, double normalized) =>
+        -32768d + 65535d * normalized;
 
-    private static double Transform(short value, GateSignalDomain domain) => domain switch
-    {
-        GateSignalDomain.RawSigned => value,
-        GateSignalDomain.Positive => Math.Max((int)value, 0),
-        GateSignalDomain.NegativeMagnitude => Math.Max(-(int)value, 0),
-        GateSignalDomain.Absolute => Math.Abs((int)value),
-        _ => throw new ArgumentOutOfRangeException(nameof(domain))
-    };
+    private static double Transform(short value, GateSignalDomain domain) => value;
 }

@@ -45,7 +45,7 @@ public static class ProductiveGateProcessingFactory
         double duration = configuration.SampleCount / configuration.SampleRateHz;
         var gate = new GateDefinition(new GateId("default-global-maximum"), new GateRevision(1),
             new GateWindowDefinition(GateTimeReference.TraceOrigin(), configuration.FirstSampleOffsetSeconds, duration),
-            GateSignalDomain.Absolute, new GateDetectorDefinition(GateDetectorKind.GlobalMaximum),
+            GateSignalDomain.RawSigned, new GateDetectorDefinition(GateDetectorKind.GlobalMaximum, new(.6)),
             [GateMeasureKind.Amplitude, GateMeasureKind.DetectionTime, GateMeasureKind.Status, GateMeasureKind.Quality]);
         var plan = new GatePlan(new GatePlanId("productive-default"), new GatePlanRevision(1),
             new GateSchemaVersion(GatePlanCompilerOptions.CurrentSchemaVersion),
@@ -62,11 +62,11 @@ public static class ProductiveGateProcessingFactory
         GateMeasureKind[] measures = [GateMeasureKind.Amplitude, GateMeasureKind.DetectionTime,
             GateMeasureKind.Status, GateMeasureKind.Quality];
         var a = new GateDefinition(new("A"), new(1), new(GateTimeReference.TraceOrigin(), 8.5e-6, 3e-6),
-            GateSignalDomain.Absolute, new(GateDetectorKind.GlobalMaximum), measures);
+            GateSignalDomain.RawSigned, new(GateDetectorKind.GlobalMaximum, new(.6)), measures);
         var b = new GateDefinition(new("B"), new(1), new(GateTimeReference.GateEvent(a.Id), 13.5e-6, 3e-6),
-            GateSignalDomain.Absolute, new(GateDetectorKind.GlobalMaximum), measures);
+            GateSignalDomain.RawSigned, new(GateDetectorKind.GlobalMaximum, new(.6)), measures);
         var c = new GateDefinition(new("C"), new(1), new(GateTimeReference.TraceOrigin(), 23.5e-6, 3e-6),
-            GateSignalDomain.Absolute, new(GateDetectorKind.GlobalMaximum), measures);
+            GateSignalDomain.RawSigned, new(GateDetectorKind.GlobalMaximum, new(.6)), measures);
         var plan = new GatePlan(new("stationary-abc"), new(1),
             new(GatePlanCompilerOptions.CurrentSchemaVersion),
             new(GatePlanCompilerOptions.CurrentAlgorithmVersion), [a, b, c]);

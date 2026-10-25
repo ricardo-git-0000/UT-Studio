@@ -8,7 +8,8 @@ public enum GatePlanEditIntentKind { Unknown, Preview, Cancel, Apply }
 public enum GatePlanEditOutcome
 {
     Unknown, Previewed, Cancelled, Superseded, Closed, Accepted, ValidationFailed, Conflict,
-    CapacityExceeded, RevisionExhausted, InvalidPreviewArtifact, CancelledBeforeCommit, FaultedBeforeCommit
+    CapacityExceeded, RevisionExhausted, InvalidPreviewArtifact, CancelledBeforeCommit, FaultedBeforeCommit,
+    CandidateRejected
 }
 public enum GatePlanCapacityResource { Unknown, LiveEpochs, LedgerRevisions, LedgerBytes, DerivedStore }
 public enum GatePlanEditorState
@@ -382,6 +383,15 @@ public sealed class GatePlanEditResult
             !snapshot.DraftErrors.SequenceEqual(captured))
             throw new ArgumentException("Snapshot and result diagnostics must describe the same validation failure.", nameof(validationErrors));
         return new(GatePlanEditOutcome.ValidationFailed, snapshot, snapshot.CurrentRevision, validationErrors: captured);
+    }
+    public static GatePlanEditResult CandidateRejected(GatePlanEditorSnapshot currentSnapshot,
+        GatePlanRevision expectedRevision, IEnumerable<GateCompilationError> validationErrors)
+    {
+        ArgumentNullException.ThrowIfNull(currentSnapshot);
+        GateCompilationError[] captured = GatePlanEditorSnapshot.CaptureErrors(validationErrors, nameof(validationErrors));
+        if (!expectedRevision.IsValid || captured.Length == 0 || currentSnapshot.CurrentRevision != expectedRevision)
+            throw new ArgumentException("A rejected candidate requires a current snapshot and diagnostics.");
+        return new(GatePlanEditOutcome.CandidateRejected, currentSnapshot, expectedRevision, validationErrors: captured);
     }
     public static GatePlanEditResult Conflict(GatePlanRevision expectedRevision, GatePlanEditorSnapshot currentSnapshot)
     {

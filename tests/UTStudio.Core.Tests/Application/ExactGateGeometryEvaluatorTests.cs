@@ -11,6 +11,47 @@ namespace UTStudio.Core.Tests.Application;
 public sealed class ExactGateGeometryEvaluatorTests
 {
     [TestMethod]
+    public async Task ExactCrossingEventKeepsLeftSampleIndexAndInterpolatesDisplayedRfOrdinate()
+    {
+        const double normalized = .5;
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(GateEvaluationTestData.Gate("A", 3,
+            detector: GateDetectorKind.FirstRisingCrossing, domain: GateSignalDomain.RawSigned,
+            threshold: normalized));
+        Fixture fixture = Fixture.Create([-100, 100, 0], plan, previewGeneration: 3);
+
+        GateGeometryEvaluationResult result = await fixture.Evaluator.EvaluateAsync(fixture.Request, plan);
+
+        GateExactEventSnapshot detected = result.Snapshot!.Gates.Single().DetectedEvent!;
+        double threshold = GateThresholdScale.ToSignalCounts(GateSignalDomain.RawSigned, normalized);
+        double fraction = (threshold + 100d) / 200d;
+        Assert.AreEqual(GateResultStatus.Detected, detected.Status);
+        Assert.AreEqual(GateDetectionEventKind.RisingCrossing, detected.EventKind);
+        Assert.AreEqual(0, detected.SampleIndex);
+        Assert.AreEqual(fraction, detected.FractionalSamplePosition!.Value, 1e-15);
+        Assert.AreEqual(threshold, detected.DetectorAmplitudeCounts!.Value, 1e-15);
+        Assert.AreEqual(threshold, detected.DisplayedRfAmplitudeCounts!.Value, 1e-12);
+    }
+
+    [TestMethod]
+    public async Task ExactEventAndCausalAnchorDoNotDependOnRequestedMeasureProjection()
+    {
+        GateMeasureKind[] statusOnly = [GateMeasureKind.Status, GateMeasureKind.Quality];
+        GateDefinition a = GateEvaluationTestData.Gate("A", 3, measures: statusOnly);
+        GateDefinition b = GateEvaluationTestData.Gate("B", 2, dependency: "A",
+            offsetSeconds: 1e-6, measures: statusOnly);
+        CompiledGatePlan plan = GateEvaluationTestData.CompilePreview(a, b);
+        Fixture fixture = Fixture.Create([0, 100, 0, 200, 0], plan, previewGeneration: 31);
+
+        GateGeometryEvaluationResult result = await fixture.Evaluator.EvaluateAsync(fixture.Request, plan);
+
+        GateGeometryItemSnapshot[] gates = result.Snapshot!.Gates.ToArray();
+        Assert.AreEqual(GateResultStatus.Detected, gates[0].DetectedEvent!.Status);
+        Assert.AreEqual(1e-6, gates[0].DetectedEvent!.DetectionTimeSeconds!.Value, 1e-15);
+        Assert.AreEqual(1e-6, gates[1].Anchor!.DetectionTimeSeconds!.Value, 1e-15);
+        Assert.AreEqual(2e-6, gates[1].StartSeconds!.Value, 1e-15);
+    }
+
+    [TestMethod]
     public async Task PreviewChainUsesOneExactEvaluationAndPreservesCausalTerminals()
     {
         short[] samples = [0, 100, 0, 200, 0, 300, 0, 0];

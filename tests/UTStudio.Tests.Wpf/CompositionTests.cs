@@ -5,6 +5,8 @@ using System.Windows.Input;
 using System.Windows.Media.Imaging;
 using System.Windows.Automation;
 using System.Buffers;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading.Channels;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.DependencyInjection;
@@ -23,6 +25,7 @@ using UTStudio.Domain.Acquisition;
 using UTStudio.Domain.Inspection;
 using UTStudio.Domain.Processing;
 using UTStudio.Presentation;
+using AScanView = UTStudio.ScanVisualization.AScan.Wpf.AScanView;
 using UTStudio.Processing.Core;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Core.Scan2D;
@@ -96,32 +99,40 @@ public sealed class CompositionTests
             window.UpdateLayout();
             await Dispatcher.Yield();
             if (editor.State.Overlay.Status != GateOverlayGeometryStatus.Current ||
-                editor.State.Overlay.Handles.Count != 2)
+                !HasDefaultEditableHandles())
             {
                 var editable = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 void EditingReady(object? _, System.ComponentModel.PropertyChangedEventArgs __)
                 {
                     if (editor.State.Overlay.Status == GateOverlayGeometryStatus.Current &&
-                        editor.State.Overlay.Handles.Count == 2) editable.TrySetResult();
+                        HasDefaultEditableHandles()) editable.TrySetResult();
                 }
                 editor.PropertyChanged += EditingReady;
                 try { await editable.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
                 finally { editor.PropertyChanged -= EditingReady; }
             }
+            bool HasDefaultEditableHandles() =>
+                editor.State.Overlay.Handles.Any(x => x.Kind == GateHandleKind.Start) &&
+                editor.State.Overlay.Handles.Any(x => x.Kind == GateHandleKind.End) &&
+                editor.State.Overlay.Handles.Any(x => x.Kind == GateHandleKind.Threshold);
             GatePlanDraft initialDraft = editor.State.Editor.Draft!;
             GateDefinition initialGate = initialDraft.Gates.Single();
             Assert.AreEqual("default-global-maximum", editor.SelectedGateId);
             Assert.AreEqual(0d, editor.SelectedGateStartMicroseconds);
             Assert.AreEqual(16d, editor.SelectedGateEndMicroseconds);
-            Assert.IsFalse(editor.SelectedGateHasThreshold);
-            Assert.IsFalse(editor.State.Overlay.Handles.Any(x => x.Kind == GateHandleKind.Threshold));
+            Assert.IsTrue(editor.SelectedGateHasThreshold);
+            Assert.AreEqual(20d, editor.SelectedGateThresholdPercent);
+            Assert.IsTrue(editor.State.Overlay.Handles.Any(x => x.Kind == GateHandleKind.Threshold));
             Assert.AreEqual(Visibility.Visible,
                 ((FrameworkElement)window.AScan.FindName("GateEditorPanel")).Visibility);
+            Assert.AreEqual(220d, ((FrameworkElement)window.AScan.FindName("GateResolvedWindow")).Width);
+            Assert.AreEqual(130d, ((FrameworkElement)window.AScan.FindName("GateResolutionStatus")).Width);
+            Assert.AreEqual(430d, ((FrameworkElement)window.AScan.FindName("GateExactEvent")).Width);
             var startEditor = (TextBox)window.AScan.FindName("GateStartValue");
             var endEditor = (TextBox)window.AScan.FindName("GateEndValue");
             Assert.AreEqual(Visibility.Visible, startEditor.Visibility);
             Assert.AreEqual(Visibility.Visible, endEditor.Visibility);
-            Assert.AreEqual(Visibility.Collapsed,
+            Assert.AreEqual(Visibility.Visible,
                 ((FrameworkElement)window.AScan.FindName("GateThresholdPanel")).Visibility);
             GateHandleVisualState startHandle = editor.State.Overlay.Handles.Single(x => x.Kind == GateHandleKind.Start);
             GateHandleVisualState endHandle = editor.State.Overlay.Handles.Single(x => x.Kind == GateHandleKind.End);
@@ -222,13 +233,15 @@ public sealed class CompositionTests
             await WaitForNumericAsync(() => editor.SelectedGateStartMicroseconds == 2d);
 
             endEditor.Text = "12";
+            await WaitForNumericAsync(() => editor.SelectedGateEndMicroseconds == 12d);
+            Assert.IsTrue(endEditor.IsKeyboardFocusWithin,
+                "The end value must reach the draft without requiring focus to leave the field.");
             GateControlledSource.FrameOwner endTypingFrame = source.QueueFrame();
             await endTypingFrame.Returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await Dispatcher.Yield();
             Assert.AreEqual("12", endEditor.Text,
                 "A live visual publication must not overwrite an in-progress numeric edit.");
             Keyboard.ClearFocus();
-            await WaitForNumericAsync(() => editor.SelectedGateEndMicroseconds == 12d);
             Assert.AreEqual(2d, editor.SelectedGateStartMicroseconds);
             Assert.AreEqual(12d, editor.SelectedGateEndMicroseconds);
             await ExecuteWhenEnabled(editor.PreviewCommand);
@@ -612,21 +625,150 @@ public sealed class CompositionTests
             await editor.BeginEditCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
             await DiagnosticWait.Until(() => editor.State.Editor.Draft is not null,
                 "stationary draft is available");
+            editor.SelectedGateId = "A";
+            Assert.HasCount(6, editor.DetectorChoices);
+            foreach (GateEditorChoice<GateDetectorKind> detector in editor.DetectorChoices)
+            {
+                if (editor.SelectedGateDetector == detector.Value) continue;
+                editor.SelectedGateDetector = detector.Value;
+                await DiagnosticWait.Until(() => editor.SelectedGateDetector == detector.Value &&
+                    editor.State.Phase == GateEditorViewPhase.Previewed,
+                    $"detector {detector.Value} Preview converges");
+            }
+            editor.SelectedGateDetector = GateDetectorKind.FirstLocalMaximum;
+            await DiagnosticWait.Until(() => editor.SelectedGateDetector == GateDetectorKind.FirstLocalMaximum &&
+                editor.State.Phase == GateEditorViewPhase.Previewed, "A local detector Preview converges");
+            Assert.AreEqual(20d, editor.SelectedGateThresholdPercent);
+            Assert.AreEqual(1, editor.SelectedGateNeighborhoodRadius);
+            Assert.AreEqual(0d, editor.SelectedGateMinimumProminence);
+            Assert.AreEqual(1, editor.SelectedGateMinimumDistance);
+            Assert.IsTrue(editor.SelectedGateHasThreshold);
+            Assert.IsTrue(editor.SelectedGateHasLocalParameters);
+            Assert.AreEqual(GateThresholdScale.ToSignalCounts(GateSignalDomain.RawSigned, .6),
+                editor.SelectedGateThresholdCounts);
+            editor.SelectedGateDetector = GateDetectorKind.GlobalMinimum;
+            await DiagnosticWait.Until(() => editor.SelectedGateDetector == GateDetectorKind.GlobalMinimum &&
+                editor.State.Phase == GateEditorViewPhase.Previewed, "incompatible local parameters are removed");
+            Assert.IsTrue(editor.SelectedGateHasThreshold);
+            Assert.AreEqual(20d, editor.SelectedGateThresholdPercent);
+            Assert.IsFalse(editor.SelectedGateHasLocalParameters);
+            editor.SelectedGateDetector = GateDetectorKind.FirstFallingCrossing;
+            await DiagnosticWait.Until(() => editor.SelectedGateDetector == GateDetectorKind.FirstFallingCrossing &&
+                editor.State.Phase == GateEditorViewPhase.Previewed, "falling crossing defaults converge");
+            Assert.AreEqual(20d, editor.SelectedGateThresholdPercent);
+            Assert.IsFalse(editor.SelectedGateHasLocalParameters);
+            editor.SelectedGateDetector = GateDetectorKind.FirstLocalMaximum;
+            await DiagnosticWait.Until(() => editor.SelectedGateDetector == GateDetectorKind.FirstLocalMaximum &&
+                editor.State.Phase == GateEditorViewPhase.Previewed, "local detector is restored");
+            window.UpdateLayout();
+            var radiusEditor = (TextBox)window.AScan.FindName("GateRadiusValue");
+            var prominenceEditor = (TextBox)window.AScan.FindName("GateProminenceValue");
+            Assert.IsTrue(radiusEditor.Focus());
+            radiusEditor.Text = "inválido";
+            Assert.IsTrue(prominenceEditor.Focus());
+            await Dispatcher.Yield();
+            Assert.Contains("Error", AutomationProperties.GetItemStatus(radiusEditor));
+            Assert.AreEqual(Visibility.Visible,
+                ((TextBlock)window.AScan.FindName("GateRadiusValidation")).Visibility);
+            Assert.IsNotNull(editor.DefinitionValidationMessage);
+            Assert.IsFalse(editor.ApplyCommand.CanExecute(null));
+            Assert.IsTrue(radiusEditor.Focus());
+            radiusEditor.Text = "1e20";
+            Assert.IsTrue(prominenceEditor.Focus());
+            await Dispatcher.Yield();
+            Assert.Contains("Error", AutomationProperties.GetItemStatus(radiusEditor));
+            Assert.IsFalse(editor.ApplyCommand.CanExecute(null));
+            Assert.IsTrue(radiusEditor.Focus());
+            radiusEditor.Text = "1";
+            Assert.IsTrue(prominenceEditor.Focus());
+            await DiagnosticWait.Until(() => editor.SelectedGateNeighborhoodRadius == 1,
+                "local numeric validation recovers");
+            Assert.AreEqual(string.Empty, AutomationProperties.GetItemStatus(radiusEditor));
+
+            editor.SelectedGateId = "C";
+            double cOffset = editor.SelectedGateStartMicroseconds!.Value;
+            editor.SelectedGateReference = "B";
+            await DiagnosticWait.Until(() => editor.SelectedGateReference == "B" &&
+                editor.State.Phase == GateEditorViewPhase.Previewed, "C causal reference converges");
+            Assert.AreEqual(cOffset, editor.SelectedGateStartMicroseconds);
+
             editor.SelectedGateId = "B";
             Assert.AreEqual("B", editor.SelectedGateId);
             Assert.AreEqual("respecto de A", editor.SelectedGateReferenceLabel);
+            Assert.AreEqual("Offset inicial (µs):", editor.SelectedGateStartLabel);
+            Assert.AreEqual("Ancho (µs):", editor.SelectedGateEndLabel);
+            GatePlanDraft validBeforeCycle = editor.State.Editor.Draft!;
+            editor.SelectedGateReference = "C";
+            await DiagnosticWait.Until(() => editor.DefinitionValidationMessage is not null,
+                "cycle rejection is visible");
+            Assert.AreEqual("A", editor.SelectedGateReference);
+            Assert.AreSame(validBeforeCycle, editor.State.Editor.Draft);
+            StringAssert.Contains(editor.DefinitionValidationMessage!, "no se realizó");
             editor.SelectedGateStartMicroseconds = 14d;
             await DiagnosticWait.Until(() => editor.SelectedGateStartMicroseconds == 14d,
                 "stationary B start draft converges");
-            editor.SelectedGateEndMicroseconds = 17d;
+            editor.SelectedGateEndMicroseconds = 3d;
             await DiagnosticWait.Until(() => editor.SelectedGateStartMicroseconds == 14d &&
-                editor.SelectedGateEndMicroseconds == 17d, "stationary B numeric draft converges");
+                editor.SelectedGateEndMicroseconds == 3d, "stationary B numeric draft converges");
+            GateDefinition editedB = editor.State.Editor.Draft!.Gates.Single(x => x.Id == new GateId("B"));
+            Assert.AreEqual(14e-6, editedB.Window.StartOffsetSeconds, 1e-15);
+            Assert.AreEqual(3e-6, editedB.Window.DurationSeconds, 1e-15);
+            await DiagnosticWait.Until(() => editor.State.Overlay.Status == GateOverlayGeometryStatus.Current &&
+                editor.State.Overlay.Gates.Any(x => x.GateId == new GateId("B") &&
+                    x.StartCoordinate is not null && x.EndCoordinate is not null),
+                "stationary B exact Preview becomes current");
+            await DiagnosticWait.Until(() =>
+            {
+                window.AScan.Renderer.RefreshSnapshot();
+                return window.AScan.Renderer.DisplayedVisualSnapshot?.Gates is
+                { Status: GateOverlayGeometryStatus.Current } displayed &&
+                    displayed.Gates.Any(x => x.GateId == new GateId("B") &&
+                        x.StartCoordinate is not null && x.EndCoordinate is not null);
+            }, "stationary B exact Preview becomes visible");
+            ulong signalVersionBeforeLiveWait = window.AScan.Renderer.RenderedSignalSnapshotVersion!.Value;
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
+            window.AScan.Renderer.RefreshSnapshot();
+            Assert.IsGreaterThanOrEqualTo(signalVersionBeforeLiveWait + 5,
+                window.AScan.Renderer.RenderedSignalSnapshotVersion!.Value,
+                "Editing gate limits must preserve continuous productive live RF delivery, not occasional updates.");
+            AScanCompositeVisualSnapshot livePreview = window.AScan.Renderer.DisplayedVisualSnapshot!;
+            Assert.AreEqual(livePreview.Signal.TraceIdentity, livePreview.Gates.TraceIdentity,
+                "Exact gate geometry must be displayed only with the RF trace that was evaluated.");
+            Assert.IsTrue(livePreview.Gates.Gates.Any(x => x.GateId == new GateId("B") &&
+                x.StartCoordinate is not null && x.EndCoordinate is not null),
+                "Continuous live publications must not make the accepted Preview disappear.");
+            Assert.IsTrue(livePreview.Gates.Gates.Any(x => x.GateId == new GateId("B") &&
+                x.DetectedEvent is not null),
+                "The stationary echo inside B must retain an exact detected event during live delivery.");
+            const double movedCursorTime = 5e-6;
+            window.AScan.ViewModel!.MoveCursor(AScanCursorId.A, movedCursorTime);
+            await DiagnosticWait.Until(() =>
+            {
+                window.AScan.Renderer.RefreshSnapshot();
+                return window.AScan.Renderer.DisplayedVisualSnapshot?.Cursors?.A.TimeSeconds is { } time &&
+                    Math.Abs(time - movedCursorTime) < 1e-12;
+            }, "manual cursor movement is immediately projected over the exact gate composite");
+            ulong cursorVersion = window.AScan.Renderer.RenderedSignalSnapshotVersion!.Value;
+            await DiagnosticWait.Until(() =>
+            {
+                window.AScan.Renderer.RefreshSnapshot();
+                return window.AScan.Renderer.RenderedSignalSnapshotVersion >= cursorVersion + 3;
+            }, "successive live traces are rendered after moving the manual cursor");
+            Assert.AreEqual(movedCursorTime, window.AScan.ViewModel.Cursors!.A.TimeSeconds, 1e-12);
+            Assert.AreEqual(movedCursorTime,
+                window.AScan.Renderer.DisplayedVisualSnapshot!.Cursors!.A.TimeSeconds, 1e-12,
+                "Live gate and RF publications must not restore an older cursor position.");
             await editor.PreviewCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
             GatePlanRevision before = scope.Authority.Read(scope.AuthorityKey).Committed.Revision;
             await editor.ApplyCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
             GatePlanAuthoritySnapshot committed = scope.Authority.Read(scope.AuthorityKey);
             GateDefinition b = committed.Committed.Plan.Gates.Single(x => x.Id.Value == "B");
+            GateDefinition a = committed.Committed.Plan.Gates.Single(x => x.Id.Value == "A");
+            GateDefinition c = committed.Committed.Plan.Gates.Single(x => x.Id.Value == "C");
             Assert.AreEqual(before.Value + 1, committed.Committed.Revision.Value);
+            Assert.AreEqual(GateDetectorKind.FirstLocalMaximum, a.Detector.Kind);
+            Assert.AreEqual(.6, a.Detector.Threshold!.NormalizedValue);
+            Assert.AreEqual(new GateId("B"), c.Window.StartReference.DependencyGateId);
             Assert.AreEqual(14e-6, b.Window.StartOffsetSeconds, 1e-15);
             Assert.AreEqual(3e-6, b.Window.DurationSeconds, 1e-15);
 
@@ -721,6 +863,97 @@ public sealed class CompositionTests
             Assert.AreEqual(SessionPhase.Disposed, session.Snapshot.Phase);
         }
         finally { await runtime.Shutdown.ShutdownAsync(); }
+    });
+
+    [TestMethod]
+    public Task AScanRootNeverInheritsHostDataContextOrEmitsTransientBindingErrors() => StaTest.Run(async () =>
+    {
+        var listener = new BindingTraceListener();
+        PresentationTraceSources.DataBindingSource.Listeners.Add(listener);
+        DesktopRuntime? runtime = null;
+        try
+        {
+            runtime = await DesktopRuntime.CreateAsync(new WpfUiDispatcher(Dispatcher.CurrentDispatcher));
+            IServiceProvider services = runtime.Host.Services;
+            var host = services.GetRequiredService<AScanHostViewModel>();
+            var context = services.GetRequiredService<AScanComponentContext>();
+            var window = services.GetRequiredService<MainWindow>();
+            var root = (Grid)window.AScan.FindName("Root");
+
+            Assert.AreSame(host, window.DataContext);
+            Assert.AreSame(DependencyProperty.UnsetValue,
+                window.AScan.ReadLocalValue(FrameworkElement.DataContextProperty));
+            Assert.IsNull(root.DataContext);
+            Assert.IsNull(root.ReadLocalValue(FrameworkElement.DataContextProperty));
+
+            window.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, window.AScan));
+            await Dispatcher.Yield();
+            Assert.AreSame(host, window.AScan.DataContext);
+            Assert.AreSame(window.AScan.ViewModel, root.DataContext);
+            Assert.IsNotNull(window.AScan.ViewModel!.ResetViewportCommand);
+            Assert.AreEqual(string.Empty, AutomationProperties.GetHelpText(
+                (TextBox)window.AScan.FindName("GateRadiusValue")));
+            Assert.AreEqual(string.Empty, AutomationProperties.GetHelpText(
+                (TextBox)window.AScan.FindName("GateProminenceValue")));
+            Assert.AreEqual(string.Empty, AutomationProperties.GetHelpText(
+                (TextBox)window.AScan.FindName("GateDistanceValue")));
+            await runtime.Host.StartAsync();
+            await host.StartCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(10));
+            await DiagnosticWait.Until(() => host.Session.Phase == SessionPhase.Running,
+                "Start completes while binding diagnostics are captured");
+            GateEditorViewCoordinator editor = window.AScan.ViewModel!.GateEditor!;
+            await editor.BeginEditCommand.ExecuteAsync(null).WaitAsync(TimeSpan.FromSeconds(5));
+            await DiagnosticWait.Until(() => editor.SelectedGateId is not null,
+                "gate selection becomes available while binding diagnostics are captured");
+            foreach (string selectorName in new[]
+            {
+                "GateSelector", "GateDetectorSelector", "GateReferenceSelector"
+            })
+            {
+                var selector = (ComboBox)window.AScan.FindName(selectorName);
+                selector.IsDropDownOpen = true;
+                window.UpdateLayout();
+                await Dispatcher.Yield();
+                if (selector.Items.Count > 0) selector.SelectedIndex = 0;
+                selector.IsDropDownOpen = false;
+                await Dispatcher.Yield();
+            }
+            Assert.ThrowsExactly<InvalidOperationException>(() => window.AScan.Context = context with { });
+
+            window.AScan.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent, window.AScan));
+            Assert.AreSame(window.AScan.ViewModel, root.DataContext);
+            await window.AScan.CloseAsync();
+            Assert.IsNull(root.DataContext);
+            Assert.IsNull(root.ReadLocalValue(FrameworkElement.DataContextProperty));
+
+            var reopened = new AScanView
+            {
+                DataContext = host,
+                Context = context with { GateEditing = null, DeferredGateEditing = null }
+            };
+            var reopenedRoot = (Grid)reopened.FindName("Root");
+            Assert.AreSame(host, reopened.DataContext);
+            Assert.IsNull(reopenedRoot.DataContext);
+            Assert.IsNull(reopenedRoot.ReadLocalValue(FrameworkElement.DataContextProperty));
+            reopened.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, reopened));
+            await Dispatcher.Yield();
+            Assert.AreSame(reopened.ViewModel, reopenedRoot.DataContext);
+            Assert.IsNull(reopened.ViewModel!.GateEditor);
+            Assert.IsNotNull(reopened.ViewModel.ToggleCursorsCommand);
+            await reopened.CloseAsync();
+            Assert.IsNull(reopenedRoot.DataContext);
+            Assert.IsNull(reopenedRoot.ReadLocalValue(FrameworkElement.DataContextProperty));
+
+            string diagnostics = listener.Messages;
+            Assert.DoesNotContain("System.Windows.Data Error:", diagnostics);
+            Assert.DoesNotContain("BindingExpression path error", diagnostics);
+            Assert.DoesNotContain("property not found", diagnostics);
+        }
+        finally
+        {
+            PresentationTraceSources.DataBindingSource.Listeners.Remove(listener);
+            if (runtime is not null) await runtime.Shutdown.ShutdownAsync();
+        }
     });
 
     [TestMethod]
@@ -1288,6 +1521,14 @@ public sealed class CompositionTests
                 returned(); Returned.TrySetResult();
             }
         }
+    }
+
+    private sealed class BindingTraceListener : TraceListener
+    {
+        private readonly ConcurrentQueue<string> _messages = new();
+        internal string Messages => string.Join(Environment.NewLine, _messages);
+        public override void Write(string? message) { if (message is not null) _messages.Enqueue(message); }
+        public override void WriteLine(string? message) { if (message is not null) _messages.Enqueue(message); }
     }
 
     private sealed class ControlledSource : IUtFrameSource

@@ -6,7 +6,7 @@ using UTStudio.Domain.Processing;
 
 namespace UTStudio.Visualization.Core;
 
-public enum GateHandleKind { Unknown, Start, End, Threshold }
+public enum GateHandleKind { Unknown, Start, End, Threshold, Window }
 public enum GateOverlayGeometryStatus { Unknown, NotRequested, Evaluating, Current, Stale, Unavailable, Closed, Faulted }
 public enum PortablePointerCaptureOwner { None, Cursor, Gate }
 public enum GateOverlayInteractionKind

@@ -32,18 +32,22 @@ public readonly record struct GateGeometryProjectionContext
 }
 
 public sealed record GateThresholdProjection(double SignalCounts, double AmplitudePercent, double Coordinate);
+public sealed record GateEventProjection(double TimeCoordinate, double AmplitudeCoordinate,
+    double TimeSeconds, double DisplayedRfAmplitudeCounts, double DetectorAmplitudeCounts,
+    GateDetectionEventKind EventKind);
 
 public sealed class ProjectedGateGeometryItem
 {
     private readonly ReadOnlyCollection<GateThresholdProjection> _thresholds;
     public ProjectedGateGeometryItem(GateId gateId, GateRevision gateRevision,
         GateGeometryProjectionStatus status, double? startCoordinate, double? endCoordinate,
-        IEnumerable<GateThresholdProjection> thresholds)
+        IEnumerable<GateThresholdProjection> thresholds, GateEventProjection? detectedEvent = null)
     {
         ArgumentNullException.ThrowIfNull(thresholds);
         GateId = gateId; GateRevision = gateRevision; Status = status;
         StartCoordinate = startCoordinate; EndCoordinate = endCoordinate;
         _thresholds = Array.AsReadOnly(thresholds.ToArray());
+        DetectedEvent = detectedEvent;
     }
     public GateId GateId { get; }
     public GateRevision GateRevision { get; }
@@ -51,6 +55,7 @@ public sealed class ProjectedGateGeometryItem
     public double? StartCoordinate { get; }
     public double? EndCoordinate { get; }
     public IReadOnlyList<GateThresholdProjection> Thresholds => _thresholds;
+    public GateEventProjection? DetectedEvent { get; }
 }
 
 public static class GateGeometryProjector
@@ -67,38 +72,36 @@ public static class GateGeometryProjector
     {
         double? start = ProjectTime(gate.StartSeconds, context);
         double? end = ProjectTime(gate.EndSeconds, context);
+        GateEventProjection? detectedEvent = ProjectEvent(gate.DetectedEvent, context);
         if (!gate.ThresholdNormalized.HasValue)
-            return new(gate.GateId, gate.GateRevision, GateGeometryProjectionStatus.Projected, start, end, []);
-        if (context.AmplitudePresentation == GateAmplitudePresentationKind.RectifiedMagnitude &&
-            gate.SignalDomain == GateSignalDomain.RawSigned)
-            return new(gate.GateId, gate.GateRevision,
-                GateGeometryProjectionStatus.IncompatibleAmplitudeDomain, start, end, []);
-
-        double counts = GateThresholdScale.ToSignalCounts(gate.SignalDomain, gate.ThresholdNormalized.Value);
-        double[] percentages = context.AmplitudePresentation switch
-        {
-            GateAmplitudePresentationKind.RawRf => gate.SignalDomain switch
-            {
-                GateSignalDomain.RawSigned => [100d * counts / 32768d],
-                GateSignalDomain.Positive => [100d * counts / 32768d],
-                GateSignalDomain.NegativeMagnitude => [-100d * counts / 32768d],
-                GateSignalDomain.Absolute => [-100d * counts / 32768d, 100d * counts / 32768d],
-                _ => []
-            },
-            GateAmplitudePresentationKind.RectifiedMagnitude =>
-                [100d * counts / (gate.SignalDomain == GateSignalDomain.Positive ? 32767d : 32768d)],
-            _ => []
-        };
-        var projected = new List<GateThresholdProjection>(percentages.Length);
-        foreach (double percentage in percentages)
-        {
-            double minimum = context.AmplitudePresentation == GateAmplitudePresentationKind.RawRf ? -100 : 0;
-            if (LinearAxisTransform.TryDataToCoordinate(percentage, minimum, 100,
-                context.AmplitudeCoordinateOrigin, context.AmplitudeCoordinateLength, out double coordinate))
-                projected.Add(new(counts, percentage, coordinate));
-        }
+            return new(gate.GateId, gate.GateRevision, GateGeometryProjectionStatus.Projected, start, end, [], detectedEvent);
+        double normalized = gate.ThresholdNormalized.Value;
+        double percentage = context.AmplitudePresentation == GateAmplitudePresentationKind.RawRf
+            ? -100d + 200d * normalized : 100d * normalized;
+        double minimum = context.AmplitudePresentation == GateAmplitudePresentationKind.RawRf ? -100d : 0d;
+        var projected = new List<GateThresholdProjection>(1);
+        if (LinearAxisTransform.TryDataToCoordinate(percentage, minimum, 100d,
+            context.AmplitudeCoordinateOrigin, context.AmplitudeCoordinateLength, out double coordinate))
+            projected.Add(new(GateThresholdScale.ToSignalCounts(GateSignalDomain.RawSigned, normalized),
+                percentage, coordinate));
         return new(gate.GateId, gate.GateRevision, GateGeometryProjectionStatus.Projected,
-            start, end, projected);
+            start, end, projected, detectedEvent);
+    }
+
+    private static GateEventProjection? ProjectEvent(GateExactEventSnapshot? detected,
+        GateGeometryProjectionContext context)
+    {
+        if (detected?.Status != GateResultStatus.Detected ||
+            detected.DetectionTimeSeconds is not { } time ||
+            detected.DisplayedRfAmplitudeCounts is not { } displayed ||
+            detected.DetectorAmplitudeCounts is not { } detector ||
+            ProjectTime(time, context) is not { } x) return null;
+        double percent = context.AmplitudePresentation == GateAmplitudePresentationKind.RawRf
+            ? 100d * displayed / 32768d : 100d * Math.Abs(displayed) / 32768d;
+        double minimum = context.AmplitudePresentation == GateAmplitudePresentationKind.RawRf ? -100d : 0d;
+        if (!LinearAxisTransform.TryDataToCoordinate(percent, minimum, 100d,
+            context.AmplitudeCoordinateOrigin, context.AmplitudeCoordinateLength, out double y)) return null;
+        return new(x, y, time, displayed, detector, detected.EventKind);
     }
 
     private static double? ProjectTime(double? seconds, GateGeometryProjectionContext context)

@@ -15,7 +15,14 @@ internal sealed class AScanVisualSnapshotAdapter
         if (state?.VisualContent is not { IsCoherent: true } content || widthDip <= 84 || heightDip <= 54 ||
             !double.IsFinite(widthDip) || !double.IsFinite(heightDip) || dpiScaleX <= 0 || dpiScaleY <= 0) return null;
         if (state.CompositeVisual is { } composed && Compatible(composed.Transform, widthDip, heightDip, dpiScaleX, dpiScaleY))
-            return composed;
+        {
+            AScanCursorState? cursors = content.Cursors is { } requested &&
+                requested.RunId == composed.Signal.Metadata.RunId
+                ? AScanCursorMeasurements.Reconcile(requested, composed.Signal)
+                : composed.Cursors;
+            return Equals(cursors, composed.Cursors) ? composed :
+                new(composed.Signal, cursors, composed.Gates, composed.Transform);
+        }
         GateVisualTransform transform = CreateTransform(content, widthDip, heightDip, dpiScaleX, dpiScaleY);
         if (state.GateEditor is { } gateEditor)
             return new(content.Signal, content.Cursors, gateEditor.Overlay, transform);

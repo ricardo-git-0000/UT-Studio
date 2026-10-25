@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.Windows.Media;
 using System.Windows.Automation;
+using System.Windows.Threading;
 using UTStudio.Presentation;
 using UTStudio.Contracts.Application;
 using UTStudio.Domain.Acquisition;
@@ -29,6 +30,8 @@ public partial class AScanView : UserControl, IAsyncDisposable
     private Task? _close;
     private bool _contextAssigned;
     private bool _publishingVisual;
+    private bool _visualPublishPending;
+    private readonly Dictionary<TextBox, ulong> _numericEditGenerations = [];
     private readonly AScanVisualSnapshotAdapter _visualAdapter = new();
 
     public AScanView()
@@ -36,6 +39,7 @@ public partial class AScanView : UserControl, IAsyncDisposable
         InitializeComponent(); Loaded += OnLoaded; SizeChanged += OnVisualContextChanged;
         Scan.VisualContextChanged += OnVisualContextChanged;
         Scan.GateBeginCaptureRequested += OnGateBeginCaptureRequested;
+        Scan.GateBeginWindowCaptureRequested += OnGateBeginWindowCaptureRequested;
         Scan.GateInteractionRequested += OnGateInteractionRequested;
     }
     public AScanComponentContext? Context { get => (AScanComponentContext?)GetValue(ContextProperty); set => SetValue(ContextProperty, value); }
@@ -101,6 +105,7 @@ public partial class AScanView : UserControl, IAsyncDisposable
 
     private async Task CloseCoreAsync()
     {
+        _numericEditGenerations.Clear();
         Loaded -= OnLoaded;
         AScanViewModel? viewModel = _viewModel;
         _viewModel = null;
@@ -109,6 +114,7 @@ public partial class AScanView : UserControl, IAsyncDisposable
         Scan.VisualSnapshot = null;
         Scan.VisualContextChanged -= OnVisualContextChanged;
         Scan.GateBeginCaptureRequested -= OnGateBeginCaptureRequested;
+        Scan.GateBeginWindowCaptureRequested -= OnGateBeginWindowCaptureRequested;
         Scan.GateInteractionRequested -= OnGateInteractionRequested;
         SizeChanged -= OnVisualContextChanged;
         SetValue(StatePropertyKey, null);
@@ -140,7 +146,55 @@ public partial class AScanView : UserControl, IAsyncDisposable
         PublishNumericField(GateStartValue, editor?.SelectedGateStartMicroseconds, "0.###");
         PublishNumericField(GateEndValue, editor?.SelectedGateEndMicroseconds, "0.###");
         PublishNumericField(GateThresholdValue, editor?.SelectedGateThresholdPercent, "0.##");
+        PublishNumericField(GateRadiusValue, editor?.SelectedGateNeighborhoodRadius, "0");
+        PublishNumericField(GateProminenceValue, editor?.SelectedGateMinimumProminence, "0.###");
+        PublishNumericField(GateDistanceValue, editor?.SelectedGateMinimumDistance, "0");
+        if (editor?.SelectedGateHasThreshold != true)
+            ClearNumericFieldError(GateThresholdValue, GateHandleKind.Threshold);
+        if (editor?.SelectedGateHasLocalParameters != true)
+        {
+            GateRadiusValidation.Text = string.Empty; GateRadiusValidation.Visibility = Visibility.Collapsed;
+            GateProminenceValidation.Text = string.Empty; GateProminenceValidation.Visibility = Visibility.Collapsed;
+            GateDistanceValidation.Text = string.Empty; GateDistanceValidation.Visibility = Visibility.Collapsed;
+            AutomationProperties.SetItemStatus(GateRadiusValue, string.Empty);
+            AutomationProperties.SetItemStatus(GateProminenceValue, string.Empty);
+            AutomationProperties.SetItemStatus(GateDistanceValue, string.Empty);
+        }
     }
+
+    private void OnGateParameterLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs args)
+    {
+        if (sender is not TextBox field || _viewModel?.GateEditor is not { } editor || field.Tag is not string name) return;
+        if (!double.TryParse(field.Text, NumberStyles.Float, CultureInfo.CurrentCulture, out double value) ||
+            !double.IsFinite(value) || name is "Radius" or "Distance" &&
+                (value < 1 || value > int.MaxValue || value != Math.Truncate(value)) ||
+            name == "Prominence" && value < 0)
+        {
+            const string message = "Introduzca un valor válido para el parámetro.";
+            TextBlock error = ParameterError(name);
+            error.Text = message; error.Visibility = Visibility.Visible;
+            AutomationProperties.SetItemStatus(field, $"Error: {message}");
+            editor.SetDefinitionInputValidity(name, false); return;
+        }
+        AutomationProperties.SetItemStatus(field, string.Empty);
+        TextBlock validation = ParameterError(name);
+        validation.Text = string.Empty; validation.Visibility = Visibility.Collapsed;
+        editor.SetDefinitionInputValidity(name, true);
+        switch (name)
+        {
+            case "Radius": editor.SelectedGateNeighborhoodRadius = checked((int)value); break;
+            case "Prominence": editor.SelectedGateMinimumProminence = value; break;
+            case "Distance": editor.SelectedGateMinimumDistance = checked((int)value); break;
+        }
+    }
+
+    private TextBlock ParameterError(string name) => name switch
+    {
+        "Radius" => GateRadiusValidation,
+        "Prominence" => GateProminenceValidation,
+        "Distance" => GateDistanceValidation,
+        _ => throw new ArgumentOutOfRangeException(nameof(name))
+    };
 
     private static void PublishNumericField(TextBox field, double? value, string format)
     {
@@ -148,9 +202,35 @@ public partial class AScanView : UserControl, IAsyncDisposable
         field.Text = value?.ToString(format, CultureInfo.CurrentCulture) ?? string.Empty;
     }
 
+    private async void OnGateNumericTextChanged(object sender, TextChangedEventArgs args)
+    {
+        if (sender is not TextBox field || !field.IsKeyboardFocusWithin || _close is not null) return;
+        ulong generation = NextNumericEditGeneration(field);
+        string text = field.Text;
+        await Task.Delay(TimeSpan.FromMilliseconds(150));
+        if (_close is not null || !_numericEditGenerations.TryGetValue(field, out ulong current) ||
+            current != generation || field.Text != text) return;
+        await CommitGateNumericAsync(field);
+    }
+
     private async void OnGateNumericLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs args)
     {
-        if (sender is not TextBox field || _viewModel?.GateEditor is not { } editor ||
+        if (sender is not TextBox field) return;
+        NextNumericEditGeneration(field);
+        await CommitGateNumericAsync(field);
+    }
+
+    private ulong NextNumericEditGeneration(TextBox field)
+    {
+        _numericEditGenerations.TryGetValue(field, out ulong generation);
+        generation = checked(generation + 1);
+        _numericEditGenerations[field] = generation;
+        return generation;
+    }
+
+    private async Task CommitGateNumericAsync(TextBox field)
+    {
+        if (_viewModel?.GateEditor is not { } editor ||
             editor.SelectedGateId is not { } selected) return;
         GateHandleKind kind = (field.Tag as string) switch
         {
@@ -169,7 +249,10 @@ public partial class AScanView : UserControl, IAsyncDisposable
         }
         ClearNumericFieldError(field, kind);
         editor.SetNumericInputValidity(kind, true);
-        double value = kind == GateHandleKind.Threshold ? displayed / 100d : displayed / 1_000_000d;
+        double value = kind == GateHandleKind.Threshold ? (displayed + 100d) / 200d : displayed / 1_000_000d;
+        if (kind == GateHandleKind.End && editor.SelectedGateReference != "origin" &&
+            editor.SelectedGateStartMicroseconds is { } startMicroseconds)
+            value += startMicroseconds / 1_000_000d;
         try { await editor.PreviewHandleValueAsync(new GateId(selected), kind, value); }
         catch (Exception error) { SetNumericFieldError(field, kind, error.Message); editor.SetNumericInputValidity(kind, false); }
         finally { PublishGateEditorFields(); }
@@ -208,7 +291,12 @@ public partial class AScanView : UserControl, IAsyncDisposable
 
     private void PublishVisualSnapshot()
     {
-        if (_publishingVisual || _close is not null || Scan.ActualWidth <= 0 || Scan.ActualHeight <= 0) return;
+        if (_publishingVisual)
+        {
+            _visualPublishPending = true;
+            return;
+        }
+        if (_close is not null || Scan.ActualWidth <= 0 || Scan.ActualHeight <= 0) return;
         _publishingVisual = true;
         try
         {
@@ -224,7 +312,15 @@ public partial class AScanView : UserControl, IAsyncDisposable
             Scan.VisualSnapshot = _visualAdapter.Adapt(state, Scan.ActualWidth, Scan.ActualHeight,
                 dpi.DpiScaleX, dpi.DpiScaleY);
         }
-        finally { _publishingVisual = false; }
+        finally
+        {
+            _publishingVisual = false;
+            if (_visualPublishPending && _close is null)
+            {
+                _visualPublishPending = false;
+                _ = Dispatcher.BeginInvoke(DispatcherPriority.Render, PublishVisualSnapshot);
+            }
+        }
     }
 
     public ValueTask DisposeAsync() => new(CloseAsync());
@@ -240,6 +336,13 @@ public partial class AScanView : UserControl, IAsyncDisposable
     {
         if (_viewModel?.GateEditor?.TryBeginCapture(args.Snapshot, args.Handle.Identity, out GateCaptureGeneration capture) == true)
             args.Accept(capture);
+    }
+
+    private void OnGateBeginWindowCaptureRequested(object? sender, GateBeginWindowCaptureRequestedEventArgs args)
+    {
+        if (_viewModel?.GateEditor?.TryBeginWindowCapture(args.Snapshot, args.GateId,
+            out GateCaptureGeneration capture, out double initialStart) == true)
+            args.Accept(capture, initialStart);
     }
 
     private void OnGateInteractionRequested(object? sender, GateInteractionRequestedEventArgs args) =>

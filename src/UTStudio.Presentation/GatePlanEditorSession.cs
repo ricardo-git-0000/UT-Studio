@@ -84,7 +84,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
                 throw new ArgumentException("The draft does not belong to this editorial session.", nameof(draft));
             if (draft.BaseRevision != _current.Committed.Revision)
                 throw new InvalidOperationException("A stale draft cannot be edited.");
-            EnsureOnlyPreviewFieldsChanged(_current.Committed.Plan, draft);
+            EnsureLegacyPreviewFieldsChanged(_current.Committed.Plan, draft);
             GatePlanEditorState state = draft.BaseRevision == _current.Committed.Revision ?
                 GatePlanEditorState.Editing : GatePlanEditorState.Stale;
             next = new(_current.Committed, draft, state: state);
@@ -95,20 +95,30 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
         return next;
     }
 
-    public GatePlanEditResult Preview()
+    public GatePlanEditResult Preview() => PreviewCandidate(null, false);
+
+    public GatePlanEditResult Preview(GatePlanDraft proposedDraft, bool preserveCurrentOnFailure) =>
+        PreviewCandidate(proposedDraft, preserveCurrentOnFailure);
+
+    private GatePlanEditResult PreviewCandidate(GatePlanDraft? proposedDraft, bool preserveCurrentOnFailure)
     {
         GatePlanDraft draft;
         CommittedGatePlanSnapshot observedCommitted;
         GateAuthorityGeneration authorityGeneration;
         ulong operationGeneration;
         GatePreviewIdentity previewIdentity;
+        GatePlanDraft editorialBaseline;
         GatePlanEditorSnapshot? conflictSnapshot = null;
         GatePlanEditResult? conflictResult = null;
         bool publish = false;
         lock (_gate)
         {
             ThrowIfDisposed();
-            draft = _current.Draft ?? throw new InvalidOperationException("Preview requires an active draft.");
+            editorialBaseline = _current.Draft ?? throw new InvalidOperationException("Preview requires an active draft.");
+            draft = proposedDraft ?? editorialBaseline;
+            if (draft.Authority != _authorityKey || draft.BaseRevision != editorialBaseline.BaseRevision)
+                throw new ArgumentException("The candidate does not belong to this editorial session.", nameof(proposedDraft));
+            EnsureEditableFieldsOnly(_current.Committed.Plan, draft);
             observedCommitted = _current.Committed;
             authorityGeneration = _authorityCurrent.Generation;
             operationGeneration = ++_editorGeneration;
@@ -136,7 +146,7 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
                     new(_current.Committed, state: GatePlanEditorState.Closed);
                 result = GatePlanEditResult.Closed(next, draft.BaseRevision);
             }
-            else if (_editorGeneration != operationGeneration || !ReferenceEquals(_current.Draft, draft))
+            else if (_editorGeneration != operationGeneration || !ReferenceEquals(_current.Draft, editorialBaseline))
                 result = _lastInvalidation == EditorialInvalidation.Cancelled ?
                     GatePlanEditResult.Cancelled(new(_current.Committed, state: GatePlanEditorState.Cancelled)) :
                     GatePlanEditResult.Superseded(_current, draft.BaseRevision);
@@ -158,9 +168,10 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             }
             else if (compilation.Status == GatePlanPreviewCompilationStatus.RevisionExhausted)
             {
-                next = new(_current.Committed, draft, state: GatePlanEditorState.Editing);
+                next = preserveCurrentOnFailure ? _current :
+                    new(_current.Committed, draft, state: GatePlanEditorState.Editing);
                 result = GatePlanEditResult.RevisionExhausted(next);
-                publish = EnqueueUnderLock(next);
+                if (!preserveCurrentOnFailure) publish = EnqueueUnderLock(next);
             }
             else if (compilation.IsCompiled)
             {
@@ -171,9 +182,14 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             }
             else
             {
-                next = new(_current.Committed, draft, compilation.Errors, GatePlanEditorState.ValidationFailed);
-                result = GatePlanEditResult.ValidationFailed(next, compilation.Errors);
-                publish = EnqueueUnderLock(next);
+                if (preserveCurrentOnFailure)
+                    result = GatePlanEditResult.CandidateRejected(_current, draft.BaseRevision, compilation.Errors);
+                else
+                {
+                    next = new(_current.Committed, draft, compilation.Errors, GatePlanEditorState.ValidationFailed);
+                    result = GatePlanEditResult.ValidationFailed(next, compilation.Errors);
+                    publish = EnqueueUnderLock(next);
+                }
             }
         }
         if (publish) DrainPublications();
@@ -227,23 +243,34 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
         return (stale, result);
     }
 
-    private static void EnsureOnlyPreviewFieldsChanged(GatePlan committed, GatePlanDraft draft)
+    private static void EnsureEditableFieldsOnly(GatePlan committed, GatePlanDraft draft)
     {
         if (draft.SchemaVersion != committed.SchemaVersion || draft.AlgorithmVersion != committed.AlgorithmVersion ||
             draft.Gates.Count != committed.Gates.Count)
-            throw new ArgumentException("Preview may change only gate windows and thresholds.", nameof(draft));
+            throw new ArgumentException("Preview may only edit existing gate definitions.", nameof(draft));
         for (int index = 0; index < committed.Gates.Count; index++)
         {
             GateDefinition baseline = committed.Gates[index];
             GateDefinition candidate = draft.Gates[index];
             if (candidate.Id != baseline.Id || candidate.Revision != baseline.Revision ||
-                candidate.SignalDomain != baseline.SignalDomain ||
+                !candidate.RequestedMeasures.SequenceEqual(baseline.RequestedMeasures))
+                throw new ArgumentException("Preview may only edit existing gate definitions.", nameof(draft));
+        }
+    }
+
+    private static void EnsureLegacyPreviewFieldsChanged(GatePlan committed, GatePlanDraft draft)
+    {
+        EnsureEditableFieldsOnly(committed, draft);
+        for (int index = 0; index < committed.Gates.Count; index++)
+        {
+            GateDefinition baseline = committed.Gates[index];
+            GateDefinition candidate = draft.Gates[index];
+            if (candidate.SignalDomain != baseline.SignalDomain ||
                 !SameReference(candidate.Window.StartReference, baseline.Window.StartReference) ||
                 candidate.Detector.Kind != baseline.Detector.Kind ||
                 !SameHysteresis(candidate.Detector.Hysteresis, baseline.Detector.Hysteresis) ||
-                !SameLocalExtrema(candidate.Detector.LocalExtrema, baseline.Detector.LocalExtrema) ||
-                !candidate.RequestedMeasures.SequenceEqual(baseline.RequestedMeasures))
-                throw new ArgumentException("Preview may change only gate windows and thresholds.", nameof(draft));
+                !SameLocalExtrema(candidate.Detector.LocalExtrema, baseline.Detector.LocalExtrema))
+                throw new ArgumentException("UpdateDraft may change only gate windows and thresholds; structural changes require transactional Preview.", nameof(draft));
         }
     }
 
@@ -336,6 +363,16 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
         }
     }
 
+    internal GatePreviewArtifact? BorrowPreviewForEvaluation()
+    {
+        lock (_gate)
+        {
+            if (_disposed || _current.State != GatePlanEditorState.Previewed) return null;
+            GatePreviewArtifact? artifact = _previewWorkspace.Candidate ?? _previewWorkspace.Stable;
+            return artifact is not null && ReferenceEquals(_current.Draft, artifact.Checkpoint) ? artifact : null;
+        }
+    }
+
     internal GateCommittedArtifact? BorrowCommittedArtifact()
     {
         lock (_gate) return _disposed ? null : new(
@@ -405,11 +442,24 @@ public sealed class GatePlanEditorSession : IObservable<GatePlanEditorSnapshot>,
             ReferenceEquals(_current.Draft, artifact.Checkpoint);
     }
 
-    internal bool PromotePreview(GatePreviewArtifact artifact)
+    internal bool IsCurrentPreviewArtifact(GatePreviewArtifact artifact)
     {
         ArgumentNullException.ThrowIfNull(artifact);
-        lock (_gate) return !_disposed && ReferenceEquals(_current.Draft, artifact.Checkpoint) &&
-            _previewWorkspace.Promote(artifact);
+        lock (_gate) return !_disposed &&
+            ReferenceEquals(_previewWorkspace.Candidate ?? _previewWorkspace.Stable, artifact) &&
+            ReferenceEquals(_current.Draft, artifact.Checkpoint);
+    }
+
+    internal bool AcceptPreviewGeometry(GatePreviewArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (_gate)
+        {
+            if (_disposed || !ReferenceEquals(_current.Draft, artifact.Checkpoint)) return false;
+            if (ReferenceEquals(_previewWorkspace.Stable, artifact) &&
+                _previewWorkspace.Candidate is null) return true;
+            return _previewWorkspace.Promote(artifact);
+        }
     }
 
     internal void DiscardPreviewCandidate(GatePreviewArtifact artifact)

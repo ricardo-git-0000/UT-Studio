@@ -45,8 +45,111 @@ public sealed class AScanGateInteractionTests
         Assert.IsTrue(intents.Any(x => x.Kind == GateOverlayInteractionKind.MoveCapture && x.Capture == token));
 
         control.VisualSnapshot = fixture.Composite(capture: null, evaluation: 3, threshold: .4);
+        fixture.Render();
+        Assert.AreEqual(token, control.ActiveGateCapture);
+
+        control.VisualSnapshot = fixture.NotRequested();
         Assert.IsNull(control.ActiveGateCapture); Assert.IsFalse(control.IsMouseCaptured);
         Assert.AreEqual(1, intents.Count(x => x.Kind == GateOverlayInteractionKind.CancelPreview && x.Capture == token));
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task OwnPreviewSourceMayAdvanceWhileStableCaptureTokenContinuesDragging() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.Capture(25);
+        var intents = new List<GateInteractionRequestedEventArgs>();
+        control.GateBeginCaptureRequested += (_, request) => request.Accept(token);
+        control.GateInteractionRequested += (_, request) => intents.Add(request);
+
+        Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
+        control.VisualSnapshot = fixture.Composite(capture: token, evaluation: 2, advancePreview: true);
+        fixture.Render();
+        control.ContinueGateDrag(new(fixture.HandlePoint.X + 40, fixture.HandlePoint.Y));
+
+        Assert.AreEqual(token, control.ActiveGateCapture);
+        Assert.IsTrue(intents.Any(x => x.Kind == GateOverlayInteractionKind.MoveCapture && x.Capture == token));
+        Assert.IsFalse(intents.Any(x => x.Kind == GateOverlayInteractionKind.CancelPreview));
+        control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task TransientMissingLiveCompositionDoesNotCancelBoundaryDrag() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.Capture(18);
+        var intents = new List<GateInteractionRequestedEventArgs>();
+        control.GateBeginCaptureRequested += (_, request) => request.Accept(token);
+        control.GateInteractionRequested += (_, request) => intents.Add(request);
+
+        Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
+        control.VisualSnapshot = null;
+
+        Assert.AreEqual(token, control.ActiveGateCapture);
+        Assert.IsTrue(control.IsMouseCaptured);
+        Assert.IsFalse(intents.Any(x => x.Kind == GateOverlayInteractionKind.CancelPreview));
+
+        control.VisualSnapshot = fixture.Composite(capture: token, evaluation: 2, threshold: .3);
+        fixture.Render();
+        control.ContinueGateDrag(new(fixture.HandlePoint.X, fixture.HandlePoint.Y - 10));
+        Assert.IsTrue(intents.Any(x => x.Kind == GateOverlayInteractionKind.MoveCapture && x.Capture == token));
+        control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task BoundaryDragTracksPhysicalPointerWhenRoutedMouseMoveIsCoalesced() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.Capture(23);
+        var intents = new List<GateInteractionRequestedEventArgs>();
+        control.GateBeginCaptureRequested += (_, request) => request.Accept(token);
+        control.GateInteractionRequested += (_, request) => intents.Add(request);
+
+        Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
+        fixture.CurrentPointer = new(fixture.HandlePoint.X, fixture.HandlePoint.Y - 20);
+        control.RefreshCursorGesture();
+
+        Assert.IsTrue(intents.Any(x => x.Kind == GateOverlayInteractionKind.MoveCapture && x.Capture == token));
+        control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task GateDragContinuesFromPhysicalPointerAfterLostCaptureLikeCursorDrag() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.Capture(24);
+        var intents = new List<GateInteractionRequestedEventArgs>();
+        control.GateBeginCaptureRequested += (_, request) => request.Accept(token);
+        control.GateInteractionRequested += (_, request) => intents.Add(request);
+
+        Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
+        Assert.IsTrue(control.IsMouseCaptured);
+        Mouse.Capture(null);
+        fixture.CurrentPointer = new(fixture.HandlePoint.X + 30, fixture.HandlePoint.Y);
+        control.RefreshCursorGesture();
+
+        Assert.AreEqual(token, control.ActiveGateCapture);
+        Assert.IsFalse(control.IsMouseCaptured);
+        Assert.IsFalse(intents.Any(x => x.Kind == GateOverlayInteractionKind.CancelPreview));
+        Assert.IsTrue(intents.Any(x => x.Kind == GateOverlayInteractionKind.MoveCapture && x.Capture == token));
+        control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task DisplayedLiveFrameMayLagAcceptedGateCaptureContext() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration newer = fixture.Capture(16, contextGeneration: 2);
+        control.GateBeginCaptureRequested += (_, request) => request.Accept(newer);
+
+        Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
+        Assert.AreEqual(newer, control.ActiveGateCapture);
+        control.EndInteraction();
         return Task.CompletedTask;
     });
 
@@ -60,13 +163,87 @@ public sealed class AScanGateInteractionTests
         control.GateBeginCaptureRequested += (_, request) =>
         {
             request.Accept(token);
-            control.VisualSnapshot = fixture.Composite(capture: null, evaluation: 2, threshold: .4);
+            control.VisualSnapshot = fixture.NotRequested();
         };
 
         Assert.IsFalse(control.BeginGateDrag(fixture.HandlePoint));
         Assert.IsFalse(control.IsMouseCaptured);
         Assert.IsNull(control.ActiveGateCapture);
         Assert.AreEqual(1, intents.Count(x => x.Kind == GateOverlayInteractionKind.CancelPreview && x.Capture == token));
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task ReentrantCompatibleLiveSnapshotWithoutProjectedTokenStillAcquiresCapture() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.Capture(22);
+        control.GateBeginCaptureRequested += (_, request) =>
+        {
+            request.Accept(token);
+            control.VisualSnapshot = fixture.Composite(capture: null, evaluation: 2, threshold: .4);
+        };
+
+        Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
+        Assert.AreEqual(token, control.ActiveGateCapture);
+        Assert.IsTrue(control.IsMouseCaptured);
+        control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task ReentrantTransientMissingSnapshotAfterAcceptedBeginStillAcquiresCapture() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.Capture(19);
+        control.GateBeginCaptureRequested += (_, request) =>
+        {
+            request.Accept(token);
+            control.VisualSnapshot = null;
+        };
+
+        Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
+        Assert.AreEqual(token, control.ActiveGateCapture);
+        Assert.IsTrue(control.IsMouseCaptured);
+        control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task ReentrantExternalSnapshotAfterAcceptedWindowBeginDoesNotAcquireCapture() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.WindowCapture(17);
+        var intents = new List<GateInteractionRequestedEventArgs>();
+        control.GateInteractionRequested += (_, request) => intents.Add(request);
+        control.GateBeginWindowCaptureRequested += (_, request) =>
+        {
+            request.Accept(token, 0);
+            control.VisualSnapshot = fixture.NotRequested();
+        };
+
+        Assert.IsFalse(control.BeginGateWindowDrag(new(225, 120)));
+        Assert.IsFalse(control.IsMouseCaptured);
+        Assert.IsNull(control.ActiveGateCapture);
+        Assert.AreEqual(1, intents.Count(x => x.Kind == GateOverlayInteractionKind.CancelPreview && x.Capture == token));
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task ReentrantTransientMissingSnapshotAfterAcceptedWindowBeginStillAcquiresCapture() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.WindowCapture(21);
+        control.GateBeginWindowCaptureRequested += (_, request) =>
+        {
+            request.Accept(token, 0);
+            control.VisualSnapshot = null;
+        };
+
+        Assert.IsTrue(control.BeginGateWindowDrag(new(225, 120)));
+        Assert.AreEqual(token, control.ActiveGateCapture);
+        Assert.IsTrue(control.IsMouseCaptured);
+        control.EndInteraction();
         return Task.CompletedTask;
     });
 
@@ -81,6 +258,81 @@ public sealed class AScanGateInteractionTests
         Assert.IsTrue(control.BeginGateDrag(fixture.HandlePoint));
         Assert.IsFalse(control.BeginCursorDrag(fixture.HandlePoint));
         control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task EntireVisibleStartAndEndLinesAreActionable() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create();
+        var start = new GateHandleLogicalIdentity(new("A"), new(1), GateHandleKind.Start);
+        fixture.ShowHandles(start); fixture.Render();
+        Assert.AreEqual(start, fixture.Control.HitTestGate(new(160, 40))!.Identity);
+        Assert.AreEqual(GateHandleKind.End, fixture.Control.HitTestGate(new(200, 160))!.Kind);
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task EntireVisibleThresholdLineIsActionableAndDragsWithLeftCapture() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create();
+        AScanControl control = fixture.Control;
+        Point linePoint = new(260, fixture.HandlePoint.Y);
+        GateHandleVisualState hit = control.HitTestGate(linePoint)!;
+        Assert.AreEqual(GateHandleKind.Threshold, hit.Kind);
+
+        GateCaptureGeneration token = fixture.Capture(26);
+        var intents = new List<GateInteractionRequestedEventArgs>();
+        control.GateBeginCaptureRequested += (_, request) => request.Accept(token);
+        control.GateInteractionRequested += (_, request) => intents.Add(request);
+        Assert.IsTrue(control.BeginGateDrag(linePoint));
+        control.ContinueGateDrag(new(linePoint.X, linePoint.Y - 20));
+
+        GateInteractionRequestedEventArgs move = intents.Last(x =>
+            x.Kind == GateOverlayInteractionKind.MoveCapture);
+        Assert.AreEqual(GateHandleKind.Threshold, move.Handle!.Value.Kind);
+        Assert.IsGreaterThan(.25, move.Value!.Value);
+        control.EndInteraction();
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task ExactVisibleBoundaryRemainsActionableWhenHandleProjectionLags() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create();
+        fixture.ShowLaggingStartHandle(); fixture.Render();
+
+        GateHandleVisualState hit = fixture.Control.HitTestGate(new(260, 160))!;
+        Assert.AreEqual(new GateId("A"), hit.GateId);
+        Assert.AreEqual(GateHandleKind.Start, hit.Kind);
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public Task RightDragMovesWholeGateByDeltaWithoutPublishingAWindowHandle() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create(); AScanControl control = fixture.Control;
+        GateCaptureGeneration token = fixture.WindowCapture(20);
+        var intents = new List<GateInteractionRequestedEventArgs>();
+        control.GateBeginWindowCaptureRequested += (_, request) => request.Accept(token, 0);
+        control.GateInteractionRequested += (_, request) => intents.Add(request);
+        Point inside = new(225, 120);
+        Assert.AreEqual(new GateId("A"), control.HitTestGateWindow(inside)!.GateId);
+        Assert.IsFalse(control.DisplayedVisualSnapshot!.Gates.Handles.Any(x => x.Kind == GateHandleKind.Window));
+        Assert.IsTrue(control.BeginGateWindowDrag(inside));
+        control.VisualSnapshot = fixture.Composite(capture: token, evaluation: 2);
+        fixture.Render();
+
+        control.ContinueGateDrag(new(275, inside.Y));
+        GateInteractionRequestedEventArgs move = intents.Last(x => x.Kind == GateOverlayInteractionKind.MoveCapture);
+        double expectedDelta = 50 / (control.ActualWidth - 84) *
+            control.DisplayedVisualSnapshot.Transform.TimeViewport.VisibleSpanSeconds;
+        Assert.AreEqual(expectedDelta, move.Value!.Value, 1e-12);
+        Assert.AreEqual(token, move.Capture);
+        control.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Right)
+        { RoutedEvent = Mouse.MouseUpEvent, Source = control });
+        Assert.IsNull(control.ActiveGateCapture);
+        Assert.IsTrue(intents.Any(x => x.Kind == GateOverlayInteractionKind.EndCapture));
         return Task.CompletedTask;
     });
 
@@ -115,8 +367,52 @@ public sealed class AScanGateInteractionTests
 
         control.VisualSnapshot = fixture.Composite(includeHandles: false); fixture.Render();
         Assert.IsNull(root.GetChildren());
+        Assert.Contains("Gate A", await Task.Run(peer1.GetName));
+        Assert.IsTrue(await Task.Run(() => range.IsReadOnly));
+        Assert.AreEqual(.4, await Task.Run(() => range.Value), 1e-12);
+        Assert.IsFalse(await Task.Run(() => selection.IsSelected));
+        Assert.IsFalse(await Task.Run(peer1.IsKeyboardFocusable));
+        Assert.IsFalse(await Task.Run(peer1.IsEnabled));
+        Assert.IsTrue(await Task.Run(peer1.IsOffscreen));
+        Assert.AreEqual(Rect.Empty, await Task.Run(peer1.GetBoundingRectangle));
+        Assert.IsFalse(await Task.Run(peer1.HasKeyboardFocus));
         await Assert.ThrowsExactlyAsync<System.Windows.Automation.ElementNotAvailableException>(async () =>
-            await Task.Run(peer1.GetName));
+            await Task.Run(() => range.SetValue(.5)));
+        await Assert.ThrowsExactlyAsync<System.Windows.Automation.ElementNotAvailableException>(async () =>
+            await Task.Run(selection.Select));
+        await Assert.ThrowsExactlyAsync<System.Windows.Automation.ElementNotAvailableException>(async () =>
+            await Task.Run(selection.AddToSelection));
+        await Assert.ThrowsExactlyAsync<System.Windows.Automation.ElementNotAvailableException>(async () =>
+            await Task.Run(selection.RemoveFromSelection));
+        await Assert.ThrowsExactlyAsync<System.Windows.Automation.ElementNotAvailableException>(async () =>
+            await Task.Run(peer1.SetFocus));
+    });
+
+    [TestMethod]
+    public Task LiveEvaluationKeepsLastCoherentGateUntilReplacementIsComplete() => StaTest.Run(() =>
+    {
+        using var fixture = Fixture.Create();
+        AScanControl control = fixture.Control;
+        AScanCompositeVisualSnapshot complete = control.DisplayedVisualSnapshot!;
+        Assert.AreEqual(1, control.RenderedDetectedGateEventCount);
+
+        control.VisualSnapshot = fixture.EvaluatingSameDefinition();
+        fixture.Render();
+
+        Assert.AreSame(complete, control.DisplayedVisualSnapshot);
+        Assert.IsNotNull(control.RenderedSignalSnapshotVersion);
+        Assert.IsGreaterThan(complete.Signal.Version, control.RenderedSignalSnapshotVersion.Value,
+            "RF must advance while the complete gate overlay is retained.");
+        Assert.AreEqual(GateOverlayGeometryStatus.Current, control.DisplayedVisualSnapshot!.Gates.Status);
+        Assert.IsNotEmpty(control.DisplayedVisualSnapshot.Gates.Gates);
+        Assert.AreEqual(0, control.RenderedDetectedGateEventCount,
+            "An event from the retained trace must not be drawn over newer RF.");
+
+        control.VisualSnapshot = fixture.NotRequested();
+        fixture.Render();
+        Assert.AreNotSame(complete, control.DisplayedVisualSnapshot);
+        Assert.AreEqual(GateOverlayGeometryStatus.NotRequested, control.DisplayedVisualSnapshot!.Gates.Status);
+        return Task.CompletedTask;
     });
 
     [TestMethod]
@@ -126,13 +422,16 @@ public sealed class AScanGateInteractionTests
         var root = (AScanControlAutomationPeer)(UIElementAutomationPeer.CreatePeerForElement(control) ??
             new AScanControlAutomationPeer(control));
         AutomationPeer visiblePeer = root.GetChildren()!.Single();
+        var staleRange = (IRangeValueProvider)visiblePeer.GetPattern(PatternInterface.RangeValue)!;
 
         control.VisualSnapshot = fixture.Composite(evaluation: 2, includeHandles: false); fixture.Render();
         Assert.IsNull(GateOverlayHitTester.HitTest(control.DisplayedVisualSnapshot!.Gates,
             fixture.HandlePoint.X, fixture.HandlePoint.Y, 12));
         Assert.IsNull(root.GetChildren());
+        Assert.Contains("Gate A", await Task.Run(visiblePeer.GetName));
+        Assert.IsTrue(await Task.Run(() => staleRange.IsReadOnly));
         await Assert.ThrowsExactlyAsync<System.Windows.Automation.ElementNotAvailableException>(async () =>
-            await Task.Run(visiblePeer.GetName));
+            await Task.Run(() => staleRange.SetValue(.5)));
 
         control.VisualSnapshot = fixture.Composite(evaluation: 3); fixture.Render();
         Assert.IsNotNull(GateOverlayHitTester.HitTest(control.DisplayedVisualSnapshot!.Gates,
@@ -299,12 +598,15 @@ public sealed class AScanGateInteractionTests
         private readonly GateHandleVisualState _baseHandle;
         private readonly ManualClock _clock;
         private readonly ModifierState _modifierState;
+        private readonly PointerState _pointerState;
         private Fixture(Window host, AScanControl control, AScanSnapshot signal, GateGeometrySourceIdentity source,
-            TraceIdentity trace, GateHandleVisualState handle, ManualClock clock, ModifierState modifierState)
-        { Host = host; Control = control; _signal = signal; _source = source; _trace = trace; _baseHandle = handle; _clock = clock; _modifierState = modifierState; }
+            TraceIdentity trace, GateHandleVisualState handle, ManualClock clock, ModifierState modifierState,
+            PointerState pointerState)
+        { Host = host; Control = control; _signal = signal; _source = source; _trace = trace; _baseHandle = handle; _clock = clock; _modifierState = modifierState; _pointerState = pointerState; }
         internal Window Host { get; }
         internal AScanControl Control { get; }
         internal Point HandlePoint => new(_baseHandle.X, _baseHandle.Y);
+        internal Point CurrentPointer { set => _pointerState.Value = value; }
         internal ModifierKeys Modifiers { set => _modifierState.Value = value; }
 
         internal static Fixture Create(bool overlapCursor = false)
@@ -320,21 +622,25 @@ public sealed class AScanGateInteractionTests
             GatePlanSignature signature = new GatePlanCompiler().Compile(plan).CompiledPlan!.Signature;
             var source = GateGeometrySourceIdentity.PreviewSource(new(inspection, plan.Id), new(1),
                 plan.Revision, signature, new(Guid.NewGuid(), 1));
-            var clock = new ManualClock(); var modifierState = new ModifierState();
-            var control = new AScanControl(clock, () => modifierState.Value, null, null);
+            var clock = new ManualClock(); var modifierState = new ModifierState(); var pointerState = new PointerState();
+            var control = new AScanControl(clock, () => modifierState.Value, null, null, () => pointerState.Value);
             var host = new Window { Content = control, Width = 640, Height = 300, WindowStyle = WindowStyle.None, ShowInTaskbar = false };
             host.Show(); host.UpdateLayout();
             double x = overlapCursor ? 64 + (control.ActualWidth - 84) * .25 : 180;
             var handle = new GateHandleVisualState(gate.Id, gate.Revision, GateHandleKind.Threshold,
                 x, 100, .25, "normalized", 0, 1, .01, true, true, true);
-            var fixture = new Fixture(host, control, signal, source, trace, handle, clock, modifierState);
+            pointerState.Value = new(handle.X, handle.Y);
+            var fixture = new Fixture(host, control, signal, source, trace, handle, clock, modifierState, pointerState);
             control.VisualSnapshot = fixture.Composite(); fixture.Render(); return fixture;
         }
-        internal GateCaptureGeneration Capture(ulong nonce) => new(1, nonce, _signal.Metadata.RunId, _trace,
+        internal GateCaptureGeneration Capture(ulong nonce, ulong contextGeneration = 1) => new(contextGeneration, nonce, _signal.Metadata.RunId, _trace,
             _source.Kind, _source.Revision, _source.Preview, _baseHandle.GateId, _baseHandle.Kind,
             _baseHandle.AnchorGateId, _baseHandle.AnchorRevision, Control.DisplayedVisualSnapshot!.Transform.Version);
+        internal GateCaptureGeneration WindowCapture(ulong nonce) => new(1, nonce, _signal.Metadata.RunId, _trace,
+            _source.Kind, _source.Revision, _source.Preview, _baseHandle.GateId, GateHandleKind.Window,
+            default, default, Control.DisplayedVisualSnapshot!.Transform.Version);
         internal AScanCompositeVisualSnapshot Composite(GateCaptureGeneration? capture = null, ulong evaluation = 1,
-            double threshold = .25, bool includeHandles = true)
+            double threshold = .25, bool includeHandles = true, bool advancePreview = false)
         {
             DpiScale dpi = VisualTreeHelper.GetDpi(Control);
             var transform = new GateVisualTransform(1, ScanTimeViewportOperations.Create(_signal.MinimumTimeSeconds, _signal.MaximumTimeSeconds),
@@ -343,8 +649,13 @@ public sealed class AScanGateInteractionTests
             GateHandleVisualState handle = new(_baseHandle.GateId, _baseHandle.GateRevision, _baseHandle.Kind,
                 _baseHandle.X, _baseHandle.Y, threshold, _baseHandle.Unit, 0, 1, .01, true, true, true);
             var projected = new ProjectedGateGeometryItem(handle.GateId, handle.GateRevision,
-                GateGeometryProjectionStatus.Projected, 150, 300, [new(0, threshold * 100, handle.Y)]);
-            var overlay = new GateOverlayVisualSnapshot(GateOverlayGeometryStatus.Current, _source, _trace,
+                GateGeometryProjectionStatus.Projected, 150, 300, [new(0, threshold * 100, handle.Y)],
+                new(225, 90, 4e-6, 100, 100, GateDetectionEventKind.RisingCrossing));
+            GateGeometrySourceIdentity source = advancePreview
+                ? GateGeometrySourceIdentity.PreviewSource(_source.Authority, _source.BaseRevision,
+                    _source.CandidateRevision, _source.Signature, new(Guid.NewGuid(), _source.Preview.Generation + 1))
+                : _source;
+            var overlay = new GateOverlayVisualSnapshot(GateOverlayGeometryStatus.Current, source, _trace,
                 _inspectionRevision, [projected], includeHandles ? [handle] : [], includeHandles ? handle.GateId : null,
                 includeHandles ? handle.Kind : GateHandleKind.Unknown, 1, evaluation, capture);
             return new(_signal, AScanCursorMeasurements.Create(_signal), overlay, transform);
@@ -355,6 +666,16 @@ public sealed class AScanGateInteractionTests
             var overlay = new GateOverlayVisualSnapshot(GateOverlayGeometryStatus.NotRequested, null, null,
                 InspectionRevision.Initial, [], [], null, GateHandleKind.Unknown, 1, 0, null);
             return new(_signal, AScanCursorMeasurements.Create(_signal), overlay, transform);
+        }
+        internal AScanCompositeVisualSnapshot EvaluatingSameDefinition()
+        {
+            AScanSnapshot signal = VisualizationComponentTests.Snapshot(2, _signal.Metadata.RunId);
+            var trace = new TraceIdentity(_trace.Stream, 2);
+            signal.SetAuthority(trace, _inspectionRevision);
+            GateVisualTransform transform = Composite().Transform;
+            var overlay = new GateOverlayVisualSnapshot(GateOverlayGeometryStatus.Evaluating, _source, trace,
+                _inspectionRevision, [], [], null, GateHandleKind.Unknown, 2, 2, null);
+            return new(signal, AScanCursorMeasurements.Create(signal), overlay, transform);
         }
         internal void ShowHandles(GateHandleLogicalIdentity focused)
         {
@@ -368,6 +689,17 @@ public sealed class AScanGateInteractionTests
             GateVisualTransform transform = Composite().Transform;
             var overlay = new GateOverlayVisualSnapshot(GateOverlayGeometryStatus.Current, _source, _trace,
                 _inspectionRevision, [], handles, focused.GateId, focused.Kind, 1, 30, null);
+            Control.VisualSnapshot = new(_signal, AScanCursorMeasurements.Create(_signal), overlay, transform);
+        }
+        internal void ShowLaggingStartHandle()
+        {
+            GateHandleVisualState handle = Handle("A", GateHandleKind.Start, 180, 2e-6,
+                new(new("A"), new(1), GateHandleKind.Start), true);
+            var projected = new ProjectedGateGeometryItem(handle.GateId, handle.GateRevision,
+                GateGeometryProjectionStatus.Projected, 260, 320, [], null);
+            GateVisualTransform transform = Composite().Transform;
+            var overlay = new GateOverlayVisualSnapshot(GateOverlayGeometryStatus.Current, _source, _trace,
+                _inspectionRevision, [projected], [handle], handle.GateId, handle.Kind, 1, 31, null);
             Control.VisualSnapshot = new(_signal, AScanCursorMeasurements.Create(_signal), overlay, transform);
         }
         internal KeyEventArgs Key(Key key) => new(Keyboard.PrimaryDevice, PresentationSource.FromVisual(Control),
@@ -388,4 +720,5 @@ public sealed class AScanGateInteractionTests
     }
 
     private sealed class ModifierState { internal ModifierKeys Value { get; set; } }
+    private sealed class PointerState { internal Point Value { get; set; } }
 }

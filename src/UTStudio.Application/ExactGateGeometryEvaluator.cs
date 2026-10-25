@@ -107,7 +107,8 @@ public sealed class ExactGateGeometryEvaluator : IGateGeometryEvaluator
                 catch (Exception error) { return Fault(request, $"source-validation-{error.GetType().Name}"); }
                 if (final != GateGeometrySourceValidationStatus.Current) return GuardResult(final, request);
                 return new(GateGeometryEvaluationStatus.Completed, request,
-                    BuildSnapshot(request, compiledPlan, evaluated.Batch));
+                    BuildSnapshot(request, compiledPlan, evaluated.Batch,
+                        samples.AsSpan(0, descriptor.SampleCount)));
             }
             finally { ArrayPool<short>.Shared.Return(samples); }
         }
@@ -115,7 +116,7 @@ public sealed class ExactGateGeometryEvaluator : IGateGeometryEvaluator
     }
 
     private static GateGeometrySnapshot BuildSnapshot(GateGeometryEvaluationRequest request,
-        CompiledGatePlan plan, GateEvaluationBatch batch)
+        CompiledGatePlan plan, GateEvaluationBatch batch, ReadOnlySpan<short> samples)
     {
         GateEvaluationEntry[] entries = batch.Entries.ToArray();
         var items = new GateGeometryItemSnapshot[plan.DeclaredGates.Count];
@@ -125,16 +126,32 @@ public sealed class ExactGateGeometryEvaluator : IGateGeometryEvaluator
             GateEvaluationEntry entry = entries[index];
             bool traceOrigin = gate.Window.StartReference.Kind == GateTimeReferenceKind.TraceOrigin;
             GateEvaluationEntry? dependency = traceOrigin ? null : entries[plan.DeclaredGates[index].DependencyIndex];
-            double? anchorTime = traceOrigin ? 0d : dependency?.DetectionTimeSeconds;
+            double? anchorTime = traceOrigin ? 0d : dependency?.ExactDetection?.DetectionTimeSeconds;
             double? start = anchorTime.HasValue ? anchorTime.Value + gate.Window.StartOffsetSeconds : null;
             GateAnchorSnapshot? anchor = dependency is null ? null : new(dependency.GateId,
                 dependency.GateRevision, gate.Window.StartReference.Kind,
                 gate.Window.StartReference.DependencyGateId, dependency.Status, dependency.CausalGateId,
-                dependency.CausalStatus, dependency.DetectionTimeSeconds);
+                dependency.CausalStatus, dependency.ExactDetection?.DetectionTimeSeconds);
+            GateExactDetectionData? exact = entry.ExactDetection;
+            GateExactEventSnapshot? detectedEvent = exact is null ? null :
+                new(entry.Status, exact.EventKind, exact.SampleIndex, exact.FractionalSamplePosition,
+                    exact.DetectionTimeSeconds, exact.DetectorAmplitudeCounts,
+                    InterpolateDisplayedRf(samples, exact.FractionalSamplePosition),
+                    entry.Metrics.ProminenceCounts, entry.Metrics.ThresholdMarginCounts);
             items[index] = new(gate.Id, gate.Revision, gate.SignalDomain, entry.Status, anchor, start,
-                start + gate.Window.DurationSeconds, gate.Detector.Threshold?.NormalizedValue);
+                start + gate.Window.DurationSeconds, gate.Detector.Threshold?.NormalizedValue, detectedEvent);
         }
         return new(request.Source, request.TraceIdentity, request.ExpectedInspectionRevision, items);
+    }
+
+    private static double? InterpolateDisplayedRf(ReadOnlySpan<short> samples, double? position)
+    {
+        if (position is not { } finite || !double.IsFinite(finite) || finite < 0 || samples.IsEmpty) return null;
+        int left = (int)Math.Floor(finite);
+        if ((uint)left >= (uint)samples.Length) return null;
+        if (left == samples.Length - 1 || finite == left) return samples[left];
+        double fraction = finite - left;
+        return samples[left] + (samples[left + 1] - samples[left]) * fraction;
     }
 
     private static void ValidatePlanIdentity(GateGeometrySourceIdentity source, CompiledGatePlan plan)

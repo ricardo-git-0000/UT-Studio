@@ -1213,7 +1213,8 @@ public sealed partial class InMemoryGateDerivedStore : IGateDerivedStore, IGateP
             x.SampleIndex, x.FractionalSamplePosition, x.DetectionTimeSeconds, x.AmplitudeCounts,
             x.SignedRfAmplitudeCounts, x.TimeOfFlightSeconds, x.OffsetWithinWindowSeconds, x.Quality,
             x.SignalDomain, x.Provenance, x.CausalGateId, x.CausalStatus, x.DiagnosticCode,
-            new GateDetectorMetrics(x.Metrics.ProminenceCounts, x.Metrics.ThresholdMarginCounts))).ToArray();
+            new GateDetectorMetrics(x.Metrics.ProminenceCounts, x.Metrics.ThresholdMarginCounts),
+            x.ExactDetection)).ToArray();
         return new(trace, signature, entries);
     }
 

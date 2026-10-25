@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Peers;
@@ -6,6 +7,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using UTStudio.Contracts.Processing;
+using UTStudio.Domain.Processing;
 using UTStudio.Visualization.Core;
 using UTStudio.Visualization.Wpf.Rendering;
 
@@ -21,14 +23,19 @@ public sealed class AScanControl : FrameworkElement
     private readonly TimeProvider _clock;
     private readonly Func<ModifierKeys> _readModifiers;
     private readonly Func<MouseEventArgs, Point> _readPosition;
+    private readonly Func<Point> _readCurrentPosition;
     private readonly Func<MouseButtonEventArgs, int> _readClickCount;
     private long? _lastRefresh;
     private AScanCompositeVisualSnapshot? _received, _displayed;
+    private bool _retainingCompleteGateSnapshot;
     private bool _dirty;
     private InteractionOwner _owner;
     private AScanCursorId? _draggingCursor;
+    private double? _lastRequestedCursorTime;
     private GateCaptureGeneration? _gateCapture;
     private GateHandleLogicalIdentity? _gateHandle;
+    private double _windowPointerStartTime, _windowInitialStart;
+    private bool _cursorInputTracking;
     private double _lastPanX;
     private ulong _transformInvalidation;
     private AScanControlAutomationPeer? _automationPeer;
@@ -44,23 +51,28 @@ public sealed class AScanControl : FrameworkElement
     private static readonly Pen CursorBPen = FrozenPen(FrozenBrush(0xF7, 0x7F, 0xBE), 1.5);
     private static readonly Pen GatePen = FrozenPen(GateBrush, 1.25);
     private static readonly Pen SelectedGatePen = FrozenPen(SelectedGateBrush, 2);
-    private const double CursorHitToleranceDip = 8, GateHitToleranceDip = 9;
+    private const double CursorHitToleranceDip = 8, GateHitToleranceDip = 9, GateBoundaryHitToleranceDip = 24;
 
-    public AScanControl() : this(TimeProvider.System, () => Keyboard.Modifiers, null, null) { }
-    internal AScanControl(TimeProvider clock) : this(clock, () => Keyboard.Modifiers, null, null) { }
+    public AScanControl() : this(TimeProvider.System, () => Keyboard.Modifiers, null, null, null) { }
+    internal AScanControl(TimeProvider clock) : this(clock, () => Keyboard.Modifiers, null, null, null) { }
     internal AScanControl(TimeProvider clock, Func<ModifierKeys> readModifiers,
-        Func<MouseEventArgs, Point>? readPosition, Func<MouseButtonEventArgs, int>? readClickCount)
+        Func<MouseEventArgs, Point>? readPosition, Func<MouseButtonEventArgs, int>? readClickCount,
+        Func<Point>? readCurrentPosition = null)
     {
         _clock = clock; _readModifiers = readModifiers ?? throw new ArgumentNullException(nameof(readModifiers));
         _readPosition = readPosition ?? (args => args.GetPosition(this));
+        _readCurrentPosition = readCurrentPosition ?? ReadPhysicalCursorPosition;
         _readClickCount = readClickCount ?? (args => args.ClickCount);
         ClipToBounds = true; Focusable = true;
         _timer = new(DispatcherPriority.Render, Dispatcher) { Interval = TimeSpan.FromMilliseconds(16) };
         _timer.Tick += (_, _) => RefreshSnapshot();
-        Loaded += OnLoaded; Unloaded += OnUnloaded; MouseLeftButtonDown += OnMouseLeftButtonDown;
-        MouseDown += OnMouseDown; MouseMove += OnMouseMove; MouseLeftButtonUp += OnMouseLeftButtonUp;
+        Loaded += OnLoaded; Unloaded += OnUnloaded;
+        AddHandler(MouseLeftButtonDownEvent, new MouseButtonEventHandler(OnMouseLeftButtonDown), handledEventsToo: true);
+        AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnMouseDown), handledEventsToo: true);
+        AddHandler(MouseMoveEvent, new MouseEventHandler(OnMouseMove), handledEventsToo: true);
+        AddHandler(MouseLeftButtonUpEvent, new MouseButtonEventHandler(OnMouseLeftButtonUp), handledEventsToo: true);
+        AddHandler(MouseRightButtonUpEvent, new MouseButtonEventHandler(OnMouseRightButtonUp), handledEventsToo: true);
         MouseUp += OnMouseUp; MouseWheel += OnMouseWheel; LostMouseCapture += OnLostMouseCapture;
-        LostKeyboardFocus += OnLostKeyboardFocus;
     }
 
     public AScanCompositeVisualSnapshot? VisualSnapshot
@@ -71,12 +83,17 @@ public sealed class AScanControl : FrameworkElement
     public event EventHandler<ScanTimePanRequestedEventArgs>? TimePanRequested;
     public event EventHandler? TimeResetRequested;
     public event EventHandler<GateBeginCaptureRequestedEventArgs>? GateBeginCaptureRequested;
+    public event EventHandler<GateBeginWindowCaptureRequestedEventArgs>? GateBeginWindowCaptureRequested;
     public event EventHandler<GateInteractionRequestedEventArgs>? GateInteractionRequested;
     public event EventHandler<AScanVisualContextChangedEventArgs>? VisualContextChanged;
     internal bool IsRefreshTimerEnabled => _timer.IsEnabled;
+    internal bool IsCursorInputTrackingEnabled => _cursorInputTracking;
     internal bool HasDisplayedSnapshot => _displayed is not null;
     internal ulong? DisplayedCursorSnapshotVersion => _displayed?.Cursors?.SnapshotVersion;
     internal AScanCompositeVisualSnapshot? DisplayedVisualSnapshot => _displayed;
+    internal ulong? RenderedSignalSnapshotVersion => SignalSnapshotForRender()?.Signal.Version;
+    internal int RenderedDetectedGateEventCount => _retainingCompleteGateSnapshot ? 0 :
+        _displayed?.Gates.Gates.Count(gate => gate.DetectedEvent is not null) ?? 0;
     internal GateCaptureGeneration? ActiveGateCapture => _gateCapture;
     internal bool HasCurrentTransform => _displayed is not null && IsTransformCompatible(_displayed.Transform);
 
@@ -84,14 +101,44 @@ public sealed class AScanControl : FrameworkElement
     {
         var control = (AScanControl)sender;
         control._received = (AScanCompositeVisualSnapshot?)args.NewValue; control._dirty = true;
-        if (control._gateCapture is { } token && !IsCompatibleOwnCapture(control._received, token))
+        if (control._received is not null && control._gateCapture is { } token &&
+            !IsCompatibleCaptureContext(control._received, token))
             control.CancelInteraction(true);
         if (args.NewValue is null)
-        { control.CancelInteraction(true); control._displayed = null; control.UpdateAutomationPeers(null); }
+        {
+            // Live composition briefly becomes unavailable while signal, gate geometry and viewport revisions
+            // converge. That is not an authority or lifecycle boundary and must not terminate a physical gesture.
+            // A subsequent incompatible non-null snapshot still cancels an exact gate capture above.
+            bool preservesPhysicalGesture = control._owner is InteractionOwner.Cursor or InteractionOwner.Gate;
+            if (!preservesPhysicalGesture || !control.IsLoaded)
+                control.CancelInteraction(true);
+            if (control._displayed?.Gates.Gates.Count > 0 && control.IsLoaded)
+                control._retainingCompleteGateSnapshot = true;
+            else
+            {
+                control._displayed = null; control._retainingCompleteGateSnapshot = false;
+                control.UpdateAutomationPeers(null);
+            }
+        }
+        else if (ShouldRetainCompleteGateSnapshot(control._displayed, control._received!))
+        {
+            control._retainingCompleteGateSnapshot = true; control._dirty = false;
+            control._lastRefresh = control._clock.GetTimestamp(); control.UpdateAutomationPeers(control._displayed);
+        }
         else if ((control._displayed is null || !control.IsTransformCompatible(control._displayed.Transform)) &&
             control.IsTransformCompatible(control._received!.Transform))
         {
             control._displayed = control._received; control._dirty = false;
+            control._retainingCompleteGateSnapshot = false;
+            control._lastRefresh = control._clock.GetTimestamp(); control.UpdateAutomationPeers(control._displayed);
+        }
+        else if (control._received!.Gates.Status == GateOverlayGeometryStatus.Current &&
+            control.IsTransformCompatible(control._received.Transform))
+        {
+            // A complete exact gate snapshot can be shorter lived than the ordinary visual cadence while RF is
+            // live. Latch it immediately so a following Evaluating placeholder cannot make the Preview vanish.
+            control._displayed = control._received; control._dirty = false;
+            control._retainingCompleteGateSnapshot = false;
             control._lastRefresh = control._clock.GetTimestamp(); control.UpdateAutomationPeers(control._displayed);
         }
     }
@@ -102,19 +149,36 @@ public sealed class AScanControl : FrameworkElement
     {
         if (_dirty) { TryAdmitReceived(); InvalidateVisual(); }
     }
+    internal void RefreshCursorGesture() => ContinuePhysicalGestureFromInput();
+    private Point ReadPhysicalCursorPosition()
+    {
+        if (!GetCursorPos(out NativePoint screen)) return Mouse.GetPosition(this);
+        try { return PointFromScreen(new(screen.X, screen.Y)); }
+        catch (InvalidOperationException) { return Mouse.GetPosition(this); }
+    }
     protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
     { CancelForTransformChange(); base.OnRenderSizeChanged(sizeInfo); RequestVisualContext(); InvalidateVisual(); }
     protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
     { CancelForTransformChange(); base.OnDpiChanged(oldDpi, newDpi); RequestVisualContext(); InvalidateVisual(); }
     private void CancelForTransformChange()
-    { _transformInvalidation++; CancelInteraction(true); if (_displayed is not null) UpdateAutomationPeers(null); }
+    {
+        _transformInvalidation++;
+        // Gate captures and pan deltas are tied to the previous exact transform. A manual cursor gesture is not:
+        // it can resume as soon as the coherent replacement transform is published, and live layout must not steal
+        // its mouse capture merely because changing status text resized the plot.
+        if (_owner != InteractionOwner.Cursor) CancelInteraction(true);
+        if (_displayed is not null) UpdateAutomationPeers(null);
+    }
 
     protected override void OnRender(DrawingContext drawing)
     {
         base.OnRender(drawing);
         if (_dirty) TryAdmitReceived();
-        AScanCompositeVisualSnapshot? displayed = _displayed;
-        bool currentTransform = displayed is not null && IsTransformCompatible(displayed.Transform);
+        AScanCompositeVisualSnapshot? gateSnapshot = _displayed;
+        AScanCompositeVisualSnapshot? displayed = SignalSnapshotForRender();
+        bool currentTransform = displayed is not null && (IsTransformCompatible(displayed.Transform) ||
+            _retainingCompleteGateSnapshot && _received is not null &&
+            displayed.Transform.TimeViewport == _received.Transform.TimeViewport);
         if (!currentTransform) displayed = null;
         drawing.DrawRectangle(BackgroundBrush, null, new Rect(RenderSize));
         Rect plot = PlotBounds(); if (plot.Width <= 0 || plot.Height <= 0) return;
@@ -122,8 +186,13 @@ public sealed class AScanControl : FrameworkElement
         if (displayed is null)
         { Label(drawing, "Pulse Start para adquirir RF simulada", new(plot.Left + 16, plot.Top + 16)); return; }
         DrawSignal(drawing, plot, displayed); DrawCursors(drawing, plot, displayed);
-        DrawGates(drawing, plot, displayed.Gates);
+        DrawGates(drawing, plot, gateSnapshot?.Gates ?? displayed.Gates,
+            suppressDetectedEvents: _retainingCompleteGateSnapshot);
     }
+
+    private AScanCompositeVisualSnapshot? SignalSnapshotForRender() =>
+        _retainingCompleteGateSnapshot && _received is { } received && IsTransformCompatible(received.Transform)
+            ? received : _displayed;
     private void DrawAxes(DrawingContext drawing, Rect plot, AScanCompositeVisualSnapshot? displayed)
     {
         for (int i = 0; i <= 4; i++)
@@ -176,7 +245,8 @@ public sealed class AScanControl : FrameworkElement
                 new(LabelOriginX(plot, x + 4, 128), id == AScanCursorId.A ? plot.Top + 22 : plot.Top + 40));
         }
     }
-    private static void DrawGates(DrawingContext drawing, Rect plot, GateOverlayVisualSnapshot overlay)
+    private static void DrawGates(DrawingContext drawing, Rect plot, GateOverlayVisualSnapshot overlay,
+        bool suppressDetectedEvents)
     {
         if (overlay.Status is not (GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating)) return;
         drawing.PushClip(new RectangleGeometry(plot));
@@ -188,29 +258,64 @@ public sealed class AScanControl : FrameworkElement
             foreach (GateThresholdProjection threshold in gate.Thresholds)
                 if (gate.StartCoordinate is { } x1 && gate.EndCoordinate is { } x2)
                     drawing.DrawLine(pen, new(x1, threshold.Coordinate), new(x2, threshold.Coordinate));
+            if (!suppressDetectedEvents && gate.DetectedEvent is { } detected)
+            {
+                Point center = new(detected.TimeCoordinate, detected.AmplitudeCoordinate);
+                drawing.DrawEllipse(overlay.SelectedGate == gate.GateId ? SelectedGateBrush : GateBrush,
+                    AxisPen, center, 4, 4);
+            }
         }
-        foreach (GateHandleVisualState handle in overlay.Handles)
-            drawing.DrawEllipse(handle.IsSelected ? SelectedGateBrush : GateBrush, AxisPen, new(handle.X, handle.Y),
-                handle.IsFocused ? 5 : 4, handle.IsFocused ? 5 : 4);
+        // Handles remain semantic hit-test and automation targets, but the complete boundary and threshold
+        // lines are directly draggable; extra circular affordances would obscure the RF trace.
         drawing.Pop();
     }
 
     private void OnMouseLeftButtonDown(object sender, MouseButtonEventArgs args)
     {
+        if (_owner == InteractionOwner.Cursor && !IsMouseCaptured) CancelInteraction(false, false);
         Point position = _readPosition(args);
-        if (BeginGateDrag(position)) { args.Handled = true; return; }
-        if (HitTestCursor(position) is not null) { if (BeginCursorDrag(position)) args.Handled = true; return; }
+        Point gatePosition = position;
+        bool gateHit = HitTestGate(gatePosition) is not null;
+        if (!gateHit)
+        {
+            Point physicalPosition = _readCurrentPosition();
+            if (HitTestGate(physicalPosition) is not null)
+            {
+                gatePosition = physicalPosition;
+                gateHit = true;
+            }
+        }
+        if (gateHit)
+        {
+            BeginGateDrag(gatePosition);
+            args.Handled = true;
+            return;
+        }
         if (_readClickCount(args) == 2 && RequestTimeReset(position)) { args.Handled = true; return; }
-        if ((_readModifiers() & ModifierKeys.Shift) != 0 && BeginPan(position)) args.Handled = true;
+        if ((_readModifiers() & ModifierKeys.Shift) != 0)
+        { if (BeginPan(position)) args.Handled = true; return; }
+        if (BeginCursorDrag(position, allowNearest: true)) args.Handled = true;
     }
     private void OnMouseDown(object sender, MouseButtonEventArgs args)
-    { if (args.ChangedButton == MouseButton.Middle && BeginPan(_readPosition(args))) args.Handled = true; }
+    {
+        if (args.ChangedButton == MouseButton.Middle && BeginPan(_readPosition(args))) args.Handled = true;
+        else if (args.ChangedButton == MouseButton.Right)
+        {
+            Point position = _readPosition(args);
+            if (HitTestGateWindow(position) is null)
+            {
+                Point physicalPosition = _readCurrentPosition();
+                if (HitTestGateWindow(physicalPosition) is not null) position = physicalPosition;
+            }
+            if (BeginGateWindowDrag(position)) args.Handled = true;
+        }
+    }
     private void OnMouseMove(object sender, MouseEventArgs args)
     {
         if (_owner == InteractionOwner.Pan) { ContinuePan(_readPosition(args)); args.Handled = true; }
-        else if (_owner == InteractionOwner.Cursor && args.LeftButton == MouseButtonState.Pressed)
+        else if (_owner == InteractionOwner.Cursor)
         { ContinueCursorDrag(_readPosition(args)); args.Handled = true; }
-        else if (_owner == InteractionOwner.Gate && args.LeftButton == MouseButtonState.Pressed)
+        else if (_owner == InteractionOwner.Gate && IsMouseCaptured)
         { ContinueGateDrag(_readPosition(args)); args.Handled = true; }
     }
     private void OnMouseUp(object sender, MouseButtonEventArgs args)
@@ -221,12 +326,27 @@ public sealed class AScanControl : FrameworkElement
     private void OnMouseLeftButtonUp(object sender, MouseButtonEventArgs args)
     {
         if (_owner == InteractionOwner.Cursor) { ContinueCursorDrag(_readPosition(args)); CancelInteraction(false); args.Handled = true; }
-        else if (_owner == InteractionOwner.Gate) { ContinueGateDrag(_readPosition(args)); EndGateCapture(); args.Handled = true; }
+        else if (_owner == InteractionOwner.Gate)
+        {
+            ContinueGateDrag(_readPosition(args));
+            EndGateCapture(); args.Handled = true;
+        }
+    }
+    private void OnMouseRightButtonUp(object sender, MouseButtonEventArgs args)
+    {
+        if (_owner == InteractionOwner.Gate && _gateHandle?.Kind == GateHandleKind.Window)
+        { ContinueGateDrag(_readPosition(args)); EndGateCapture(); args.Handled = true; }
     }
     private void OnMouseWheel(object sender, MouseWheelEventArgs args)
     { if ((_readModifiers() & (ModifierKeys.Control | ModifierKeys.Shift | ModifierKeys.Alt)) == 0 && RequestTimeZoom(_readPosition(args), args.Delta)) args.Handled = true; }
-    private void OnLostMouseCapture(object sender, MouseEventArgs args) => CancelInteraction(true, false);
-    private void OnLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs args) => CancelInteraction(true);
+    private void OnLostMouseCapture(object sender, MouseEventArgs args)
+    {
+        // Cursor and gate gestures deliberately continue from the physical pointer stream. LostMouseCapture is
+        // routed and can also be raised by transient live UI changes; ending here truncates a real drag after its
+        // first pixel. The global input stream completes the gesture on the matching button release.
+        if (_owner is InteractionOwner.Cursor or InteractionOwner.Gate) return;
+        CancelInteraction(true, false);
+    }
 
     protected override void OnPreviewKeyDown(KeyEventArgs args)
     {
@@ -259,26 +379,39 @@ public sealed class AScanControl : FrameworkElement
     internal bool BeginGateDrag(Point position)
     {
         if (_owner != InteractionOwner.None || _displayed is not { } displayed || !IsTransformCompatible(displayed.Transform) ||
-            HitTestGate(position) is not { } handle || !displayed.HasAuthoritativeIdentity) return false;
+            HitTestGate(position) is not { } handle || !displayed.HasAuthoritativeIdentity)
+            return false;
         AScanCompositeVisualSnapshot? receivedBefore = _received;
         var request = new GateBeginCaptureRequestedEventArgs(displayed, handle);
         GateBeginCaptureRequested?.Invoke(this, request);
-        if (!request.IsAccepted || request.Capture is not { } acceptedCapture) return false;
-        bool receivedIsCompatible = ReferenceEquals(_received, receivedBefore) ||
-            IsCompatibleOwnCapture(_received, acceptedCapture);
-        if (!receivedIsCompatible || !IsStillDisplayed(displayed) || !IsAcceptedToken(acceptedCapture, displayed, handle) ||
+        if (!request.IsAccepted || request.Capture is not { } acceptedCapture)
+            return false;
+        bool receivedIsCompatible = _received is null || ReferenceEquals(_received, receivedBefore) ||
+            IsCompatibleCaptureContext(_received, acceptedCapture);
+        if (!receivedIsCompatible || _displayed is null || !IsAcceptedToken(acceptedCapture, displayed, handle) ||
             !IsLoaded || !CaptureMouse())
         {
             GateInteractionRequested?.Invoke(this, new(GateOverlayInteractionKind.CancelPreview, request.Snapshot,
                 handle.Identity, acceptedCapture, null));
             return false;
         }
-        _owner = InteractionOwner.Gate; _gateCapture = acceptedCapture; _gateHandle = handle.Identity; Focus(); return true;
+        _owner = InteractionOwner.Gate; _gateCapture = acceptedCapture; _gateHandle = handle.Identity;
+        StartCursorInputTracking(); Focus(); return true;
     }
     internal void ContinueGateDrag(Point position)
     {
         if (_owner != InteractionOwner.Gate || _displayed is not { } displayed || _gateCapture is not { } token ||
-            _gateHandle is not { } identity || !IsCompatibleOwnCapture(displayed, token)) return;
+            _gateHandle is not { } identity || !IsCompatibleCaptureContext(displayed, token))
+            return;
+        if (identity.Kind == GateHandleKind.Window)
+        {
+            Rect plot = PlotBounds(); (double minimum, double maximum) = VisibleRange(displayed);
+            if (plot.Width > 0 && LinearAxisTransform.TryCoordinateToData(Math.Clamp(position.X, plot.Left, plot.Right),
+                plot.Left, plot.Width, minimum, maximum, out double pointerTime))
+                EmitGateIntent(GateOverlayInteractionKind.MoveCapture, null,
+                    _windowInitialStart + pointerTime - _windowPointerStartTime, token);
+            return;
+        }
         GateHandleVisualState? handle = displayed.Gates.Handles.FirstOrDefault(x => x.Identity == identity);
         if (handle is null) return;
         double value;
@@ -287,7 +420,8 @@ public sealed class AScanControl : FrameworkElement
             GateVisualTransform transform = displayed.Transform;
             if (!LinearAxisTransform.TryCoordinateToData(position.Y, transform.AmplitudeOrigin, transform.AmplitudeLength,
                 transform.AmplitudePresentation == GateAmplitudePresentationKind.RawRf ? -100 : 0, 100, out double percent)) return;
-            value = transform.AmplitudePresentation == GateAmplitudePresentationKind.RawRf ? Math.Abs(percent) / 100d : percent / 100d;
+            value = transform.AmplitudePresentation == GateAmplitudePresentationKind.RawRf
+                ? (percent + 100d) / 200d : percent / 100d;
         }
         else
         {
@@ -296,7 +430,45 @@ public sealed class AScanControl : FrameworkElement
             if (!LinearAxisTransform.TryCoordinateToData(exactCoordinate, displayed.Transform.TimeOrigin, displayed.Transform.TimeLength,
                 viewport.VisibleMinimumSeconds, viewport.VisibleMaximumSeconds, out value)) return;
         }
-        EmitGateIntent(GateOverlayInteractionKind.MoveCapture, handle, Math.Clamp(value, handle.Minimum, handle.Maximum), token);
+        EmitGateIntent(GateOverlayInteractionKind.MoveCapture, handle, value, token);
+    }
+
+    internal bool BeginGateWindowDrag(Point position)
+    {
+        if (_owner != InteractionOwner.None || _displayed is not { } displayed ||
+            !IsTransformCompatible(displayed.Transform) || HitTestGateWindow(position) is not { } gate ||
+            !displayed.HasAuthoritativeIdentity) return false;
+        Rect plot = PlotBounds(); (double minimum, double maximum) = VisibleRange(displayed);
+        if (!LinearAxisTransform.TryCoordinateToData(position.X, plot.Left, plot.Width, minimum, maximum,
+            out double pointerTime)) return false;
+        AScanCompositeVisualSnapshot? receivedBefore = _received;
+        var request = new GateBeginWindowCaptureRequestedEventArgs(displayed, gate.GateId);
+        GateBeginWindowCaptureRequested?.Invoke(this, request);
+        if (!request.IsAccepted || request.Capture is not { } accepted) return false;
+        bool receivedIsCompatible = _received is null || ReferenceEquals(_received, receivedBefore) ||
+            IsCompatibleCaptureContext(_received, accepted);
+        if (!receivedIsCompatible || _displayed is null || !IsCompatibleCaptureContext(displayed, accepted) ||
+            !IsLoaded || !CaptureMouse())
+        {
+            GateInteractionRequested?.Invoke(this, new(GateOverlayInteractionKind.CancelPreview, request.Snapshot,
+                null, accepted, null));
+            return false;
+        }
+        _owner = InteractionOwner.Gate; _gateCapture = accepted;
+        _gateHandle = new(gate.GateId, gate.GateRevision, GateHandleKind.Window);
+        _windowPointerStartTime = pointerTime; _windowInitialStart = request.InitialStartOffsetSeconds;
+        StartCursorInputTracking(); Focus(); return true;
+    }
+
+    internal ProjectedGateGeometryItem? HitTestGateWindow(Point position)
+    {
+        if (_displayed is not { } displayed || !IsTransformCompatible(displayed.Transform) ||
+            !PlotBounds().Contains(position)) return null;
+        return displayed.Gates.Gates.Where(gate => gate.StartCoordinate is { } start && gate.EndCoordinate is { } end &&
+                position.X >= Math.Min(start, end) && position.X <= Math.Max(start, end))
+            .OrderByDescending(gate => displayed.Gates.SelectedGate == gate.GateId)
+            .ThenBy(gate => Math.Abs(gate.EndCoordinate!.Value - gate.StartCoordinate!.Value))
+            .ThenBy(gate => gate.GateId.Value, StringComparer.Ordinal).FirstOrDefault();
     }
 
     private void EndGateCapture()
@@ -304,15 +476,96 @@ public sealed class AScanControl : FrameworkElement
         GateCaptureGeneration? token = _gateCapture; GateHandleVisualState? handle = CurrentGateHandle();
         CancelInteraction(false); if (token is { } capture) EmitGateIntent(GateOverlayInteractionKind.EndCapture, handle, null, capture);
     }
-    internal GateHandleVisualState? HitTestGate(Point position) => _displayed is { } displayed &&
-        IsTransformCompatible(displayed.Transform) && displayed.HasAuthoritativeIdentity &&
-        displayed.Gates.Status is GateOverlayGeometryStatus.Current or GateOverlayGeometryStatus.Evaluating
-        ? GateOverlayHitTester.HitTest(displayed.Gates, position.X, position.Y, GateHitToleranceDip) : null;
-
-    internal bool BeginCursorDrag(Point position)
+    internal GateHandleVisualState? HitTestGate(Point position)
     {
-        if (_owner != InteractionOwner.None || HitTestCursor(position) is not { } hit || !CaptureMouse()) return false;
-        _owner = InteractionOwner.Cursor; _draggingCursor = hit; CursorActivated?.Invoke(this, new(hit)); ContinueCursorDrag(position); return true;
+        if (_displayed is not { } displayed || !IsTransformCompatible(displayed.Transform) ||
+            !displayed.HasAuthoritativeIdentity ||
+            !PlotBounds().Contains(position)) return null;
+        GateHandleVisualState? timeBoundary = displayed.Gates.Handles
+            .Where(handle => handle.IsEnabled && handle.Kind is GateHandleKind.Start or GateHandleKind.End)
+            .Select(handle => (Handle: handle, Distance: GateBoundaryDistance(displayed.Gates, handle, position.X)))
+            .Where(candidate => candidate.Distance <= GateBoundaryHitToleranceDip)
+            .OrderBy(candidate => candidate.Distance).ThenBy(candidate => candidate.Handle.GateId.Value)
+            .ThenBy(candidate => candidate.Handle.Kind).Select(candidate => candidate.Handle).FirstOrDefault();
+        GateHandleVisualState? thresholdLine = displayed.Gates.Handles
+            .Where(handle => handle.IsEnabled && handle.Kind == GateHandleKind.Threshold)
+            .Select(handle => (Handle: handle,
+                Distance: GateThresholdDistance(displayed.Gates, handle, position.X, position.Y)))
+            .Where(candidate => candidate.Distance <= GateHitToleranceDip)
+            .OrderBy(candidate => candidate.Distance).ThenBy(candidate => candidate.Handle.GateId.Value)
+            .Select(candidate => candidate.Handle).FirstOrDefault();
+        return timeBoundary ?? thresholdLine ??
+            GateOverlayHitTester.HitTest(displayed.Gates, position.X, position.Y, GateHitToleranceDip);
+    }
+
+    private static double GateBoundaryDistance(GateOverlayVisualSnapshot overlay,
+        GateHandleVisualState handle, double pointerX)
+    {
+        double distance = Math.Abs(handle.X - pointerX);
+        ProjectedGateGeometryItem? gate = overlay.Gates.FirstOrDefault(candidate =>
+            candidate.GateId == handle.GateId && candidate.GateRevision == handle.GateRevision);
+        double? exact = handle.Kind == GateHandleKind.Start ? gate?.StartCoordinate : gate?.EndCoordinate;
+        return exact is { } coordinate ? Math.Min(distance, Math.Abs(coordinate - pointerX)) : distance;
+    }
+
+    private static double GateThresholdDistance(GateOverlayVisualSnapshot overlay,
+        GateHandleVisualState handle, double pointerX, double pointerY)
+    {
+        ProjectedGateGeometryItem? gate = overlay.Gates.FirstOrDefault(candidate =>
+            candidate.GateId == handle.GateId && candidate.GateRevision == handle.GateRevision);
+        if (gate?.StartCoordinate is not { } start || gate.EndCoordinate is not { } end ||
+            pointerX < Math.Min(start, end) || pointerX > Math.Max(start, end)) return double.PositiveInfinity;
+        double projected = gate.Thresholds.Count == 0 ? Math.Abs(handle.Y - pointerY) :
+            gate.Thresholds.Min(threshold => Math.Abs(threshold.Coordinate - pointerY));
+        return Math.Min(projected, Math.Abs(handle.Y - pointerY));
+    }
+
+    internal bool BeginCursorDrag(Point position) => BeginCursorDrag(position, allowNearest: false);
+    private bool BeginCursorDrag(Point position, bool allowNearest)
+    {
+        if (_owner != InteractionOwner.None ||
+            (HitTestCursor(position) ?? (allowNearest ? NearestVisibleCursor(position) : null)) is not { } hit ||
+            !CaptureMouse()) return false;
+        _owner = InteractionOwner.Cursor; _draggingCursor = hit; _lastRequestedCursorTime = null;
+        StartCursorInputTracking();
+        CursorActivated?.Invoke(this, new(hit)); ContinueCursorDrag(position); return true;
+    }
+    private void StartCursorInputTracking()
+    {
+        if (_cursorInputTracking) return;
+        InputManager.Current.PreProcessInput += OnPreProcessInput;
+        CompositionTarget.Rendering += OnCursorRendering;
+        _cursorInputTracking = true;
+    }
+    private void StopCursorInputTracking()
+    {
+        if (!_cursorInputTracking) return;
+        InputManager.Current.PreProcessInput -= OnPreProcessInput;
+        CompositionTarget.Rendering -= OnCursorRendering;
+        _cursorInputTracking = false;
+    }
+    private void OnPreProcessInput(object sender, PreProcessInputEventArgs args)
+    {
+        if (_owner is not InteractionOwner.Cursor and not InteractionOwner.Gate)
+        { StopCursorInputTracking(); return; }
+        if (!IsMouseCaptured && args.StagingItem.Input is MouseButtonEventArgs button &&
+            button.ButtonState == MouseButtonState.Released &&
+            (_owner == InteractionOwner.Cursor && button.ChangedButton == MouseButton.Left ||
+             _owner == InteractionOwner.Gate && _gateHandle?.Kind == GateHandleKind.Window && button.ChangedButton == MouseButton.Right ||
+             _owner == InteractionOwner.Gate && _gateHandle?.Kind != GateHandleKind.Window && button.ChangedButton == MouseButton.Left))
+        {
+            ContinuePhysicalGestureFromInput();
+            if (_owner == InteractionOwner.Gate) EndGateCapture();
+            else CancelInteraction(false);
+        }
+        else if (args.StagingItem.Input is MouseEventArgs mouse && mouse.RoutedEvent == Mouse.MouseMoveEvent)
+            ContinuePhysicalGestureFromInput();
+    }
+    private void OnCursorRendering(object? sender, EventArgs args) => ContinuePhysicalGestureFromInput();
+    private void ContinuePhysicalGestureFromInput()
+    {
+        if (_owner == InteractionOwner.Cursor) ContinueCursorDrag(_readCurrentPosition());
+        else if (_owner == InteractionOwner.Gate) ContinueGateDrag(_readCurrentPosition());
     }
     internal void ContinueCursorDrag(Point position)
     {
@@ -320,7 +573,12 @@ public sealed class AScanControl : FrameworkElement
             !IsTransformCompatible(displayed.Transform)) return;
         Rect plot = PlotBounds(); (double minimum, double maximum) = VisibleRange(displayed);
         if (plot.Width > 0 && LinearAxisTransform.TryCoordinateToData(Math.Clamp(position.X, plot.Left, plot.Right), plot.Left,
-            plot.Width, minimum, maximum, out double time)) CursorMoveRequested?.Invoke(this, new(cursor, time));
+            plot.Width, minimum, maximum, out double time) &&
+            (_lastRequestedCursorTime is not { } previous || Math.Abs(previous - time) > 1e-15))
+        {
+            _lastRequestedCursorTime = time;
+            CursorMoveRequested?.Invoke(this, new(cursor, time));
+        }
     }
     internal void EndCursorDrag() => CancelInteraction(false);
     internal void CancelCursorDrag() => CancelInteraction(false);
@@ -336,6 +594,16 @@ public sealed class AScanControl : FrameworkElement
         return ad == bd ? cursors.ActiveCursor : ad < bd ? AScanCursorId.A : AScanCursorId.B;
         double Distance(double time) => time < minimum || time > maximum ? double.PositiveInfinity :
             Math.Abs(position.X - (plot.Left + (time - minimum) / range * plot.Width));
+    }
+    private AScanCursorId? NearestVisibleCursor(Point position)
+    {
+        if (_displayed is not { Cursors: { IsVisible: true } cursors } displayed ||
+            !IsTransformCompatible(displayed.Transform) || !PlotBounds().Contains(position)) return null;
+        (double minimum, double maximum) = VisibleRange(displayed); double range = maximum - minimum;
+        if (range <= 0) return null;
+        double a = Coordinate(cursors.A.TimeSeconds), b = Coordinate(cursors.B.TimeSeconds);
+        return Math.Abs(position.X - a) <= Math.Abs(position.X - b) ? AScanCursorId.A : AScanCursorId.B;
+        double Coordinate(double time) => PlotBounds().Left + (time - minimum) / range * PlotBounds().Width;
     }
     internal bool BeginPan(Point position)
     {
@@ -370,24 +638,38 @@ public sealed class AScanControl : FrameworkElement
     private void CancelInteraction(bool notifyGate, bool releaseMouse = true)
     {
         GateCaptureGeneration? token = _gateCapture; GateHandleVisualState? handle = CurrentGateHandle();
-        _owner = InteractionOwner.None; _draggingCursor = null; _gateCapture = null; _gateHandle = null;
+        _owner = InteractionOwner.None; _draggingCursor = null; _lastRequestedCursorTime = null;
+        _gateCapture = null; _gateHandle = null;
+        StopCursorInputTracking();
         if (releaseMouse && IsMouseCaptured) ReleaseMouseCapture();
         if (notifyGate && token is { } capture) EmitGateIntent(GateOverlayInteractionKind.CancelPreview, handle, null, capture);
     }
+
     private GateHandleVisualState? CurrentGateHandle() => _displayed?.Gates.Handles
         .FirstOrDefault(x => _gateHandle is { } identity && x.Identity == identity);
-    private bool IsStillDisplayed(AScanCompositeVisualSnapshot snapshot) => ReferenceEquals(_displayed, snapshot) && IsTransformCompatible(snapshot.Transform);
     private static bool IsAcceptedToken(GateCaptureGeneration? token, AScanCompositeVisualSnapshot snapshot, GateHandleVisualState handle)
     {
         if (token is not { IsValid: true } value || snapshot.Gates.Source is not { } source ||
-            value.ContextGeneration != snapshot.Gates.ContextGeneration || value.RunId != snapshot.Signal.Metadata.RunId ||
-            value.TraceIdentity != snapshot.Signal.TraceIdentity || value.SourceKind != source.Kind ||
+            value.RunId != snapshot.Signal.Metadata.RunId ||
+            snapshot.Signal.TraceIdentity is not { } shownTrace || value.TraceIdentity.Stream != shownTrace.Stream ||
+            value.SourceKind != source.Kind ||
             value.PlanRevision != source.Revision || value.Preview != source.Preview || value.GateId != handle.GateId ||
             value.Handle != handle.Kind || value.TransformVersion != snapshot.Transform.Version) return false;
         return value.AnchorGateId == handle.AnchorGateId && value.AnchorRevision == handle.AnchorRevision;
     }
-    private static bool IsCompatibleOwnCapture(AScanCompositeVisualSnapshot? snapshot, GateCaptureGeneration token) =>
-        snapshot is not null && snapshot.Gates.Capture == token && snapshot.Transform.Version == token.TransformVersion;
+    private static bool IsCompatibleCaptureContext(AScanCompositeVisualSnapshot? snapshot, GateCaptureGeneration token)
+    {
+        if (snapshot is null || snapshot.Transform.Version != token.TransformVersion ||
+            snapshot.Signal.Metadata.RunId != token.RunId ||
+            snapshot.Signal.TraceIdentity is not { } trace || trace.Stream != token.TraceIdentity.Stream)
+            return false;
+        // An accepted gesture owns one stable capture token while each MoveCapture legitimately produces a new
+        // Preview source identity. When the portable overlay projects that exact token, it is the authority for
+        // continuity; source identity checks are only the fallback for lagging live frames without a projection.
+        if (snapshot.Gates.Capture is { } projected) return projected == token;
+        return snapshot.Gates.Source is { } source && source.Kind == token.SourceKind &&
+            source.Revision == token.PlanRevision && source.Preview == token.Preview;
+    }
     private void EmitGateIntent(GateOverlayInteractionKind kind, GateHandleVisualState? handle, double? value,
         GateCaptureGeneration? capture = null)
     {
@@ -422,8 +704,24 @@ public sealed class AScanControl : FrameworkElement
     }
     private void TryAdmitReceived()
     {
-        if (_received is not { } candidate || !IsTransformCompatible(candidate.Transform) || !TryAdmitSnapshot()) return;
-        _dirty = false; _displayed = candidate; UpdateAutomationPeers(candidate);
+        if (_received is not { } candidate || !IsTransformCompatible(candidate.Transform)) return;
+        if (ShouldRetainCompleteGateSnapshot(_displayed, candidate))
+        {
+            _dirty = false; _retainingCompleteGateSnapshot = true; UpdateAutomationPeers(_displayed);
+            return;
+        }
+        if (!TryAdmitSnapshot()) return;
+        _dirty = false; _displayed = candidate; _retainingCompleteGateSnapshot = false; UpdateAutomationPeers(candidate);
+    }
+    private static bool ShouldRetainCompleteGateSnapshot(AScanCompositeVisualSnapshot? displayed,
+        AScanCompositeVisualSnapshot candidate)
+    {
+        if (displayed?.Gates is not { } previous || previous.Gates.Count == 0 ||
+            candidate.Gates.Gates.Any(gate => gate.StartCoordinate is not null || gate.EndCoordinate is not null ||
+                gate.Thresholds.Count != 0 || gate.DetectedEvent is not null) ||
+            candidate.Gates.Status is not (GateOverlayGeometryStatus.Evaluating or
+                GateOverlayGeometryStatus.Stale)) return false;
+        return true;
     }
     private static double LabelOriginX(Rect plot, double desired, double labelWidth) => plot.Width <= labelWidth ? plot.Left : Math.Clamp(desired, plot.Left, plot.Right - labelWidth);
     private void Label(DrawingContext drawing, string text, Point origin) => drawing.DrawText(
@@ -452,6 +750,11 @@ public sealed class AScanControl : FrameworkElement
             handle, Math.Clamp(value, handle.Minimum, handle.Maximum));
     }
     private enum InteractionOwner { None, Cursor, Pan, Gate }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint { internal int X; internal int Y; }
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out NativePoint point);
 }
 
 public sealed class AScanCursorMoveRequestedEventArgs(AScanCursorId cursor, double timeSeconds) : EventArgs
@@ -469,10 +772,28 @@ public sealed class GateBeginCaptureRequestedEventArgs(AScanCompositeVisualSnaps
     public bool IsAccepted => Capture is { IsValid: true };
     public void Accept(GateCaptureGeneration capture)
     {
-        if (!capture.IsValid || capture.RunId != Snapshot.Signal.Metadata.RunId || capture.TraceIdentity != Snapshot.Signal.TraceIdentity ||
+        if (!capture.IsValid || capture.RunId != Snapshot.Signal.Metadata.RunId ||
+            Snapshot.Signal.TraceIdentity is not { } shownTrace || capture.TraceIdentity.Stream != shownTrace.Stream ||
             capture.GateId != Handle.GateId || capture.Handle != Handle.Kind || capture.TransformVersion != Snapshot.Transform.Version)
             throw new ArgumentException("The accepted capture does not belong to the displayed handle.", nameof(capture));
         Capture = capture;
+    }
+}
+public sealed class GateBeginWindowCaptureRequestedEventArgs(AScanCompositeVisualSnapshot snapshot, GateId gateId) : EventArgs
+{
+    public AScanCompositeVisualSnapshot Snapshot { get; } = snapshot;
+    public GateId GateId { get; } = gateId;
+    public GateCaptureGeneration? Capture { get; private set; }
+    public double InitialStartOffsetSeconds { get; private set; }
+    public bool IsAccepted => Capture is { IsValid: true, Handle: GateHandleKind.Window };
+    public void Accept(GateCaptureGeneration capture, double initialStartOffsetSeconds)
+    {
+        if (!capture.IsValid || capture.Handle != GateHandleKind.Window || capture.GateId != GateId ||
+            capture.RunId != Snapshot.Signal.Metadata.RunId || Snapshot.Signal.TraceIdentity is not { } shownTrace ||
+            capture.TraceIdentity.Stream != shownTrace.Stream ||
+            capture.TransformVersion != Snapshot.Transform.Version || !double.IsFinite(initialStartOffsetSeconds))
+            throw new ArgumentException("The accepted window capture does not belong to the displayed gate.", nameof(capture));
+        Capture = capture; InitialStartOffsetSeconds = initialStartOffsetSeconds;
     }
 }
 public sealed class GateInteractionRequestedEventArgs(GateOverlayInteractionKind kind, AScanCompositeVisualSnapshot snapshot,

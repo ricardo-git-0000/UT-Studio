@@ -112,6 +112,30 @@ public sealed class GatePlanEditorSessionTests
     }
 
     [TestMethod]
+    public void RejectedTransactionalCandidatePreservesValidDraftAndApplicablePreview()
+    {
+        using var authority = Authority(out CommittedGatePlanSnapshot committed);
+        using var editor = new GatePlanEditorSession(committed.AuthorityKey, authority.Reader, new GatePlanPreviewCompiler());
+        GatePlanDraft validDraft = editor.BeginEdit().Draft!;
+        Assert.AreEqual(GatePlanEditOutcome.Previewed, editor.Preview().Outcome);
+        GatePreviewArtifact validArtifact = editor.BorrowPreviewCandidate()!;
+        GateDefinition gate = validDraft.Gates.Single();
+        var selfReference = new GateDefinition(gate.Id, gate.Revision,
+            new(GateTimeReference.GateEvent(gate.Id), gate.Window.StartOffsetSeconds, gate.Window.DurationSeconds),
+            gate.SignalDomain, gate.Detector, gate.RequestedMeasures);
+        var rejected = new GatePlanDraft(validDraft.Authority, validDraft.BaseRevision,
+            validDraft.SchemaVersion, validDraft.AlgorithmVersion, [selfReference]);
+
+        GatePlanEditResult result = editor.Preview(rejected, preserveCurrentOnFailure: true);
+
+        Assert.AreEqual(GatePlanEditOutcome.CandidateRejected, result.Outcome);
+        Assert.IsTrue(result.ValidationErrors.Any(x => x.Code == GateCompilationErrorCode.SelfDependency));
+        Assert.AreSame(validDraft, editor.Snapshot.Draft);
+        Assert.AreSame(validArtifact, editor.BorrowApplicablePreview());
+        Assert.AreEqual(GatePlanEditorState.Previewed, editor.Snapshot.State);
+    }
+
+    [TestMethod]
     public void CancelIsDeterministicIdempotentAndClearsDraftAndErrors()
     {
         using var authority = Authority(out CommittedGatePlanSnapshot committed);

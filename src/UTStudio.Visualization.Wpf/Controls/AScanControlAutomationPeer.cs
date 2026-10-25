@@ -51,7 +51,12 @@ internal sealed class AScanControlAutomationPeer : FrameworkElementAutomationPee
             foreach ((GateHandleAutomationIdentity identity, GateHandleAutomationPeer peer) in _peers.ToArray())
                 if (!retained.Contains(identity)) { peer.Retire(); _peers.Remove(identity); }
             foreach (GateHandleAutomationIdentity identity in identities)
-                if (!_peers.ContainsKey(identity)) _peers.Add(identity, new(Control, this, identity));
+            {
+                GateHandleVisualState handle = snapshot!.Gates.Handles.First(candidate =>
+                    GateHandleAutomationIdentity.Create(snapshot, candidate) == identity);
+                if (_peers.TryGetValue(identity, out GateHandleAutomationPeer? peer)) peer.Update(handle);
+                else _peers.Add(identity, new(Control, this, identity, handle));
+            }
             _ordered = identities.Select(identity => _peers[identity]).ToArray();
             if (structureChanged) { ResetChildrenCache(); InvalidatePeer(); }
         });
@@ -66,23 +71,30 @@ internal sealed class GateHandleAutomationPeer : AutomationPeer, IRangeValueProv
     private readonly AScanControl _owner;
     private readonly AScanControlAutomationPeer _parent;
     private readonly GateHandleAutomationIdentity _identity;
+    private GateHandleVisualState _lastKnown;
     private bool _retired;
 
     internal GateHandleAutomationPeer(AScanControl owner, AScanControlAutomationPeer parent,
-        GateHandleAutomationIdentity identity)
-    { _owner = owner; _parent = parent; _identity = identity; }
+        GateHandleAutomationIdentity identity, GateHandleVisualState initial)
+    { _owner = owner; _parent = parent; _identity = identity; _lastKnown = initial; }
 
     internal void Retire() => _retired = true;
+    internal void Update(GateHandleVisualState handle) => _lastKnown = handle;
     internal GateHandleAutomationIdentity Identity => _identity;
     private GateHandleVisualState Current() => _owner.OnDispatcher(() => !_retired &&
         _owner.FindCurrentHandle(_identity) is { } handle ? handle : throw new ElementNotAvailableException());
+    private GateHandleVisualState PropertyState() => _owner.OnDispatcher(() =>
+    {
+        if (!_retired && _owner.FindCurrentHandle(_identity) is { } handle) _lastKnown = handle;
+        return _lastKnown;
+    });
     protected override string GetClassNameCore() => "GateHandle";
     protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.Slider;
     protected override string GetAutomationIdCore() => $"gate-{_identity.GateId.Value}-{_identity.GateRevision.Value}-{_identity.Kind}";
     protected override string GetAcceleratorKeyCore() => string.Empty;
     protected override string GetAccessKeyCore() => string.Empty;
     protected override string GetItemTypeCore() => "Gate handle";
-    protected override string GetItemStatusCore() => Current().IsEnabled ? "Editable" : "Read-only";
+    protected override string GetItemStatusCore() => !_retired && PropertyState().IsEnabled ? "Editable" : "Unavailable";
     protected override AutomationOrientation GetOrientationCore() => _identity.Kind == GateHandleKind.Threshold
         ? AutomationOrientation.Vertical : AutomationOrientation.Horizontal;
     protected override AutomationPeer? GetLabeledByCore() => null;
@@ -91,39 +103,44 @@ internal sealed class GateHandleAutomationPeer : AutomationPeer, IRangeValueProv
     protected override bool IsRequiredForFormCore() => false;
     protected override bool IsControlElementCore() => true;
     protected override bool IsContentElementCore() => true;
-    protected override string GetNameCore() => _owner.OnDispatcher(() =>
-    { _ = Current(); return $"Gate {_identity.GateId.Value} – {KindName(_identity.Kind)}"; });
-    protected override string GetHelpTextCore() => _owner.OnDispatcher(() => $"{Current().Unit}; " +
-        $"mínimo {Current().Minimum:G}, máximo {Current().Maximum:G}, paso {Current().Step:G}");
-    protected override bool IsEnabledCore() => Current().IsEnabled;
-    protected override bool IsKeyboardFocusableCore() => true;
-    protected override bool HasKeyboardFocusCore() => Current().IsFocused;
+    protected override string GetNameCore() => $"Gate {_identity.GateId.Value} – {KindName(_identity.Kind)}";
+    protected override string GetHelpTextCore() => _owner.OnDispatcher(() =>
+    {
+        GateHandleVisualState state = PropertyState();
+        return $"{state.Unit}; mínimo {state.Minimum:G}, máximo {state.Maximum:G}, paso {state.Step:G}";
+    });
+    protected override bool IsEnabledCore() => !_retired && PropertyState().IsEnabled;
+    protected override bool IsKeyboardFocusableCore() => !_retired;
+    protected override bool HasKeyboardFocusCore() => !_retired && PropertyState().IsFocused;
     protected override bool IsOffscreenCore() => _owner.OnDispatcher(() =>
     {
-        GateHandleVisualState handle = Current();
+        if (_retired) return true;
+        GateHandleVisualState handle = PropertyState();
         return handle.X < 0 || handle.Y < 0 || handle.X > _owner.ActualWidth || handle.Y > _owner.ActualHeight;
     });
     protected override Rect GetBoundingRectangleCore() => _owner.OnDispatcher(() =>
     {
-        GateHandleVisualState handle = Current();
+        if (_retired) return Rect.Empty;
+        GateHandleVisualState handle = PropertyState();
         Point topLeft = _owner.PointToScreen(new(handle.X - 6, handle.Y - 6));
         Point bottomRight = _owner.PointToScreen(new(handle.X + 6, handle.Y + 6));
         return new Rect(topLeft, bottomRight);
     });
     protected override Point GetClickablePointCore() => _owner.OnDispatcher(() =>
     {
-        GateHandleVisualState handle = Current(); return _owner.PointToScreen(new(handle.X, handle.Y));
+        if (_retired) return new(double.NaN, double.NaN);
+        GateHandleVisualState handle = PropertyState(); return _owner.PointToScreen(new(handle.X, handle.Y));
     });
     protected override void SetFocusCore() => Select();
     public override object? GetPattern(PatternInterface patternInterface) =>
         patternInterface is PatternInterface.RangeValue or PatternInterface.SelectionItem ? this : null;
 
-    bool IRangeValueProvider.IsReadOnly => !Current().IsEnabled;
-    double IRangeValueProvider.LargeChange => Current().Step;
-    double IRangeValueProvider.Maximum => Current().Maximum;
-    double IRangeValueProvider.Minimum => Current().Minimum;
-    double IRangeValueProvider.SmallChange => Current().Step;
-    double IRangeValueProvider.Value => Current().Value;
+    bool IRangeValueProvider.IsReadOnly => _retired || !PropertyState().IsEnabled;
+    double IRangeValueProvider.LargeChange => PropertyState().Step;
+    double IRangeValueProvider.Maximum => PropertyState().Maximum;
+    double IRangeValueProvider.Minimum => PropertyState().Minimum;
+    double IRangeValueProvider.SmallChange => PropertyState().Step;
+    double IRangeValueProvider.Value => PropertyState().Value;
     void IRangeValueProvider.SetValue(double value) => _owner.OnDispatcher(() =>
     {
         GateHandleVisualState handle = Current();
@@ -132,10 +149,10 @@ internal sealed class GateHandleAutomationPeer : AutomationPeer, IRangeValueProv
             throw new ArgumentOutOfRangeException(nameof(value));
         _owner.RequestAutomationValue(_identity, value);
     });
-    bool ISelectionItemProvider.IsSelected => Current().IsSelected;
+    bool ISelectionItemProvider.IsSelected => !_retired && PropertyState().IsSelected;
     IRawElementProviderSimple ISelectionItemProvider.SelectionContainer => ProviderFromPeer(_parent);
     void ISelectionItemProvider.AddToSelection() => Select();
-    void ISelectionItemProvider.RemoveFromSelection() { }
+    void ISelectionItemProvider.RemoveFromSelection() => _ = Current();
     void ISelectionItemProvider.Select() => Select();
     private void Select() => _owner.OnDispatcher(() =>
     {

@@ -78,8 +78,10 @@ La ampliación aprobada, todavía no implementada, permitirá un perfil estacion
 estables y cambiar detector/referencia mediante el mismo draft, Preview y Apply; crear/eliminar permanece fuera.
 El perfil móvil actual y su plan vigente se conservan sin migración. Los cruces conservan tiempo interpolado y
 `SampleIndex` izquierdo. Los máximos locales con threshold exigen amplitud estrictamente mayor y filtran threshold
-antes de la supresión por distancia. Máximo y mínimo no conservan un threshold incompatible. Se mantienen los
-dominios RF actuales; `Absolute` no equivale a señal rectificada adquirida y `RectifiedInput` queda fuera.
+antes de la supresión por distancia. El calculador de puertas opera directamente sobre la señal que recibe y no
+rectifica, calcula magnitud ni selecciona un dominio por puerta. El threshold es único, puede recorrer todo el
+rango de esa señal y se representa con una sola línea. Rectificación, vídeo, Hilbert, FIR, FFT, escala logarítmica
+y reducción pertenecen a un módulo DSP posterior, fuera del alcance actual.
 
 Una referencia nueva conserva el offset numérico; padre sin evento produce ausencia causal explícita, nunca cero
 ni evento anterior. Los eventos visibles procederán de evaluación sobre muestras originales. El perfil
@@ -87,3 +89,9 @@ estacionario A/B/C está aceptado condicionado a validar límites y resultados e
 configuraciones nuevas y no está implementado. El wrap móvil es válido; una combinación incompatible se rechazará
 de forma tipada y sin efectos. Véanse [ADR 0019](../adr/0019-configurable-causal-gate-editor.md) y el
 [diseño de ampliación](../architecture/ut-gate-editor-extension-design.md).
+
+En una puerta referida al origen, el formulario muestra `Inicio` y `Fin`. En una puerta enlazada muestra
+`Offset inicial` y `Ancho`. El gráfico continúa mostrando posiciones absolutas, pero el arrastre izquierdo de
+un límite se convierte mediante el instante exacto del evento padre capturado al comenzar el gesto; el arrastre
+derecho traslada ambos límites conservando el ancho. Sin un evento padre detectado no existe edición gráfica de
+esa puerta enlazada.

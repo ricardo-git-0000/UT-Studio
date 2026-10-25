@@ -1,5 +1,11 @@
 # Diseño aceptado del procesamiento neutral de puertas UT
 
+> Actualización 2026-10-25: ADR 0019 sustituye la selección de dominio por puerta. El evaluator consume una
+> señal ya procesada y no ejecuta rectificación, magnitud ni otras transformaciones DSP. Las menciones históricas
+> a `EffectiveSignalDomain`, `Positive`, `NegativeMagnitude`, `Absolute` o `AbsoluteMaximum` describen el contrato
+> anterior y no deben usarse para planes nuevos. Esos identificadores permanecen temporalmente en persistencia
+> hasta que el futuro módulo DSP aporte identidad, unidad y rango de su salida.
+
 Fecha: 2026-10-19. Estado: **contrato aceptado; Fases 1–5 integradas en `main`; Fase 6 implementada y validada en
 `feature/ut-gate-ascan-editor`; persistencia y C-Scan
 siguen fuera**. La

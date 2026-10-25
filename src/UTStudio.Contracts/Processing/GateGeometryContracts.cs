@@ -148,18 +148,20 @@ public sealed class GateGeometryItemSnapshot
 {
     public GateGeometryItemSnapshot(GateId gateId, GateRevision gateRevision,
         GateSignalDomain signalDomain, GateResultStatus evaluationStatus, GateAnchorSnapshot? anchor,
-        double? startSeconds, double? endSeconds, double? thresholdNormalized)
+        double? startSeconds, double? endSeconds, double? thresholdNormalized,
+        GateExactEventSnapshot? detectedEvent = null)
     {
         if (!gateId.IsValid || !gateRevision.IsValid || !Enum.IsDefined(signalDomain) ||
             signalDomain == GateSignalDomain.Unknown || !Enum.IsDefined(evaluationStatus) ||
             evaluationStatus == GateResultStatus.Unknown || (startSeconds.HasValue != endSeconds.HasValue) ||
             startSeconds is { } start && !double.IsFinite(start) ||
             endSeconds is { } end && (!double.IsFinite(end) || end <= startSeconds!.Value) ||
-            thresholdNormalized is { } threshold && (!double.IsFinite(threshold) || threshold is < 0 or > 1))
+            thresholdNormalized is { } threshold && (!double.IsFinite(threshold) || threshold is < 0 or > 1) ||
+            detectedEvent is not null && detectedEvent.Status != evaluationStatus)
             throw new ArgumentException("A valid immutable gate geometry item is required.");
         GateId = gateId; GateRevision = gateRevision; SignalDomain = signalDomain;
         EvaluationStatus = evaluationStatus; Anchor = anchor; StartSeconds = startSeconds;
-        EndSeconds = endSeconds; ThresholdNormalized = thresholdNormalized;
+        EndSeconds = endSeconds; ThresholdNormalized = thresholdNormalized; DetectedEvent = detectedEvent;
     }
     public GateId GateId { get; }
     public GateRevision GateRevision { get; }
@@ -169,6 +171,42 @@ public sealed class GateGeometryItemSnapshot
     public double? StartSeconds { get; }
     public double? EndSeconds { get; }
     public double? ThresholdNormalized { get; }
+    public GateExactEventSnapshot? DetectedEvent { get; }
+}
+
+public sealed class GateExactEventSnapshot
+{
+    public GateExactEventSnapshot(GateResultStatus status, GateDetectionEventKind eventKind,
+        int? sampleIndex, double? fractionalSamplePosition, double? detectionTimeSeconds,
+        double? detectorAmplitudeCounts, double? displayedRfAmplitudeCounts,
+        double? prominenceCounts, double? thresholdMarginCounts)
+    {
+        if (!Enum.IsDefined(status) || status == GateResultStatus.Unknown ||
+            !Enum.IsDefined(eventKind) || eventKind == GateDetectionEventKind.Unknown ||
+            sampleIndex is < 0 || fractionalSamplePosition is { } position && (!double.IsFinite(position) || position < 0) ||
+            detectionTimeSeconds is { } time && !double.IsFinite(time) ||
+            detectorAmplitudeCounts is { } amplitude && !double.IsFinite(amplitude) ||
+            displayedRfAmplitudeCounts is { } displayed && !double.IsFinite(displayed) ||
+            prominenceCounts is { } prominence && (!double.IsFinite(prominence) || prominence < 0) ||
+            thresholdMarginCounts is { } margin && !double.IsFinite(margin) ||
+            status == GateResultStatus.Detected &&
+                (sampleIndex is null || fractionalSamplePosition is null || detectionTimeSeconds is null ||
+                 detectorAmplitudeCounts is null || displayedRfAmplitudeCounts is null))
+            throw new ArgumentException("A valid exact gate event is required.");
+        Status = status; EventKind = eventKind; SampleIndex = sampleIndex;
+        FractionalSamplePosition = fractionalSamplePosition; DetectionTimeSeconds = detectionTimeSeconds;
+        DetectorAmplitudeCounts = detectorAmplitudeCounts; DisplayedRfAmplitudeCounts = displayedRfAmplitudeCounts;
+        ProminenceCounts = prominenceCounts; ThresholdMarginCounts = thresholdMarginCounts;
+    }
+    public GateResultStatus Status { get; }
+    public GateDetectionEventKind EventKind { get; }
+    public int? SampleIndex { get; }
+    public double? FractionalSamplePosition { get; }
+    public double? DetectionTimeSeconds { get; }
+    public double? DetectorAmplitudeCounts { get; }
+    public double? DisplayedRfAmplitudeCounts { get; }
+    public double? ProminenceCounts { get; }
+    public double? ThresholdMarginCounts { get; }
 }
 
 public sealed class GateGeometrySnapshot

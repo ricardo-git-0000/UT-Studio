@@ -134,8 +134,9 @@ public sealed class GatePlanCompilerTests
             local: new(1, 25_000, 1)).IsCompiled);
         AssertFailure(CompileDetector(GateDetectorKind.FirstLocalMaximum,
             local: new(1, .2, 0)), GateCompilationErrorCode.InvalidLocalExtremaParameters);
-        AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A", detector: GateDetectorKind.AbsoluteMaximum,
-            domain: GateSignalDomain.Positive)])), GateCompilationErrorCode.UnsupportedCombination);
+        Assert.IsTrue(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A", detector: GateDetectorKind.AbsoluteMaximum,
+            domain: GateSignalDomain.Positive)])).IsCompiled,
+            "Legacy AbsoluteMaximum is retained only as a direct-input alias; it no longer rectifies samples.");
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A",
             detector: (GateDetectorKind)999)])), GateCompilationErrorCode.UnsupportedCombination);
         AssertFailure(_compiler.Compile(GateTestPlan.Plan([GateTestPlan.Gate("A",
